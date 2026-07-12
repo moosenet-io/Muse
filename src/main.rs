@@ -6,6 +6,7 @@
 //! `specs/S96-muse-foundation.md`.
 
 pub mod arr;
+pub mod channels;
 mod config;
 mod db;
 pub mod embed;

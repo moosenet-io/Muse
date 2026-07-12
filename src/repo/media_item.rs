@@ -65,3 +65,20 @@ pub async fn list_by_metadata(pool: &PgPool, media_metadata_id: i64) -> MuseResu
     .await
     .map_err(MuseError::Database)
 }
+
+/// Resolve a Plex `ratingKey` to its `media_items` row (the table's
+/// `UNIQUE (plex_rating_key)` — see `migrations/0006_media_items.sql`).
+/// Used by MUSE-06's Tautulli backfill importer to resolve a history row's
+/// movie/show `rating_key` onto a library item; returns `Ok(None)` (not an
+/// error) when the item isn't in the library yet — the caller leaves the
+/// media reference NULL rather than failing the whole import.
+pub async fn find_by_plex_rating_key(
+    pool: &PgPool,
+    plex_rating_key: &str,
+) -> MuseResult<Option<MediaItem>> {
+    sqlx::query_as::<_, MediaItem>("SELECT * FROM media_items WHERE plex_rating_key = $1")
+        .bind(plex_rating_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}

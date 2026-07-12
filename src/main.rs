@@ -8,6 +8,7 @@
 pub mod arr;
 mod config;
 mod db;
+pub mod embed;
 pub mod enrichment;
 mod error;
 mod http;
@@ -17,7 +18,9 @@ pub mod models;
 mod plex;
 mod plex_control;
 mod prowlarr;
+mod radar;
 pub mod repo;
+pub mod tautulli;
 mod trending;
 mod workers;
 

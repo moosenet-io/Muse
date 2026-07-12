@@ -23,5 +23,6 @@ pub mod quality;
 pub mod release;
 pub mod season;
 pub mod taste;
+pub mod taste_divergence;
 pub mod trending;
 pub mod watch_stats;

@@ -144,6 +144,45 @@ pub async fn find_by_tmdb_id(
         .map_err(MuseError::Database)
 }
 
+/// Best-effort resolve a parsed release (title + optional year) to an
+/// existing `media_metadata` row via an exact, case-insensitive title match
+/// (+ year equality when a year was parsed). Used by the Prowlarr
+/// report-pull worker (MUSE-17) to link a release to a title without ever
+/// guessing at a fuzzy match -- a release that doesn't resolve stays
+/// unmatched (`media_metadata_id = NULL`), which is preserved on purpose
+/// (negative-space discovery, spec S4b-B) rather than silently dropped.
+///
+/// Deliberately NOT a fuzzy/similarity match (unlike `search_by_title`
+/// above): a curation/availability signal is only as trustworthy as its
+/// resolution, and a wrong match silently feeding curation is worse than a
+/// visibly-unresolved release.
+pub async fn find_by_title_year(
+    pool: &PgPool,
+    kind: MediaKind,
+    title: &str,
+    year: Option<i32>,
+) -> MuseResult<Option<i64>> {
+    match year {
+        Some(y) => sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM media_metadata WHERE kind = $1 AND lower(title) = lower($2) AND year = $3 LIMIT 1",
+        )
+        .bind(kind)
+        .bind(title)
+        .bind(y)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database),
+        None => sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM media_metadata WHERE kind = $1 AND lower(title) = lower($2) LIMIT 1",
+        )
+        .bind(kind)
+        .bind(title)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database),
+    }
+}
+
 pub async fn search_by_title(pool: &PgPool, query: &str, limit: i64) -> MuseResult<Vec<MediaMetadata>> {
     sqlx::query_as::<_, MediaMetadata>(
         r#"

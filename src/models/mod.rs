@@ -32,6 +32,7 @@ pub mod quality;
 pub mod release;
 pub mod season;
 pub mod taste;
+pub mod taste_divergence;
 pub mod taxonomy;
 pub mod trending;
 pub mod watch_stats;
@@ -58,6 +59,7 @@ pub use quality::{CustomFormat, QualityDefinition, QualityProfile, QualityProfil
 pub use release::{NewRelease, Release};
 pub use season::Season;
 pub use taste::{TasteContextCentroid, TasteProfile, TasteSignal};
+pub use taste_divergence::{NewTasteDivergence, TasteDivergence};
 pub use taxonomy::{Collection, Genre, MediaMetadataCredit, Person, Tag};
 pub use trending::{
     NewPopulationProfile, NewStreamingAvailability, NewTrendingSnapshot, PopulationProfile,

@@ -56,6 +56,34 @@ pub struct Config {
     /// startup. Never a literal instance list — always sourced from
     /// `MUSE_ARR_INSTANCES` at runtime (<secret-manager>-materialized).
     pub arr_instances_json: Option<String>,
+
+    // --- MUSE-17: Prowlarr report-pull worker (behavioral config, not
+    // secret-shaped -- no vault involvement, same posture as MUSE_BIND_ADDR
+    // above). ---
+    /// How often the report-pull worker's background loop wakes up to check
+    /// which indexers are due for a poll (spec S4b-B: "on a per-indexer
+    /// interval ... never poll faster than this" -- the *indexer's own*
+    /// `polite_min_interval_secs` is the real etiquette gate; this is just
+    /// the scheduler's check cadence and should be well under the smallest
+    /// configured per-indexer interval).
+    pub prowlarr_tick_interval_secs: u64,
+    /// Newznab parent category ids treated as "movies" for report-pull
+    /// (spec S4b-B: "movies 2000s"). Comma-separated in
+    /// `MUSE_PROWLARR_MOVIE_CATEGORIES`.
+    pub prowlarr_movie_categories: Vec<i32>,
+    /// Newznab parent category ids treated as "tv" for report-pull (spec
+    /// S4b-B: "tv 5000s"). Comma-separated in `MUSE_PROWLARR_TV_CATEGORIES`.
+    pub prowlarr_tv_categories: Vec<i32>,
+    /// Minimum `prowlarr::ParsedRelease::confidence` required before the
+    /// worker will attempt to resolve a release to an existing
+    /// `media_metadata` title. Below this, the release is still stored
+    /// (negative-space discovery, spec S4b-B) but `media_metadata_id` stays
+    /// NULL rather than risk a wrong match on a poorly-parsed name.
+    pub prowlarr_resolve_min_confidence: f32,
+    /// How long a rolling `releases` snapshot row stays before
+    /// `repo::release::prune_expired` removes it (spec S3.6: "expired rows
+    /// are pruned"). Every re-seen release refreshes this on upsert.
+    pub release_expiry_days: i64,
 }
 
 impl Config {
@@ -85,6 +113,12 @@ impl Config {
             news_url: env_opt("MUSE_NEWS_URL"),
             news_api_key: env_opt("MUSE_NEWS_API_KEY"),
             arr_instances_json: env_opt("MUSE_ARR_INSTANCES"),
+
+            prowlarr_tick_interval_secs: env_u64("MUSE_PROWLARR_TICK_INTERVAL_SECS", 60),
+            prowlarr_movie_categories: env_int_list("MUSE_PROWLARR_MOVIE_CATEGORIES", &[2000]),
+            prowlarr_tv_categories: env_int_list("MUSE_PROWLARR_TV_CATEGORIES", &[5000]),
+            prowlarr_resolve_min_confidence: env_f32("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", 0.5),
+            release_expiry_days: env_i64("MUSE_RELEASE_EXPIRY_DAYS", 21),
         }
     }
 
@@ -101,8 +135,80 @@ impl Config {
     }
 }
 
+/// Test/scaffold convenience -- NOT used by `from_env`, which always reads
+/// every field explicitly. Lets test modules elsewhere in the crate build a
+/// `Config` via struct-update syntax (`Config { prowlarr_url, ..Default::default() }`)
+/// without having to enumerate every unrelated field.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            database_url: None,
+            bind_addr: DEFAULT_BIND_ADDR.to_string(),
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
+            plex_url: None,
+            plex_token: None,
+            tautulli_url: None,
+            tautulli_api_key: None,
+            radarr_url: None,
+            radarr_api_key: None,
+            sonarr_url: None,
+            sonarr_api_key: None,
+            prowlarr_url: None,
+            prowlarr_api_key: None,
+            tmdb_api_key: None,
+            ollama_url: None,
+            chord_url: None,
+            arr_instances_json: None,
+            prowlarr_tick_interval_secs: 60,
+            prowlarr_movie_categories: vec![2000],
+            prowlarr_tv_categories: vec![5000],
+            prowlarr_resolve_min_confidence: 0.5,
+            release_expiry_days: 21,
+        }
+    }
+}
+
 fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Parse a comma-separated list of integers from `key`, falling back to
+/// `default` when unset, empty, or fully unparseable. Individual tokens that
+/// fail to parse are skipped (not fatal) rather than dropping the whole
+/// list -- a single typo'd category id shouldn't take out the rest.
+fn env_int_list(key: &str, default: &[i32]) -> Vec<i32> {
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => {
+            let parsed: Vec<i32> = v
+                .split(',')
+                .filter_map(|s| s.trim().parse::<i32>().ok())
+                .collect();
+            if parsed.is_empty() {
+                default.to_vec()
+            } else {
+                parsed
+            }
+        }
+        _ => default.to_vec(),
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    env_opt(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(key: &str, default: i64) -> i64 {
+    env_opt(key)
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f32(key: &str, default: f32) -> f32 {
+    env_opt(key)
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -136,6 +242,11 @@ mod tests {
             "MUSE_NEWS_URL",
             "MUSE_NEWS_API_KEY",
             "MUSE_ARR_INSTANCES",
+            "MUSE_PROWLARR_TICK_INTERVAL_SECS",
+            "MUSE_PROWLARR_MOVIE_CATEGORIES",
+            "MUSE_PROWLARR_TV_CATEGORIES",
+            "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
+            "MUSE_RELEASE_EXPIRY_DAYS",
         ] {
             std::env::remove_var(key);
         }
@@ -152,6 +263,49 @@ mod tests {
             .arr_instances()
             .expect("empty instances should parse")
             .is_empty());
+        assert_eq!(cfg.prowlarr_tick_interval_secs, 60);
+        assert_eq!(cfg.prowlarr_movie_categories, vec![2000]);
+        assert_eq!(cfg.prowlarr_tv_categories, vec![5000]);
+        assert!((cfg.prowlarr_resolve_min_confidence - 0.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.release_expiry_days, 21);
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_prowlarr_worker_overrides_from_env() {
+        std::env::set_var("MUSE_PROWLARR_TICK_INTERVAL_SECS", "30");
+        std::env::set_var("MUSE_PROWLARR_MOVIE_CATEGORIES", "2000, 2010,bogus");
+        std::env::set_var("MUSE_PROWLARR_TV_CATEGORIES", "5000,5010");
+        std::env::set_var("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", "0.75");
+        std::env::set_var("MUSE_RELEASE_EXPIRY_DAYS", "7");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.prowlarr_tick_interval_secs, 30);
+        assert_eq!(cfg.prowlarr_movie_categories, vec![2000, 2010]);
+        assert_eq!(cfg.prowlarr_tv_categories, vec![5000, 5010]);
+        assert!((cfg.prowlarr_resolve_min_confidence - 0.75).abs() < f32::EPSILON);
+        assert_eq!(cfg.release_expiry_days, 7);
+
+        for key in [
+            "MUSE_PROWLARR_TICK_INTERVAL_SECS",
+            "MUSE_PROWLARR_MOVIE_CATEGORIES",
+            "MUSE_PROWLARR_TV_CATEGORIES",
+            "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
+            "MUSE_RELEASE_EXPIRY_DAYS",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn env_int_list_falls_back_to_default_when_all_tokens_unparseable() {
+        std::env::set_var("MUSE_TEST_ENV_INT_LIST_ALL_BOGUS", "a,b,c");
+        assert_eq!(
+            env_int_list("MUSE_TEST_ENV_INT_LIST_ALL_BOGUS", &[42]),
+            vec![42]
+        );
+        std::env::remove_var("MUSE_TEST_ENV_INT_LIST_ALL_BOGUS");
     }
 
     #[test]

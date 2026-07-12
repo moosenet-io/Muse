@@ -8,6 +8,7 @@
 pub mod arr;
 mod config;
 mod db;
+pub mod embed;
 mod error;
 mod http;
 #[cfg(test)]
@@ -18,6 +19,7 @@ mod plex_control;
 mod prowlarr;
 mod radar;
 pub mod repo;
+pub mod tautulli;
 mod trending;
 mod workers;
 

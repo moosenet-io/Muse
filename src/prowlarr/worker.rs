@@ -638,6 +638,8 @@ mod tests {
             enrichment: crate::enrichment::EnrichmentService::from_config(
                 &crate::config::Config::default(),
             ),
+            tmdb: None,
+            embed: None,
         };
 
         let summary = run_tick(&state).await.expect("run_tick should succeed");

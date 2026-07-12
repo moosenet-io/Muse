@@ -635,6 +635,9 @@ mod tests {
             plex: None,
             prowlarr: Some(prowlarr),
             arr_instances: Vec::new(),
+            enrichment: crate::enrichment::EnrichmentService::from_config(
+                &crate::config::Config::default(),
+            ),
         };
 
         let summary = run_tick(&state).await.expect("run_tick should succeed");

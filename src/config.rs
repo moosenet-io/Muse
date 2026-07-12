@@ -34,6 +34,19 @@ pub struct Config {
     pub ollama_url: Option<String>,
     pub chord_url: Option<String>,
 
+    /// MUSE-14: fleet SearXNG instance base URL, used for forum/critic
+    /// sentiment + "does it get good" enrichment queries. `None` disables
+    /// that enrichment source (graceful degrade, same posture as every
+    /// other optional integration in this struct).
+    pub searxng_url: Option<String>,
+    /// MUSE-14: news-search endpoint base URL, used for renewal/trailer
+    /// enrichment queries. `None` disables that enrichment source.
+    pub news_url: Option<String>,
+    /// MUSE-14: optional bearer API key for [`Config::news_url`]. Many
+    /// self-hosted news aggregators need none, so this is independently
+    /// optional even when `news_url` is set.
+    pub news_api_key: Option<String>,
+
     /// MUSE-05: raw JSON describing the multi-instance Radarr/Sonarr fleet
     /// (the operator runs 8 *arr instances — 5 Radarr + 3 Sonarr, sharded by
     /// root folder — see `arr::config::ArrInstanceConfig`). Kept as an
@@ -96,6 +109,9 @@ impl Config {
             tmdb_api_key: env_opt("TMDB_API_KEY"),
             ollama_url: env_opt("MUSE_OLLAMA_URL"),
             chord_url: env_opt("CHORD_URL"),
+            searxng_url: env_opt("MUSE_SEARXNG_URL"),
+            news_url: env_opt("MUSE_NEWS_URL"),
+            news_api_key: env_opt("MUSE_NEWS_API_KEY"),
             arr_instances_json: env_opt("MUSE_ARR_INSTANCES"),
 
             prowlarr_tick_interval_secs: env_u64("MUSE_PROWLARR_TICK_INTERVAL_SECS", 60),
@@ -148,6 +164,9 @@ impl Default for Config {
             prowlarr_tv_categories: vec![5000],
             prowlarr_resolve_min_confidence: 0.5,
             release_expiry_days: 21,
+            searxng_url: None,
+            news_url: None,
+            news_api_key: None,
         }
     }
 }
@@ -222,6 +241,9 @@ mod tests {
             "TMDB_API_KEY",
             "MUSE_OLLAMA_URL",
             "CHORD_URL",
+            "MUSE_SEARXNG_URL",
+            "MUSE_NEWS_URL",
+            "MUSE_NEWS_API_KEY",
             "MUSE_ARR_INSTANCES",
             "MUSE_PROWLARR_TICK_INTERVAL_SECS",
             "MUSE_PROWLARR_MOVIE_CATEGORIES",

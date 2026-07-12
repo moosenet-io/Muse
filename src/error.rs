@@ -21,6 +21,13 @@ pub enum MuseError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A well-formed request whose *content* is invalid — e.g.
+    /// `POST /proactive/{id}/ack`'s `outcome` field holding a value other
+    /// than `"sent"`/`"dismissed"`. Distinct from [`MuseError::Config`]
+    /// (a server-side misconfiguration, 500) — this is caller error, 400.
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -71,6 +78,7 @@ impl IntoResponse for MuseError {
             MuseError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             MuseError::NotImplemented => (StatusCode::NOT_IMPLEMENTED, self.to_string()),
             MuseError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            MuseError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             MuseError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             MuseError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             MuseError::Http(e) => (StatusCode::BAD_GATEWAY, e.to_string()),

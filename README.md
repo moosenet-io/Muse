@@ -32,6 +32,7 @@ fleet — never hardcode secrets):
 | `MUSE_PROWLARR_TV_CATEGORIES` | `5000` | Comma-separated Newznab parent category ids treated as "tv". |
 | `MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE` | `0.5` | Minimum release-name parse confidence required before a release is resolved to a title. |
 | `MUSE_RELEASE_EXPIRY_DAYS` | `21` | How long a rolling release snapshot row stays before it's pruned. |
+| `MUSE_RECALL_VECTOR_MAX_DISTANCE` | `0.4` | Max pgvector cosine distance a `/query/resolve` vector-tier match may have and still count as confident (see below). |
 
 ```
 cargo run
@@ -57,3 +58,46 @@ expired `releases` rows are pruned at the end of each tick (never silently — a
 count is logged). A Prowlarr outage or a single malformed release only skips that one
 indexer/release for the current tick; the next tick retries. If Prowlarr isn't configured, the
 worker is never spawned at all.
+
+## Vector recall + search API (MUSE-09)
+
+Assistant-speed, private lookup over the library — `/query/resolve` and `/query/similar`, both
+`POST`, both under the top-level `/query` group. Every tier degrades gracefully: an unconfigured
+or failing dependency never turns into a 500, it just falls through to the next rung.
+
+### `POST /query/resolve`
+
+```json
+{"query": "that space linguist movie", "limit": 10, "include_tmdb": false}
+```
+
+A resolution ladder, in order, stopping at the first rung with results:
+
+1. **vector** — embeds `query` via the MUSE-08 `OllamaEmbedClient` (`MUSE_OLLAMA_URL`) and runs a
+   pgvector cosine nearest-neighbor search over the library's stored embeddings. A match is only
+   "confident" if its cosine distance is `<= MUSE_RECALL_VECTOR_MAX_DISTANCE`; anything less
+   confident (or no Ollama configured, or the embed/search call fails) falls through.
+2. **trigram** — `pg_trgm` fuzzy title search over the library's own `media_metadata`, scoped to
+   what's actually in the catalog.
+3. **tmdb** — only attempted when the caller passes `include_tmdb: true`. A TMDb
+   `/search/multi` lookup beyond the library; every hit is tagged `"source": "tmdb"` with a
+   `note` explicitly marking it as not in your library.
+
+The response reports which tier answered (`"tier": "vector" | "trigram" | "tmdb" | "none"`) and
+a `results` array whose entries are tagged by `"source"`. An unmatched or empty query returns
+`"tier": "none"` with an empty `results` array — never an error.
+
+### `POST /query/similar`
+
+```json
+{"media_item_id": 42, "limit": 10}
+```
+
+"More like this" for a known `media_item_id`. Prefers the item's own stored MUSE-08 embedding
+(cosine nearest-neighbor, excluding the seed from its own result list — `"tier": "vector"`).
+When the seed has no embedding yet (not embedded, or Ollama was never configured), falls back to
+a shared-genre similarity ranking (`"tier": "genre"`) so the endpoint still returns something
+useful instead of erroring. Returns `"tier": "none"` with an empty `results` array when neither
+tier finds anything. A `media_item_id` that doesn't exist in the library is a `404`, not a
+degraded response — unlike `/query/resolve`'s free-text ladder, a caller-supplied id is expected
+to resolve.

@@ -72,6 +72,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/ingest", ingest_routes())
         .nest("/query", query_routes())
         .nest("/proactive", proactive_routes())
+        // MUSE-11: the curation/recommend engine — `POST /recommend`,
+        // `GET /recommend/on_deck`, `GET /recommend/gaps`.
+        .nest("/recommend", recommend_routes())
         // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
         // `/api/channels*`, `/art/{kind}/{id}`).
         .merge(crate::web::routes())
@@ -133,6 +136,15 @@ fn query_routes() -> Router<Arc<AppState>> {
 
 fn proactive_routes() -> Router<Arc<AppState>> {
     Router::new().fallback(not_implemented)
+}
+
+/// MUSE-11: `POST /recommend` (mounted at nest root, i.e. `POST /recommend`
+/// itself) + `GET /recommend/on_deck` + `GET /recommend/gaps`.
+fn recommend_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/", post(crate::curation::recommend_handler))
+        .route("/on_deck", get(crate::curation::on_deck_handler))
+        .route("/gaps", get(crate::curation::gaps_handler))
 }
 
 async fn not_implemented() -> MuseError {

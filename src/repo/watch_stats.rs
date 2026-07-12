@@ -1,8 +1,10 @@
 //! Repo functions for `watch_stats` / `ratings` / `watchlist`.
 
-use sqlx::PgPool;
+use chrono::{DateTime, Utc};
+use sqlx::{FromRow, PgPool};
 
 use crate::error::{MuseError, MuseResult};
+use crate::models::media_metadata::MediaKind;
 use crate::models::watch_stats::{NewWatchStats, Rating, WatchStats, WatchlistEntry};
 
 // --- watch_stats -----------------------------------------------------
@@ -60,6 +62,61 @@ pub async fn list_watch_stats_for_account(pool: &PgPool, account_id: i64) -> Mus
         "SELECT * FROM watch_stats WHERE account_id = $1 ORDER BY last_watched_at DESC NULLS LAST",
     )
     .bind(account_id)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// One "continue watching" candidate row (MUSE-11 curation §6): a title the
+/// account has started but neither finished nor abandoned, joined with the
+/// display fields the curation layer needs so it doesn't have to N+1 back to
+/// `media_items`/`media_metadata` per row.
+#[derive(Debug, Clone, FromRow)]
+pub struct OnDeckRow {
+    pub media_item_id: i64,
+    pub media_metadata_id: i64,
+    pub title: String,
+    pub year: Option<i32>,
+    pub kind: MediaKind,
+    pub avg_percent: Option<f32>,
+    pub last_watched_at: Option<DateTime<Utc>>,
+}
+
+/// MUSE-11: on-deck / continue-watching candidates for `account_id` —
+/// `watch_stats` rows that are neither finished (`finished_count = 0`) nor
+/// abandoned, with a recorded, non-trivial `avg_percent` (excludes a session
+/// that barely started, and excludes anything essentially done, which
+/// `watch_stats::recompute` would ordinarily have already marked finished —
+/// the `< 95` guard is a defensive belt-and-suspenders against a not-yet-
+/// recomputed edge case, not the primary "is this finished" signal).
+/// Ordered most-recently-watched first, the natural "pick this back up"
+/// order.
+pub async fn list_on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<Vec<OnDeckRow>> {
+    sqlx::query_as::<_, OnDeckRow>(
+        r#"
+        SELECT
+            mi.id AS media_item_id,
+            mm.id AS media_metadata_id,
+            mm.title AS title,
+            mm.year AS year,
+            mm.kind AS kind,
+            ws.avg_percent AS avg_percent,
+            ws.last_watched_at AS last_watched_at
+        FROM watch_stats ws
+        JOIN media_items mi ON mi.id = ws.media_item_id
+        JOIN media_metadata mm ON mm.id = mi.media_metadata_id
+        WHERE ws.account_id = $1
+          AND ws.finished_count = 0
+          AND ws.abandoned = false
+          AND ws.avg_percent IS NOT NULL
+          AND ws.avg_percent > 0
+          AND ws.avg_percent < 95
+        ORDER BY ws.last_watched_at DESC NULLS LAST
+        LIMIT $2
+        "#,
+    )
+    .bind(account_id)
+    .bind(limit)
     .fetch_all(pool)
     .await
     .map_err(MuseError::Database)

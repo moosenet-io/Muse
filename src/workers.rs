@@ -1,18 +1,28 @@
 //! Background-worker harness.
 //!
-//! Phase 0 ships no real workers yet — the session poller, embedder,
-//! taste-recompute, and proactive-scheduler workers land in MUSE-05+. This
-//! module exists so `main.rs` has a stable spawn point to grow from.
+//! The session poller, embedder, taste-recompute, and proactive-scheduler
+//! workers still land in MUSE-05+; the Prowlarr report-pull worker (MUSE-17)
+//! is the first real background worker to register here.
 
 use std::sync::Arc;
 
 use crate::http::AppState;
+use crate::prowlarr::spawn_report_pull_worker;
 
 /// Spawn all background workers for the given application state.
 ///
-/// Currently a no-op harness: it logs that no workers are registered yet and
-/// returns immediately. Future workers should be spawned here via
-/// `tokio::spawn` and their `JoinHandle`s tracked/returned as needed.
-pub fn spawn_workers(_state: Arc<AppState>) {
-    tracing::info!("worker harness started: no workers registered yet (see MUSE-05+)");
+/// Each worker is expected to degrade gracefully rather than panic when its
+/// upstream dependency isn't configured (see `prowlarr::worker::run_tick`,
+/// which no-ops per tick when `state.prowlarr` is `None`) -- but the report
+/// -pull worker is only spawned at all when Prowlarr IS configured, so an
+/// unconfigured deployment doesn't run an idle tokio task forever.
+pub fn spawn_workers(state: Arc<AppState>) {
+    tracing::info!("worker harness started");
+
+    if state.prowlarr.is_some() {
+        spawn_report_pull_worker(state.clone());
+        tracing::info!("prowlarr report-pull worker spawned (MUSE-17)");
+    } else {
+        tracing::info!("prowlarr not configured; report-pull worker not started");
+    }
 }

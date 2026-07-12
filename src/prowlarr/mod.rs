@@ -10,6 +10,12 @@
 //!   the client enforces.
 //! - [`parse::parse_release_name`] — the deterministic release-name parser
 //!   v0 that populates `releases.parsed_*`.
+//! - [`scheduler::is_due`] — the persisted (DB-backed) per-indexer
+//!   scheduling decision the report-pull worker uses (MUSE-17).
+//! - [`worker::run_tick`] / [`worker::spawn_report_pull_worker`] — the
+//!   scheduled report-pull worker itself (MUSE-17): ties the client, parser,
+//!   and repo layer together into one pull -> parse -> upsert -> rollup
+//!   pass, run on a background loop.
 //!
 //! This module makes no writes to Prowlarr and never grabs anything; the
 //! persistence side (upserting into `indexers`/`releases`/`availability`)
@@ -19,8 +25,11 @@ mod client;
 mod models;
 mod parse;
 mod rate_limit;
+mod scheduler;
+mod worker;
 
 pub use client::ProwlarrClient;
 pub use models::{ProwlarrCapabilities, ProwlarrCategory, ProwlarrIndexer, ProwlarrRelease};
 pub use parse::{parse_release_name, ParsedRelease};
 pub use rate_limit::RateLimiter;
+pub use worker::{spawn_report_pull_worker, TickSummary};

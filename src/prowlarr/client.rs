@@ -401,6 +401,7 @@ mod tests {
             prowlarr_url,
             prowlarr_api_key,
             tmdb_api_key: None,
+            arr_instances_json: None,
             ollama_url: None,
             chord_url: None,
         }

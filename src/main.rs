@@ -12,6 +12,7 @@ mod http;
 #[cfg(test)]
 mod integration_tests;
 pub mod models;
+mod plex;
 pub mod repo;
 mod workers;
 
@@ -33,9 +34,13 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::build_pool(&config)
         .map_err(|e| anyhow::anyhow!("failed to construct database pool: {e}"))?;
 
+    let plex_client = crate::plex::PlexClient::from_config(&config);
+    tracing::info!(plex_configured = plex_client.is_some(), "plex client initialized");
+
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
+        plex: plex_client,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

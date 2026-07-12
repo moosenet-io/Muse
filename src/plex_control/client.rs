@@ -58,7 +58,7 @@ impl PlexControlClient {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|e| MuseError::Upstream(format!("failed to build HTTP client: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("failed to build HTTP client: {e}")))?;
 
         Ok(Self::new(base_url, token, http))
     }
@@ -92,10 +92,10 @@ impl PlexControlClient {
             .header("X-Plex-Token", &self.token)
             .send()
             .await
-            .map_err(|e| MuseError::Upstream(format!("GET /clients failed: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("GET /clients failed: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(MuseError::Upstream(format!(
+            return Err(MuseError::upstream(format!(
                 "GET /clients returned {}",
                 resp.status()
             )));
@@ -104,7 +104,7 @@ impl PlexControlClient {
         let body: MediaContainerEnvelope<ClientsMediaContainer> = resp
             .json()
             .await
-            .map_err(|e| MuseError::Upstream(format!("GET /clients: invalid response body: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("GET /clients: invalid response body: {e}")))?;
 
         Ok(body
             .media_container
@@ -129,10 +129,10 @@ impl PlexControlClient {
             .header("X-Plex-Token", &self.token)
             .send()
             .await
-            .map_err(|e| MuseError::Upstream(format!("GET /identity failed: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("GET /identity failed: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(MuseError::Upstream(format!(
+            return Err(MuseError::upstream(format!(
                 "GET /identity returned {}",
                 resp.status()
             )));
@@ -141,7 +141,7 @@ impl PlexControlClient {
         let body: MediaContainerEnvelope<IdentityMediaContainer> = resp
             .json()
             .await
-            .map_err(|e| MuseError::Upstream(format!("GET /identity: invalid response body: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("GET /identity: invalid response body: {e}")))?;
 
         let id = body.media_container.machine_identifier;
         *self.server_machine_id.write().await = Some(id.clone());
@@ -152,7 +152,7 @@ impl PlexControlClient {
     /// `ratingKey`s — the native primitive for a sequenced "channel".
     pub async fn create_play_queue(&self, req: &PlayQueueRequest) -> MuseResult<PlayQueue> {
         if req.rating_keys.is_empty() {
-            return Err(MuseError::Upstream(
+            return Err(MuseError::upstream(
                 "cannot create a play queue from zero items".to_string(),
             ));
         }
@@ -177,10 +177,10 @@ impl PlexControlClient {
             ])
             .send()
             .await
-            .map_err(|e| MuseError::Upstream(format!("POST /playQueues failed: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("POST /playQueues failed: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(MuseError::Upstream(format!(
+            return Err(MuseError::upstream(format!(
                 "POST /playQueues returned {}",
                 resp.status()
             )));
@@ -189,7 +189,7 @@ impl PlexControlClient {
         let body: MediaContainerEnvelope<PlayQueueMediaContainer> = resp
             .json()
             .await
-            .map_err(|e| MuseError::Upstream(format!("POST /playQueues: invalid response body: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("POST /playQueues: invalid response body: {e}")))?;
 
         Ok(PlayQueue {
             play_queue_id: body.media_container.play_queue_id,
@@ -269,10 +269,10 @@ impl PlexControlClient {
             .query(query)
             .send()
             .await
-            .map_err(|e| MuseError::Upstream(format!("GET /player/playback/{endpoint} failed: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("GET /player/playback/{endpoint} failed: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(MuseError::Upstream(format!(
+            return Err(MuseError::upstream(format!(
                 "GET /player/playback/{endpoint} returned {}",
                 resp.status()
             )));
@@ -298,10 +298,10 @@ impl PlexControlClient {
             ])
             .send()
             .await
-            .map_err(|e| MuseError::Upstream(format!("GET /player/timeline/poll failed: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("GET /player/timeline/poll failed: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(MuseError::Upstream(format!(
+            return Err(MuseError::upstream(format!(
                 "GET /player/timeline/poll returned {}",
                 resp.status()
             )));
@@ -310,7 +310,7 @@ impl PlexControlClient {
         let raw: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| MuseError::Upstream(format!("GET /player/timeline/poll: invalid response body: {e}")))?;
+            .map_err(|e| MuseError::upstream(format!("GET /player/timeline/poll: invalid response body: {e}")))?;
 
         Ok(parse_timeline_poll(raw))
     }
@@ -428,7 +428,7 @@ mod tests {
 
         let client = test_client(&server);
         let err = client.list_clients().await.unwrap_err();
-        assert!(matches!(err, MuseError::Upstream(_)));
+        assert!(matches!(err, MuseError::Upstream { .. }));
     }
 
     #[tokio::test]
@@ -473,7 +473,7 @@ mod tests {
         let client = test_client(&server);
         let req = PlayQueueRequest::new(vec![]);
         let err = client.create_play_queue(&req).await.unwrap_err();
-        assert!(matches!(err, MuseError::Upstream(_)));
+        assert!(matches!(err, MuseError::Upstream { .. }));
     }
 
     #[tokio::test]

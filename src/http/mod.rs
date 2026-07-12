@@ -59,6 +59,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/ingest", ingest_routes())
         .nest("/query", query_routes())
         .nest("/proactive", proactive_routes())
+        // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
+        // `/api/channels*`, `/art/{kind}/{id}`).
+        .merge(crate::web::routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

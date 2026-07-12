@@ -23,6 +23,7 @@ pub mod repo;
 pub mod tautulli;
 mod tracker;
 mod trending;
+mod web;
 mod workers;
 
 use std::sync::Arc;

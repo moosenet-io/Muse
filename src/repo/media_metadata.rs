@@ -1,0 +1,143 @@
+//! Repo functions for `media_metadata` — shared provider-keyed metadata.
+//!
+//! Two upsert entry points reflect the blueprint's provider-precedence
+//! finding (§7.7): movies key primarily on `(kind, tmdb_id)` (Radarr), shows
+//! key primarily on `(kind, tvdb_id)` (Sonarr).
+
+use sqlx::PgPool;
+
+use crate::error::{MuseError, MuseResult};
+use crate::models::media_metadata::{MediaMetadata, NewMediaMetadata};
+
+pub async fn upsert_by_tmdb(pool: &PgPool, new: &NewMediaMetadata) -> MuseResult<MediaMetadata> {
+    let tmdb_id = new
+        .tmdb_id
+        .as_deref()
+        .ok_or_else(|| MuseError::Conflict("upsert_by_tmdb requires tmdb_id".to_string()))?;
+
+    sqlx::query_as::<_, MediaMetadata>(
+        r#"
+        INSERT INTO media_metadata (
+            kind, tmdb_id, tvdb_id, imdb_id, provider_ids, title, sort_title,
+            original_title, original_language, status, overview, studio,
+            network, runtime_minutes, year, images
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        ON CONFLICT (kind, tmdb_id) DO UPDATE SET
+            tvdb_id = EXCLUDED.tvdb_id,
+            imdb_id = EXCLUDED.imdb_id,
+            provider_ids = EXCLUDED.provider_ids,
+            title = EXCLUDED.title,
+            sort_title = EXCLUDED.sort_title,
+            original_title = EXCLUDED.original_title,
+            original_language = EXCLUDED.original_language,
+            status = EXCLUDED.status,
+            overview = EXCLUDED.overview,
+            studio = EXCLUDED.studio,
+            network = EXCLUDED.network,
+            runtime_minutes = EXCLUDED.runtime_minutes,
+            year = EXCLUDED.year,
+            images = EXCLUDED.images,
+            updated_at = now()
+        RETURNING *
+        "#,
+    )
+    .bind(new.kind)
+    .bind(tmdb_id)
+    .bind(&new.tvdb_id)
+    .bind(&new.imdb_id)
+    .bind(&new.provider_ids)
+    .bind(&new.title)
+    .bind(&new.sort_title)
+    .bind(&new.original_title)
+    .bind(&new.original_language)
+    .bind(&new.status)
+    .bind(&new.overview)
+    .bind(&new.studio)
+    .bind(&new.network)
+    .bind(new.runtime_minutes)
+    .bind(new.year)
+    .bind(&new.images)
+    .fetch_one(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+pub async fn upsert_by_tvdb(pool: &PgPool, new: &NewMediaMetadata) -> MuseResult<MediaMetadata> {
+    let tvdb_id = new
+        .tvdb_id
+        .as_deref()
+        .ok_or_else(|| MuseError::Conflict("upsert_by_tvdb requires tvdb_id".to_string()))?;
+
+    sqlx::query_as::<_, MediaMetadata>(
+        r#"
+        INSERT INTO media_metadata (
+            kind, tmdb_id, tvdb_id, imdb_id, provider_ids, title, sort_title,
+            original_title, original_language, status, overview, studio,
+            network, runtime_minutes, year, images
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        ON CONFLICT (kind, tvdb_id) DO UPDATE SET
+            tmdb_id = EXCLUDED.tmdb_id,
+            imdb_id = EXCLUDED.imdb_id,
+            provider_ids = EXCLUDED.provider_ids,
+            title = EXCLUDED.title,
+            sort_title = EXCLUDED.sort_title,
+            original_title = EXCLUDED.original_title,
+            original_language = EXCLUDED.original_language,
+            status = EXCLUDED.status,
+            overview = EXCLUDED.overview,
+            studio = EXCLUDED.studio,
+            network = EXCLUDED.network,
+            runtime_minutes = EXCLUDED.runtime_minutes,
+            year = EXCLUDED.year,
+            images = EXCLUDED.images,
+            updated_at = now()
+        RETURNING *
+        "#,
+    )
+    .bind(new.kind)
+    .bind(&new.tmdb_id)
+    .bind(tvdb_id)
+    .bind(&new.imdb_id)
+    .bind(&new.provider_ids)
+    .bind(&new.title)
+    .bind(&new.sort_title)
+    .bind(&new.original_title)
+    .bind(&new.original_language)
+    .bind(&new.status)
+    .bind(&new.overview)
+    .bind(&new.studio)
+    .bind(&new.network)
+    .bind(new.runtime_minutes)
+    .bind(new.year)
+    .bind(&new.images)
+    .fetch_one(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+pub async fn get(pool: &PgPool, id: i64) -> MuseResult<MediaMetadata> {
+    sqlx::query_as::<_, MediaMetadata>("SELECT * FROM media_metadata WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)?
+        .ok_or_else(|| MuseError::NotFound(format!("media_metadata {id} not found")))
+}
+
+pub async fn search_by_title(pool: &PgPool, query: &str, limit: i64) -> MuseResult<Vec<MediaMetadata>> {
+    sqlx::query_as::<_, MediaMetadata>(
+        r#"
+        SELECT * FROM media_metadata
+        WHERE title ILIKE '%' || $1 || '%'
+        ORDER BY similarity(title, $1) DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(query)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}

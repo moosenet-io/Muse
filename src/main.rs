@@ -9,7 +9,11 @@ mod config;
 mod db;
 mod error;
 mod http;
+#[cfg(test)]
+mod integration_tests;
+pub mod models;
 mod plex;
+pub mod repo;
 mod workers;
 
 use std::sync::Arc;

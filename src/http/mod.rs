@@ -1,0 +1,67 @@
+//! HTTP surface: the axum `Router` and shared application state.
+//!
+//! Phase 0 only wires `/health` for real; `/ingest`, `/query`, and
+//! `/proactive` are mounted as stub route groups that answer `501 Not
+//! Implemented` until their respective spec items (MUSE-04+) land.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use serde_json::json;
+use sqlx::postgres::PgPool;
+use tower_http::trace::TraceLayer;
+
+use crate::config::Config;
+use crate::error::MuseError;
+
+/// Shared state handed to every axum handler.
+pub struct AppState {
+    pub pool: PgPool,
+    pub config: Config,
+}
+
+/// Timeout for the `/health` DB probe — health must never hang/500 just
+/// because Postgres is slow or down.
+const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Build the top-level router for the service.
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .nest("/ingest", ingest_routes())
+        .nest("/query", query_routes())
+        .nest("/proactive", proactive_routes())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let db_status = match tokio::time::timeout(HEALTH_DB_TIMEOUT, sqlx::query("SELECT 1").execute(&state.pool)).await
+    {
+        Ok(Ok(_)) => "up",
+        Ok(Err(_)) | Err(_) => "down",
+    };
+
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "db": db_status,
+    }))
+}
+
+fn ingest_routes() -> Router<Arc<AppState>> {
+    Router::new().fallback(not_implemented)
+}
+
+fn query_routes() -> Router<Arc<AppState>> {
+    Router::new().fallback(not_implemented)
+}
+
+fn proactive_routes() -> Router<Arc<AppState>> {
+    Router::new().fallback(not_implemented)
+}
+
+async fn not_implemented() -> MuseError {
+    MuseError::NotImplemented
+}

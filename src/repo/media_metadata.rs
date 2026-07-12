@@ -183,6 +183,42 @@ pub async fn find_by_title_year(
     }
 }
 
+/// MUSE-09 "more like this" fallback for a seed with no stored embedding:
+/// rank other `media_metadata` rows of the same `kind` by shared-genre
+/// overlap with `seed_id`, most genres in common first (ties broken by
+/// `popularity` so the fallback still surfaces something reasonable, not an
+/// arbitrary id order). Excludes the seed itself. Returns an empty vec
+/// (never an error) when the seed has no genres recorded — that's a normal
+/// sparse-metadata case, not a failure.
+pub async fn similar_by_genre(
+    pool: &PgPool,
+    seed_id: i64,
+    kind: MediaKind,
+    limit: i64,
+) -> MuseResult<Vec<MediaMetadata>> {
+    sqlx::query_as::<_, MediaMetadata>(
+        r#"
+        SELECT mm.*
+        FROM media_metadata mm
+        JOIN media_metadata_genres mmg ON mmg.media_metadata_id = mm.id
+        WHERE mm.kind = $1
+          AND mm.id <> $2
+          AND mmg.genre_id IN (
+              SELECT genre_id FROM media_metadata_genres WHERE media_metadata_id = $2
+          )
+        GROUP BY mm.id
+        ORDER BY COUNT(*) DESC, mm.popularity DESC NULLS LAST, mm.id
+        LIMIT $3
+        "#,
+    )
+    .bind(kind)
+    .bind(seed_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
 pub async fn search_by_title(pool: &PgPool, query: &str, limit: i64) -> MuseResult<Vec<MediaMetadata>> {
     sqlx::query_as::<_, MediaMetadata>(
         r#"

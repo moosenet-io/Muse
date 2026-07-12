@@ -19,6 +19,7 @@ mod plex;
 mod plex_control;
 mod prowlarr;
 mod radar;
+mod recall;
 pub mod repo;
 pub mod tautulli;
 mod tracker;
@@ -66,13 +67,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // MUSE-19: constructed for parity with the Plex client above (and so
+    // MUSE-19/MUSE-09: `TmdbClient` is shared between the trending ingest
+    // (MUSE-19) and `/query/resolve`'s beyond-the-library tier (MUSE-09).
+    // Constructed once here (parity with the Plex client above, and so
     // TMDB_API_KEY misconfiguration is visible at boot); the scheduled
-    // trending-ingest worker that actually calls
-    // `trending::snapshot_trending` on a cadence is a follow-on wiring item
-    // — see `src/trending/mod.rs`.
-    let tmdb_configured = crate::trending::TmdbClient::from_config(&config).is_some();
-    tracing::info!(tmdb_configured, "tmdb client initialized");
+    // trending-ingest worker that calls `trending::snapshot_trending` on a
+    // cadence is a follow-on wiring item — see `src/trending/mod.rs`.
+    let tmdb_client = crate::trending::TmdbClient::from_config(&config);
+    tracing::info!(tmdb_configured = tmdb_client.is_some(), "tmdb client initialized");
+
+    // MUSE-09: the query-embedding side of the MUSE-08 embed client. Reuses
+    // the same `OllamaEmbedClient` type the embedder pipeline uses to embed
+    // `media_item`s, just pointed at a caller's free-text query instead of
+    // a title's composed source text.
+    let embed_client = crate::embed::OllamaEmbedClient::from_config(&config);
+    tracing::info!(embed_configured = embed_client.is_some(), "embed client initialized");
 
     // MUSE-14: forum/critic sentiment + "does it get good" + renewal/
     // trailer news, cached into `external_enrichment`. Both sub-clients
@@ -86,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
         prowlarr: prowlarr_client,
         arr_instances,
         enrichment,
+        tmdb: tmdb_client,
+        embed: embed_client,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

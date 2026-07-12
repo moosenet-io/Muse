@@ -5,6 +5,8 @@
 //! rest of `/ingest` and `/query` are mounted as stub route groups that
 //! answer `501 Not Implemented` until their respective spec items land.
 
+pub mod ops;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,8 +83,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         // MUSE-28: HDHomeRun-emulation linear tuner (`/discover.json`,
         // `/lineup.json`, `/muse.m3u`, `/xmltv.xml`, ...).
         .merge(tuner_routes())
+        // MUSE-31: the on-demand channel composer trigger (MUSE-24's
+        // `compose_channel_run` had no HTTP surface until now).
+        .route("/channels/{id}/compose", post(crate::channels::compose_handler))
+        // MUSE-31: on-demand ops routes -- manual triggers for the same
+        // routines the background maintenance/trending workers run on a
+        // schedule (see `crate::maintenance`). Mainly for priming a fresh
+        // deploy and operator debugging.
+        .nest("/ops", ops_routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// MUSE-31: on-demand ops routes — see `crate::http::ops`.
+fn ops_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/ingest/arr", post(ops::ingest_arr))
+        .route("/ingest/tautulli", post(ops::ingest_tautulli))
+        .route("/maintenance", post(ops::run_maintenance_now))
 }
 
 /// MUSE-28/29: the linear tuner surface — HDHomeRun-emulation discovery

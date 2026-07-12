@@ -23,6 +23,7 @@ mod prowlarr;
 mod radar;
 mod recall;
 pub mod repo;
+mod streaming;
 pub mod tautulli;
 pub mod taste_model;
 mod tracker;

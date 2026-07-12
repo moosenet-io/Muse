@@ -7,7 +7,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::json;
 use sqlx::postgres::PgPool;
 use tower_http::trace::TraceLayer;
@@ -73,7 +78,12 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 fn ingest_routes() -> Router<Arc<AppState>> {
-    Router::new().fallback(not_implemented)
+    // MUSE-07: the native Plex tracker's webhook receiver (spec §4-A) — the
+    // only real route in this group so far; everything else still answers
+    // 501 until its own spec item lands.
+    Router::new()
+        .route("/plex-webhook", post(crate::tracker::webhook::plex_webhook))
+        .fallback(not_implemented)
 }
 
 fn query_routes() -> Router<Arc<AppState>> {

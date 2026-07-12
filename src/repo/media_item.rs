@@ -56,6 +56,20 @@ pub async fn list_by_library(pool: &PgPool, library_id: i64) -> MuseResult<Vec<M
     .map_err(MuseError::Database)
 }
 
+/// Look up a media_item by its Plex `ratingKey` — MUSE-07's session
+/// reconstruction resolves a raw `play_events.rating_key` to a local
+/// `media_item_id` this way (movies are 1:1; TV rating keys resolve via
+/// `repo::episode::get_by_plex_rating_key` instead). Returns `Ok(None)`
+/// rather than erroring when unresolved — a session for an item not yet
+/// seen by *arr ingest is a normal race, not a failure.
+pub async fn get_by_plex_rating_key(pool: &PgPool, plex_rating_key: &str) -> MuseResult<Option<MediaItem>> {
+    sqlx::query_as::<_, MediaItem>("SELECT * FROM media_items WHERE plex_rating_key = $1")
+        .bind(plex_rating_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}
+
 pub async fn list_by_metadata(pool: &PgPool, media_metadata_id: i64) -> MuseResult<Vec<MediaItem>> {
     sqlx::query_as::<_, MediaItem>(
         "SELECT * FROM media_items WHERE media_metadata_id = $1 ORDER BY id",

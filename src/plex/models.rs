@@ -8,7 +8,7 @@
 //! episode vs session) — a strict schema would break parsing on fields we
 //! don't otherwise care about.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level Plex response envelope: `{ "MediaContainer": { ... } }`.
 #[derive(Debug, Deserialize)]
@@ -84,14 +84,14 @@ pub struct Account {
 }
 
 /// A `{tag: "..."}` style entry used for genres and collections.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tag {
     pub tag: String,
 }
 
 /// A person credit entry (`Director`, `Writer`, `Role`/actor). `role` carries
 /// the character name and is only populated for `Role` (cast) entries.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PersonTag {
     pub tag: String,
     #[serde(default)]
@@ -101,13 +101,13 @@ pub struct PersonTag {
 }
 
 /// An external-provider GUID, e.g. `{"id": "tmdb://603"}`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Guid {
     pub id: String,
 }
 
 /// The `User` block Plex attaches to active sessions and history entries.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SessionUser {
     #[serde(default)]
     pub id: Option<String>,
@@ -118,7 +118,7 @@ pub struct SessionUser {
 }
 
 /// The `Player` block Plex attaches to active sessions and history entries.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SessionPlayer {
     #[serde(default)]
     pub title: Option<String>,
@@ -134,11 +134,54 @@ pub struct SessionPlayer {
     pub machine_identifier: Option<String>,
 }
 
+/// One entry of the `Media` array Plex attaches to session entries (and
+/// full item metadata) — carries codec/resolution/bitrate for MUSE-07's
+/// `play_session_media_info` capture (spec §4-B). Plex nests the actual
+/// `Part`/`Stream` decision info one level deeper; this crate only reads
+/// the top-level `Media` fields it needs (resolution/codecs/bitrate) plus
+/// the separate top-level `TranscodeSession` block below for the
+/// direct-play/transcode decision itself.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MediaInfo {
+    #[serde(rename = "videoResolution", default)]
+    pub video_resolution: Option<String>,
+    #[serde(default)]
+    pub bitrate: Option<i64>,
+    #[serde(default)]
+    pub width: Option<i64>,
+    #[serde(default)]
+    pub height: Option<i64>,
+    #[serde(rename = "videoCodec", default)]
+    pub video_codec: Option<String>,
+    #[serde(rename = "audioCodec", default)]
+    pub audio_codec: Option<String>,
+    #[serde(rename = "audioChannels", default)]
+    pub audio_channels: Option<f64>,
+    #[serde(default)]
+    pub container: Option<String>,
+}
+
+/// Plex's `TranscodeSession` block, present on an active session entry only
+/// when the server is transcoding it (its *absence* is itself Plex's signal
+/// that playback is direct-play end to end — see
+/// `tracker::poller::plex_media_info`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TranscodeSession {
+    #[serde(rename = "videoDecision", default)]
+    pub video_decision: Option<String>,
+    #[serde(rename = "audioDecision", default)]
+    pub audio_decision: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// A Plex `Metadata` entry — reused across library items, session entries,
 /// history entries, on-deck/recently-added, and watchlist entries. Not every
 /// field is populated for every endpoint; callers should treat all of these
 /// as best-effort.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MediaItem {
     #[serde(rename = "ratingKey", default)]
     pub rating_key: Option<String>,
@@ -223,6 +266,12 @@ pub struct MediaItem {
     pub user: Option<SessionUser>,
     #[serde(rename = "Player", default)]
     pub player: Option<SessionPlayer>,
+
+    // --- media/quality info (active sessions only; MUSE-07 §4-B) ---
+    #[serde(rename = "Media", default)]
+    pub media: Vec<MediaInfo>,
+    #[serde(rename = "TranscodeSession", default)]
+    pub transcode_session: Option<TranscodeSession>,
 }
 
 impl MediaItem {

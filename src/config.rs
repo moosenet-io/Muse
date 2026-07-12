@@ -22,6 +22,11 @@ pub struct Config {
     // --- External service placeholders (Phase 0+ integrations) ---
     pub plex_url: Option<String>,
     pub plex_token: Option<String>,
+    /// MUSE-07: session-poller cadence in seconds (`MUSE_PLEX_POLL_SECS`).
+    /// `None` when unset/unparseable — the poller falls back to its own
+    /// default (10s, see `tracker::poller`) rather than this module
+    /// authoring a default value.
+    pub plex_poll_secs: Option<u64>,
     pub tautulli_url: Option<String>,
     pub tautulli_api_key: Option<String>,
     pub radarr_url: Option<String>,
@@ -98,6 +103,7 @@ impl Config {
 
             plex_url: env_opt("PLEX_URL"),
             plex_token: env_opt("PLEX_TOKEN"),
+            plex_poll_secs: env_opt("MUSE_PLEX_POLL_SECS").and_then(|v| v.parse().ok()),
             tautulli_url: env_opt("TAUTULLI_URL"),
             tautulli_api_key: env_opt("TAUTULLI_API_KEY"),
             radarr_url: env_opt("RADARR_URL"),
@@ -167,6 +173,7 @@ impl Default for Config {
             searxng_url: None,
             news_url: None,
             news_api_key: None,
+            plex_poll_secs: None,
         }
     }
 }
@@ -230,6 +237,7 @@ mod tests {
             "MUSE_LOG_LEVEL",
             "PLEX_URL",
             "PLEX_TOKEN",
+            "MUSE_PLEX_POLL_SECS",
             "TAUTULLI_URL",
             "TAUTULLI_API_KEY",
             "RADARR_URL",
@@ -260,6 +268,7 @@ mod tests {
         assert_eq!(cfg.log_level, DEFAULT_LOG_LEVEL);
         assert!(cfg.database_url.is_none());
         assert!(cfg.plex_url.is_none());
+        assert!(cfg.plex_poll_secs.is_none());
         assert!(cfg.tmdb_api_key.is_none());
         assert!(cfg.arr_instances_json.is_none());
         assert!(cfg

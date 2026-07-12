@@ -21,6 +21,7 @@ mod prowlarr;
 mod radar;
 pub mod repo;
 pub mod tautulli;
+mod tracker;
 mod trending;
 mod workers;
 

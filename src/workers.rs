@@ -1,23 +1,27 @@
 //! Background-worker harness.
 //!
-//! The session poller, embedder, taste-recompute, and proactive-scheduler
-//! workers still land in MUSE-05+; the Prowlarr report-pull worker (MUSE-17)
-//! is the first real background worker to register here.
+//! Registers the real background workers: the Plex session poller (MUSE-07,
+//! spec §4-B) and the Prowlarr report-pull worker (MUSE-17). The embedder,
+//! taste-recompute, and proactive-scheduler workers still land in later spec
+//! items — this module remains the stable spawn point for them to grow from.
 
 use std::sync::Arc;
 
 use crate::http::AppState;
 use crate::prowlarr::spawn_report_pull_worker;
+use crate::tracker::poller;
 
 /// Spawn all background workers for the given application state.
 ///
-/// Each worker is expected to degrade gracefully rather than panic when its
-/// upstream dependency isn't configured (see `prowlarr::worker::run_tick`,
-/// which no-ops per tick when `state.prowlarr` is `None`) -- but the report
-/// -pull worker is only spawned at all when Prowlarr IS configured, so an
-/// unconfigured deployment doesn't run an idle tokio task forever.
+/// Each worker degrades gracefully rather than panicking when its upstream
+/// dependency isn't configured. The report-pull worker is only spawned when
+/// Prowlarr IS configured, so an unconfigured deployment doesn't run an idle
+/// tokio task forever. The Plex poller likewise no-ops (a single log line)
+/// when Plex isn't configured.
 pub fn spawn_workers(state: Arc<AppState>) {
     tracing::info!("worker harness started");
+
+    poller::spawn(state.clone());
 
     if state.prowlarr.is_some() {
         spawn_report_pull_worker(state.clone());

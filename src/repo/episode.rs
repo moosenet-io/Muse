@@ -61,6 +61,19 @@ pub async fn list_by_season(pool: &PgPool, season_id: i64) -> MuseResult<Vec<Epi
     .map_err(MuseError::Database)
 }
 
+/// Look up an episode by its Plex `ratingKey` — MUSE-07's session
+/// reconstruction resolves a raw `play_events.rating_key` to a local
+/// `(media_item_id, episode_id)` pair this way for TV plays (movies resolve
+/// via `repo::media_item::get_by_plex_rating_key` instead). Returns
+/// `Ok(None)` rather than erroring when unresolved.
+pub async fn get_by_plex_rating_key(pool: &PgPool, plex_rating_key: &str) -> MuseResult<Option<Episode>> {
+    sqlx::query_as::<_, Episode>("SELECT * FROM episodes WHERE plex_rating_key = $1")
+        .bind(plex_rating_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}
+
 /// Resolve a Plex `ratingKey` to its `episodes` row (the table's
 /// `UNIQUE (plex_rating_key)` — see `migrations/0008_episodes.sql`). Used by
 /// MUSE-06's Tautulli backfill importer to resolve an episode-level history

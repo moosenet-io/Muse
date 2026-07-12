@@ -8,6 +8,7 @@
 pub mod arr;
 pub mod channels;
 mod config;
+pub mod curation;
 mod db;
 pub mod embed;
 pub mod enrichment;

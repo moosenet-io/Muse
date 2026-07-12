@@ -113,6 +113,18 @@ pub struct Config {
     /// Purely a wake cadence, not a secret — same posture as
     /// `prowlarr_tick_interval_secs` above.
     pub channel_scheduler_tick_secs: u64,
+
+    /// MUSE-09: the maximum pgvector cosine distance (`embedding <=> query`,
+    /// range 0.0 = identical to 2.0 = opposite) a vector-tier match may have
+    /// and still be treated as "confident" by `/query/resolve`'s resolution
+    /// ladder. A vector hit above this distance is not trustworthy enough to
+    /// answer with — the ladder falls through to the pg_trgm tier instead of
+    /// returning a wrong-but-vector-scored guess. Tune via
+    /// `MUSE_RECALL_VECTOR_MAX_DISTANCE`; the default (0.4) is a
+    /// conservative starting point for `nomic-embed-text` cosine distances
+    /// at Phase-0 library sizes, not a value derived from a production
+    /// corpus yet.
+    pub recall_vector_max_distance: f64,
 }
 
 impl Config {
@@ -157,6 +169,9 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_HDHR_DEVICE_ID.to_string()),
             channel_guide_window_hours: env_i64("MUSE_CHANNEL_GUIDE_WINDOW_HOURS", 48),
             channel_scheduler_tick_secs: env_u64("MUSE_CHANNEL_SCHEDULER_TICK_SECS", 900),
+            recall_vector_max_distance: env_opt("MUSE_RECALL_VECTOR_MAX_DISTANCE")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.4),
         }
     }
 
@@ -210,6 +225,7 @@ impl Default for Config {
             hdhr_device_id: DEFAULT_HDHR_DEVICE_ID.to_string(),
             channel_guide_window_hours: 48,
             channel_scheduler_tick_secs: 900,
+            recall_vector_max_distance: 0.4,
         }
     }
 }
@@ -298,6 +314,7 @@ mod tests {
             "MUSE_HDHR_DEVICE_ID",
             "MUSE_CHANNEL_GUIDE_WINDOW_HOURS",
             "MUSE_CHANNEL_SCHEDULER_TICK_SECS",
+            "MUSE_RECALL_VECTOR_MAX_DISTANCE",
         ] {
             std::env::remove_var(key);
         }
@@ -324,6 +341,7 @@ mod tests {
         assert_eq!(cfg.hdhr_device_id, DEFAULT_HDHR_DEVICE_ID);
         assert_eq!(cfg.channel_guide_window_hours, 48);
         assert_eq!(cfg.channel_scheduler_tick_secs, 900);
+        assert!((cfg.recall_vector_max_distance - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]

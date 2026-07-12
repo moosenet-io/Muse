@@ -32,10 +32,25 @@ pub enum MuseError {
     #[error("upstream request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// An upstream HTTP dependency (e.g. Plex) responded, but with a
-    /// non-success status or a body we couldn't parse.
+    /// An upstream/external service (Plex, Tautulli, TMDb, …) responded with a
+    /// non-success status, an unexpected response, or was otherwise unusable.
+    /// Generic across every upstream integration, not just Plex control.
     #[error("upstream error ({status}): {message}")]
     Upstream { status: u16, message: String },
+}
+
+impl MuseError {
+    /// Convenience constructor for a generic upstream failure with no specific
+    /// upstream HTTP status of its own — transport wrappers, malformed bodies,
+    /// or preconditions. Records status 502 (the status this maps to in
+    /// `IntoResponse`); call sites that know the real upstream status should
+    /// build `Upstream { status, message }` directly instead.
+    pub fn upstream(message: impl Into<String>) -> Self {
+        MuseError::Upstream {
+            status: 502,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for MuseError {

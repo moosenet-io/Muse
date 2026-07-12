@@ -21,6 +21,10 @@ CREATE TABLE seasons (
     air_date        date,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (media_item_id, season_number)
+    UNIQUE (media_item_id, season_number),
+    -- superkey enabling a composite FK from episodes(season_id, media_item_id),
+    -- so an episode's denormalized media_item_id is structurally forced to match
+    -- its season's owning media_item (prevents cross-show episode drift).
+    UNIQUE (id, media_item_id)
 );
 CREATE INDEX ON seasons (media_item_id, season_number);

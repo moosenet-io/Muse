@@ -53,11 +53,18 @@ pub async fn list_by_media_item(pool: &PgPool, media_item_id: i64) -> MuseResult
 }
 
 /// Link a (possibly season-pack) file to an episode it satisfies. Idempotent.
+///
+/// The join's `media_item_id` is derived from the episode, so the composite FK
+/// to `media_files (id, media_item_id)` rejects any attempt to attach a file
+/// from a different show (surfaces as `MuseError::Database`). Attaching to a
+/// non-existent episode inserts nothing (the SELECT yields no row).
 pub async fn attach_to_episode(pool: &PgPool, episode_id: i64, media_file_id: i64) -> MuseResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO episode_files (episode_id, media_file_id)
-        VALUES ($1, $2)
+        INSERT INTO episode_files (episode_id, media_file_id, media_item_id)
+        SELECT e.id, $2, e.media_item_id
+        FROM episodes e
+        WHERE e.id = $1
         ON CONFLICT (episode_id, media_file_id) DO NOTHING
         "#,
     )

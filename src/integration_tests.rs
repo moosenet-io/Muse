@@ -339,4 +339,13 @@ async fn core_schema_migrates_and_round_trips() {
         .await
         .expect("trigram search by title");
     assert!(searched.iter().any(|m| m.id == metadata.id));
+
+    // Cross-show integrity: attaching a file that belongs to a DIFFERENT
+    // media_item (the movie file) to a show episode must be rejected by the
+    // episode_files composite FK — not silently accepted.
+    let cross_show = repo::media_file::attach_to_episode(&pool, ep1.id, movie_file.id).await;
+    assert!(
+        cross_show.is_err(),
+        "attaching a file from another media_item to an episode must be blocked by the composite FK"
+    );
 }

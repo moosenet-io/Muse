@@ -7,8 +7,8 @@
 -- show/library" queries a single-table scan without joining through seasons.
 CREATE TABLE episodes (
     id                          bigserial PRIMARY KEY,
-    season_id                   bigint NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
-    media_item_id                bigint NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+    season_id                   bigint NOT NULL,
+    media_item_id                bigint NOT NULL,
     episode_number                int NOT NULL,
     absolute_episode_number         int,               -- anime-style continuous numbering, nullable
     scene_absolute_episode_number     int,
@@ -28,7 +28,13 @@ CREATE TABLE episodes (
     created_at                                       timestamptz NOT NULL DEFAULT now(),
     updated_at                                        timestamptz NOT NULL DEFAULT now(),
     UNIQUE (season_id, episode_number),
-    UNIQUE (plex_rating_key)
+    UNIQUE (plex_rating_key),
+    -- Composite FK forces the denormalized media_item_id to equal the owning
+    -- season's media_item — an episode cannot belong to a season of a different
+    -- show. Cascade chains media_items -> seasons -> episodes (single path).
+    FOREIGN KEY (season_id, media_item_id) REFERENCES seasons (id, media_item_id) ON DELETE CASCADE,
+    -- superkey enabling the same-show composite FK from episode_files.
+    UNIQUE (id, media_item_id)
 );
 CREATE INDEX ON episodes (media_item_id);
 CREATE INDEX ON episodes (season_id, episode_number);

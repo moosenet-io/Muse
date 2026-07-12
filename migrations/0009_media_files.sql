@@ -37,6 +37,10 @@ CREATE TABLE media_files (
     revision_version                                int NOT NULL DEFAULT 1,
     revision_real                                     int NOT NULL DEFAULT 0,
     revision_is_repack                                  boolean NOT NULL DEFAULT false,
-    created_at                                            timestamptz NOT NULL DEFAULT now()
+    created_at                                            timestamptz NOT NULL DEFAULT now(),
+    -- superkey enabling a same-show composite FK from episode_files: a file can
+    -- only satisfy episodes belonging to its own media_item (blocks cross-show
+    -- season-pack links).
+    UNIQUE (id, media_item_id)
 );
 CREATE INDEX ON media_files (media_item_id);

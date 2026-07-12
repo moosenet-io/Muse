@@ -210,6 +210,43 @@ impl PlexClient {
         let container: AccountContainer = self.get("/accounts", &[]).await?;
         Ok(container.account)
     }
+
+    /// Fetch a raw image (poster/thumb/art) from Plex, server-side, for the
+    /// MUSE-27 artwork proxy. `path_or_url` is either a Plex-relative path
+    /// (e.g. `/library/metadata/100/thumb/171234567`, resolved against this
+    /// client's `base_url`) or an already-absolute URL. The `X-Plex-Token`
+    /// header configured on this client's `reqwest::Client` is attached the
+    /// same way as every other request here — **never** forwarded to the
+    /// caller, and never present in the returned bytes/content-type. Returns
+    /// the raw body bytes plus the upstream `content-type` (defaulting to
+    /// `image/jpeg` if the response omits one, which some Plex thumb
+    /// responses do).
+    pub async fn fetch_image(&self, path_or_url: &str) -> MuseResult<(Vec<u8>, String)> {
+        let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+            path_or_url.to_string()
+        } else {
+            format!("{}{}", self.base_url, path_or_url)
+        };
+
+        let resp = self.http.get(&url).send().await?;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let bytes = resp.bytes().await?;
+
+        if !status.is_success() {
+            return Err(MuseError::Upstream {
+                status: status.as_u16(),
+                message: format!("plex image request to {url} failed"),
+            });
+        }
+
+        Ok((bytes.to_vec(), content_type))
+    }
 }
 
 #[cfg(test)]
@@ -530,6 +567,47 @@ mod tests {
             ..Default::default()
         };
         assert!(PlexClient::from_config(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_image_returns_bytes_and_content_type() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/library/metadata/100/thumb/1")
+                .header("X-Plex-Token", "test-token");
+            then.status(200)
+                .header("content-type", "image/png")
+                .body(vec![1u8, 2, 3, 4]);
+        });
+
+        let client = client_for(&server);
+        let (bytes, content_type) = client
+            .fetch_image("/library/metadata/100/thumb/1")
+            .await
+            .expect("image should fetch");
+
+        mock.assert();
+        assert_eq!(bytes, vec![1u8, 2, 3, 4]);
+        assert_eq!(content_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn fetch_image_surfaces_upstream_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/library/metadata/999/thumb/1");
+            then.status(404).body("not found");
+        });
+
+        let client = client_for(&server);
+        let result = client.fetch_image("/library/metadata/999/thumb/1").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MuseError::Upstream { status, .. } => assert_eq!(status, 404),
+            other => panic!("expected Upstream error, got {other:?}"),
+        }
     }
 
     #[test]

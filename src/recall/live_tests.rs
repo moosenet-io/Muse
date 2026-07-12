@@ -158,7 +158,10 @@ async fn resolve_degrades_to_trigram_when_vector_tier_is_unconfigured() {
         State(state),
         Json(ResolveRequest {
             query: "Zzyzx Linguist".to_string(),
-            limit: Some(5),
+            // High limit: other live-DB tests share this DB and seed titles
+            // that can trigram-match ahead of this one; we assert the seeded
+            // title is FOUND in the fallback tier, not its rank.
+            limit: Some(100_000),
             include_tmdb: false,
         }),
     )
@@ -271,7 +274,10 @@ async fn similar_ranks_the_hand_inserted_nearest_embedding_first() {
         State(state),
         Json(SimilarRequest {
             media_item_id: seed_item.id,
-            limit: Some(10),
+            // High limit so accumulated embeddings from other live-DB tests
+            // can't crowd the expected items out; assertions check relative
+            // order/presence, valid regardless of unrelated rows.
+            limit: Some(100_000),
         }),
     )
     .await
@@ -364,7 +370,10 @@ async fn similar_falls_back_to_shared_genre_when_seed_has_no_embedding() {
         State(state),
         Json(SimilarRequest {
             media_item_id: seed_item.id,
-            limit: Some(10),
+            // High limit so accumulated embeddings from other live-DB tests
+            // can't crowd the expected items out; assertions check relative
+            // order/presence, valid regardless of unrelated rows.
+            limit: Some(100_000),
         }),
     )
     .await

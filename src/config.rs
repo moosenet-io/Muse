@@ -89,6 +89,18 @@ pub struct Config {
     /// `repo::release::prune_expired` removes it (spec S3.6: "expired rows
     /// are pruned"). Every re-seen release refreshes this on upsert.
     pub release_expiry_days: i64,
+
+    /// MUSE-09: the maximum pgvector cosine distance (`embedding <=> query`,
+    /// range 0.0 = identical to 2.0 = opposite) a vector-tier match may have
+    /// and still be treated as "confident" by `/query/resolve`'s resolution
+    /// ladder. A vector hit above this distance is not trustworthy enough to
+    /// answer with — the ladder falls through to the pg_trgm tier instead of
+    /// returning a wrong-but-vector-scored guess. Tune via
+    /// `MUSE_RECALL_VECTOR_MAX_DISTANCE`; the default (0.4) is a
+    /// conservative starting point for `nomic-embed-text` cosine distances
+    /// at Phase-0 library sizes, not a value derived from a production
+    /// corpus yet.
+    pub recall_vector_max_distance: f64,
 }
 
 impl Config {
@@ -125,6 +137,9 @@ impl Config {
             prowlarr_tv_categories: env_int_list("MUSE_PROWLARR_TV_CATEGORIES", &[5000]),
             prowlarr_resolve_min_confidence: env_f32("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", 0.5),
             release_expiry_days: env_i64("MUSE_RELEASE_EXPIRY_DAYS", 21),
+            recall_vector_max_distance: env_opt("MUSE_RECALL_VECTOR_MAX_DISTANCE")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.4),
         }
     }
 
@@ -174,6 +189,7 @@ impl Default for Config {
             news_url: None,
             news_api_key: None,
             plex_poll_secs: None,
+            recall_vector_max_distance: 0.4,
         }
     }
 }
@@ -258,6 +274,7 @@ mod tests {
             "MUSE_PROWLARR_TV_CATEGORIES",
             "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
             "MUSE_RELEASE_EXPIRY_DAYS",
+            "MUSE_RECALL_VECTOR_MAX_DISTANCE",
         ] {
             std::env::remove_var(key);
         }
@@ -280,6 +297,7 @@ mod tests {
         assert_eq!(cfg.prowlarr_tv_categories, vec![5000]);
         assert!((cfg.prowlarr_resolve_min_confidence - 0.5).abs() < f32::EPSILON);
         assert_eq!(cfg.release_expiry_days, 21);
+        assert!((cfg.recall_vector_max_distance - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]

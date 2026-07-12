@@ -1,8 +1,9 @@
 //! HTTP surface: the axum `Router` and shared application state.
 //!
-//! Phase 0 only wires `/health` for real; `/ingest`, `/query`, and
-//! `/proactive` are mounted as stub route groups that answer `501 Not
-//! Implemented` until their respective spec items (MUSE-04+) land.
+//! Phase 0 wires `/health` and (MUSE-09) `/query/resolve` + `/query/similar`
+//! for real; the rest of `/ingest`, `/query`, and `/proactive` are mounted
+//! as stub route groups that answer `501 Not Implemented` until their
+//! respective spec items land.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,10 +20,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::arr::ArrInstanceConfig;
 use crate::config::Config;
+use crate::embed::OllamaEmbedClient;
 use crate::enrichment::EnrichmentService;
 use crate::error::MuseError;
 use crate::plex::PlexClient;
 use crate::prowlarr::ProwlarrClient;
+use crate::trending::TmdbClient;
 
 /// Shared state handed to every axum handler.
 pub struct AppState {
@@ -46,6 +49,16 @@ pub struct AppState {
     /// underlying HTTP sources degrade independently and gracefully when
     /// unconfigured.
     pub enrichment: EnrichmentService,
+    /// Read-only TMDb client (MUSE-19), also used by MUSE-09's
+    /// `/query/resolve` beyond-the-library tier. `None` when
+    /// `TMDB_API_KEY` isn't configured — that tier degrades to unreachable
+    /// (never a 500) rather than failing.
+    pub tmdb: Option<TmdbClient>,
+    /// Query-embedding client for MUSE-09's `/query/resolve` vector tier
+    /// (the same `OllamaEmbedClient` type MUSE-08's embed pipeline uses).
+    /// `None` when `MUSE_OLLAMA_URL` isn't configured — the vector tier
+    /// degrades to skipped, falling through to pg_trgm.
+    pub embed: Option<OllamaEmbedClient>,
 }
 
 /// Timeout for the `/health` DB probe — health must never hang/500 just
@@ -87,7 +100,13 @@ fn ingest_routes() -> Router<Arc<AppState>> {
 }
 
 fn query_routes() -> Router<Arc<AppState>> {
-    Router::new().fallback(not_implemented)
+    // MUSE-09: the vector-recall / search API. `/resolve` and `/similar` are
+    // the only real routes in this group so far; everything else still
+    // answers 501 until its own spec item lands.
+    Router::new()
+        .route("/resolve", post(crate::recall::resolve_handler))
+        .route("/similar", post(crate::recall::similar_handler))
+        .fallback(not_implemented)
 }
 
 fn proactive_routes() -> Router<Arc<AppState>> {

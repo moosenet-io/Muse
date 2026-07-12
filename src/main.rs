@@ -13,6 +13,7 @@ mod http;
 mod integration_tests;
 pub mod models;
 mod plex;
+mod plex_control;
 pub mod repo;
 mod trending;
 mod workers;

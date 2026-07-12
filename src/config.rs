@@ -164,6 +164,9 @@ impl Default for Config {
             prowlarr_tv_categories: vec![5000],
             prowlarr_resolve_min_confidence: 0.5,
             release_expiry_days: 21,
+            searxng_url: None,
+            news_url: None,
+            news_api_key: None,
         }
     }
 }

@@ -362,28 +362,7 @@ mod tests {
     /// (`Config` has no `Default` impl) so this is the one place that needs
     /// updating if a field is added.
     fn blank_config() -> Config {
-        Config {
-            database_url: None,
-            bind_addr: "0.0.0.0:8090".to_string(),
-            log_level: "info".to_string(),
-            plex_url: None,
-            plex_token: None,
-            tautulli_url: None,
-            tautulli_api_key: None,
-            radarr_url: None,
-            radarr_api_key: None,
-            sonarr_url: None,
-            sonarr_api_key: None,
-            prowlarr_url: None,
-            prowlarr_api_key: None,
-            tmdb_api_key: None,
-            ollama_url: None,
-            chord_url: None,
-            searxng_url: None,
-            news_url: None,
-            news_api_key: None,
-            arr_instances_json: None,
-        }
+        Config::default()
     }
 
     #[test]

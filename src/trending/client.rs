@@ -296,24 +296,7 @@ mod tests {
     #[test]
     fn from_config_returns_none_when_unconfigured() {
         let config = Config {
-            database_url: None,
-            bind_addr: "0.0.0.0:8090".to_string(),
-            log_level: "info".to_string(),
-            plex_url: None,
-            plex_token: None,
-            plex_poll_secs: None,
-            tautulli_url: None,
-            tautulli_api_key: None,
-            radarr_url: None,
-            radarr_api_key: None,
-            sonarr_url: None,
-            sonarr_api_key: None,
-            prowlarr_url: None,
-            prowlarr_api_key: None,
-            tmdb_api_key: None,
-            arr_instances_json: None,
-            ollama_url: None,
-            chord_url: None,
+            ..Default::default()
         };
         assert!(TmdbClient::from_config(&config).is_none());
     }
@@ -321,24 +304,8 @@ mod tests {
     #[test]
     fn from_config_builds_client_when_configured() {
         let config = Config {
-            database_url: None,
-            bind_addr: "0.0.0.0:8090".to_string(),
-            log_level: "info".to_string(),
-            plex_url: None,
-            plex_token: None,
-            plex_poll_secs: None,
-            tautulli_url: None,
-            tautulli_api_key: None,
-            radarr_url: None,
-            radarr_api_key: None,
-            sonarr_url: None,
-            sonarr_api_key: None,
-            prowlarr_url: None,
-            prowlarr_api_key: None,
             tmdb_api_key: Some("abc123".to_string()),
-            arr_instances_json: None,
-            ollama_url: None,
-            chord_url: None,
+            ..Default::default()
         };
         assert!(TmdbClient::from_config(&config).is_some());
     }

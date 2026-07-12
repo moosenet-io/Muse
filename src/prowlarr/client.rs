@@ -387,24 +387,9 @@ mod tests {
 
     fn test_config(prowlarr_url: Option<String>, prowlarr_api_key: Option<String>) -> Config {
         Config {
-            database_url: None,
-            bind_addr: "0.0.0.0:8090".to_string(),
-            log_level: "info".to_string(),
-            plex_url: None,
-            plex_token: None,
-            plex_poll_secs: None,
-            tautulli_url: None,
-            tautulli_api_key: None,
-            radarr_url: None,
-            radarr_api_key: None,
-            sonarr_url: None,
-            sonarr_api_key: None,
             prowlarr_url,
             prowlarr_api_key,
-            tmdb_api_key: None,
-            arr_instances_json: None,
-            ollama_url: None,
-            chord_url: None,
+            ..Default::default()
         }
     }
 }

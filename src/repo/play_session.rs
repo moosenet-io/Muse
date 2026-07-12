@@ -168,3 +168,92 @@ pub async fn get_media_info(pool: &PgPool, play_session_id: i64) -> MuseResult<O
     .await
     .map_err(MuseError::Database)
 }
+
+/// Find a session previously imported from Tautulli by its `reference_id`
+/// (stored as `tautulli_ref_id`). This is MUSE-06's *primary* idempotency
+/// guard: the table's own `(account_id, media_item_id, episode_id,
+/// started_at)` UNIQUE only dedups a re-run for *resolved* rows (Postgres
+/// treats NULL media/episode refs as distinct — see the caveat on
+/// [`upsert`]), so an unresolved history row would otherwise be re-inserted
+/// on every backfill run. Checking `tautulli_ref_id` first covers both the
+/// resolved and unresolved case uniformly.
+pub async fn find_by_tautulli_ref(
+    pool: &PgPool,
+    tautulli_ref_id: i64,
+) -> MuseResult<Option<PlaySession>> {
+    sqlx::query_as::<_, PlaySession>("SELECT * FROM play_sessions WHERE tautulli_ref_id = $1")
+        .bind(tautulli_ref_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}
+
+/// Find a *natively*-captured session (`tautulli_ref_id IS NULL` — i.e. from
+/// MUSE-07's webhook/poller path, not a prior backfill run) that overlaps a
+/// Tautulli history row for the same account/media/episode within
+/// `tolerance_secs` of `started_at`. Comparisons use `IS NOT DISTINCT FROM`
+/// rather than `=` so an *unresolved* Tautulli row (media/episode both
+/// `NULL`) can still match an equally-unresolved native row instead of
+/// silently never deduping just because SQL treats `NULL <> NULL`.
+///
+/// Per spec §4-D: during the overlap window both native capture and the
+/// backfill can observe the same watch — native capture wins (higher
+/// fidelity); the caller should attach `tautulli_ref_id` to the returned row
+/// for provenance rather than inserting a second, duplicate session.
+pub async fn find_overlapping_native(
+    pool: &PgPool,
+    account_id: Option<i64>,
+    media_item_id: Option<i64>,
+    episode_id: Option<i64>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    tolerance_secs: i64,
+) -> MuseResult<Option<PlaySession>> {
+    let window_start = started_at - chrono::Duration::seconds(tolerance_secs);
+    let window_end = started_at + chrono::Duration::seconds(tolerance_secs);
+
+    sqlx::query_as::<_, PlaySession>(
+        r#"
+        SELECT * FROM play_sessions
+        WHERE tautulli_ref_id IS NULL
+          AND account_id IS NOT DISTINCT FROM $1
+          AND media_item_id IS NOT DISTINCT FROM $2
+          AND episode_id IS NOT DISTINCT FROM $3
+          AND started_at BETWEEN $4 AND $5
+        ORDER BY started_at
+        LIMIT 1
+        "#,
+    )
+    .bind(account_id)
+    .bind(media_item_id)
+    .bind(episode_id)
+    .bind(window_start)
+    .bind(window_end)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// Attach Tautulli provenance to an existing (native-captured) session
+/// without touching any other field — used when the backfill importer finds
+/// a native session that already covers a Tautulli history row (see
+/// [`find_overlapping_native`]): the native row wins, but we still want
+/// `tautulli_ref_id` recorded so the row's Tautulli provenance is visible.
+/// A no-op (does not overwrite) if the row already carries a
+/// `tautulli_ref_id`, so a later, spurious "overlap" can't clobber earlier
+/// provenance.
+pub async fn attach_tautulli_ref(
+    pool: &PgPool,
+    play_session_id: i64,
+    tautulli_ref_id: i64,
+) -> MuseResult<()> {
+    sqlx::query(
+        "UPDATE play_sessions SET tautulli_ref_id = $2 \
+         WHERE id = $1 AND tautulli_ref_id IS NULL",
+    )
+    .bind(play_session_id)
+    .bind(tautulli_ref_id)
+    .execute(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(())
+}

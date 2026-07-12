@@ -20,10 +20,7 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::error::{MuseError, MuseResult};
 
-pub use models::{
-    Account, Guid, Library, MediaInfo, MediaItem, PersonTag, SessionPlayer, SessionUser, Tag,
-    TranscodeSession,
-};
+pub use models::{Account, Guid, Library, MediaItem, PersonTag, SessionPlayer, SessionUser, Tag};
 
 use models::{AccountContainer, DirectoryContainer, Envelope, MetadataContainer};
 
@@ -527,24 +524,7 @@ mod tests {
     #[test]
     fn from_config_returns_none_when_unconfigured() {
         let config = Config {
-            database_url: None,
-            bind_addr: "0.0.0.0:8090".to_string(),
-            log_level: "info".to_string(),
-            plex_url: None,
-            plex_token: None,
-            plex_poll_secs: None,
-            tautulli_url: None,
-            tautulli_api_key: None,
-            radarr_url: None,
-            radarr_api_key: None,
-            sonarr_url: None,
-            sonarr_api_key: None,
-            prowlarr_url: None,
-            prowlarr_api_key: None,
-            tmdb_api_key: None,
-            ollama_url: None,
-            chord_url: None,
-            arr_instances_json: None,
+            ..Default::default()
         };
         assert!(PlexClient::from_config(&config).is_none());
     }
@@ -552,24 +532,9 @@ mod tests {
     #[test]
     fn from_config_builds_client_when_configured() {
         let config = Config {
-            database_url: None,
-            bind_addr: "0.0.0.0:8090".to_string(),
-            log_level: "info".to_string(),
             plex_url: Some("http://127.0.0.1:32400".to_string()),
             plex_token: Some("abc123".to_string()),
-            plex_poll_secs: None,
-            tautulli_url: None,
-            tautulli_api_key: None,
-            radarr_url: None,
-            radarr_api_key: None,
-            sonarr_url: None,
-            sonarr_api_key: None,
-            prowlarr_url: None,
-            prowlarr_api_key: None,
-            tmdb_api_key: None,
-            ollama_url: None,
-            chord_url: None,
-            arr_instances_json: None,
+            ..Default::default()
         };
         assert!(PlexClient::from_config(&config).is_some());
     }

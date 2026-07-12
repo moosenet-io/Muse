@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::arr::ArrInstanceConfig;
 use crate::config::Config;
+use crate::enrichment::EnrichmentService;
 use crate::error::MuseError;
 use crate::plex::PlexClient;
 use crate::prowlarr::ProwlarrClient;
@@ -40,6 +41,11 @@ pub struct AppState {
     /// constructs a short-lived client per instance per run. This is what a
     /// future scheduled ingest worker or `/ingest/arr` trigger reads.
     pub arr_instances: Vec<ArrInstanceConfig>,
+    /// MUSE-14: forum/critic sentiment + "does it get good" + renewal/
+    /// trailer news enrichment, cached into `external_enrichment`. Both
+    /// underlying HTTP sources degrade independently and gracefully when
+    /// unconfigured.
+    pub enrichment: EnrichmentService,
 }
 
 /// Timeout for the `/health` DB probe — health must never hang/500 just

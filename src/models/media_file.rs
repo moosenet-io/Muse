@@ -97,6 +97,7 @@ mod tests {
             revision_version: 2,
             revision_real: 1,
             revision_is_repack: true,
+            created_at: Utc::now(),
         }
     }
 

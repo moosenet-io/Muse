@@ -5,9 +5,11 @@
 //! macros, since the crate must build without a live database.
 
 pub mod account;
+pub mod channel;
 pub mod embedding;
 pub mod episode;
 pub mod external_enrichment;
+pub mod interstitial;
 pub mod library;
 pub mod media_file;
 pub mod media_item;
@@ -18,4 +20,5 @@ pub mod proactive_item;
 pub mod quality;
 pub mod season;
 pub mod taste;
+pub mod trending;
 pub mod watch_stats;

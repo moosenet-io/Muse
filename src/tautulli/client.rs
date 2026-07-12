@@ -430,6 +430,7 @@ mod tests {
             ollama_url: None,
             chord_url: None,
             arr_instances_json: None,
+            ..Default::default()
         }
     }
 }

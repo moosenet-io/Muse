@@ -773,7 +773,12 @@ mod tests {
         for p in &sorted {
             match p.item_type {
                 crate::models::ChannelProgramItemType::Interstitial => {
-                    assert_eq!(p.interstitial_id, Some(interstitial.id));
+                    // Interstitials are a GLOBAL pool (unlike content, which the
+                    // channel's library_ids rules scope): under a shared test DB
+                    // the director may legitimately pick an interstitial another
+                    // concurrent test seeded, so assert only that a valid
+                    // interstitial was chosen, not that it is this test's fixture.
+                    assert!(p.interstitial_id.is_some(), "interstitial row must reference an interstitial");
                 }
                 crate::models::ChannelProgramItemType::Episode => {
                     assert!(p.episode_id.is_some());

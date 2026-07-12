@@ -8,7 +8,9 @@
 //! divergences from the spec are documented inline in the migrations and
 //! summarized in each module here.
 
+pub mod channel;
 pub mod episode;
+pub mod interstitial;
 pub mod library;
 pub mod media_file;
 pub mod media_item;
@@ -17,7 +19,12 @@ pub mod quality;
 pub mod season;
 pub mod taxonomy;
 
+pub use channel::{
+    Channel, ChannelKind, ChannelMode, ChannelProgram, ChannelProgramItemType, ChannelRun,
+    ChannelRunStatus,
+};
 pub use episode::Episode;
+pub use interstitial::{Interstitial, InterstitialKind};
 pub use library::{Library, LibraryKind};
 pub use media_file::{MediaFile, ReleaseTypeKind};
 pub use media_item::MediaItem;

@@ -295,16 +295,22 @@ async fn similar_ranks_the_hand_inserted_nearest_embedding_first() {
         .iter()
         .position(|h| h.media_item_id == Some(close_item.id))
         .expect("the near-identical item should be present in the results");
-    let far_pos = resp
+
+    // The far item is *maximally* dissimilar to the seed, so it ranks last;
+    // with the handler's capped limit and a shared test DB accumulating other
+    // tests' embeddings, it may legitimately fall outside the returned window.
+    // Only assert the ordering invariant when it IS returned — the meaningful
+    // guarantee is that the near-identical item ranks ahead of it.
+    if let Some(far_pos) = resp
         .results
         .iter()
         .position(|h| h.media_item_id == Some(far_item.id))
-        .expect("the dissimilar item should be present in the results");
-
-    assert!(
-        close_pos < far_pos,
-        "the near-identical vector must rank ahead of the maximally-dissimilar one"
-    );
+    {
+        assert!(
+            close_pos < far_pos,
+            "the near-identical vector must rank ahead of the maximally-dissimilar one"
+        );
+    }
 }
 
 #[tokio::test]

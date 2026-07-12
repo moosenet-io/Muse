@@ -14,7 +14,9 @@ mod http;
 mod integration_tests;
 pub mod models;
 mod plex;
+mod plex_control;
 pub mod repo;
+mod trending;
 mod workers;
 
 use std::sync::Arc;
@@ -51,6 +53,14 @@ async fn main() -> anyhow::Result<()> {
             Vec::new()
         }
     };
+
+    // MUSE-19: constructed for parity with the Plex client above (and so
+    // TMDB_API_KEY misconfiguration is visible at boot); the scheduled
+    // trending-ingest worker that actually calls
+    // `trending::snapshot_trending` on a cadence is a follow-on wiring item
+    // — see `src/trending/mod.rs`.
+    let tmdb_configured = crate::trending::TmdbClient::from_config(&config).is_some();
+    tracing::info!(tmdb_configured, "tmdb client initialized");
 
     let state = Arc::new(AppState {
         pool,

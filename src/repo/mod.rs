@@ -4,7 +4,9 @@
 //! MUSE-02 build constraint — never the `query!`/`query_as!` compile-time
 //! macros, since the crate must build without a live database.
 
+pub mod channel;
 pub mod episode;
+pub mod interstitial;
 pub mod library;
 pub mod media_file;
 pub mod media_item;

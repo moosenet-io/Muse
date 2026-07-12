@@ -541,6 +541,9 @@ mod tests {
             ollama_url: None,
             chord_url: None,
             arr_instances_json: None,
+            searxng_url: None,
+            news_url: None,
+            news_api_key: None,
         };
         assert!(PlexClient::from_config(&config).is_none());
     }
@@ -565,6 +568,9 @@ mod tests {
             ollama_url: None,
             chord_url: None,
             arr_instances_json: None,
+            searxng_url: None,
+            news_url: None,
+            news_api_key: None,
         };
         assert!(PlexClient::from_config(&config).is_some());
     }

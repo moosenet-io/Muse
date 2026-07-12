@@ -404,6 +404,9 @@ mod tests {
             arr_instances_json: None,
             ollama_url: None,
             chord_url: None,
+            searxng_url: None,
+            news_url: None,
+            news_api_key: None,
         }
     }
 }

@@ -8,6 +8,7 @@
 pub mod arr;
 mod config;
 mod db;
+pub mod enrichment;
 mod error;
 mod http;
 #[cfg(test)]
@@ -69,12 +70,18 @@ async fn main() -> anyhow::Result<()> {
     let tmdb_configured = crate::trending::TmdbClient::from_config(&config).is_some();
     tracing::info!(tmdb_configured, "tmdb client initialized");
 
+    // MUSE-14: forum/critic sentiment + "does it get good" + renewal/
+    // trailer news, cached into `external_enrichment`. Both sub-clients
+    // degrade independently and gracefully — see `EnrichmentService`.
+    let enrichment = crate::enrichment::EnrichmentService::from_config(&config);
+
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
         plex: plex_client,
         prowlarr: prowlarr_client,
         arr_instances,
+        enrichment,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

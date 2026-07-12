@@ -59,8 +59,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/ingest", ingest_routes())
         .nest("/query", query_routes())
         .nest("/proactive", proactive_routes())
+        .merge(tuner_routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// MUSE-28: the linear tuner surface — HDHomeRun-emulation discovery
+/// (`/discover.json`, `/lineup_status.json`, `/lineup.json`), the M3U+XMLTV
+/// alternative (`/muse.m3u`, `/xmltv.xml`), and the MUSE-29 stream stub
+/// (`/auto/v{channel_id}`) every one of the above advertises a URL for.
+/// Mounted at the router root (not nested) — HDHomeRun/M3U/XMLTV clients
+/// expect these exact top-level paths, not a namespaced prefix.
+fn tuner_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/discover.json", get(crate::tuner::hdhr::discover_json))
+        .route("/lineup_status.json", get(crate::tuner::hdhr::lineup_status_json))
+        .route("/lineup.json", get(crate::tuner::hdhr::lineup_json))
+        .route("/muse.m3u", get(crate::tuner::m3u::muse_m3u))
+        .route("/xmltv.xml", get(crate::tuner::xmltv::xmltv_xml))
+        .route("/auto/v{channel_id}", get(crate::tuner::stream_stub))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {

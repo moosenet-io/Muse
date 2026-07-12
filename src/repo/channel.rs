@@ -65,6 +65,42 @@ pub async fn list_presets(pool: &PgPool) -> MuseResult<Vec<Channel>> {
         .map_err(MuseError::Database)
 }
 
+/// MUSE-28: the tuner's channel set — every `mode = 'linear'` channel, in
+/// `channel_number` order (falling back to `id` when `channel_number` is
+/// unset) so the HDHomeRun lineup / M3U / XMLTV all agree on ordering.
+/// `mode = 'linear'` IS the tuner-enable gate: there is no separate
+/// `enabled` flag on `channels` (spec divergence — see MUSE-28's report;
+/// an `on_demand` channel simply never appears here).
+pub async fn list_linear_channels(pool: &PgPool) -> MuseResult<Vec<Channel>> {
+    sqlx::query_as::<_, Channel>(
+        r#"
+        SELECT * FROM channels
+        WHERE mode = 'linear'
+        ORDER BY channel_number NULLS LAST, id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// The end of the currently scheduled grid for a channel, if any rows
+/// exist yet. Used by the MUSE-28 scheduler to resume filling forward
+/// (idempotent: never re-derives a `start_at` that already has a row).
+pub async fn latest_program_end(
+    pool: &PgPool,
+    channel_id: i64,
+) -> MuseResult<Option<DateTime<Utc>>> {
+    let row: (Option<DateTime<Utc>>,) = sqlx::query_as(
+        "SELECT MAX(end_at) FROM channel_programs WHERE channel_id = $1",
+    )
+    .bind(channel_id)
+    .fetch_one(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(row.0)
+}
+
 // --- channel_runs ----------------------------------------------------------
 
 pub async fn create_run(pool: &PgPool, new: &NewChannelRun) -> MuseResult<ChannelRun> {

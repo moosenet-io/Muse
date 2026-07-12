@@ -35,6 +35,9 @@ anyhow = "1"
 thiserror = "1"
 async-trait = "0.1"
 pgvector = { version = "=0.4.1", features = ["sqlx"] }
+# MUSE-29: `stream!` used to chain per-program ffmpeg child-process stdout
+# into the `/auto/v{channel_id}` HTTP response body.
+async-stream = "0.3"
 
 [dev-dependencies]
 httpmock = "0.7"

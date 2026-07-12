@@ -8,6 +8,10 @@
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8090";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_HDHR_DEVICE_ID: &str = "MUSE0001";
+const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
+/// Empty means "no prefix" — `relative_path`/`file_path` values are used
+/// as-is. See [`crate::streaming::ffmpeg::join_media_path`].
+const DEFAULT_MEDIA_ROOT: &str = "";
 
 /// Muse service configuration, assembled from environment variables at startup.
 #[derive(Debug, Clone)]
@@ -125,6 +129,23 @@ pub struct Config {
     /// at Phase-0 library sizes, not a value derived from a production
     /// corpus yet.
     pub recall_vector_max_distance: f64,
+
+    // --- MUSE-29: ffmpeg channel streaming engine ---
+    /// Path (or bare command name resolved via `$PATH`) to the ffmpeg
+    /// binary (`MUSE_FFMPEG_PATH`). Not secret-shaped — a deploy-host detail,
+    /// same posture as `MUSE_HDHR_DEVICE_ID`. Defaults to `"ffmpeg"` (rely on
+    /// `$PATH`); the streaming handler degrades to a clean 501 rather than
+    /// 500 when this binary can't be spawned (see
+    /// `crate::streaming::ffmpeg::classify_spawn_error`).
+    pub ffmpeg_path: String,
+    /// Base filesystem path prepended to `media_files.relative_path` /
+    /// `interstitials.file_path` to get an absolute path ffmpeg can open
+    /// (`MUSE_MEDIA_ROOT`). Empty string (the default) means "no prefix" —
+    /// stored paths are used exactly as-is, which is correct when they're
+    /// already absolute (as Radarr/Sonarr-sourced `relative_path` values
+    /// often are in this codebase's fixtures) or when the process's cwd is
+    /// already the library root.
+    pub media_root: String,
 }
 
 impl Config {
@@ -172,6 +193,14 @@ impl Config {
             recall_vector_max_distance: env_opt("MUSE_RECALL_VECTOR_MAX_DISTANCE")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.4),
+
+            ffmpeg_path: std::env::var("MUSE_FFMPEG_PATH")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_FFMPEG_PATH.to_string()),
+            media_root: std::env::var("MUSE_MEDIA_ROOT")
+                .ok()
+                .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_string()),
         }
     }
 
@@ -226,6 +255,8 @@ impl Default for Config {
             channel_guide_window_hours: 48,
             channel_scheduler_tick_secs: 900,
             recall_vector_max_distance: 0.4,
+            ffmpeg_path: DEFAULT_FFMPEG_PATH.to_string(),
+            media_root: DEFAULT_MEDIA_ROOT.to_string(),
         }
     }
 }
@@ -315,6 +346,8 @@ mod tests {
             "MUSE_CHANNEL_GUIDE_WINDOW_HOURS",
             "MUSE_CHANNEL_SCHEDULER_TICK_SECS",
             "MUSE_RECALL_VECTOR_MAX_DISTANCE",
+            "MUSE_FFMPEG_PATH",
+            "MUSE_MEDIA_ROOT",
         ] {
             std::env::remove_var(key);
         }
@@ -342,6 +375,23 @@ mod tests {
         assert_eq!(cfg.channel_guide_window_hours, 48);
         assert_eq!(cfg.channel_scheduler_tick_secs, 900);
         assert!((cfg.recall_vector_max_distance - 0.4).abs() < f64::EPSILON);
+        assert_eq!(cfg.ffmpeg_path, DEFAULT_FFMPEG_PATH);
+        assert_eq!(cfg.media_root, DEFAULT_MEDIA_ROOT);
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_streaming_overrides_from_env() {
+        std::env::set_var("MUSE_FFMPEG_PATH", "/opt/ffmpeg/bin/ffmpeg");
+        std::env::set_var("MUSE_MEDIA_ROOT", "/srv/media");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.ffmpeg_path, "/opt/ffmpeg/bin/ffmpeg");
+        assert_eq!(cfg.media_root, "/srv/media");
+
+        std::env::remove_var("MUSE_FFMPEG_PATH");
+        std::env::remove_var("MUSE_MEDIA_ROOT");
     }
 
     #[test]

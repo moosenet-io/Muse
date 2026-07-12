@@ -37,6 +37,17 @@ pub enum MuseError {
     /// Generic across every upstream integration, not just Plex control.
     #[error("upstream error ({status}): {message}")]
     Upstream { status: u16, message: String },
+
+    /// MUSE-29: a request that is well-formed but can't be served *right
+    /// now* — the ffmpeg binary spawned but errored transiently, or a
+    /// linear channel has no `channel_programs` row covering "now" (grid
+    /// not yet filled / channel between programs). Distinct from
+    /// [`MuseError::NotImplemented`] (a hard "this feature doesn't exist on
+    /// this deployment yet", e.g. ffmpeg binary missing entirely) — both
+    /// map to a clean, non-500 response so a tuner client can retry rather
+    /// than treating either as a crash.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl MuseError {
@@ -64,6 +75,7 @@ impl IntoResponse for MuseError {
             MuseError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             MuseError::Http(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
             MuseError::Upstream { message, .. } => (StatusCode::BAD_GATEWAY, message.clone()),
+            MuseError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
         };
 
         let body = Json(json!({

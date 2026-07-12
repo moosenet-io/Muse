@@ -1,0 +1,15 @@
+-- MUSE-29: the ffmpeg streaming engine needs a real on-disk file to feed
+-- into the concat/stream pipeline for each scheduled `channel_programs` row
+-- (spec S96-muse-foundation §4d-E/§4d — "resolving each program → its real
+-- file path"). Episodes/movies already resolve via `media_files.relative_path`
+-- (MUSE-02), but `interstitials` (MUSE-23, migrations/0091) only ever carried
+-- a `plex_rating_key` — there was no local-filesystem path to stream from.
+--
+-- This adds a single nullable column so MUSE-29 has a seam to resolve
+-- against. It is NOT backfilled here (no library scan runs as part of this
+-- migration — benign, no *arr/library mutation, per MUSE-29's scope) and
+-- defaults to NULL; the streaming engine degrades gracefully (skips that
+-- program, logs a warning) when a given interstitial has no `file_path` yet.
+-- Populating it (from the Plex "Bumpers" library MUSE-23 already ingests
+-- from) is a follow-up, not part of this item.
+ALTER TABLE interstitials ADD COLUMN file_path text;

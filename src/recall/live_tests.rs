@@ -251,13 +251,16 @@ async fn similar_ranks_the_hand_inserted_nearest_embedding_first() {
     .await;
 
     // Hand-inserted, known vectors (no live Ollama needed) — `close_item` is
-    // constructed to be nearly identical to the seed by cosine distance,
-    // `far_item` maximally dissimilar. Same technique as MUSE-08's own
-    // `embed_stale_and_nearest_round_trip` test.
-    let seed_vec = vec![1.0_f32; 768];
-    let mut close_vec = vec![1.0_f32; 768];
-    close_vec[0] = 0.99;
-    let far_vec = vec![-1.0_f32; 768];
+    // nearly identical to the seed by cosine distance, `far_item` maximally
+    // dissimilar. A CHECKERBOARD (+1/-1 alternating) direction is used instead
+    // of the all-ones vector so this test's cluster is (cosine-)orthogonal to
+    // the many all-ones/[1;768] embeddings other live-DB tests seed into the
+    // shared DB — otherwise those exact matches would outrank `close_item`
+    // and, past the recall handler's clamped result limit, crowd it out.
+    let seed_vec: Vec<f32> = (0..768).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+    let mut close_vec = seed_vec.clone();
+    close_vec[1] = -0.99; // a hair off the seed → nearest, but a distinct row
+    let far_vec: Vec<f32> = (0..768).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect();
 
     for (item_id, vector) in [(seed_item.id, seed_vec), (close_item.id, close_vec), (far_item.id, far_vec)] {
         repo::embedding::upsert(

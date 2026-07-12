@@ -33,6 +33,16 @@ pub struct Config {
     pub tmdb_api_key: Option<String>,
     pub ollama_url: Option<String>,
     pub chord_url: Option<String>,
+
+    /// MUSE-05: raw JSON describing the multi-instance Radarr/Sonarr fleet
+    /// (the operator runs 8 *arr instances — 5 Radarr + 3 Sonarr, sharded by
+    /// root folder — see `arr::config::ArrInstanceConfig`). Kept as an
+    /// unparsed string here (same "config only reads env" discipline as
+    /// every other field); [`Config::arr_instances`] parses it lazily so a
+    /// malformed value degrades that one feature rather than blocking
+    /// startup. Never a literal instance list — always sourced from
+    /// `MUSE_ARR_INSTANCES` at runtime (<secret-manager>-materialized).
+    pub arr_instances_json: Option<String>,
 }
 
 impl Config {
@@ -58,7 +68,20 @@ impl Config {
             tmdb_api_key: env_opt("TMDB_API_KEY"),
             ollama_url: env_opt("MUSE_OLLAMA_URL"),
             chord_url: env_opt("CHORD_URL"),
+            arr_instances_json: env_opt("MUSE_ARR_INSTANCES"),
         }
+    }
+
+    /// Parse the configured *arr instance fleet (MUSE-05). Returns an empty
+    /// list (not an error) when `MUSE_ARR_INSTANCES` is unset — the ingest
+    /// routine simply has nothing to do, same graceful-degrade posture as
+    /// `PlexClient::from_config`. Returns `Err` only for a genuinely
+    /// malformed JSON value, so the caller can decide whether to log and
+    /// continue with zero instances or treat it as fatal.
+    pub fn arr_instances(
+        &self,
+    ) -> crate::error::MuseResult<Vec<crate::arr::config::ArrInstanceConfig>> {
+        crate::arr::config::load_arr_instances(self.arr_instances_json.as_deref())
     }
 }
 
@@ -93,6 +116,7 @@ mod tests {
             "TMDB_API_KEY",
             "MUSE_OLLAMA_URL",
             "CHORD_URL",
+            "MUSE_ARR_INSTANCES",
         ] {
             std::env::remove_var(key);
         }
@@ -104,6 +128,11 @@ mod tests {
         assert!(cfg.database_url.is_none());
         assert!(cfg.plex_url.is_none());
         assert!(cfg.tmdb_api_key.is_none());
+        assert!(cfg.arr_instances_json.is_none());
+        assert!(cfg
+            .arr_instances()
+            .expect("empty instances should parse")
+            .is_empty());
     }
 
     #[test]

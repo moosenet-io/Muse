@@ -310,6 +310,7 @@ mod tests {
             prowlarr_url: None,
             prowlarr_api_key: None,
             tmdb_api_key: None,
+            arr_instances_json: None,
             ollama_url: None,
             chord_url: None,
         };
@@ -333,6 +334,7 @@ mod tests {
             prowlarr_url: None,
             prowlarr_api_key: None,
             tmdb_api_key: Some("abc123".to_string()),
+            arr_instances_json: None,
             ollama_url: None,
             chord_url: None,
         };

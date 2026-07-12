@@ -33,9 +33,11 @@
 
 pub mod compose;
 pub mod presets;
+pub mod routes;
 
 pub use compose::{
     adjust_channel_run, compose_channel_run, regenerate_channel_run, ComposeOptions,
     EpisodeOrdering,
 };
+pub use routes::compose_handler;
 pub use presets::{list_presets, resolve_preset, Preset, PresetName};

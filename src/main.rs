@@ -16,6 +16,7 @@ mod error;
 mod http;
 #[cfg(test)]
 mod integration_tests;
+pub mod maintenance;
 pub mod models;
 mod plex;
 mod plex_control;

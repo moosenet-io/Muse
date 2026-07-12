@@ -155,6 +155,36 @@ pub struct Config {
     /// (cooldown windows measure in days), so there's no benefit to a
     /// tighter loop.
     pub proactive_tick_interval_secs: u64,
+
+    // --- MUSE-31: background maintenance pipeline + on-demand ops routes ---
+    /// How often the maintenance worker wakes up to run one full pass (arr
+    /// ingest -> embed_stale -> per-account taste/divergence recompute ->
+    /// bounded enrichment) — `MUSE_MAINTENANCE_TICK_SECS`. Purely a wake
+    /// cadence, not a secret. Defaults to every 30 minutes: this is what
+    /// keeps a freshly-deployed Muse self-populating (embeddings/
+    /// taste_profile/taste_divergence never had a scheduled caller before
+    /// MUSE-31 — see the module doc on `crate::maintenance`).
+    pub maintenance_tick_secs: u64,
+    /// How often the daily trending/population worker wakes up to run
+    /// `trending::snapshot_trending` + `compute_population_distributions`
+    /// (`MUSE_TRENDING_TICK_SECS`). Purely a wake cadence. Defaults to
+    /// 86400s (once a day) — matches TMDb's own trending page's practical
+    /// refresh cadence and keeps this polite/low-volume against TMDb.
+    pub trending_tick_secs: u64,
+    /// Upper bound on how many `media_item` rows one maintenance pass's
+    /// `embed_stale` call will actually embed (`MUSE_EMBED_BATCH_SIZE`).
+    /// Bounded so one pass can't turn into an unbounded Ollama burst on a
+    /// freshly-ingested large library — subsequent passes make forward
+    /// progress on the rest (see `embed::pipeline::embed_stale`'s own
+    /// paging/batch docs).
+    pub embed_batch_size: usize,
+    /// Upper bound on how many gap-analysis candidates the maintenance
+    /// pass's enrichment step will attempt per account per pass
+    /// (`MUSE_MAINTENANCE_ENRICHMENT_LIMIT`). Bounded for the same reason as
+    /// `embed_batch_size` — enrichment calls out to SearXNG/news HTTP
+    /// endpoints, so an unbounded pass could turn into a request storm
+    /// against a self-hosted instance.
+    pub maintenance_enrichment_limit: i64,
 }
 
 impl Config {
@@ -212,6 +242,11 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_string()),
 
             proactive_tick_interval_secs: env_u64("MUSE_PROACTIVE_TICK_INTERVAL_SECS", 3600),
+
+            maintenance_tick_secs: env_u64("MUSE_MAINTENANCE_TICK_SECS", 1800),
+            trending_tick_secs: env_u64("MUSE_TRENDING_TICK_SECS", 86400),
+            embed_batch_size: env_u64("MUSE_EMBED_BATCH_SIZE", 50) as usize,
+            maintenance_enrichment_limit: env_i64("MUSE_MAINTENANCE_ENRICHMENT_LIMIT", 10),
         }
     }
 
@@ -269,6 +304,10 @@ impl Default for Config {
             ffmpeg_path: DEFAULT_FFMPEG_PATH.to_string(),
             media_root: DEFAULT_MEDIA_ROOT.to_string(),
             proactive_tick_interval_secs: 3600,
+            maintenance_tick_secs: 1800,
+            trending_tick_secs: 86400,
+            embed_batch_size: 50,
+            maintenance_enrichment_limit: 10,
         }
     }
 }
@@ -361,6 +400,10 @@ mod tests {
             "MUSE_FFMPEG_PATH",
             "MUSE_MEDIA_ROOT",
             "MUSE_PROACTIVE_TICK_INTERVAL_SECS",
+            "MUSE_MAINTENANCE_TICK_SECS",
+            "MUSE_TRENDING_TICK_SECS",
+            "MUSE_EMBED_BATCH_SIZE",
+            "MUSE_MAINTENANCE_ENRICHMENT_LIMIT",
         ] {
             std::env::remove_var(key);
         }
@@ -391,6 +434,35 @@ mod tests {
         assert_eq!(cfg.ffmpeg_path, DEFAULT_FFMPEG_PATH);
         assert_eq!(cfg.media_root, DEFAULT_MEDIA_ROOT);
         assert_eq!(cfg.proactive_tick_interval_secs, 3600);
+        assert_eq!(cfg.maintenance_tick_secs, 1800);
+        assert_eq!(cfg.trending_tick_secs, 86400);
+        assert_eq!(cfg.embed_batch_size, 50);
+        assert_eq!(cfg.maintenance_enrichment_limit, 10);
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_maintenance_overrides_from_env() {
+        std::env::set_var("MUSE_MAINTENANCE_TICK_SECS", "60");
+        std::env::set_var("MUSE_TRENDING_TICK_SECS", "3600");
+        std::env::set_var("MUSE_EMBED_BATCH_SIZE", "5");
+        std::env::set_var("MUSE_MAINTENANCE_ENRICHMENT_LIMIT", "2");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.maintenance_tick_secs, 60);
+        assert_eq!(cfg.trending_tick_secs, 3600);
+        assert_eq!(cfg.embed_batch_size, 5);
+        assert_eq!(cfg.maintenance_enrichment_limit, 2);
+
+        for key in [
+            "MUSE_MAINTENANCE_TICK_SECS",
+            "MUSE_TRENDING_TICK_SECS",
+            "MUSE_EMBED_BATCH_SIZE",
+            "MUSE_MAINTENANCE_ENRICHMENT_LIMIT",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::http::AppState;
+use crate::maintenance::{spawn_maintenance_worker, spawn_trending_worker};
 use crate::proactive::scheduler as proactive_scheduler;
 use crate::prowlarr::spawn_report_pull_worker;
 use crate::tracker::poller;
@@ -46,4 +47,21 @@ pub fn spawn_workers(state: Arc<AppState>) {
     // deployment with zero accounts yet just ticks a harmless no-op.
     proactive_scheduler::spawn(state.clone());
     tracing::info!("proactive content generator worker spawned (MUSE-12)");
+
+    // MUSE-31: the background maintenance pipeline -- arr ingest ->
+    // embed_stale -> per-account taste/divergence recompute -> bounded
+    // enrichment, in dependency order. Always spawned (same posture as the
+    // tuner scheduler / proactive generator above): with nothing configured
+    // yet, each tick is a harmless no-op pass. This is what makes a freshly
+    // deployed Muse self-populate embeddings/taste_profile/taste_divergence
+    // -- previously nothing ever called those routines on a schedule.
+    spawn_maintenance_worker(state.clone());
+    tracing::info!("background maintenance worker spawned (MUSE-31)");
+
+    // MUSE-31: the daily trending/population worker -- snapshot_trending +
+    // compute_population_distributions, only when TMDb is configured.
+    // Separate cadence from the maintenance pass above (coarser, TMDb-
+    // specific); always spawned, no-ops cleanly without state.tmdb.
+    spawn_trending_worker(state.clone());
+    tracing::info!("trending/population worker spawned (MUSE-31)");
 }

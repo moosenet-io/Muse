@@ -12,6 +12,7 @@ use serde_json::json;
 use sqlx::postgres::PgPool;
 use tower_http::trace::TraceLayer;
 
+use crate::arr::ArrInstanceConfig;
 use crate::config::Config;
 use crate::error::MuseError;
 use crate::plex::PlexClient;
@@ -28,6 +29,12 @@ pub struct AppState {
     /// `PROWLARR_URL`/`PROWLARR_API_KEY` aren't configured — availability
     /// features degrade rather than fail.
     pub prowlarr: Option<ProwlarrClient>,
+    /// Configured *arr fleet (MUSE-05) — empty when `MUSE_ARR_INSTANCES`
+    /// isn't set or fails to parse (logged at startup, never fatal). Held
+    /// as config rather than pre-built `ArrClient`s: `arr::ingest::run`
+    /// constructs a short-lived client per instance per run. This is what a
+    /// future scheduled ingest worker or `/ingest/arr` trigger reads.
+    pub arr_instances: Vec<ArrInstanceConfig>,
 }
 
 /// Timeout for the `/health` DB probe — health must never hang/500 just

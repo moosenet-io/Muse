@@ -540,6 +540,7 @@ mod tests {
             tmdb_api_key: None,
             ollama_url: None,
             chord_url: None,
+            arr_instances_json: None,
         };
         assert!(PlexClient::from_config(&config).is_none());
     }
@@ -563,6 +564,7 @@ mod tests {
             tmdb_api_key: None,
             ollama_url: None,
             chord_url: None,
+            arr_instances_json: None,
         };
         assert!(PlexClient::from_config(&config).is_some());
     }

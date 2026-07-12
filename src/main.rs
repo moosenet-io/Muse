@@ -5,6 +5,7 @@
 //! harness. No domain logic lives here yet — see the founding spec
 //! `specs/S96-muse-foundation.md`.
 
+pub mod arr;
 mod config;
 mod db;
 mod error;
@@ -13,8 +14,10 @@ mod http;
 mod integration_tests;
 pub mod models;
 mod plex;
+mod plex_control;
 mod prowlarr;
 pub mod repo;
+mod trending;
 mod workers;
 
 use std::sync::Arc;
@@ -44,11 +47,34 @@ async fn main() -> anyhow::Result<()> {
         "prowlarr client initialized"
     );
 
+    // MUSE-05: parse the configured *arr fleet. A malformed MUSE_ARR_INSTANCES
+    // degrades to zero instances (logged, not fatal) — same posture as an
+    // unconfigured Plex client above.
+    let arr_instances = match config.arr_instances() {
+        Ok(instances) => {
+            tracing::info!(count = instances.len(), "arr fleet configured");
+            instances
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse MUSE_ARR_INSTANCES; arr ingest will have no instances");
+            Vec::new()
+        }
+    };
+
+    // MUSE-19: constructed for parity with the Plex client above (and so
+    // TMDB_API_KEY misconfiguration is visible at boot); the scheduled
+    // trending-ingest worker that actually calls
+    // `trending::snapshot_trending` on a cadence is a follow-on wiring item
+    // — see `src/trending/mod.rs`.
+    let tmdb_configured = crate::trending::TmdbClient::from_config(&config).is_some();
+    tracing::info!(tmdb_configured, "tmdb client initialized");
+
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
         plex: plex_client,
         prowlarr: prowlarr_client,
+        arr_instances,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

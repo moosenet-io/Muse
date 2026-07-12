@@ -20,6 +20,13 @@ pub enum MuseError {
 
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
+
+    /// A downstream/external service (Plex, Tautulli, TMDb, …) returned an
+    /// error, an unexpected response, or was unreachable. Kept generic
+    /// (rather than e.g. `Plex(String)`) so it's reusable across every
+    /// upstream integration, not just Plex control.
+    #[error("upstream error: {0}")]
+    Upstream(String),
 }
 
 impl IntoResponse for MuseError {
@@ -29,6 +36,7 @@ impl IntoResponse for MuseError {
             MuseError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             MuseError::NotImplemented => (StatusCode::NOT_IMPLEMENTED, self.to_string()),
             MuseError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            MuseError::Upstream(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
         };
 
         let body = Json(json!({

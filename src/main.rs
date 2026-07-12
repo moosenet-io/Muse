@@ -9,6 +9,7 @@ mod config;
 mod db;
 mod error;
 mod http;
+mod plex_control;
 mod workers;
 
 use std::sync::Arc;

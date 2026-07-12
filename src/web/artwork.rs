@@ -216,6 +216,8 @@ mod tests {
             prowlarr: None,
             arr_instances: Vec::new(),
             enrichment: crate::enrichment::EnrichmentService::from_config(&config),
+            tmdb: None,
+            embed: None,
         });
 
         // First request: cache miss, fetches from (mocked) Plex.
@@ -315,6 +317,8 @@ mod tests {
             prowlarr: None,
             arr_instances: Vec::new(),
             enrichment: crate::enrichment::EnrichmentService::from_config(&config),
+            tmdb: None,
+            embed: None,
         });
 
         let resp = art_handler(

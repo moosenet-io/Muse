@@ -75,6 +75,24 @@ pub async fn list_by_kind_decade_theme(
     .map_err(MuseError::Database)
 }
 
+/// MUSE-29: resolve an interstitial to its on-disk `file_path`
+/// (migrations/0098), if one has been populated. Selects the single column
+/// directly (rather than reusing [`get`]'s `SELECT *`/`Interstitial` model)
+/// so callers on the streaming hot path never pull the taxonomy columns
+/// they don't need. Returns `Ok(None)` both when the interstitial doesn't
+/// exist and when it exists but has no `file_path` yet — either way the
+/// caller's only correct move is to skip that program, so the two cases are
+/// deliberately not distinguished here.
+pub async fn get_file_path(pool: &PgPool, id: i64) -> MuseResult<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT file_path FROM interstitials WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(MuseError::Database)?;
+    Ok(row.and_then(|(path,)| path))
+}
+
 pub async fn list_by_tag(pool: &PgPool, tag: &str) -> MuseResult<Vec<Interstitial>> {
     sqlx::query_as::<_, Interstitial>(
         "SELECT * FROM interstitials WHERE $1 = ANY(tags) ORDER BY id",

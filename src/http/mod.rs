@@ -14,11 +14,15 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::error::MuseError;
+use crate::plex::PlexClient;
 
 /// Shared state handed to every axum handler.
 pub struct AppState {
     pub pool: PgPool,
     pub config: Config,
+    /// Read-only Plex client (MUSE-04). `None` when `PLEX_URL`/`PLEX_TOKEN`
+    /// aren't configured — Plex-backed features degrade rather than fail.
+    pub plex: Option<PlexClient>,
 }
 
 /// Timeout for the `/health` DB probe — health must never hang/500 just

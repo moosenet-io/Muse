@@ -18,6 +18,7 @@ pub mod media_metadata;
 pub mod quality;
 pub mod season;
 pub mod taxonomy;
+pub mod trending;
 
 pub use channel::{
     Channel, ChannelKind, ChannelMode, ChannelProgram, ChannelProgramItemType, ChannelRun,
@@ -32,3 +33,7 @@ pub use media_metadata::{MediaKind, MediaMetadata};
 pub use quality::{CustomFormat, QualityDefinition, QualityProfile, QualityProfileFormat};
 pub use season::Season;
 pub use taxonomy::{Collection, Genre, MediaMetadataCredit, Person, Tag};
+pub use trending::{
+    NewPopulationProfile, NewStreamingAvailability, NewTrendingSnapshot, PopulationProfile,
+    StreamingAvailability, TrendingSnapshot,
+};

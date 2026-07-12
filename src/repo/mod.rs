@@ -13,3 +13,4 @@ pub mod media_item;
 pub mod media_metadata;
 pub mod quality;
 pub mod season;
+pub mod trending;

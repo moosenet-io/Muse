@@ -173,6 +173,7 @@ impl Default for Config {
             searxng_url: None,
             news_url: None,
             news_api_key: None,
+            plex_poll_secs: None,
         }
     }
 }

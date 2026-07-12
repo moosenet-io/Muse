@@ -20,7 +20,10 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::error::{MuseError, MuseResult};
 
-pub use models::{Account, Guid, Library, MediaItem, PersonTag, SessionPlayer, SessionUser, Tag};
+pub use models::{
+    Account, Guid, Library, MediaInfo, MediaItem, PersonTag, SessionPlayer, SessionUser, Tag,
+    TranscodeSession,
+};
 
 use models::{AccountContainer, DirectoryContainer, Envelope, MetadataContainer};
 

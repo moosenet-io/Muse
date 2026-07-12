@@ -7,7 +7,7 @@
 use sqlx::PgPool;
 
 use crate::error::{MuseError, MuseResult};
-use crate::models::media_metadata::{MediaMetadata, NewMediaMetadata};
+use crate::models::media_metadata::{MediaKind, MediaMetadata, NewMediaMetadata};
 
 pub async fn upsert_by_tmdb(pool: &PgPool, new: &NewMediaMetadata) -> MuseResult<MediaMetadata> {
     let tmdb_id = new
@@ -124,6 +124,24 @@ pub async fn get(pool: &PgPool, id: i64) -> MuseResult<MediaMetadata> {
         .await
         .map_err(MuseError::Database)?
         .ok_or_else(|| MuseError::NotFound(format!("media_metadata {id} not found")))
+}
+
+/// Resolve a provider `tmdb_id` (+ kind) to an existing `media_metadata.id`,
+/// if the title is already known to the catalog. Used by the trending
+/// ingest (MUSE-19) to link a trending entry to a library title — most
+/// trending entries won't resolve and stay `None` (the caller falls back to
+/// `external_ref`).
+pub async fn find_by_tmdb_id(
+    pool: &PgPool,
+    kind: MediaKind,
+    tmdb_id: &str,
+) -> MuseResult<Option<i64>> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM media_metadata WHERE kind = $1 AND tmdb_id = $2")
+        .bind(kind)
+        .bind(tmdb_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
 }
 
 pub async fn search_by_title(pool: &PgPool, query: &str, limit: i64) -> MuseResult<Vec<MediaMetadata>> {

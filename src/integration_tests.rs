@@ -21,6 +21,7 @@ use crate::models::media_item::NewMediaItem;
 use crate::models::media_metadata::{MediaKind, NewMediaMetadata};
 use crate::models::quality::{NewCustomFormat, NewQualityDefinition, NewQualityProfile};
 use crate::models::season::NewSeason;
+use crate::models::trending::{NewPopulationProfile, NewStreamingAvailability, NewTrendingSnapshot};
 use crate::repo;
 
 #[tokio::test]
@@ -348,4 +349,123 @@ async fn core_schema_migrates_and_round_trips() {
         cross_show.is_err(),
         "attaching a file from another media_item to an episode must be blocked by the composite FK"
     );
+
+    // --- MUSE-19: trending/population feed round-trip ---
+    // `metadata` (the movie created above) doubles as the "resolved to
+    // library" case; a bare `external_ref`-only row covers the (far more
+    // common) unresolved case.
+    let region = format!("XX-{suffix}"); // scoped region so this test's rows never collide with others'
+
+    let resolved_snapshot = repo::trending::insert_snapshot(
+        &pool,
+        &NewTrendingSnapshot {
+            source: "tmdb".to_string(),
+            scope: "trending".to_string(),
+            platform: None,
+            region: region.clone(),
+            window: "day".to_string(),
+            rank: Some(1),
+            media_metadata_id: Some(metadata.id),
+            external_ref: None,
+            popularity: Some(42.5),
+        },
+    )
+    .await
+    .expect("insert resolved trending snapshot");
+    assert_eq!(resolved_snapshot.media_metadata_id, Some(metadata.id));
+
+    let unresolved_snapshot = repo::trending::insert_snapshot(
+        &pool,
+        &NewTrendingSnapshot {
+            source: "tmdb".to_string(),
+            scope: "trending".to_string(),
+            platform: None,
+            region: region.clone(),
+            window: "day".to_string(),
+            rank: Some(2),
+            media_metadata_id: None,
+            external_ref: Some(serde_json::json!({"tmdb_id": "999999", "title": "Some Unlibraried Show", "year": 2026})),
+            popularity: Some(10.0),
+        },
+    )
+    .await
+    .expect("insert unresolved trending snapshot");
+    assert!(unresolved_snapshot.media_metadata_id.is_none());
+    assert!(unresolved_snapshot.external_ref.is_some());
+
+    let recent = repo::trending::list_recent(&pool, "trending", &region, 10)
+        .await
+        .expect("list recent trending snapshots");
+    assert_eq!(recent.len(), 2);
+
+    let resolved_by_tmdb = repo::media_metadata::find_by_tmdb_id(
+        &pool,
+        MediaKind::Movie,
+        &format!("tmdb-{suffix}"),
+    )
+    .await
+    .expect("find_by_tmdb_id should not error");
+    assert_eq!(resolved_by_tmdb, Some(metadata.id));
+
+    let availability = repo::trending::upsert_streaming_availability(
+        &pool,
+        &NewStreamingAvailability {
+            media_metadata_id: metadata.id,
+            provider: "netflix".to_string(),
+            region: region.clone(),
+            offer_type: "flatrate".to_string(),
+            link: Some("https://example.invalid/watch".to_string()),
+        },
+    )
+    .await
+    .expect("upsert streaming availability");
+    assert_eq!(availability.provider, "netflix");
+
+    // Re-upsert with a changed link exercises the ON CONFLICT DO UPDATE path
+    // rather than duplicating the (media_metadata_id, provider, region,
+    // offer_type) row.
+    let availability_updated = repo::trending::upsert_streaming_availability(
+        &pool,
+        &NewStreamingAvailability {
+            media_metadata_id: metadata.id,
+            provider: "netflix".to_string(),
+            region: region.clone(),
+            offer_type: "flatrate".to_string(),
+            link: Some("https://example.invalid/watch-v2".to_string()),
+        },
+    )
+    .await
+    .expect("re-upsert streaming availability");
+    assert_eq!(availability_updated.link.as_deref(), Some("https://example.invalid/watch-v2"));
+
+    let listed_availability = repo::trending::list_streaming_availability(&pool, metadata.id)
+        .await
+        .expect("list streaming availability");
+    assert_eq!(listed_availability.len(), 1, "re-upsert must not duplicate the row");
+
+    let sample_size_before = repo::trending::count_recent_snapshots(&pool, &region)
+        .await
+        .expect("count recent snapshots");
+    assert_eq!(sample_size_before, 2);
+
+    let profile = repo::trending::insert_population_profile(
+        &pool,
+        &NewPopulationProfile {
+            window: "week".to_string(),
+            region: region.clone(),
+            genre_distribution: serde_json::json!({}),
+            decade_distribution: None,
+            runtime_distribution: None,
+            sample_size: Some(sample_size_before as i32),
+        },
+    )
+    .await
+    .expect("insert population profile");
+    assert_eq!(profile.sample_size, Some(2));
+
+    let latest_profile = repo::trending::latest_population_profile(&pool, "week", &region)
+        .await
+        .expect("latest population profile")
+        .expect("a population profile row should exist for this window/region");
+    assert_eq!(latest_profile.id, profile.id);
 }

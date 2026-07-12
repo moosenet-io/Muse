@@ -18,6 +18,7 @@ mod plex;
 mod plex_control;
 mod prowlarr;
 pub mod repo;
+pub mod tautulli;
 mod trending;
 mod workers;
 

@@ -1,6 +1,6 @@
 //! Repo functions for `media_items` — per-library instance state.
 
-use sqlx::PgPool;
+use sqlx::{FromRow, PgPool};
 
 use crate::error::{MuseError, MuseResult};
 use crate::models::media_item::{MediaItem, NewMediaItem};
@@ -95,4 +95,32 @@ pub async fn find_by_plex_rating_key(
         .fetch_optional(pool)
         .await
         .map_err(MuseError::Database)
+}
+
+/// `(media_item_id, runtime_minutes)` for a set of media_items whose shared
+/// `media_metadata.runtime_minutes` is set — MUSE-10's `runtime_pref`
+/// bucketing lookup. An item with no runtime on record simply doesn't
+/// appear in the result (the `runtime_minutes IS NOT NULL` filter), so
+/// callers should treat an absent id as "unknown runtime", not zero.
+#[derive(Debug, Clone, FromRow)]
+struct MediaItemRuntimeRow {
+    media_item_id: i64,
+    runtime_minutes: i32,
+}
+
+pub async fn runtimes_for_media_items(pool: &PgPool, media_item_ids: &[i64]) -> MuseResult<Vec<(i64, i32)>> {
+    let rows = sqlx::query_as::<_, MediaItemRuntimeRow>(
+        r#"
+        SELECT mi.id AS media_item_id, mm.runtime_minutes AS runtime_minutes
+        FROM media_items mi
+        JOIN media_metadata mm ON mm.id = mi.media_metadata_id
+        WHERE mi.id = ANY($1) AND mm.runtime_minutes IS NOT NULL
+        "#,
+    )
+    .bind(media_item_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)?;
+
+    Ok(rows.into_iter().map(|r| (r.media_item_id, r.runtime_minutes)).collect())
 }

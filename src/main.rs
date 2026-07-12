@@ -22,6 +22,7 @@ mod radar;
 mod recall;
 pub mod repo;
 pub mod tautulli;
+pub mod taste_model;
 mod tracker;
 mod trending;
 mod workers;

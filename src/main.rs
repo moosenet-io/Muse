@@ -19,6 +19,7 @@ mod integration_tests;
 pub mod models;
 mod plex;
 mod plex_control;
+pub mod proactive;
 mod prowlarr;
 mod radar;
 mod recall;

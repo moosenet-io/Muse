@@ -146,6 +146,15 @@ pub struct Config {
     /// often are in this codebase's fixtures) or when the process's cwd is
     /// already the library root.
     pub media_root: String,
+
+    /// MUSE-12: how often the proactive-content generator worker wakes up
+    /// to run all five generators for every account
+    /// (`MUSE_PROACTIVE_TICK_INTERVAL_SECS`). Purely a wake cadence, not a
+    /// secret — same posture as `channel_scheduler_tick_secs` above.
+    /// Defaults to hourly: proactive nudges are inherently low-frequency
+    /// (cooldown windows measure in days), so there's no benefit to a
+    /// tighter loop.
+    pub proactive_tick_interval_secs: u64,
 }
 
 impl Config {
@@ -201,6 +210,8 @@ impl Config {
             media_root: std::env::var("MUSE_MEDIA_ROOT")
                 .ok()
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_string()),
+
+            proactive_tick_interval_secs: env_u64("MUSE_PROACTIVE_TICK_INTERVAL_SECS", 3600),
         }
     }
 
@@ -257,6 +268,7 @@ impl Default for Config {
             recall_vector_max_distance: 0.4,
             ffmpeg_path: DEFAULT_FFMPEG_PATH.to_string(),
             media_root: DEFAULT_MEDIA_ROOT.to_string(),
+            proactive_tick_interval_secs: 3600,
         }
     }
 }
@@ -348,6 +360,7 @@ mod tests {
             "MUSE_RECALL_VECTOR_MAX_DISTANCE",
             "MUSE_FFMPEG_PATH",
             "MUSE_MEDIA_ROOT",
+            "MUSE_PROACTIVE_TICK_INTERVAL_SECS",
         ] {
             std::env::remove_var(key);
         }
@@ -377,6 +390,16 @@ mod tests {
         assert!((cfg.recall_vector_max_distance - 0.4).abs() < f64::EPSILON);
         assert_eq!(cfg.ffmpeg_path, DEFAULT_FFMPEG_PATH);
         assert_eq!(cfg.media_root, DEFAULT_MEDIA_ROOT);
+        assert_eq!(cfg.proactive_tick_interval_secs, 3600);
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_proactive_tick_interval_override_from_env() {
+        std::env::set_var("MUSE_PROACTIVE_TICK_INTERVAL_SECS", "120");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.proactive_tick_interval_secs, 120);
+        std::env::remove_var("MUSE_PROACTIVE_TICK_INTERVAL_SECS");
     }
 
     #[test]

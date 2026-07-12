@@ -1,9 +1,9 @@
 //! HTTP surface: the axum `Router` and shared application state.
 //!
-//! Phase 0 wires `/health` and (MUSE-09) `/query/resolve` + `/query/similar`
-//! for real; the rest of `/ingest`, `/query`, and `/proactive` are mounted
-//! as stub route groups that answer `501 Not Implemented` until their
-//! respective spec items land.
+//! Phase 0 wires `/health`, (MUSE-09) `/query/resolve` + `/query/similar`,
+//! and (MUSE-12) `/proactive/pending` + `/proactive/{id}/ack` for real; the
+//! rest of `/ingest` and `/query` are mounted as stub route groups that
+//! answer `501 Not Implemented` until their respective spec items land.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,8 +134,14 @@ fn query_routes() -> Router<Arc<AppState>> {
         .fallback(not_implemented)
 }
 
+/// MUSE-12: `GET /proactive/pending` (the Lumina reminders/engagement +
+/// Terminus `muse_proactive` surface's read path) + `POST /proactive/{id}/ack`.
+/// Replaces the previous 501 stub.
 fn proactive_routes() -> Router<Arc<AppState>> {
-    Router::new().fallback(not_implemented)
+    Router::new()
+        .route("/pending", get(crate::proactive::pending_handler))
+        .route("/{id}/ack", post(crate::proactive::ack_handler))
+        .fallback(not_implemented)
 }
 
 /// MUSE-11: `POST /recommend` (mounted at nest root, i.e. `POST /recommend`

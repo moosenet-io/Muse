@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::http::AppState;
+use crate::proactive::scheduler as proactive_scheduler;
 use crate::prowlarr::spawn_report_pull_worker;
 use crate::tracker::poller;
 
@@ -37,4 +38,12 @@ pub fn spawn_workers(state: Arc<AppState>) {
     // graceful-degrade posture as an unreachable DB.
     crate::tuner::scheduler::spawn(state.clone());
     tracing::info!("linear tuner scheduler worker spawned (MUSE-28)");
+
+    // MUSE-12: the proactive-content generator worker — runs the five
+    // event-driven generators for every account on a configurable cadence
+    // and upserts cooldown/dedup-filtered results into `proactive_items`.
+    // Always spawned (same posture as the tuner scheduler above): a
+    // deployment with zero accounts yet just ticks a harmless no-op.
+    proactive_scheduler::spawn(state.clone());
+    tracing::info!("proactive content generator worker spawned (MUSE-12)");
 }

@@ -122,6 +122,76 @@ pub async fn list_on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseRes
     .map_err(MuseError::Database)
 }
 
+/// One abandoned-title candidate for MUSE-12's abandonment-insight
+/// generator: an `watch_stats.abandoned = true` row joined with the display
+/// fields the generator needs (mirrors [`OnDeckRow`]'s shape/rationale).
+#[derive(Debug, Clone, FromRow)]
+pub struct AbandonedRow {
+    pub media_item_id: i64,
+    pub media_metadata_id: i64,
+    pub title: String,
+    pub year: Option<i32>,
+    pub kind: MediaKind,
+    pub avg_percent: Option<f32>,
+    pub last_watched_at: Option<DateTime<Utc>>,
+}
+
+/// MUSE-12: abandoned titles for `account_id` — never finished, and flagged
+/// `abandoned = true` (see `taste_model::signals::SIGNAL_ABANDONED`).
+/// Ordered most-recently-abandoned first (the freshest "give it another
+/// shot" candidate).
+pub async fn list_abandoned(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<Vec<AbandonedRow>> {
+    sqlx::query_as::<_, AbandonedRow>(
+        r#"
+        SELECT
+            mi.id AS media_item_id,
+            mm.id AS media_metadata_id,
+            mm.title AS title,
+            mm.year AS year,
+            mm.kind AS kind,
+            ws.avg_percent AS avg_percent,
+            ws.last_watched_at AS last_watched_at
+        FROM watch_stats ws
+        JOIN media_items mi ON mi.id = ws.media_item_id
+        JOIN media_metadata mm ON mm.id = mi.media_metadata_id
+        WHERE ws.account_id = $1
+          AND ws.abandoned = true
+          AND ws.finished_count = 0
+        ORDER BY ws.last_watched_at DESC NULLS LAST
+        LIMIT $2
+        "#,
+    )
+    .bind(account_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// MUSE-12: how many *other* accounts finished this `media_item_id` — the
+/// "or that others finished" abandonment-insight grounding signal (spec
+/// MUSE-12). Deliberately a count rather than a list: the generator only
+/// needs "did anyone else push through this", never another account's
+/// identity (multi-user isolation — no cross-account data leaves this
+/// query as anything but an aggregate).
+pub async fn count_other_accounts_finished(
+    pool: &PgPool,
+    media_item_id: i64,
+    exclude_account_id: i64,
+) -> MuseResult<i64> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*) FROM watch_stats
+        WHERE media_item_id = $1 AND account_id != $2 AND finished_count > 0
+        "#,
+    )
+    .bind(media_item_id)
+    .bind(exclude_account_id)
+    .fetch_one(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
 // --- ratings -----------------------------------------------------------
 
 pub async fn upsert_rating(

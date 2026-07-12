@@ -14,7 +14,12 @@
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
+use crate::models::channel::{
+    ChannelKind, ChannelMode, ChannelProgramItemType, ChannelRunStatus, NewChannel,
+    NewChannelProgram, NewChannelRun,
+};
 use crate::models::episode::NewEpisode;
+use crate::models::interstitial::{InterstitialKind, NewInterstitial};
 use crate::models::library::{LibraryKind, NewLibrary};
 use crate::models::media_file::{NewMediaFile, ReleaseTypeKind, Revision};
 use crate::models::media_item::NewMediaItem;
@@ -347,5 +352,316 @@ async fn core_schema_migrates_and_round_trips() {
     assert!(
         cross_show.is_err(),
         "attaching a file from another media_item to an episode must be blocked by the composite FK"
+    );
+}
+
+/// MUSE-23: interstitials + channels + channel_runs + channel_programs
+/// (the linear EPG grid) round-trip. Gated on `MUSE_TEST_DATABASE_URL` per
+/// the same skip pattern as `core_schema_migrates_and_round_trips` above —
+/// unset means "skip cleanly," not "fail."
+///
+/// NOTE: this migrates cleanly only once `plex_clients` (MUSE-22,
+/// `migrations/0090_plex_clients.sql`) exists ahead of MUSE-23's 0091-0099
+/// block — see the ordering-assumption comment in
+/// `migrations/0092_channels.sql`. This test never inserts a `plex_clients`
+/// row itself (all `target_client_id` fields are left `None`), so it does
+/// not need one to exist as data — only the table itself, for the FK.
+#[tokio::test]
+async fn channels_schema_round_trips() {
+    let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+        eprintln!(
+            "MUSE_TEST_DATABASE_URL not set — skipping channels_schema_round_trips \
+             (this is expected in the default test run; the crate does not require a live DB)"
+        );
+        return;
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("connect to MUSE_TEST_DATABASE_URL");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrations should apply cleanly (FK ordering, incl. plex_clients ahead of MUSE-23)");
+
+    let suffix = Uuid::new_v4().simple().to_string();
+
+    // --- minimal content fixtures: a show + episode for the grid to reference ---
+    let library = repo::library::create(
+        &pool,
+        &NewLibrary {
+            name: format!("sonarr_muse23_{suffix}"),
+            kind: LibraryKind::Tv,
+            root_folder: "/media/TV/".to_string(),
+            source_arr_name: Some("sonarr".to_string()),
+            source_arr_url: None,
+        },
+    )
+    .await
+    .expect("create library");
+
+    let show_metadata = repo::media_metadata::upsert_by_tvdb(
+        &pool,
+        &NewMediaMetadata {
+            kind: MediaKind::Show,
+            tmdb_id: None,
+            tvdb_id: Some(format!("tvdb-muse23-{suffix}")),
+            imdb_id: None,
+            provider_ids: serde_json::json!({}),
+            title: "Muse Test Show".to_string(),
+            sort_title: None,
+            original_title: None,
+            original_language: Some("en".to_string()),
+            status: Some("continuing".to_string()),
+            overview: None,
+            studio: None,
+            network: None,
+            runtime_minutes: Some(22),
+            year: Some(1994),
+            images: serde_json::json!([]),
+        },
+    )
+    .await
+    .expect("upsert show media_metadata");
+
+    let show_item = repo::media_item::upsert(
+        &pool,
+        &NewMediaItem {
+            library_id: library.id,
+            media_metadata_id: show_metadata.id,
+            path: "/media/TV/Muse Test Show".to_string(),
+            monitored: true,
+            quality_profile_id: None,
+            minimum_availability: None,
+            plex_rating_key: None,
+            added_at: None,
+        },
+    )
+    .await
+    .expect("upsert show media_item");
+
+    let season = repo::season::upsert(
+        &pool,
+        &NewSeason {
+            media_item_id: show_item.id,
+            season_number: 1,
+            title: None,
+            overview: None,
+            monitored: true,
+            air_date: None,
+        },
+    )
+    .await
+    .expect("upsert season");
+
+    let episode = repo::episode::upsert(
+        &pool,
+        &NewEpisode {
+            season_id: season.id,
+            media_item_id: show_item.id,
+            episode_number: 1,
+            absolute_episode_number: Some(1),
+            title: Some("Pilot".to_string()),
+            overview: None,
+            air_date: None,
+            air_date_utc: None,
+            runtime_minutes: Some(22),
+            monitored: true,
+            tvdb_id: None,
+        },
+    )
+    .await
+    .expect("upsert episode");
+
+    // --- interstitials: a themed pool the composer would pick from ---
+    let bumper = repo::interstitial::upsert(
+        &pool,
+        &NewInterstitial {
+            plex_rating_key: Some(format!("plex-bumper-{suffix}")),
+            kind: InterstitialKind::Bumper,
+            title: Some("Saturday Morning Bumper".to_string()),
+            decade: Some(1990),
+            theme: Some("saturday_morning".to_string()),
+            genre: None,
+            mood: Some("upbeat".to_string()),
+            duration_ms: Some(15_000),
+            tags: vec!["retro".to_string(), "cartoon".to_string()],
+            source: Some("plex_library".to_string()),
+        },
+    )
+    .await
+    .expect("upsert interstitial");
+    assert_eq!(bumper.kind, InterstitialKind::Bumper);
+
+    let queried = repo::interstitial::list_by_kind_decade_theme(
+        &pool,
+        Some(InterstitialKind::Bumper),
+        Some(1990),
+        Some("saturday_morning"),
+    )
+    .await
+    .expect("query interstitials by kind/decade/theme");
+    assert!(queried.iter().any(|i| i.id == bumper.id));
+
+    let by_tag = repo::interstitial::list_by_tag(&pool, "retro")
+        .await
+        .expect("query interstitials by tag");
+    assert!(by_tag.iter().any(|i| i.id == bumper.id));
+
+    // --- channel definition (on_demand, per spec §3.8) ---
+    let channel = repo::channel::create_channel(
+        &pool,
+        &NewChannel {
+            account_id: None, // seam: accounts not yet built (MUSE-03)
+            name: format!("Saturday Morning {suffix}"),
+            kind: ChannelKind::Preset,
+            mode: ChannelMode::OnDemand,
+            channel_number: None,
+            target_client_id: None, // seam: plex_clients row not needed for this test
+            directive: Some("an ep of each cartoon + retro ads, 30 min".to_string()),
+            rules: serde_json::json!({"interstitial_ratio": 0.2}),
+            is_preset: true,
+        },
+    )
+    .await
+    .expect("create channel");
+    assert_eq!(channel.mode, ChannelMode::OnDemand);
+
+    let fetched_channel = repo::channel::get_channel(&pool, channel.id)
+        .await
+        .expect("get channel");
+    assert_eq!(fetched_channel.id, channel.id);
+
+    let presets = repo::channel::list_presets(&pool)
+        .await
+        .expect("list presets");
+    assert!(presets.iter().any(|c| c.id == channel.id));
+
+    // --- a composed run for that channel ---
+    let run = repo::channel::create_run(
+        &pool,
+        &NewChannelRun {
+            channel_id: Some(channel.id),
+            account_id: None,
+            target_client_id: None,
+            plex_play_queue_id: None,
+            schedule: serde_json::json!([
+                {"type": "interstitial", "ref": bumper.id, "title": "Saturday Morning Bumper"},
+                {"type": "episode", "ref": episode.id, "title": "Pilot"},
+            ]),
+            total_duration_ms: Some(bumper.duration_ms.unwrap_or(0) + 22 * 60_000),
+        },
+    )
+    .await
+    .expect("create channel_run");
+    assert_eq!(run.status, ChannelRunStatus::Composed);
+
+    let started = repo::channel::set_run_status(&pool, run.id, ChannelRunStatus::Playing)
+        .await
+        .expect("transition run to playing");
+    assert_eq!(started.status, ChannelRunStatus::Playing);
+    assert!(started.started_at.is_some());
+
+    let completed = repo::channel::set_run_status(&pool, run.id, ChannelRunStatus::Completed)
+        .await
+        .expect("transition run to completed");
+    assert_eq!(completed.status, ChannelRunStatus::Completed);
+    assert!(completed.ended_at.is_some());
+
+    let runs_for_channel = repo::channel::list_runs_by_channel(&pool, channel.id)
+        .await
+        .expect("list runs by channel");
+    assert!(runs_for_channel.iter().any(|r| r.id == run.id));
+
+    // --- linear EPG grid: the channel_programs the future XMLTV guide reads ---
+    let now = chrono::Utc::now();
+    let bumper_program = repo::channel::create_program(
+        &pool,
+        &NewChannelProgram {
+            channel_id: channel.id,
+            item_type: ChannelProgramItemType::Interstitial,
+            media_item_id: None,
+            episode_id: None,
+            interstitial_id: Some(bumper.id),
+            title: "Saturday Morning Bumper".to_string(),
+            subtitle: None,
+            description: None,
+            artwork_url: None,
+            start_at: now,
+            end_at: now + chrono::Duration::milliseconds(15_000),
+            duration_ms: 15_000,
+            rationale: Some("opened with the era-matched bumper".to_string()),
+        },
+    )
+    .await
+    .expect("create bumper channel_program");
+    assert_eq!(bumper_program.item_type, ChannelProgramItemType::Interstitial);
+
+    let episode_start = now + chrono::Duration::milliseconds(15_000);
+    let episode_program = repo::channel::create_program(
+        &pool,
+        &NewChannelProgram {
+            channel_id: channel.id,
+            item_type: ChannelProgramItemType::Episode,
+            media_item_id: None,
+            episode_id: Some(episode.id),
+            interstitial_id: None,
+            title: "Muse Test Show".to_string(),
+            subtitle: Some("S1E1 — Pilot".to_string()),
+            description: None,
+            artwork_url: None,
+            start_at: episode_start,
+            end_at: episode_start + chrono::Duration::minutes(22),
+            duration_ms: 22 * 60_000,
+            rationale: Some("next-unwatched episode".to_string()),
+        },
+    )
+    .await
+    .expect("create episode channel_program");
+    assert_eq!(episode_program.episode_id, Some(episode.id));
+
+    let grid = repo::channel::list_programs_in_window(
+        &pool,
+        channel.id,
+        now,
+        episode_start + chrono::Duration::minutes(22),
+    )
+    .await
+    .expect("list programs in window");
+    assert_eq!(grid.len(), 2);
+    assert_eq!(grid[0].id, bumper_program.id, "grid must be ordered by start_at");
+    assert_eq!(grid[1].id, episode_program.id);
+
+    let now_playing = repo::channel::current_program(&pool, channel.id, now)
+        .await
+        .expect("query current program")
+        .expect("a program should be airing at `now`");
+    assert_eq!(now_playing.id, bumper_program.id);
+
+    let with_play_event =
+        repo::channel::set_program_play_event(&pool, bumper_program.id, 42)
+            .await
+            .expect("attach a play_event seam id");
+    assert_eq!(with_play_event.play_event_id, Some(42));
+
+    // Negative test: a channel_program with no content reference at all
+    // (no media_item/episode/interstitial) must be rejected by the
+    // `CHECK` constraint, not silently accepted as an empty slot.
+    let no_content_ref = sqlx::query(
+        r#"
+        INSERT INTO channel_programs (
+            channel_id, item_type, title, start_at, end_at, duration_ms
+        ) VALUES ($1, 'movie', 'Nothing', now(), now() + interval '1 hour', 3600000)
+        "#,
+    )
+    .bind(channel.id)
+    .execute(&pool)
+    .await;
+    assert!(
+        no_content_ref.is_err(),
+        "a channel_program with no media_item/episode/interstitial reference must be rejected"
     );
 }

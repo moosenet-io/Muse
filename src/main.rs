@@ -5,6 +5,7 @@
 //! harness. No domain logic lives here yet — see the founding spec
 //! `specs/S96-muse-foundation.md`.
 
+pub mod arr;
 mod config;
 mod db;
 mod error;
@@ -37,10 +38,25 @@ async fn main() -> anyhow::Result<()> {
     let plex_client = crate::plex::PlexClient::from_config(&config);
     tracing::info!(plex_configured = plex_client.is_some(), "plex client initialized");
 
+    // MUSE-05: parse the configured *arr fleet. A malformed MUSE_ARR_INSTANCES
+    // degrades to zero instances (logged, not fatal) — same posture as an
+    // unconfigured Plex client above.
+    let arr_instances = match config.arr_instances() {
+        Ok(instances) => {
+            tracing::info!(count = instances.len(), "arr fleet configured");
+            instances
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse MUSE_ARR_INSTANCES; arr ingest will have no instances");
+            Vec::new()
+        }
+    };
+
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
         plex: plex_client,
+        arr_instances,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

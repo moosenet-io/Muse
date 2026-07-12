@@ -13,6 +13,7 @@ mod http;
 mod integration_tests;
 pub mod models;
 mod plex;
+mod prowlarr;
 pub mod repo;
 mod workers;
 
@@ -37,10 +38,17 @@ async fn main() -> anyhow::Result<()> {
     let plex_client = crate::plex::PlexClient::from_config(&config);
     tracing::info!(plex_configured = plex_client.is_some(), "plex client initialized");
 
+    let prowlarr_client = crate::prowlarr::ProwlarrClient::from_config(&config);
+    tracing::info!(
+        prowlarr_configured = prowlarr_client.is_some(),
+        "prowlarr client initialized"
+    );
+
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
         plex: plex_client,
+        prowlarr: prowlarr_client,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

@@ -16,6 +16,7 @@ pub mod models;
 mod plex;
 mod plex_control;
 mod prowlarr;
+mod radar;
 pub mod repo;
 mod trending;
 mod workers;

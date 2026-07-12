@@ -13,7 +13,10 @@ use serde::Deserialize;
 /// paginated-results envelope shape.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResultsEnvelope<T> {
-    #[serde(default)]
+    // `default = "Vec::new"` (not bare `#[serde(default)]`) avoids serde adding a
+    // spurious `T: Default` bound to the derived Deserialize impl for this
+    // generic envelope — TmdbTitle intentionally has no Default.
+    #[serde(default = "Vec::new")]
     pub(crate) results: Vec<T>,
 }
 

@@ -562,7 +562,7 @@ mod tests {
         // exactly (case-insensitive title + year), since MUSE-17 resolution
         // is deliberately exact-match, not fuzzy. The `suffix` provides
         // per-run isolation via the unique `tmdb_id` below, not the title.
-        let title = "Worker Test Movie".to_string();
+        let title = format!("Worker Test Movie {suffix}");
         let metadata = repo::media_metadata::upsert_by_tmdb(
             &pool,
             &crate::models::media_metadata::NewMediaMetadata {
@@ -603,7 +603,12 @@ mod tests {
         .expect("create indexer");
 
         let server = MockServer::start();
-        let release_title = "Worker.Test.Movie.2020.1080p.BluRay.x264-TEST".to_string();
+        // Suffix in BOTH the seeded title and the release name so exact-match
+        // resolution (find_by_title_year) is unambiguous even when the shared
+        // test DB has accumulated other tests' titles. The parser reads
+        // everything before the year token as the title, so the suffix token
+        // lands in the parsed title and matches the seeded metadata exactly.
+        let release_title = format!("Worker.Test.Movie.{suffix}.2020.1080p.BluRay.x264-TEST");
         let guid = format!("guid-{suffix}");
         server.mock(|when, then| {
             when.method(GET)
@@ -638,6 +643,8 @@ mod tests {
             enrichment: crate::enrichment::EnrichmentService::from_config(
                 &crate::config::Config::default(),
             ),
+            tmdb: None,
+            embed: None,
         };
 
         let summary = run_tick(&state).await.expect("run_tick should succeed");
@@ -655,7 +662,7 @@ mod tests {
             .expect("list releases for resolved title");
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].guid, guid);
-        assert_eq!(releases[0].parsed_title.as_deref(), Some("Worker Test Movie"));
+        assert_eq!(releases[0].parsed_title.as_deref(), Some(format!("Worker Test Movie {suffix}").as_str()));
         assert_eq!(releases[0].parsed_year, Some(2020));
 
         let availability = repo::availability::get(&pool, metadata.id).await.expect("availability rollup exists");

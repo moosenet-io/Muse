@@ -150,6 +150,21 @@ impl TmdbClient {
         Ok(envelope.results)
     }
 
+    /// `GET /search/multi` — free-text title search across movies and tv in
+    /// one call (TMDb's `media_type` field on each hit disambiguates).
+    /// MUSE-09's resolution ladder uses this as its "beyond the library"
+    /// tier: a query that neither the vector nor trigram tier could resolve
+    /// against the local catalog gets one shot at a TMDb lookup so the
+    /// caller can be told the honest answer ("not in your library, but here
+    /// it is on TMDb") rather than a bare miss. Results are returned in
+    /// TMDb's own relevance order; callers should not re-sort by
+    /// popularity, which would defeat the relevance ranking for a
+    /// free-text query.
+    pub async fn search_multi(&self, query: &str) -> MuseResult<Vec<TmdbTitle>> {
+        let envelope: ResultsEnvelope<TmdbTitle> = self.get("/search/multi", &[("query", query)]).await?;
+        Ok(envelope.results)
+    }
+
     /// `GET /movie|tv/{id}/watch/providers` — where a title streams, keyed
     /// by ISO 3166-1 region code.
     pub async fn watch_providers(
@@ -227,6 +242,38 @@ mod tests {
         mock.assert();
         assert_eq!(titles.len(), 1);
         assert_eq!(titles[0].display_title(), Some("Game of Thrones"));
+    }
+
+    #[tokio::test]
+    async fn search_multi_parses_mixed_movie_and_tv_results() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/search/multi")
+                .query_param("query", "arrival");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{
+                        "results": [
+                            {"id": 329865, "title": "Arrival", "release_date": "2016-11-10", "media_type": "movie"},
+                            {"id": 999, "name": "Arrival (TV series)", "first_air_date": "2020-01-01", "media_type": "tv"}
+                        ]
+                    }"#,
+                );
+        });
+
+        let client = client_for(&server);
+        let hits = client
+            .search_multi("arrival")
+            .await
+            .expect("search_multi should parse");
+
+        mock.assert();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].display_title(), Some("Arrival"));
+        assert_eq!(hits[0].media_type.as_deref(), Some("movie"));
+        assert_eq!(hits[1].media_type.as_deref(), Some("tv"));
     }
 
     #[tokio::test]

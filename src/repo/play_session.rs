@@ -1,6 +1,6 @@
 //! Repo functions for `play_sessions` + `play_session_media_info`.
 
-use sqlx::PgPool;
+use sqlx::{FromRow, PgPool};
 
 use crate::error::{MuseError, MuseResult};
 use crate::models::play_session::{
@@ -256,4 +256,36 @@ pub async fn attach_tautulli_ref(
     .await
     .map_err(MuseError::Database)?;
     Ok(())
+}
+
+/// One finished session's context fields — the raw input MUSE-10's
+/// `taste_model::profile::compute_context_centroids` buckets into
+/// weekend/weekday x time-of-day contexts (spec §3.4
+/// `taste_context_centroids`, "Friday-night != Sunday-morning !=
+/// phone-commute"). Scoped to `is_finished = true` (an abandoned or
+/// still-in-progress session shouldn't anchor a "you love this in this
+/// context" centroid) and `media_item_id IS NOT NULL` (an unresolved
+/// session has nothing to embed).
+#[derive(Debug, Clone, FromRow)]
+pub struct FinishedSessionContextRow {
+    pub media_item_id: i64,
+    pub started_hour: Option<i32>,
+    pub started_dow: Option<i32>,
+}
+
+pub async fn list_finished_context_rows(
+    pool: &PgPool,
+    account_id: i64,
+) -> MuseResult<Vec<FinishedSessionContextRow>> {
+    sqlx::query_as::<_, FinishedSessionContextRow>(
+        r#"
+        SELECT media_item_id, started_hour, started_dow
+        FROM play_sessions
+        WHERE account_id = $1 AND is_finished = true AND media_item_id IS NOT NULL
+        "#,
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
 }

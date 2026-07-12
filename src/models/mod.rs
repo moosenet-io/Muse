@@ -14,6 +14,7 @@
 //! migrations and summarized in each module here.
 
 pub mod account;
+pub mod artwork_cache;
 pub mod availability;
 pub mod channel;
 pub mod embedding;
@@ -38,6 +39,7 @@ pub mod trending;
 pub mod watch_stats;
 
 pub use account::Account;
+pub use artwork_cache::ArtworkCache;
 pub use availability::Availability;
 pub use channel::{
     Channel, ChannelKind, ChannelMode, ChannelProgram, ChannelProgramItemType, ChannelRun,

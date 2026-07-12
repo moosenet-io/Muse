@@ -1,8 +1,9 @@
 //! HTTP surface: the axum `Router` and shared application state.
 //!
-//! Phase 0 only wires `/health` for real; `/ingest`, `/query`, and
-//! `/proactive` are mounted as stub route groups that answer `501 Not
-//! Implemented` until their respective spec items (MUSE-04+) land.
+//! Phase 0 wires `/health` and (MUSE-09) `/query/resolve` + `/query/similar`
+//! for real; the rest of `/ingest`, `/query`, and `/proactive` are mounted
+//! as stub route groups that answer `501 Not Implemented` until their
+//! respective spec items land.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,10 +20,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::arr::ArrInstanceConfig;
 use crate::config::Config;
+use crate::embed::OllamaEmbedClient;
 use crate::enrichment::EnrichmentService;
 use crate::error::MuseError;
 use crate::plex::PlexClient;
 use crate::prowlarr::ProwlarrClient;
+use crate::trending::TmdbClient;
 
 /// Shared state handed to every axum handler.
 pub struct AppState {
@@ -46,6 +49,16 @@ pub struct AppState {
     /// underlying HTTP sources degrade independently and gracefully when
     /// unconfigured.
     pub enrichment: EnrichmentService,
+    /// Read-only TMDb client (MUSE-19), also used by MUSE-09's
+    /// `/query/resolve` beyond-the-library tier. `None` when
+    /// `TMDB_API_KEY` isn't configured — that tier degrades to unreachable
+    /// (never a 500) rather than failing.
+    pub tmdb: Option<TmdbClient>,
+    /// Query-embedding client for MUSE-09's `/query/resolve` vector tier
+    /// (the same `OllamaEmbedClient` type MUSE-08's embed pipeline uses).
+    /// `None` when `MUSE_OLLAMA_URL` isn't configured — the vector tier
+    /// degrades to skipped, falling through to pg_trgm.
+    pub embed: Option<OllamaEmbedClient>,
 }
 
 /// Timeout for the `/health` DB probe — health must never hang/500 just
@@ -59,8 +72,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/ingest", ingest_routes())
         .nest("/query", query_routes())
         .nest("/proactive", proactive_routes())
+        // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
+        // `/api/channels*`, `/art/{kind}/{id}`).
+        .merge(crate::web::routes())
+        // MUSE-28: HDHomeRun-emulation linear tuner (`/discover.json`,
+        // `/lineup.json`, `/muse.m3u`, `/xmltv.xml`, ...).
+        .merge(tuner_routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// MUSE-28: the linear tuner surface — HDHomeRun-emulation discovery
+/// (`/discover.json`, `/lineup_status.json`, `/lineup.json`), the M3U+XMLTV
+/// alternative (`/muse.m3u`, `/xmltv.xml`), and the MUSE-29 stream stub
+/// (`/auto/v{channel_id}`) every one of the above advertises a URL for.
+/// Mounted at the router root (not nested) — HDHomeRun/M3U/XMLTV clients
+/// expect these exact top-level paths, not a namespaced prefix.
+fn tuner_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/discover.json", get(crate::tuner::hdhr::discover_json))
+        .route("/lineup_status.json", get(crate::tuner::hdhr::lineup_status_json))
+        .route("/lineup.json", get(crate::tuner::hdhr::lineup_json))
+        .route("/muse.m3u", get(crate::tuner::m3u::muse_m3u))
+        .route("/xmltv.xml", get(crate::tuner::xmltv::xmltv_xml))
+        .route("/auto/v{channel_id}", get(crate::tuner::stream_stub))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -87,7 +122,13 @@ fn ingest_routes() -> Router<Arc<AppState>> {
 }
 
 fn query_routes() -> Router<Arc<AppState>> {
-    Router::new().fallback(not_implemented)
+    // MUSE-09: the vector-recall / search API. `/resolve` and `/similar` are
+    // the only real routes in this group so far; everything else still
+    // answers 501 until its own spec item lands.
+    Router::new()
+        .route("/resolve", post(crate::recall::resolve_handler))
+        .route("/similar", post(crate::recall::similar_handler))
+        .fallback(not_implemented)
 }
 
 fn proactive_routes() -> Router<Arc<AppState>> {

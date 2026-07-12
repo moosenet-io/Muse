@@ -29,4 +29,12 @@ pub fn spawn_workers(state: Arc<AppState>) {
     } else {
         tracing::info!("prowlarr not configured; report-pull worker not started");
     }
+
+    // MUSE-28: the linear-channel director — keeps every mode='linear'
+    // channel's channel_programs grid topped off a rolling
+    // channel_guide_window_hours ahead. Always spawned: a deployment with
+    // no linear channels yet just ticks a no-op (empty channel list), same
+    // graceful-degrade posture as an unreachable DB.
+    crate::tuner::scheduler::spawn(state.clone());
+    tracing::info!("linear tuner scheduler worker spawned (MUSE-28)");
 }

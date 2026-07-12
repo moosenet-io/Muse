@@ -5,6 +5,7 @@
 //! macros, since the crate must build without a live database.
 
 pub mod account;
+pub mod artwork_cache;
 pub mod availability;
 pub mod channel;
 pub mod embedding;

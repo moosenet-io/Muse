@@ -46,6 +46,29 @@ pub async fn get(pool: &PgPool, entity_kind: &str, entity_id: i64, model: &str) 
     .map_err(MuseError::Database)
 }
 
+/// Batch fetch of embeddings for a set of entity ids under one model — the
+/// MUSE-10 taste-centroid computation's lookup primitive (avoids an N+1 of
+/// [`get`] calls when averaging over dozens/hundreds of finished titles). An
+/// id with no stored embedding simply doesn't appear in the result — callers
+/// that need to "skip cleanly" for a missing embedding (per the MUSE-10
+/// build brief) do so by checking which requested ids are absent.
+pub async fn get_many(
+    pool: &PgPool,
+    entity_kind: &str,
+    model: &str,
+    entity_ids: &[i64],
+) -> MuseResult<Vec<Embedding>> {
+    sqlx::query_as::<_, Embedding>(
+        "SELECT * FROM embeddings WHERE entity_kind = $1 AND model = $2 AND entity_id = ANY($3)",
+    )
+    .bind(entity_kind)
+    .bind(model)
+    .bind(entity_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
 /// Cosine-distance nearest neighbors within an entity kind, for a given
 /// model (never mixes vectors from different embedding models/dims).
 pub async fn nearest(

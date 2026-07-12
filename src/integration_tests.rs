@@ -350,7 +350,10 @@ async fn core_schema_migrates_and_round_trips() {
     let fetched_item = repo::media_item::get(&pool, item.id).await.expect("get media_item");
     assert_eq!(fetched_item.media_metadata_id, metadata.id);
 
-    let searched = repo::media_metadata::search_by_title(&pool, "Test Movie", 5)
+    // High limit: other live-DB tests in the shared DB also seed "Test
+    // Movie"-ish titles, so a small top-N trigram cut could exclude this
+    // test's own row. We only assert it is FOUND, not its rank.
+    let searched = repo::media_metadata::search_by_title(&pool, "Test Movie", 1000)
         .await
         .expect("trigram search by title");
     assert!(searched.iter().any(|m| m.id == metadata.id));
@@ -1071,12 +1074,14 @@ async fn telemetry_taste_embeddings_schema_migrates_and_round_trips() {
         .expect("embedding should exist");
     assert_eq!(fetched_embedding.entity_id, item.id);
 
+    // High k so accumulated embeddings from other live-DB tests can't push
+    // this test's own item out of the result set (we assert presence, not rank).
     let neighbors = repo::embedding::nearest(
         &pool,
         "media_item",
         "nomic-embed-text",
         &pgvector::Vector::from(vector),
-        5,
+        100_000,
     )
     .await
     .expect("nearest-neighbor query");

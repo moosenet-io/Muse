@@ -607,7 +607,11 @@ mod tests {
         .await
         .expect("insert decoy embedding");
 
-        let neighbors = nearest(&pool, query_vec, 10)
+        // Large k so the shared test DB's accumulated embeddings from other
+        // live-DB tests can't crowd this test's target/decoy out of the
+        // result set — the assertion below is about their RELATIVE order,
+        // which holds regardless of how many unrelated rows exist.
+        let neighbors = nearest(&pool, query_vec, 100_000)
             .await
             .expect("nearest should not error");
 

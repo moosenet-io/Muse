@@ -25,6 +25,7 @@ pub mod tautulli;
 pub mod taste_model;
 mod tracker;
 mod trending;
+mod tuner;
 mod workers;
 
 use std::sync::Arc;

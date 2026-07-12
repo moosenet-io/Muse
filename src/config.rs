@@ -7,6 +7,7 @@
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8090";
 const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_HDHR_DEVICE_ID: &str = "MUSE0001";
 
 /// Muse service configuration, assembled from environment variables at startup.
 #[derive(Debug, Clone)]
@@ -90,6 +91,29 @@ pub struct Config {
     /// are pruned"). Every re-seen release refreshes this on upsert.
     pub release_expiry_days: i64,
 
+    // --- MUSE-28: linear tuner (HDHomeRun-emulation + M3U + XMLTV) ---
+    /// Public LAN base URL Plex/other players use to reach this Muse
+    /// instance (e.g. `http://192.0.2.10:8090`), advertised in
+    /// `/discover.json`'s `BaseURL`/`LineupURL`, `/muse.m3u`'s stream URLs,
+    /// and nowhere else needs to hardcode a host. `None` degrades to
+    /// `http://{bind_addr}` (only correct when `bind_addr` is itself a
+    /// LAN-reachable address, e.g. not `0.0.0.0`) rather than failing the
+    /// tuner routes outright.
+    pub public_base_url: Option<String>,
+    /// HDHomeRun-emulation device id advertised in `/discover.json`
+    /// (`MUSE_HDHR_DEVICE_ID`). Not secret-shaped; a stable identifier Plex
+    /// uses to recognize this tuner across restarts.
+    pub hdhr_device_id: String,
+    /// Rolling linear-guide window, in hours, the director keeps
+    /// `channel_programs` filled to and XMLTV renders
+    /// (`MUSE_CHANNEL_GUIDE_WINDOW_HOURS`, spec pre-flight: 24-48h).
+    pub channel_guide_window_hours: i64,
+    /// How often the linear-channel scheduler worker wakes up to top off
+    /// the rolling guide window (`MUSE_CHANNEL_SCHEDULER_TICK_SECS`).
+    /// Purely a wake cadence, not a secret — same posture as
+    /// `prowlarr_tick_interval_secs` above.
+    pub channel_scheduler_tick_secs: u64,
+
     /// MUSE-09: the maximum pgvector cosine distance (`embedding <=> query`,
     /// range 0.0 = identical to 2.0 = opposite) a vector-tier match may have
     /// and still be treated as "confident" by `/query/resolve`'s resolution
@@ -137,6 +161,14 @@ impl Config {
             prowlarr_tv_categories: env_int_list("MUSE_PROWLARR_TV_CATEGORIES", &[5000]),
             prowlarr_resolve_min_confidence: env_f32("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", 0.5),
             release_expiry_days: env_i64("MUSE_RELEASE_EXPIRY_DAYS", 21),
+
+            public_base_url: env_opt("MUSE_PUBLIC_URL"),
+            hdhr_device_id: std::env::var("MUSE_HDHR_DEVICE_ID")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_HDHR_DEVICE_ID.to_string()),
+            channel_guide_window_hours: env_i64("MUSE_CHANNEL_GUIDE_WINDOW_HOURS", 48),
+            channel_scheduler_tick_secs: env_u64("MUSE_CHANNEL_SCHEDULER_TICK_SECS", 900),
             recall_vector_max_distance: env_opt("MUSE_RECALL_VECTOR_MAX_DISTANCE")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.4),
@@ -189,6 +221,10 @@ impl Default for Config {
             news_url: None,
             news_api_key: None,
             plex_poll_secs: None,
+            public_base_url: None,
+            hdhr_device_id: DEFAULT_HDHR_DEVICE_ID.to_string(),
+            channel_guide_window_hours: 48,
+            channel_scheduler_tick_secs: 900,
             recall_vector_max_distance: 0.4,
         }
     }
@@ -274,6 +310,10 @@ mod tests {
             "MUSE_PROWLARR_TV_CATEGORIES",
             "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
             "MUSE_RELEASE_EXPIRY_DAYS",
+            "MUSE_PUBLIC_URL",
+            "MUSE_HDHR_DEVICE_ID",
+            "MUSE_CHANNEL_GUIDE_WINDOW_HOURS",
+            "MUSE_CHANNEL_SCHEDULER_TICK_SECS",
             "MUSE_RECALL_VECTOR_MAX_DISTANCE",
         ] {
             std::env::remove_var(key);
@@ -297,7 +337,36 @@ mod tests {
         assert_eq!(cfg.prowlarr_tv_categories, vec![5000]);
         assert!((cfg.prowlarr_resolve_min_confidence - 0.5).abs() < f32::EPSILON);
         assert_eq!(cfg.release_expiry_days, 21);
+        assert!(cfg.public_base_url.is_none());
+        assert_eq!(cfg.hdhr_device_id, DEFAULT_HDHR_DEVICE_ID);
+        assert_eq!(cfg.channel_guide_window_hours, 48);
+        assert_eq!(cfg.channel_scheduler_tick_secs, 900);
         assert!((cfg.recall_vector_max_distance - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_tuner_overrides_from_env() {
+        std::env::set_var("MUSE_PUBLIC_URL", "http://192.0.2.10:8090");
+        std::env::set_var("MUSE_HDHR_DEVICE_ID", "MUSETEST1");
+        std::env::set_var("MUSE_CHANNEL_GUIDE_WINDOW_HOURS", "24");
+        std::env::set_var("MUSE_CHANNEL_SCHEDULER_TICK_SECS", "60");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.public_base_url.as_deref(), Some("http://192.0.2.10:8090"));
+        assert_eq!(cfg.hdhr_device_id, "MUSETEST1");
+        assert_eq!(cfg.channel_guide_window_hours, 24);
+        assert_eq!(cfg.channel_scheduler_tick_secs, 60);
+
+        for key in [
+            "MUSE_PUBLIC_URL",
+            "MUSE_HDHR_DEVICE_ID",
+            "MUSE_CHANNEL_GUIDE_WINDOW_HOURS",
+            "MUSE_CHANNEL_SCHEDULER_TICK_SECS",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]

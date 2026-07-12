@@ -15,6 +15,7 @@ mod integration_tests;
 pub mod models;
 mod plex;
 mod plex_control;
+mod prowlarr;
 pub mod repo;
 mod trending;
 mod workers;
@@ -39,6 +40,12 @@ async fn main() -> anyhow::Result<()> {
 
     let plex_client = crate::plex::PlexClient::from_config(&config);
     tracing::info!(plex_configured = plex_client.is_some(), "plex client initialized");
+
+    let prowlarr_client = crate::prowlarr::ProwlarrClient::from_config(&config);
+    tracing::info!(
+        prowlarr_configured = prowlarr_client.is_some(),
+        "prowlarr client initialized"
+    );
 
     // MUSE-05: parse the configured *arr fleet. A malformed MUSE_ARR_INSTANCES
     // degrades to zero instances (logged, not fatal) — same posture as an
@@ -66,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         pool,
         config: config.clone(),
         plex: plex_client,
+        prowlarr: prowlarr_client,
         arr_instances,
     });
 

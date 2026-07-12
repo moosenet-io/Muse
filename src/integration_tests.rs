@@ -26,11 +26,13 @@ use crate::models::interstitial::{InterstitialKind, NewInterstitial};
 use crate::models::library::{LibraryKind, NewLibrary};
 use crate::models::media_file::{NewMediaFile, ReleaseTypeKind, Revision};
 use crate::models::media_item::NewMediaItem;
+use crate::models::indexer::NewIndexer;
 use crate::models::media_metadata::{MediaKind, NewMediaMetadata};
 use crate::models::play_event::NewPlayEvent;
 use crate::models::play_session::{DecisionKind, NewPlaySession, NewPlaySessionMediaInfo};
 use crate::models::proactive_item::NewProactiveItem;
 use crate::models::quality::{NewCustomFormat, NewQualityDefinition, NewQualityProfile};
+use crate::models::release::NewRelease;
 use crate::models::season::NewSeason;
 use crate::models::taste::{NewTasteContextCentroid, NewTasteProfile, NewTasteSignal};
 use crate::models::trending::{NewPopulationProfile, NewStreamingAvailability, NewTrendingSnapshot};
@@ -1327,4 +1329,223 @@ async fn telemetry_taste_embeddings_schema_migrates_and_round_trips() {
         .await
         .expect("list sessions for show media_item");
     assert!(episode_sessions.iter().any(|s| s.id == episode_session.id));
+}
+
+/// MUSE-16: Prowlarr availability layer — indexers / releases / availability
+/// rollup round-trip against a live Postgres. Self-contained (creates its own
+/// movie metadata) so it does not depend on the core round-trip's fixtures.
+#[tokio::test]
+async fn availability_schema_round_trips() {
+    let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+        eprintln!(
+            "MUSE_TEST_DATABASE_URL not set — skipping availability_schema_round_trips \
+             (this is expected in the default test run; the crate does not require a live DB)"
+        );
+        return;
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("connect to MUSE_TEST_DATABASE_URL");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrations should apply cleanly (FK ordering)");
+
+    let suffix = Uuid::new_v4().simple().to_string();
+
+    // The title a resolved release points at.
+    let metadata = repo::media_metadata::upsert_by_tmdb(
+        &pool,
+        &NewMediaMetadata {
+            kind: MediaKind::Movie,
+            tmdb_id: Some(format!("tmdb-avail-{suffix}")),
+            tvdb_id: None,
+            imdb_id: None,
+            provider_ids: serde_json::json!({}),
+            title: "Test Movie".to_string(),
+            sort_title: None,
+            original_title: None,
+            original_language: None,
+            status: None,
+            overview: None,
+            studio: None,
+            network: None,
+            runtime_minutes: None,
+            year: Some(2020),
+            images: serde_json::json!([]),
+        },
+    )
+    .await
+    .expect("upsert movie metadata");
+
+    // --- MUSE-16: indexers / releases / availability round trip ---
+    let prowlarr_id: i32 = (Uuid::new_v4().as_u128() % 1_000_000) as i32;
+    let indexer = repo::indexer::upsert(
+        &pool,
+        &NewIndexer {
+            prowlarr_id,
+            name: format!("test-indexer-{suffix}"),
+            protocol: Some("torrent".to_string()),
+            privacy: Some("public".to_string()),
+            enabled: true,
+            categories: vec![2000, 2010],
+            polite_min_interval_secs: 900,
+        },
+    )
+    .await
+    .expect("upsert indexer");
+    assert!(indexer.enabled);
+    assert_eq!(indexer.categories, vec![2000, 2010]);
+
+    let enabled = repo::indexer::list_enabled(&pool)
+        .await
+        .expect("list enabled indexers");
+    assert!(enabled.iter().any(|i| i.id == indexer.id));
+
+    repo::indexer::mark_rss_pulled(&pool, indexer.id)
+        .await
+        .expect("mark rss pulled");
+    let refetched_indexer = repo::indexer::get(&pool, indexer.id).await.expect("get indexer");
+    assert!(refetched_indexer.last_rss_pull_at.is_some());
+
+    // A release that resolves to the movie metadata upserted above.
+    let good_release = repo::release::upsert(
+        &pool,
+        &NewRelease {
+            media_metadata_id: Some(metadata.id),
+            indexer_id: indexer.id,
+            guid: format!("guid-good-{suffix}"),
+            title: "Test.Movie.2020.2160p.BluRay.REMUX.x265-GRP".to_string(),
+            seeders: Some(120),
+            leechers: Some(4),
+            size_bytes: Some(45_000_000_000),
+            freeleech: true,
+            quality: Some("BluRay-2160p".to_string()),
+            resolution: Some("2160p".to_string()),
+            source: Some("BluRay".to_string()),
+            video_codec: Some("x265".to_string()),
+            release_group: Some("GRP".to_string()),
+            parse_confidence: Some(0.8),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("upsert resolved release");
+    assert_eq!(good_release.media_metadata_id, Some(metadata.id));
+
+    // A lower-seeder release for the same title (still resolved).
+    repo::release::upsert(
+        &pool,
+        &NewRelease {
+            media_metadata_id: Some(metadata.id),
+            indexer_id: indexer.id,
+            guid: format!("guid-second-{suffix}"),
+            title: "Test.Movie.2020.1080p.WEB-DL.x264-TEAM".to_string(),
+            seeders: Some(10),
+            size_bytes: Some(6_000_000_000),
+            freeleech: false,
+            quality: Some("WEB-DL-1080p".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("upsert second release");
+
+    // An unresolved release (no title match yet) — negative-space discovery.
+    repo::release::upsert(
+        &pool,
+        &NewRelease {
+            media_metadata_id: None,
+            indexer_id: indexer.id,
+            guid: format!("guid-unresolved-{suffix}"),
+            title: "Some.Unmatched.Release.2019.720p.HDTV.x264-XYZ".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("upsert unresolved release");
+
+    let releases_for_title = repo::release::list_by_media_metadata(&pool, metadata.id)
+        .await
+        .expect("list releases by media_metadata");
+    assert_eq!(releases_for_title.len(), 2);
+
+    let unresolved = repo::release::list_unresolved(&pool, 50)
+        .await
+        .expect("list unresolved releases");
+    assert!(unresolved.iter().any(|r| r.guid == format!("guid-unresolved-{suffix}")));
+
+    // Re-upserting the same (indexer_id, guid) should update in place, not
+    // duplicate, and must not clobber a resolved media_metadata_id with a
+    // NULL from a later re-seen (unresolved-at-that-moment) report.
+    let reupserted = repo::release::upsert(
+        &pool,
+        &NewRelease {
+            media_metadata_id: None,
+            indexer_id: indexer.id,
+            guid: format!("guid-good-{suffix}"),
+            title: "Test.Movie.2020.2160p.BluRay.REMUX.x265-GRP".to_string(),
+            seeders: Some(150),
+            freeleech: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("re-upsert good release");
+    assert_eq!(reupserted.id, good_release.id);
+    assert_eq!(reupserted.media_metadata_id, Some(metadata.id));
+    assert_eq!(reupserted.seeders, Some(150));
+
+    let rollup = repo::availability::recompute(&pool, metadata.id)
+        .await
+        .expect("recompute availability rollup");
+    assert_eq!(rollup.media_metadata_id, metadata.id);
+    assert_eq!(rollup.release_count, 2);
+    assert_eq!(rollup.best_seeders, Some(150));
+    assert!(rollup.has_freeleech);
+
+    let fetched_rollup = repo::availability::get(&pool, metadata.id)
+        .await
+        .expect("get availability rollup");
+    assert_eq!(fetched_rollup.release_count, 2);
+
+    // A title with zero releases rolls up to an empty availability row.
+    let no_release_metadata = repo::media_metadata::upsert_by_tmdb(
+        &pool,
+        &NewMediaMetadata {
+            kind: MediaKind::Movie,
+            tmdb_id: Some(format!("tmdb-no-releases-{suffix}")),
+            tvdb_id: None,
+            imdb_id: None,
+            provider_ids: serde_json::json!({}),
+            title: "Nothing Available Yet".to_string(),
+            sort_title: None,
+            original_title: None,
+            original_language: None,
+            status: None,
+            overview: None,
+            studio: None,
+            network: None,
+            runtime_minutes: None,
+            year: None,
+            images: serde_json::json!([]),
+        },
+    )
+    .await
+    .expect("upsert media_metadata with no releases");
+    let empty_rollup = repo::availability::recompute(&pool, no_release_metadata.id)
+        .await
+        .expect("recompute availability rollup with zero releases");
+    assert_eq!(empty_rollup.release_count, 0);
+    assert!(!empty_rollup.has_freeleech);
+    assert!(empty_rollup.best_quality.is_none());
+
+    let pruned = repo::release::prune_expired(&pool)
+        .await
+        .expect("prune expired releases should not error even with none expired");
+    assert_eq!(pruned, 0);
 }

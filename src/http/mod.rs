@@ -16,6 +16,7 @@ use crate::arr::ArrInstanceConfig;
 use crate::config::Config;
 use crate::error::MuseError;
 use crate::plex::PlexClient;
+use crate::prowlarr::ProwlarrClient;
 
 /// Shared state handed to every axum handler.
 pub struct AppState {
@@ -24,6 +25,10 @@ pub struct AppState {
     /// Read-only Plex client (MUSE-04). `None` when `PLEX_URL`/`PLEX_TOKEN`
     /// aren't configured — Plex-backed features degrade rather than fail.
     pub plex: Option<PlexClient>,
+    /// Read-only Prowlarr availability client (MUSE-16). `None` when
+    /// `PROWLARR_URL`/`PROWLARR_API_KEY` aren't configured — availability
+    /// features degrade rather than fail.
+    pub prowlarr: Option<ProwlarrClient>,
     /// Configured *arr fleet (MUSE-05) — empty when `MUSE_ARR_INSTANCES`
     /// isn't set or fails to parse (logged at startup, never fatal). Held
     /// as config rather than pre-built `ArrClient`s: `arr::ingest::run`

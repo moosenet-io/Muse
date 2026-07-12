@@ -14,10 +14,12 @@
 //! migrations and summarized in each module here.
 
 pub mod account;
+pub mod availability;
 pub mod channel;
 pub mod embedding;
 pub mod episode;
 pub mod external_enrichment;
+pub mod indexer;
 pub mod interstitial;
 pub mod library;
 pub mod media_file;
@@ -27,6 +29,7 @@ pub mod play_event;
 pub mod play_session;
 pub mod proactive_item;
 pub mod quality;
+pub mod release;
 pub mod season;
 pub mod taste;
 pub mod taxonomy;
@@ -34,6 +37,7 @@ pub mod trending;
 pub mod watch_stats;
 
 pub use account::Account;
+pub use availability::Availability;
 pub use channel::{
     Channel, ChannelKind, ChannelMode, ChannelProgram, ChannelProgramItemType, ChannelRun,
     ChannelRunStatus,
@@ -41,6 +45,7 @@ pub use channel::{
 pub use embedding::{Embedding, EmbeddingEntityKind, EmbeddingMatch};
 pub use episode::Episode;
 pub use external_enrichment::ExternalEnrichment;
+pub use indexer::{Indexer, NewIndexer};
 pub use interstitial::{Interstitial, InterstitialKind};
 pub use library::{Library, LibraryKind};
 pub use media_file::{MediaFile, ReleaseTypeKind};
@@ -50,6 +55,7 @@ pub use play_event::PlayEvent;
 pub use play_session::{DecisionKind, PlaySession, PlaySessionMediaInfo};
 pub use proactive_item::ProactiveItem;
 pub use quality::{CustomFormat, QualityDefinition, QualityProfile, QualityProfileFormat};
+pub use release::{NewRelease, Release};
 pub use season::Season;
 pub use taste::{TasteContextCentroid, TasteProfile, TasteSignal};
 pub use taxonomy::{Collection, Genre, MediaMetadataCredit, Person, Tag};

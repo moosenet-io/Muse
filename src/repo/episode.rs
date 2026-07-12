@@ -61,6 +61,19 @@ pub async fn list_by_season(pool: &PgPool, season_id: i64) -> MuseResult<Vec<Epi
     .map_err(MuseError::Database)
 }
 
+/// Look up an episode by its Plex `ratingKey` — MUSE-07's session
+/// reconstruction resolves a raw `play_events.rating_key` to a local
+/// `(media_item_id, episode_id)` pair this way for TV plays (movies resolve
+/// via `repo::media_item::get_by_plex_rating_key` instead). Returns
+/// `Ok(None)` rather than erroring when unresolved.
+pub async fn get_by_plex_rating_key(pool: &PgPool, plex_rating_key: &str) -> MuseResult<Option<Episode>> {
+    sqlx::query_as::<_, Episode>("SELECT * FROM episodes WHERE plex_rating_key = $1")
+        .bind(plex_rating_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}
+
 /// Mark `has_file` for an episode — flipped by `repo::media_file::attach_to_episode`
 /// once a file join row exists, kept as a separate explicit call rather than
 /// a trigger so the write path stays visible in application code.

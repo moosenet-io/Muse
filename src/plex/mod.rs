@@ -20,7 +20,10 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::error::{MuseError, MuseResult};
 
-pub use models::{Account, Guid, Library, MediaItem, PersonTag, SessionPlayer, SessionUser, Tag};
+pub use models::{
+    Account, Guid, Library, MediaInfo, MediaItem, PersonTag, SessionPlayer, SessionUser, Tag,
+    TranscodeSession,
+};
 
 use models::{AccountContainer, DirectoryContainer, Envelope, MetadataContainer};
 
@@ -529,6 +532,7 @@ mod tests {
             log_level: "info".to_string(),
             plex_url: None,
             plex_token: None,
+            plex_poll_secs: None,
             tautulli_url: None,
             tautulli_api_key: None,
             radarr_url: None,
@@ -553,6 +557,7 @@ mod tests {
             log_level: "info".to_string(),
             plex_url: Some("http://127.0.0.1:32400".to_string()),
             plex_token: Some("abc123".to_string()),
+            plex_poll_secs: None,
             tautulli_url: None,
             tautulli_api_key: None,
             radarr_url: None,

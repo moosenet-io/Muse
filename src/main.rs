@@ -17,6 +17,7 @@ mod plex;
 mod plex_control;
 mod prowlarr;
 pub mod repo;
+mod tracker;
 mod trending;
 mod workers;
 

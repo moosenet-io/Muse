@@ -392,6 +392,7 @@ mod tests {
             log_level: "info".to_string(),
             plex_url: None,
             plex_token: None,
+            plex_poll_secs: None,
             tautulli_url: None,
             tautulli_api_key: None,
             radarr_url: None,

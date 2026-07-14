@@ -42,9 +42,14 @@
 pub mod assemble;
 pub mod model;
 pub mod query;
+pub mod viz;
 
 pub use assemble::{
     assemble_shared_graph, CoViewRecord, GraphSourceData, PersonaRecord, WatchRecord,
 };
 pub use model::{EdgeKind, KgEdge, KgGraph, KgNode, NodeKind};
 pub use query::{bridge_between, co_view_adjacency, taste_neighbor_clusters};
+pub use viz::{
+    build_group_dynamics, build_taste_clusters, build_taste_map, build_watch_history,
+    GroupDynamicsViz, TasteClusterViz, TasteMapViz, WatchHistoryViz,
+};

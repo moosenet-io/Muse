@@ -187,12 +187,20 @@ copy:
   **scratch** Postgres 17 with `vector` + `pg_trgm`, whose database name carries an explicit
   `test`/`snapshot`/`scratch` marker (for the snapshot-family tests this is enforced by the §2
   guard — a real/shared host is rejected outright; for the direct-connect endpoint/integration
-  tests it's the documented convention). Because the two families key off different env vars,
-  export **both** `MUSE_SNAPSHOT_DATABASE_URL` and `MUSE_TEST_DATABASE_URL` to that same loopback
-  DSN to run the *whole* DB-gated suite in one pass — setting only one exercises just that family.
+  tests it's the documented convention). Which var(s) you set determines what runs, per the two
+  resolvers: the snapshot-family resolver (`snapshot::load::snapshot_database_url_from_env`)
+  *prefers* `MUSE_SNAPSHOT_DATABASE_URL` but *falls back to* `MUSE_TEST_DATABASE_URL`, while the
+  direct endpoint/integration/http/channel helpers read **only** `MUSE_TEST_DATABASE_URL`. So:
+    - **only `MUSE_TEST_DATABASE_URL`** → runs the *entire* DB-gated suite (snapshot-family falls
+      back to it; the direct tests read it) — this one var alone is sufficient;
+    - **only `MUSE_SNAPSHOT_DATABASE_URL`** → runs *only* the snapshot family; the direct tests
+      have no var set and skip;
+    - **both** → runs everything, snapshot-family on the snapshot var and direct tests on the test
+      var. MUSET-10's `test-full.yml` sets both — not because one alone wouldn't cover the suite
+      (`MUSE_TEST_DATABASE_URL` would), but for explicit separation, and so the two families can be
+      pointed at different DBs if desired.
   Then run `cargo test -- --test-threads=1` (single-threaded because `config.rs`'s env-reading
-  tests use `serial_test` against process-global env). This dual-export is exactly why MUSET-10's
-  `test-full.yml` sets both vars.
+  tests use `serial_test` against process-global env).
 - **Per-phase / per-module runs** (e.g. `cargo test taste_golden_set`, `cargo test shadow::`) work
   the same way — DB-gated cases within that module skip or run depending on whether the env vars
   above are set.

@@ -839,9 +839,9 @@ mod tests {
         assert_eq!(TimeOfDay::from_hour(20), TimeOfDay::Evening);
         assert_eq!(TimeOfDay::from_hour(2), TimeOfDay::LateNight);
         assert_eq!(
-            TimeOfDay::from_hour(26),
+            TimeOfDay::from_hour(29),
             TimeOfDay::Morning,
-            "hours wrap mod 24"
+            "hours wrap mod 24 (29 % 24 = 5)"
         );
     }
 }

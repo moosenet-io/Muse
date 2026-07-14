@@ -24,6 +24,7 @@ See [`specs/S96-muse-foundation.md`](specs/S96-muse-foundation.md) for the found
 - [`docs/schema.md`](docs/schema.md) — the Postgres data model, grouped by concern, with the shipped divergences from the spec
 - [`docs/runbooks.md`](docs/runbooks.md) — operational runbooks (Tautulli replacement, Prowlarr etiquette, adding Muse as a Plex tuner, the taste/embedding pipeline, the proactive→Lumina contract)
 - [`docs/behavior-spec.md`](docs/behavior-spec.md) — the behavioral contract (taste derivation, curation ranking, proactive triggers/cooldowns, the pseudo-TV director, degradation invariants)
+- [`docs/EXPERIENCE_LAYER.md`](docs/EXPERIENCE_LAYER.md) — the S118 MUSEX experience layer (personas, channel director, watch-together, adaptation loop, conversational assistant, Discord bot, what's-hot/cultural relevance, KG + graph visualizations, the settings/GUI control panel); documents the opt-in-only privacy model that runs through all of it, and is explicit about which pieces are implemented-and-tested vs. actually wired into a running deployment
 
 > **Accuracy note.** This documentation is written against the shipped code, not the aspirational
 > spec. Where a subsystem is a wired-but-untriggered seam or diverges from the founding spec, it is

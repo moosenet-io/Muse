@@ -221,3 +221,22 @@ Env-var-reading config tests use `serial_test` (process-global env), so run the 
 single-threaded (`cargo test -- --test-threads=1`) to avoid cross-test env races. HTTP-client tests
 use `httpmock` and need no live upstream. The integration tests live *inside* the binary crate
 (there is no `[lib]` target) so they can reach `crate::repo`/`crate::models`.
+
+### Endpoint contract/integration harness (`src/endpoint_tests.rs`)
+
+A router-level test suite exercises every route mounted in `http::router` through a real axum
+`Router` via `tower::ServiceExt::oneshot` (an actual HTTP request/response round trip, not a bare
+handler call) — `/health`, `/query/resolve`, `/query/similar`, `/recommend` +
+`/recommend/on_deck` + `/recommend/gaps`, `/proactive/pending` + `/proactive/{id}/ack`,
+`/api/channels` + `/api/channels/{id}/lineup`, `/art/{kind}/{id}`, `/channels/{id}/compose`,
+`/ops/*`, and the `/ingest` \| `/query` \| `/proactive` fallback-501 contract. Each route gets a
+contract test (status + response shape), an error-path test, and — gated on
+`MUSE_TEST_DATABASE_URL` like the rest of the suite — a happy-path test against real seeded rows.
+The gated `db_gated::read_endpoints_never_mutate_the_database` test snapshots every watched
+table's row count, exercises every Phase-0 read endpoint back to back, and asserts the counts are
+unchanged — the executable form of this service's read-only-until-Phase-1 posture. The two
+intentionally-mutating Phase-0 endpoints (`/channels/{id}/compose`, `/proactive/{id}/ack`) get the
+opposite assertion in their own tests: that they write exactly the one row they claim to. No test
+in this module ever configures a real Plex/Prowlarr/TMDb/Tautulli/arr/Ollama/Chord client, so it
+can never reach a live upstream even by accident — same posture as every other test in this crate.
+Run with `cargo test endpoint_tests`.

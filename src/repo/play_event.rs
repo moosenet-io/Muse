@@ -78,3 +78,25 @@ pub async fn list_all_with_session_key(pool: &PgPool) -> MuseResult<Vec<PlayEven
     .await
     .map_err(MuseError::Database)
 }
+
+/// Every `play_events` row that came from a Tautulli history-snapshot load
+/// (`source = 'snapshot:tautulli'`, `event_type = 'snapshot.history'` — see
+/// `crate::snapshot::normalize::normalize_tautulli_play_record`, the only
+/// writer of that `(source, event_type)` pair). This is Tautulli's own
+/// side of the MUSET-09 parity diff (`crate::parity`): one row per
+/// Tautulli `session_history` record, each carrying Tautulli's own
+/// computed `percent_complete`/`watched_status`/`duration` in its `raw`
+/// JSON payload (see `crate::tautulli::models::HistoryRow`).
+///
+/// Read-only, unbounded — same posture as `list_all_with_session_key`; used
+/// only by the MUSET-09 parity report builder, never by the live
+/// webhook/poller path.
+pub async fn list_tautulli_snapshot_events(pool: &PgPool) -> MuseResult<Vec<PlayEvent>> {
+    sqlx::query_as::<_, PlayEvent>(
+        "SELECT * FROM play_events WHERE source = 'snapshot:tautulli' AND event_type = 'snapshot.history' \
+         ORDER BY account_ref, rating_key, received_at",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}

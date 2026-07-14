@@ -22,6 +22,7 @@ mod http;
 mod integration_tests;
 pub mod maintenance;
 pub mod models;
+mod parity;
 mod plex;
 mod plex_control;
 pub mod proactive;
@@ -74,6 +75,20 @@ async fn main() -> anyhow::Result<()> {
     // `shadow::run`'s doc comment for the non-authoritative guarantee).
     if std::env::args().nth(1).as_deref() == Some("shadow-run") {
         return run_shadow_run_cli().await;
+    }
+
+    // MUSET-09: the parity-report operator CLI. Gated behind an explicit
+    // subcommand argument -- `muse parity-report` -- same posture as
+    // `shadow-run`/`snapshot-acquire` above: never runs as part of normal
+    // service startup, connects ONLY through the guarded snapshot path, and
+    // -- like `shadow::run` -- never writes anything back. Unlike
+    // `shadow-run`, this subcommand doesn't even touch the live application
+    // database concept at all: `crate::parity::build_report` is a pure,
+    // in-memory diff over data this CLI fetches beforehand; there is no
+    // code path here (or anywhere in `crate::parity`) that could flip a
+    // "retire Tautulli" switch -- see `parity`'s module doc.
+    if std::env::args().nth(1).as_deref() == Some("parity-report") {
+        return run_parity_report_cli().await;
     }
 
     let config = Config::from_env();
@@ -212,6 +227,59 @@ async fn run_shadow_run_cli() -> anyhow::Result<()> {
         sessions_folded = result.sessions_folded,
         stats_produced = result.stats.len(),
         "shadow run complete (non-authoritative -- nothing was written back)"
+    );
+
+    Ok(())
+}
+
+/// MUSET-09 operator CLI: `muse parity-report`.
+///
+/// Runs the MUSET-08 shadow analytics pass, fetches the snapshot's
+/// Tautulli-origin history rows, diffs the two (`crate::parity::build_report`),
+/// and prints the resulting [`crate::parity::RetirementReadinessReport`] as
+/// both a human-readable headline and its full JSON -- the evidence an
+/// operator (<operator>) would read before deciding whether to retire Tautulli
+/// for the watch-data function. Connects ONLY through the guarded
+/// snapshot/test database path, exactly like `run_shadow_run_cli`; never
+/// invoked by normal service startup or by the test suite.
+///
+/// This subcommand cannot retire anything: it prints a report and exits.
+/// There is no flag, env var, or code path here that authorizes retirement
+/// -- see `crate::parity`'s module doc for the structural guarantee.
+async fn run_parity_report_cli() -> anyhow::Result<()> {
+    use crate::snapshot::load;
+
+    init_tracing("info");
+
+    let Some(pool) = load::connect_snapshot_db_from_env().await? else {
+        anyhow::bail!(
+            "neither {} nor {} is set -- parity-report has no snapshot/test database to read from",
+            load::SNAPSHOT_DATABASE_URL_VAR,
+            load::TEST_DATABASE_URL_VAR,
+        );
+    };
+    load::migrate_snapshot_db(&pool).await?;
+
+    let muse_result = shadow::run(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("shadow run failed: {e}"))?;
+    let tautulli_events = repo::play_event::list_tautulli_snapshot_events(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("listing tautulli snapshot events failed: {e}"))?;
+    let tautulli_stats = parity::aggregate_tautulli_stats(&tautulli_events);
+
+    let report = parity::build_report(
+        &muse_result,
+        &tautulli_stats,
+        "ad hoc muse parity-report CLI run over the configured snapshot/test database",
+    );
+
+    tracing::info!(headline = %report.headline(), "parity report complete");
+    println!("{}", report.headline());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize report: {e}\"}}"))
     );
 
     Ok(())

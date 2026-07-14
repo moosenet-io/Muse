@@ -12,6 +12,8 @@ pub mod curation;
 mod db;
 pub mod embed;
 pub mod enrichment;
+#[cfg(test)]
+mod endpoint_tests;
 mod error;
 mod http;
 #[cfg(test)]

@@ -43,3 +43,6 @@ async-stream = "0.3"
 httpmock = "0.7"
 tokio-test = "0.4"
 serial_test = "3"
+# MUSET-01: the endpoint test harness drives the real axum Router via
+# `ServiceExt::oneshot`, which is feature-gated behind tower's `util` feature.
+tower = { version = "0.4", features = ["util"] }

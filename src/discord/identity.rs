@@ -202,6 +202,20 @@ impl TrustedFriends {
     pub fn is_empty(&self) -> bool {
         self.friends.is_empty()
     }
+
+    /// MUSEX-14: every allowlisted friend who has ALSO opted in — the
+    /// enumeration [`crate::promotion::targeting::promote_new_title`] walks
+    /// to decide who to target. Filters through [`FriendIdentity::is_opted_in`]
+    /// (the same private-field-backed accessor `crate::discord::bot`'s gate
+    /// consults), so a non-opted-in friend can never appear here even by a
+    /// future refactor mistake — the same "provable by construction" posture
+    /// `crate::discord::bot::decide_response_mode` documents for itself.
+    /// There is no equivalent "all friends regardless of opt-in" iterator on
+    /// this type: every consumer that wants to touch taste-shaped output
+    /// must go through this filtered view.
+    pub fn opted_in_friends(&self) -> impl Iterator<Item = &FriendIdentity> {
+        self.friends.values().filter(|f| f.is_opted_in())
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +298,27 @@ mod tests {
         let allowlist = TrustedFriends::from_friends([FriendIdentity::new("discord-123", "Alex")]);
         let friend = allowlist.get("discord-123").expect("allowlisted");
         assert!(!friend.is_opted_in());
+    }
+
+    #[test]
+    fn opted_in_friends_excludes_not_opted_in_and_not_allowlisted() {
+        let allowlist = TrustedFriends::from_friends([
+            FriendIdentity::new("discord-opted-in", "Alex").opt_in(1),
+            FriendIdentity::new("discord-not-opted-in", "Sam"),
+        ]);
+
+        let opted_in: Vec<&str> = allowlist
+            .opted_in_friends()
+            .map(|f| f.discord_user_id.as_str())
+            .collect();
+
+        assert_eq!(opted_in, vec!["discord-opted-in"]);
+    }
+
+    #[test]
+    fn opted_in_friends_is_empty_for_an_empty_allowlist() {
+        let allowlist = TrustedFriends::new();
+        assert_eq!(allowlist.opted_in_friends().count(), 0);
     }
 
     #[test]

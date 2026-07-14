@@ -272,6 +272,42 @@ pub struct Config {
     /// startup, same graceful-degrade posture as `plex_token`/
     /// `tmdb_api_key`/every other optional integration here.
     pub discord_bot_token: Option<String>,
+
+    // --- MUSEX-14 (Plane TERM #390): taste-targeted promotion + conversational requests ---
+    /// Minimum [`crate::promotion::cosine_similarity_01`] score (`[0.0, 1.0]`)
+    /// a newly-available title must reach against an opted-in friend's taste
+    /// centroid before [`crate::promotion::targeting::promote_new_title`]
+    /// targets that friend (`MUSE_PROMOTION_MATCH_THRESHOLD`). GUI-tunable
+    /// per the AC — never a bare literal in `promotion`, always threaded
+    /// through here. Not secret-shaped, same posture as
+    /// `recall_vector_max_distance`. Defaults to `0.55`: a deliberately
+    /// permissive starting point (this is a NEW, unreviewed threshold — no
+    /// production corpus has tuned it yet, same caveat
+    /// `recall_vector_max_distance`'s own doc makes for its default).
+    pub promotion_match_threshold: f64,
+    /// How often (seconds) a promotion sweep is intended to run
+    /// (`MUSE_PROMOTION_CADENCE_SECS`) — GUI-tunable per the AC, same wake-
+    /// cadence posture as `maintenance_tick_secs`/`trending_tick_secs`.
+    /// **Not yet wired to a scheduled worker** — MUSEX-14 ships the
+    /// targeting/dispatch logic and this tunable, but a periodic driver
+    /// that calls `promotion::targeting::promote_new_title` on every newly-
+    /// landed title is reserved for a follow-up item, same explicit
+    /// "accepted but not yet incorporated" posture
+    /// `curation::recommend::RecommendRequest::context` documents for
+    /// itself. Defaults to 6 hours (21600s).
+    pub promotion_cadence_secs: u64,
+    /// Whether [`crate::arr::request::classify_tier`] may ever return
+    /// [`crate::arr::request::RequestTier::AutoApprovable`] for a
+    /// conversational missing-title request
+    /// (`MUSE_ARR_REQUEST_AUTO_TIER_ENABLED`). Defaults to `false` — the
+    /// conservative, safe default: every missing-title request needs manual
+    /// review until an operator explicitly opts in. This flag can never
+    /// bypass the read-only *arr posture `crate::arr`'s own module doc
+    /// establishes ("Never write to *arr" — S96 §1): even when `true`, the
+    /// only thing that changes is which [`crate::arr::request::RequestTier`]
+    /// a request is classified into, never whether `crate::arr` itself
+    /// gains a live write call.
+    pub arr_request_auto_tier_enabled: bool,
 }
 
 impl Config {
@@ -350,6 +386,14 @@ impl Config {
             trend_cache_ttl_secs: env_u64("MUSE_TREND_CACHE_TTL_SECS", 3600),
 
             discord_bot_token: env_opt("DISCORD_BOT_TOKEN"),
+
+            promotion_match_threshold: env_opt("MUSE_PROMOTION_MATCH_THRESHOLD")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.55),
+            promotion_cadence_secs: env_u64("MUSE_PROMOTION_CADENCE_SECS", 21_600),
+            arr_request_auto_tier_enabled: env_opt("MUSE_ARR_REQUEST_AUTO_TIER_ENABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
@@ -424,6 +468,9 @@ impl Default for Config {
             trakt_base_url: None,
             trend_cache_ttl_secs: 3600,
             discord_bot_token: None,
+            promotion_match_threshold: 0.55,
+            promotion_cadence_secs: 21_600,
+            arr_request_auto_tier_enabled: false,
         }
     }
 }
@@ -526,6 +573,10 @@ mod tests {
             "MUSE_TASTE_FINDING_SINK_URL",
             "MUSE_TASTE_FINDING_SINK_API_KEY",
             "MUSE_TASTE_FINDING_PLANE_PROJECT",
+            "DISCORD_BOT_TOKEN",
+            "MUSE_PROMOTION_MATCH_THRESHOLD",
+            "MUSE_PROMOTION_CADENCE_SECS",
+            "MUSE_ARR_REQUEST_AUTO_TIER_ENABLED",
         ] {
             std::env::remove_var(key);
         }
@@ -566,6 +617,28 @@ mod tests {
         assert!(cfg.taste_finding_sink_url.is_none());
         assert!(cfg.taste_finding_sink_api_key.is_none());
         assert!(cfg.taste_finding_plane_project.is_none());
+        assert!(cfg.discord_bot_token.is_none());
+        assert!((cfg.promotion_match_threshold - 0.55).abs() < f64::EPSILON);
+        assert_eq!(cfg.promotion_cadence_secs, 21_600);
+        assert!(!cfg.arr_request_auto_tier_enabled);
+    }
+
+    #[test]
+    #[serial]
+    fn musex14_config_reads_from_env_when_set() {
+        std::env::set_var("MUSE_PROMOTION_MATCH_THRESHOLD", "0.8");
+        std::env::set_var("MUSE_PROMOTION_CADENCE_SECS", "60");
+        std::env::set_var("MUSE_ARR_REQUEST_AUTO_TIER_ENABLED", "true");
+
+        let cfg = Config::from_env();
+
+        assert!((cfg.promotion_match_threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(cfg.promotion_cadence_secs, 60);
+        assert!(cfg.arr_request_auto_tier_enabled);
+
+        std::env::remove_var("MUSE_PROMOTION_MATCH_THRESHOLD");
+        std::env::remove_var("MUSE_PROMOTION_CADENCE_SECS");
+        std::env::remove_var("MUSE_ARR_REQUEST_AUTO_TIER_ENABLED");
     }
 
     #[test]

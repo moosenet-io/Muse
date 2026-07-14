@@ -20,12 +20,24 @@
 //! offline; [`ingest::run`] degrades gracefully — an unreachable/erroring
 //! instance is logged and skipped, never aborting ingest for the rest of the
 //! fleet (see [`ingest::IngestSummary`]).
+//!
+//! [`request`] (MUSEX-14, Plane TERM #390) adds the tiered-safety
+//! CLASSIFICATION for a conversational "please get this" ask — it does
+//! **not** relax the "never write to *arr" rule above. [`request::classify_tier`]
+//! only decides which [`request::RequestTier`] a missing title falls into;
+//! actually submitting a request is delegated to a [`request::MediaRequestSink`]
+//! seam with no live Radarr/Sonarr-writing implementation shipped here, same
+//! posture as this module's own read-only [`ArrClient`].
 
 pub mod client;
 pub mod config;
 pub mod ingest;
 pub mod models;
+pub mod request;
 
 pub use client::ArrClient;
 pub use config::{ArrInstanceConfig, ArrKind};
 pub use ingest::{run, IngestSummary};
+pub use request::{
+    classify_tier, MediaRequestDraft, MediaRequestOutcome, MediaRequestSink, RequestTier,
+};

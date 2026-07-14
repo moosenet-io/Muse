@@ -321,6 +321,47 @@ pub async fn compute_context_centroids(
     Ok(out)
 }
 
+/// Deterministic unweighted mean embedding over a set of entity ids: sums
+/// each id's embedding (looked up in `by_id`) in ascending-id order --
+/// `ids` is sorted (and deduped) internally before summing, so the result
+/// never depends on the order `ids` happens to be passed in, nor on
+/// `by_id`'s `HashMap` iteration order (only used for lookup, never
+/// iterated) -- and divides by the count of ids that actually had a stored
+/// embedding. Added for MUSEX-02 (Plane TERM #378) persona derivation
+/// (`crate::persona::derive`), which needs the exact "average these
+/// titles' embeddings" primitive [`compute_context_centroids`] already
+/// contains inline; factored out here as a new, additive function so both
+/// call sites share it without duplicating the summation logic.
+/// Returns `None` when none of `ids` have a stored embedding.
+pub fn mean_embedding(
+    ids: &[i64],
+    by_id: &HashMap<i64, &crate::models::embedding::Embedding>,
+) -> Option<Vector> {
+    let mut sorted_ids = ids.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+
+    let mut sum = vec![0.0f64; EMBEDDING_DIM as usize];
+    let mut n: i32 = 0;
+    for media_item_id in &sorted_ids {
+        let Some(embedding) = by_id.get(media_item_id) else {
+            continue; // no embedding yet -- skip cleanly
+        };
+        n += 1;
+        for (i, v) in embedding.embedding.as_slice().iter().enumerate() {
+            if let Some(slot) = sum.get_mut(i) {
+                *slot += *v as f64;
+            }
+        }
+    }
+
+    if n == 0 {
+        return None;
+    }
+    let mean: Vec<f32> = sum.iter().map(|v| (v / n as f64) as f32).collect();
+    Some(Vector::from(mean))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,4 +447,99 @@ mod tests {
     // comparison" intent explicit in the tests above without repeating the
     // magic number inline everywhere.
     const DEFAULT_HALF_LIFE_DAYS_FOR_TEST: f64 = super::super::signals::DEFAULT_HALF_LIFE_DAYS;
+
+    // --- mean_embedding: pure, DB-free determinism coverage ----------------
+    //
+    // Added for MUSEX-02 (persona derivation reuses this helper). Runs
+    // unconditionally (no MUSE_TEST_DATABASE_URL needed) -- same posture as
+    // every other pure-math test in this module.
+
+    fn fake_embedding(entity_id: i64, values: Vec<f32>) -> crate::models::embedding::Embedding {
+        assert_eq!(
+            values.len(),
+            EMBEDDING_DIM as usize,
+            "test fixture must be full-width"
+        );
+        crate::models::embedding::Embedding {
+            id: entity_id,
+            entity_kind: "media_item".to_string(),
+            entity_id,
+            model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            dim: EMBEDDING_DIM,
+            embedding: Vector::from(values),
+            source_text: None,
+            embedded_at: Utc::now(),
+        }
+    }
+
+    /// A deterministic, purely-computed EMBEDDING_DIM-length vector -- same
+    /// "fixed synthetic embedding" idiom as `taste_mechanics_tests`'s
+    /// `fixed_vector`, duplicated locally (rather than made `pub(crate)`
+    /// and imported) so this module's tests don't take on a cross-module
+    /// test-only dependency for one helper function.
+    fn fixed_vector(seed: f32) -> Vec<f32> {
+        (0..EMBEDDING_DIM as usize)
+            .map(|i| ((i as f32) * 0.01 + seed).sin())
+            .collect()
+    }
+
+    #[test]
+    fn mean_embedding_returns_none_for_ids_with_no_stored_embedding() {
+        let by_id: HashMap<i64, &crate::models::embedding::Embedding> = HashMap::new();
+        assert!(mean_embedding(&[1, 2, 3], &by_id).is_none());
+    }
+
+    #[test]
+    fn mean_embedding_skips_missing_ids_and_averages_only_present_ones() {
+        let e1 = fake_embedding(1, fixed_vector(0.1));
+        let mut by_id: HashMap<i64, &crate::models::embedding::Embedding> = HashMap::new();
+        by_id.insert(1, &e1);
+        // id 2 has no entry in by_id -- must be skipped, not treated as zero.
+        let mean = mean_embedding(&[1, 2], &by_id).expect("one embeddable id is enough");
+        assert_eq!(mean.as_slice(), Vector::from(fixed_vector(0.1)).as_slice());
+    }
+
+    /// The negative-nondeterminism guard for MUSEX-02's persona derivation:
+    /// `mean_embedding` must produce a BIT-IDENTICAL vector no matter what
+    /// order its `ids` slice is passed in, and no matter what order `by_id`
+    /// (a `HashMap`) happens to iterate -- this is exactly the class of bug
+    /// `taste_mechanics_tests`'s `dedup_then_rank_output_order_is_not_guaranteed_deterministic_for_tied_scores`
+    /// documents for `dedup_candidates`'s `HashMap`-collect (MUSET-05). If a
+    /// future edit made `mean_embedding` sum over `ids` (or over `by_id`)
+    /// without sorting first, floating-point addition's non-associativity
+    /// would make this test flaky/fail.
+    #[test]
+    fn mean_embedding_is_order_independent_and_bit_deterministic() {
+        let e1 = fake_embedding(1, fixed_vector(0.1));
+        let e2 = fake_embedding(2, fixed_vector(0.7));
+        let e3 = fake_embedding(3, fixed_vector(1.3));
+        let mut by_id: HashMap<i64, &crate::models::embedding::Embedding> = HashMap::new();
+        by_id.insert(1, &e1);
+        by_id.insert(2, &e2);
+        by_id.insert(3, &e3);
+
+        let forward = mean_embedding(&[1, 2, 3], &by_id).expect("all three ids are embeddable");
+        let reversed = mean_embedding(&[3, 2, 1], &by_id).expect("all three ids are embeddable");
+        let shuffled = mean_embedding(&[2, 3, 1], &by_id).expect("all three ids are embeddable");
+        let with_duplicate = mean_embedding(&[1, 2, 3, 2], &by_id)
+            .expect("a duplicate id must be deduped, not double-counted");
+
+        assert_eq!(
+            forward.as_slice(),
+            reversed.as_slice(),
+            "mean_embedding must be bit-identical regardless of input id order"
+        );
+        assert_eq!(forward.as_slice(), shuffled.as_slice());
+        assert_eq!(
+            forward.as_slice(),
+            with_duplicate.as_slice(),
+            "a duplicate id in the input must not skew the mean"
+        );
+
+        // Re-running twice more with the same inputs must also stay
+        // bit-identical -- this is the "same inputs -> same persona
+        // vectors" determinism AC itself, at the primitive level.
+        let again = mean_embedding(&[1, 2, 3], &by_id).expect("all three ids are embeddable");
+        assert_eq!(forward.as_slice(), again.as_slice());
+    }
 }

@@ -284,10 +284,19 @@ fn build_option(
 /// either — see the module doc's "Why the director doesn't re-score"
 /// section).
 pub fn create_group_session(
-    members: Vec<PresentMember>,
+    mut members: Vec<PresentMember>,
     pool: Vec<DirectorCandidate>,
     constraints: &GroupSessionConstraints,
 ) -> GroupSession {
+    // Normalize member order up front so the ENTIRE returned GroupSession is
+    // order-independent, not just the blend/lobby: caller input order carries
+    // no meaning (a roster is a SET of present members), so the stored
+    // `members` is sorted by the stable `(account_id, persona.id)` key. This
+    // mirrors `blend_personas`'s own sort-by-persona.id-before-anything idiom
+    // and makes the same-set-different-order guarantee hold for the whole
+    // struct, not just the parts the blend already normalized.
+    members.sort_unstable_by_key(|m| (m.account_id, m.persona.id));
+
     let personas: Vec<Persona> = members.iter().map(|m| m.persona.clone()).collect();
     let blend = blend_personas(&personas);
 
@@ -767,6 +776,52 @@ mod tests {
             "the lobby options themselves must be identical regardless of member order"
         );
         assert_eq!(ids(&s_forward), ids(&s_reversed));
+
+        // The WHOLE returned session must be order-independent, not just the
+        // blend/options: `session.members` is stored in a normalized
+        // `(account_id, persona.id)` order, so the same member SET passed in
+        // any input order yields an identical `members` list. Here the three
+        // members' account_ids are 1/2/3 (from `make_members` using
+        // `persona.id`), so every session's members must come back as
+        // [1, 2, 3] regardless of how they were passed in. This is the exact
+        // gap codex flagged: comparing only blend/options would miss a
+        // caller-order leak in `members`.
+        let member_ids = |s: &GroupSession| -> Vec<(i64, i64)> {
+            s.members
+                .iter()
+                .map(|m| (m.account_id, m.persona.id))
+                .collect()
+        };
+        assert_eq!(
+            member_ids(&s_forward),
+            vec![(1, 1), (2, 2), (3, 3)],
+            "session.members must be sorted into a stable (account_id, persona.id) order"
+        );
+        assert_eq!(
+            member_ids(&s_forward),
+            member_ids(&s_shuffled),
+            "session.members must be identical regardless of caller input order"
+        );
+        assert_eq!(member_ids(&s_forward), member_ids(&s_reversed));
+
+        // Belt-and-braces: the FULL sessions (members + blend + every option's
+        // id/label/serendipity/explanation + slot media ids) are bit-equal
+        // across shuffled input orders. Serializing to JSON is a cheap way to
+        // compare the whole observable struct at once, catching any
+        // caller-order-dependent field this test doesn't enumerate by hand.
+        let whole = |s: &GroupSession| -> serde_json::Value {
+            serde_json::json!({
+                "member_ids": member_ids(s),
+                "blend_explanation": s.blend.explanation,
+                "outcome": s.outcome,
+            })
+        };
+        assert_eq!(
+            whole(&s_forward),
+            whole(&s_shuffled),
+            "the entire observable GroupSession must be order-independent"
+        );
+        assert_eq!(whole(&s_forward), whole(&s_reversed));
     }
 
     #[test]

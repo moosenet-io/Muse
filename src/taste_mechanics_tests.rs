@@ -545,22 +545,56 @@ mod pgvector_mechanics {
                 .await
                 .expect("get_many #2");
 
-        let mut set1: Vec<i64> = first.iter().map(|e| e.entity_id).collect();
-        let mut set2: Vec<i64> = second.iter().map(|e| e.entity_id).collect();
-        set1.sort();
-        set2.sort();
+        // --- Determinism: the FULL result is bit-identical AS RETURNED. ---
+        // The property this guarantees (strengthened per MUSET-05 review): two
+        // identical `get_many` calls against unchanged rows return the same
+        // number of rows, in the same ORDER, and each row's entity_id AND its
+        // full embedding VECTOR are bit-equal. (`Embedding` doesn't derive
+        // `PartialEq` — `pgvector::Vector` isn't `Eq` — so compare
+        // element-wise on `entity_id` + `embedding.as_slice()`, which is the
+        // exact bit-level equality `assert_eq!(a, b)` would give.) Asserting
+        // the RAW returned order — not a sorted normalization — is the
+        // stronger claim the earlier set-only check missed: it would have
+        // passed even if row order (or the vectors themselves) differed
+        // between calls. Two identical `= ANY($ids)` scans of the same
+        // unchanged rows in the same pool yield the same physical row order,
+        // so ordered equality is the correct contract here; if this ever
+        // proves order-unstable in practice that is itself a real finding
+        // about `get_many` lacking an `ORDER BY`, to be documented like the
+        // dedup guard above rather than silently masked by a sort.
         assert_eq!(
-            set1, set2,
-            "get_many must return the same set of ids for the same request, every run"
+            first.len(),
+            second.len(),
+            "get_many must return the same number of rows for identical input, every run"
         );
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(
+                a.entity_id, b.entity_id,
+                "get_many row order must be identical across identical calls \
+                 (entity_id mismatch at the same position)"
+            );
+            assert_eq!(
+                a.embedding.as_slice(),
+                b.embedding.as_slice(),
+                "get_many must return the bit-identical embedding vector for entity {} on every run",
+                a.entity_id
+            );
+        }
+
+        // --- Correctness: exactly the embedded ids, skipping the unembedded
+        //     one. Order-independent (a sorted set), since correctness here is
+        //     about WHICH rows come back, not their order (the determinism
+        //     block above already pinned the order). ---
+        let mut got_ids: Vec<i64> = first.iter().map(|e| e.entity_id).collect();
+        got_ids.sort();
         let mut expected = ids.to_vec();
         expected.sort();
         assert_eq!(
-            set1, expected,
+            got_ids, expected,
             "get_many must return exactly the embedded ids, and skip the id with no stored embedding"
         );
         assert!(
-            !set1.contains(&unembedded_id),
+            !got_ids.contains(&unembedded_id),
             "an id with no stored embedding must never appear in get_many's result \
              (this is the 'skip cleanly' contract compute_overall_centroid depends on)"
         );

@@ -17,6 +17,15 @@
 //! instruction. Any Chord failure (unconfigured, unreachable, malformed
 //! response) falls back to the deterministic template — a recommendation
 //! never fails just because the LLM is down.
+//!
+//! ## "Why this" (MUSEX-04, Plane TERM #380)
+//! [`RecommendationItem::because`] is a distinct, opt-in surface from the
+//! rationale above: a short "because…" line built by
+//! `crate::taste_review::because::because_line` from the same reasoning
+//! trace MUSET-07's `include_trace` exposes, naming the real top signal(s)
+//! that drove the score. Gated behind its own `include_because` flag
+//! (`RecommendRequest`/`AccountLimitQuery`) — additive, same posture as
+//! `include_trace`, so a caller that doesn't ask for it sees no change.
 
 use std::sync::Arc;
 
@@ -30,6 +39,7 @@ use crate::http::AppState;
 use crate::models::availability::Availability;
 use crate::models::media_metadata::MediaKind;
 use crate::taste_model::chord_client::{ChordClient, DEFAULT_MODEL};
+use crate::taste_review::because::because_line;
 use crate::taste_review::trace::{build_reasoning_trace, ReasoningTrace};
 
 pub const DEFAULT_RECOMMEND_LIMIT: i64 = 10;
@@ -177,6 +187,18 @@ pub struct RecommendationItem {
     /// response shape is byte-for-byte unchanged by this feature existing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<ReasoningTrace>,
+    /// MUSEX-04 (Plane TERM #380): a concise, Lumina-voiced "because…" line
+    /// naming the real top signal(s) behind this recommendation — see
+    /// `crate::taste_review::because::because_line`. Grounded strictly in
+    /// the same signals `trace` above is built from (never fabricated).
+    /// Only populated when the caller opts in via
+    /// `RecommendRequest::include_because` / the on-deck/gap query's
+    /// `include_because`; `None` (and therefore omitted from the JSON
+    /// entirely) otherwise, so a caller that doesn't ask for it gets
+    /// byte-for-byte the same response shape as before this feature
+    /// existed — same additive posture as `trace`/`include_trace`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub because: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,11 +211,27 @@ async fn score_and_explain(
     ranked: Vec<(Candidate, f64)>,
     limit: i64,
     include_trace: bool,
+    include_because: bool,
 ) -> Vec<RecommendationItem> {
     let mut items = Vec::with_capacity(ranked.len().min(limit.max(0) as usize));
     for (candidate, score) in ranked.into_iter().take(limit.max(0) as usize) {
         let rationale = build_rationale(chord, &candidate).await;
-        let trace = include_trace.then(|| build_reasoning_trace(&candidate, score));
+        // MUSEX-04: `because_line` is a pure function of the same trace
+        // `include_trace` already builds, so when both flags are set we
+        // build the trace once and reuse it for both — never recomputed,
+        // never a second source of truth for "which signals drove this."
+        let full_trace =
+            (include_trace || include_because).then(|| build_reasoning_trace(&candidate, score));
+        // `because_line` itself returns `None` for a signal-less trace
+        // (no grounded reason → no line), so a `.and_then` here yields
+        // `None` both when the caller didn't opt in AND when there's
+        // nothing real to ground a "because…" in — never a fabricated one.
+        let because = if include_because {
+            full_trace.as_ref().and_then(because_line)
+        } else {
+            None
+        };
+        let trace = if include_trace { full_trace } else { None };
         items.push(RecommendationItem {
             media_metadata_id: candidate.media_metadata_id,
             media_item_id: candidate.media_item_id,
@@ -205,6 +243,7 @@ async fn score_and_explain(
             rationale,
             availability: candidate.availability,
             trace,
+            because,
         });
     }
     items
@@ -234,6 +273,14 @@ pub struct RecommendRequest {
     /// keeping the default response shape unchanged.
     #[serde(default)]
     pub include_trace: bool,
+    /// MUSEX-04: when `true`, each returned item carries its
+    /// [`RecommendationItem::because`] — the concise "because…" narration
+    /// line. Independent of `include_trace` (a caller can ask for the
+    /// human-readable line without the full machine-shaped trace, or vice
+    /// versa). Defaults to `false` (omitted), keeping the default response
+    /// shape unchanged.
+    #[serde(default)]
+    pub include_because: bool,
 }
 
 /// `POST /recommend` — the full MUSE-11 ranked list: on-deck + gap + taste +
@@ -271,7 +318,14 @@ pub async fn recommend_handler(
     let ranked = rank_candidates(deduped);
 
     let chord = ChordClient::from_config(&state.config);
-    let items = score_and_explain(chord.as_ref(), ranked, limit, req.include_trace).await;
+    let items = score_and_explain(
+        chord.as_ref(),
+        ranked,
+        limit,
+        req.include_trace,
+        req.include_because,
+    )
+    .await;
 
     Ok(Json(RecommendResponse { items }))
 }
@@ -284,6 +338,10 @@ pub struct AccountLimitQuery {
     /// MUSET-07: same opt-in trace flag as `RecommendRequest::include_trace`.
     #[serde(default)]
     pub include_trace: bool,
+    /// MUSEX-04: same opt-in "because…" narration flag as
+    /// `RecommendRequest::include_because`.
+    #[serde(default)]
+    pub include_because: bool,
 }
 
 /// `GET /recommend/on_deck?account_id=` — continue-watching only.
@@ -296,7 +354,14 @@ pub async fn on_deck_handler(
         candidates::gather_on_deck_candidates(&state.pool, q.account_id, limit).await?;
     let ranked = rank_candidates(candidates);
     let chord = ChordClient::from_config(&state.config);
-    let items = score_and_explain(chord.as_ref(), ranked, limit, q.include_trace).await;
+    let items = score_and_explain(
+        chord.as_ref(),
+        ranked,
+        limit,
+        q.include_trace,
+        q.include_because,
+    )
+    .await;
     Ok(Json(RecommendResponse { items }))
 }
 
@@ -309,7 +374,14 @@ pub async fn gaps_handler(
     let candidates = candidates::gather_gap_candidates(&state.pool, q.account_id, limit).await?;
     let ranked = rank_candidates(candidates);
     let chord = ChordClient::from_config(&state.config);
-    let items = score_and_explain(chord.as_ref(), ranked, limit, q.include_trace).await;
+    let items = score_and_explain(
+        chord.as_ref(),
+        ranked,
+        limit,
+        q.include_trace,
+        q.include_because,
+    )
+    .await;
     Ok(Json(RecommendResponse { items }))
 }
 
@@ -426,6 +498,68 @@ mod tests {
             CandidateSource::OnDeck,
             "on-deck should win this mix"
         );
+    }
+
+    #[tokio::test]
+    async fn score_and_explain_omits_because_by_default() {
+        let ranked = rank_candidates(vec![candidate(CandidateSource::Taste, 0.92, None)]);
+        let items = score_and_explain(None, ranked, 10, false, false).await;
+
+        assert_eq!(
+            items[0].because, None,
+            "MUSEX-04: because must be None unless include_because is set — additive, unchanged default shape"
+        );
+        assert!(items[0].trace.is_none());
+    }
+
+    #[tokio::test]
+    async fn score_and_explain_populates_because_when_opted_in() {
+        let ranked = rank_candidates(vec![candidate(CandidateSource::Taste, 0.92, None)]);
+        let items = score_and_explain(None, ranked, 10, false, true).await;
+
+        let because = items[0]
+            .because
+            .as_ref()
+            .expect("include_because=true must populate RecommendationItem::because");
+        assert!(
+            because.contains("92% match to your overall taste profile"),
+            "because must be grounded in the candidate's real top fact: {because}"
+        );
+        // Independent of include_trace: because can be requested without
+        // the full machine-shaped trace.
+        assert!(items[0].trace.is_none());
+    }
+
+    #[tokio::test]
+    async fn score_and_explain_because_and_trace_are_independently_opt_in() {
+        let ranked = rank_candidates(vec![candidate(CandidateSource::Taste, 0.92, None)]);
+        let items = score_and_explain(None, ranked, 10, true, false).await;
+
+        assert!(
+            items[0].trace.is_some(),
+            "include_trace alone must still populate trace"
+        );
+        assert_eq!(
+            items[0].because, None,
+            "include_trace alone must not implicitly populate because"
+        );
+    }
+
+    #[tokio::test]
+    async fn score_and_explain_because_matches_direct_because_line_call() {
+        // MUSEX-04 ties directly to MUSET-07's trace: the because line
+        // computed through the recommend pipeline must be identical to
+        // calling `because_line` directly on the same candidate's trace —
+        // no separate/divergent computation path.
+        let c = candidate(CandidateSource::Taste, 0.92, None);
+        let score = score_candidate(&c);
+        let expected = because_line(&build_reasoning_trace(&c, score))
+            .expect("this candidate has real facts, so a because line exists");
+
+        let ranked = rank_candidates(vec![c]);
+        let items = score_and_explain(None, ranked, 10, false, true).await;
+
+        assert_eq!(items[0].because.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

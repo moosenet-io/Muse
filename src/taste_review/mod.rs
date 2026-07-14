@@ -47,7 +47,18 @@
 //! entirely inert — never constructed, never called — on any deployment
 //! that hasn't explicitly set them. Wire the real request/response shape up
 //! when Muse gains an actual Terminus client.
+//!
+//! ## "Why this" narration ([`because`], MUSEX-04)
+//! [`because::because_line`] is a separate, user-facing consumer of
+//! [`trace::ReasoningTrace`]: a short "because…" line, in Lumina's warm
+//! concise voice, naming the real top signal(s) behind a rec — see
+//! `because`'s module doc for the exact grounding contract (verbatim reuse
+//! of `SignalContribution::description`, no LLM rephrase, no invented
+//! words). It is the trust-facing sibling of this module's adversarial
+//! reasoning-critique pipeline above: the panel asks "is the reason
+//! defensible," `because_line` tells the human what the reason IS.
 
+pub mod because;
 pub mod orchestrate;
 pub mod panel;
 pub mod sink;

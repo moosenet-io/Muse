@@ -30,10 +30,20 @@
 //!    denylist is NOT enough -- it must *affirmatively* declare itself a
 //!    test/snapshot DB (the "refuses a DSN lacking an explicit
 //!    `*_test`/snapshot marker" half of AC5).
+//! 4. **Load host is LOOPBACK** -- the primary, airtight host gate. The
+//!    isolated test Postgres is local by design, so the load host must be
+//!    `localhost` / `127.0.0.0/8` / `::1`; every off-loopback host is
+//!    rejected, closing the whole host-resolution class (numeric shorthands,
+//!    octal/hex, DNS tricks) that enumerating IP forms could never fully
+//!    cover. The shared parser additionally rejects numeric-shorthand hosts
+//!    and non-plain db names by charset (fail-closed), and both the load and
+//!    source paths reject multi-host authorities, target-overriding query
+//!    params, and empty db names -- so the validated components always equal
+//!    postgres's effective target.
 //!
-//! All three checks are pure string/IP inspection -- no network I/O, so this
-//! guard runs even when no database is reachable at all (fast, always-on,
-//! unit tested with zero setup).
+//! All checks are pure string/IP inspection -- no network I/O, so this guard
+//! runs even when no database is reachable at all (fast, always-on, unit
+//! tested with zero setup).
 
 use std::fmt;
 
@@ -76,6 +86,11 @@ pub enum SnapshotGuardError {
     /// validated string differ from the effective target. Rejected
     /// fail-closed to keep validated == effective.
     InvalidDatabaseName { db_name: String },
+    /// LOAD path only: the host is not loopback (`localhost` / `127.0.0.0/8`
+    /// / `::1`). The isolated test Postgres is local by design, so any
+    /// off-loopback host is rejected -- the airtight closure of the
+    /// host-resolution attack class.
+    NonLoopbackLoadHost { host: String },
 }
 
 impl fmt::Display for SnapshotGuardError {
@@ -130,6 +145,12 @@ impl fmt::Display for SnapshotGuardError {
                  plain [A-Za-z0-9_-] allowlist -- postgres percent-decodes URI components, so an \
                  encoded name could differ from the effective target; refusing it so the \
                  validated name equals what postgres will use"
+            ),
+            SnapshotGuardError::NonLoopbackLoadHost { host } => write!(
+                f,
+                "snapshot DSN guard: load host ({host:?}) is not loopback -- the isolated test \
+                 Postgres must be local (localhost / 127.0.0.0/8 / ::1); refusing any \
+                 off-loopback host closes the entire host-resolution class by construction"
             ),
         }
     }
@@ -197,6 +218,41 @@ fn is_clean_hostname(host: &str) -> bool {
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// True if `host` (which did NOT parse as a canonical `IpAddr`) looks like a
+/// legacy/shorthand NUMERIC IPv4 form the OS resolver would still turn into a
+/// real IP: hex (`0x..`), or any form whose rightmost dot-label is entirely
+/// digits (`10.1`, `192.168.1`, `0177.0.0.1`, or a bare decimal
+/// `2130706433`). A genuine DNS hostname's rightmost label (its TLD) is never
+/// all-numeric per RFC 1123, so this cleanly separates `db-host.internal`
+/// (allowed) from a numeric shorthand (rejected).
+fn is_numeric_shorthand_host(host: &str) -> bool {
+    if host.starts_with("0x") || host.starts_with("0X") {
+        return true;
+    }
+    matches!(
+        host.rsplit('.').next(),
+        Some(last) if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit())
+    )
+}
+
+/// True if `host` is a loopback target: the literal `localhost`, any
+/// `127.0.0.0/8` IPv4, or the IPv6 `::1`. This is the LOAD-path host
+/// allowlist -- the isolated test Postgres is LOCAL by design (AC/threat
+/// model: same host, physically isolated from the fleet net), so restricting
+/// the load host to loopback eliminates the ENTIRE host-resolution attack
+/// class (numeric shorthands, octal/hex, DNS tricks) by construction: nothing
+/// that resolves off-loopback can pass.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.octets()[0] == 127,
+        Ok(std::net::IpAddr::V6(v6)) => v6 == std::net::Ipv6Addr::LOCALHOST,
+        Err(_) => false,
+    }
 }
 
 /// True if `db` is a plain, un-encoded database name: `^[A-Za-z0-9_-]+$`
@@ -291,11 +347,20 @@ fn parse_and_canonicalize_dsn(dsn: &str) -> Result<CanonicalDsn, SnapshotGuardEr
     // Extract exactly one host, port stripped, IPv6 brackets removed.
     let host = strip_single_host(authority)?;
 
-    // FAIL-CLOSED host validation: must be EITHER a clean hostname OR a
-    // single parseable IpAddr. Anything else (a residual colon from a
-    // mangled authority, stray punctuation, empty) is rejected, never
-    // allowed to fall through.
-    if !is_clean_hostname(&host) && host.parse::<std::net::IpAddr>().is_err() {
+    // FAIL-CLOSED host validation. Rust `IpAddr` only accepts canonical
+    // dotted-quad / RFC-4291 forms, so a legacy numeric shorthand (`10.1`,
+    // `192.168.1`), octal (`0177.0.0.1`), decimal (`2130706433`), or hex
+    // (`0x0a000001`) address does NOT parse as an `IpAddr` and would be
+    // treated as a "clean hostname" here -- yet the OS resolver
+    // (`inet_aton`/`getaddrinfo`) turns it into a real (often RFC-1918) IP.
+    // So the host must be EITHER a genuine `IpAddr` OR a clean hostname that
+    // is NOT a numeric-shorthand form. A real DNS hostname's rightmost label
+    // is never all-numeric (RFC 1123), which is how we tell `db-host.internal`
+    // (allowed) from `10.1`/`0x..` (rejected). This closes the host-
+    // resolution class on BOTH paths at the parser level.
+    if host.parse::<std::net::IpAddr>().is_err()
+        && (!is_clean_hostname(&host) || is_numeric_shorthand_host(&host))
+    {
         return Err(SnapshotGuardError::UnparseableHost { host });
     }
 
@@ -392,6 +457,12 @@ fn host_is_private_ip(host: &str) -> bool {
 ///    nor a live-system hostname marker (`LIVE_DENYLIST`).
 /// 3. The database name carries no live-system marker AND does carry an
 ///    explicit snapshot/test marker (`SNAPSHOT_MARKERS`).
+/// 4. The host is LOOPBACK (`host_is_loopback`: `localhost` / `127.0.0.0/8`
+///    / `::1`) -- the primary, airtight host gate. The isolated test DB is
+///    local by design, so every off-loopback host is rejected, closing the
+///    entire host-resolution class (numeric shorthands, octal/hex, DNS
+///    tricks); checks 2 above are more-specific diagnostics kept as
+///    defense-in-depth.
 ///
 /// This is the function every snapshot-pipeline connection path (AC3) must
 /// call before opening a pool -- see `snapshot::load::connect_snapshot_db`.
@@ -419,7 +490,8 @@ pub fn validate_snapshot_dsn(dsn: &str) -> Result<(), SnapshotGuardError> {
     }
 
     // LOAD policy (a): host must NOT be a private RFC-1918 / IPv6-ULA fleet
-    // address -- the isolated test DB lives on loopback.
+    // address (a more-specific diagnostic than the loopback gate below --
+    // kept as defense-in-depth so a private IP reports as such).
     if host_is_private_ip(&host_lower) {
         return Err(SnapshotGuardError::DenylistMatch {
             field: "host",
@@ -447,6 +519,20 @@ pub fn validate_snapshot_dsn(dsn: &str) -> Result<(), SnapshotGuardError> {
     let has_marker = SNAPSHOT_MARKERS.iter().any(|m| db_lower.contains(m));
     if !has_marker {
         return Err(SnapshotGuardError::NoSnapshotMarker);
+    }
+
+    // LOAD policy (d) -- the PRIMARY, airtight host gate: the load host must
+    // be loopback (localhost / 127.0.0.0/8 / ::1). The isolated test Postgres
+    // is LOCAL by design, so this rejects EVERY off-loopback host by
+    // construction -- closing the whole host-resolution class (numeric
+    // shorthands, octal/hex, DNS tricks) that enumerating IP forms could
+    // never fully cover. The private-IP/denylist checks above remain as
+    // more-specific diagnostics; this is the catch-all that makes any
+    // non-loopback host -- public IP, internal DNS name, anything -- fail.
+    if !host_is_loopback(&canonical.host) {
+        return Err(SnapshotGuardError::NonLoopbackLoadHost {
+            host: canonical.host,
+        });
     }
 
     Ok(())
@@ -694,21 +780,72 @@ mod tests {
 
     #[test]
     fn accepts_plain_valid_db_names_and_hosts() {
-        // Plain names (incl. a hyphen) on valid hosts still pass -- the
-        // charset allowlist doesn't over-reject legitimate names.
+        // Plain names (incl. a hyphen) on LOOPBACK hosts still pass -- the
+        // charset allowlist doesn't over-reject legitimate names, and every
+        // load host is loopback by policy.
         for dsn in [
             "postgres://localhost:5433/muse_test",
             "postgres://127.0.0.1:5433/snapshot_x",
+            "postgres://127.0.0.5:5433/muse_test",
             "postgres://[::1]:5433/scratch-db",
-            "postgres://db-host.internal:5433/muse_snapshot",
         ] {
             assert!(
                 validate_snapshot_dsn(dsn).is_ok(),
                 "{dsn} should pass but was rejected"
             );
         }
-        // Source path: a plain explicit non-prod source db passes.
+        // Source path: a plain explicit non-prod source db on an arbitrary
+        // (non-loopback) fleet host passes -- the source is NOT loopback-gated.
         assert!(validate_not_prod_source("postgres://user@source-host/plex_library").is_ok());
+        assert!(validate_not_prod_source("postgres://db-host.internal:5432/plex_library").is_ok());
+    }
+
+    #[test]
+    fn load_path_rejects_a_non_loopback_host_even_with_a_marked_db() {
+        // A public IP and an internal DNS name both pass every db-name check
+        // but are rejected by the loopback allowlist -- the test DB is local.
+        for dsn in [
+            "postgres://user:pass@8.8.8.8:5432/muse_test",
+            "postgres://db-host.internal:5432/muse_test",
+        ] {
+            let err = validate_snapshot_dsn(dsn)
+                .expect_err(&format!("{dsn} (non-loopback) must be rejected"));
+            assert!(
+                matches!(err, SnapshotGuardError::NonLoopbackLoadHost { .. }),
+                "{dsn} -> {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_path_rejects_numeric_shorthand_hosts_at_the_parser() {
+        // Legacy/shorthand numeric IPv4 forms don't parse as a canonical
+        // IpAddr but the OS resolver turns them into (RFC-1918) IPs -- the
+        // parser rejects them as UnparseableHost before any policy runs.
+        for dsn in [
+            "postgres://user@10.1:5432/muse_test",       // pii-test-fixture
+            "postgres://user@192.168.1:5432/muse_test",  // pii-test-fixture
+            "postgres://user@0177.0.0.1:5432/muse_test", // pii-test-fixture
+            "postgres://user@0x0a000001:5432/muse_test", // pii-test-fixture
+        ] {
+            let err = validate_snapshot_dsn(dsn)
+                .expect_err(&format!("{dsn} (numeric shorthand) must be rejected"));
+            assert!(
+                matches!(err, SnapshotGuardError::UnparseableHost { .. }),
+                "{dsn} -> {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_rejects_numeric_shorthand_but_allows_real_hostnames() {
+        // Direct helper-level coverage of the numeric-shorthand classifier.
+        assert!(is_numeric_shorthand_host("10.1")); // pii-test-fixture
+        assert!(is_numeric_shorthand_host("192.168.1")); // pii-test-fixture
+        assert!(is_numeric_shorthand_host("0x0a000001"));
+        assert!(is_numeric_shorthand_host("2130706433"));
+        assert!(!is_numeric_shorthand_host("localhost"));
+        assert!(!is_numeric_shorthand_host("db-host.internal"));
     }
 
     #[test]
@@ -739,13 +876,17 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_non_private_public_ip_host_is_not_auto_rejected_as_private() {
-        // A public IP is not RFC-1918; it passes the private-IP check (it
-        // may still be rejected for other reasons, but not by
-        // host_is_private_ip). 8.8.8.8 with a marked test db is allowed.
+    fn public_ip_is_not_flagged_private_but_is_rejected_as_non_loopback_on_load() {
+        // A public IP is not RFC-1918 (host_is_private_ip is false), so it's
+        // the loopback allowlist -- not the private-IP diagnostic -- that
+        // rejects it on the load path. (The source path, which is not
+        // loopback-gated, would accept a public host with a non-prod db.)
         assert!(!host_is_private_ip("8.8.8.8"));
         let dsn = "postgres://user:pass@8.8.8.8:5432/muse_test";
-        assert!(validate_snapshot_dsn(dsn).is_ok());
+        assert!(matches!(
+            validate_snapshot_dsn(dsn),
+            Err(SnapshotGuardError::NonLoopbackLoadHost { .. })
+        ));
     }
 
     #[test]

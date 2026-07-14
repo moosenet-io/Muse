@@ -25,6 +25,7 @@ mod fixtures;
 mod http;
 #[cfg(test)]
 mod integration_tests;
+pub mod kg;
 pub mod maintenance;
 pub mod models;
 mod parity;

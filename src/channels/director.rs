@@ -351,12 +351,26 @@ pub fn program_channel(
         let want_exploration =
             (interval != usize::MAX && idx % interval == offset) || guarantee_pending;
 
-        let picked = if want_exploration {
-            pop_first_fitting(&mut exploration, remaining_ms)
-                .or_else(|| pop_first_fitting(&mut safe, remaining_ms))
+        // Pick a candidate AND record which queue actually supplied it, so
+        // `is_exploration` can key on RESERVATION (a deliberate exploration
+        // injection), NOT mere eligibility. On a RESERVED slot
+        // (`want_exploration`) we try the exploration queue first and, only
+        // if it can't fit anything, fall back to the safe queue — that
+        // fallback pick is NOT an exploration slot (the reservation couldn't
+        // be realized). On a NON-reserved slot we try safe first and fall
+        // back to the exploration queue; an eligible candidate that lands
+        // here is an ordinary pick, NOT a deliberate injection, so it too is
+        // `from_exploration_queue == false`.
+        let picked: Option<(DirectorCandidate, bool)> = if want_exploration {
+            match pop_first_fitting(&mut exploration, remaining_ms) {
+                Some(dc) => Some((dc, true)),
+                None => pop_first_fitting(&mut safe, remaining_ms).map(|dc| (dc, false)),
+            }
         } else {
-            pop_first_fitting(&mut safe, remaining_ms)
-                .or_else(|| pop_first_fitting(&mut exploration, remaining_ms))
+            match pop_first_fitting(&mut safe, remaining_ms) {
+                Some(dc) => Some((dc, false)),
+                None => pop_first_fitting(&mut exploration, remaining_ms).map(|dc| (dc, false)),
+            }
         };
 
         // Neither queue had anything that fits the remaining budget — either
@@ -364,7 +378,7 @@ pub fn program_channel(
         // what's left of the session (a correct exclusion, not an error).
         // `remaining_ms` only shrinks going forward, so nothing later would
         // fit either: a clean stop, never a fallback spin.
-        let Some(dc) = picked else {
+        let Some((dc, from_exploration_reservation)) = picked else {
             break;
         };
 
@@ -374,13 +388,16 @@ pub fn program_channel(
             0.0
         };
         let intent = slot_intent(idx, fraction_elapsed, constraints.time_of_day);
-        // MUSEX-06: reflects real exploration-eligibility (taste-adjacent-
-        // but-novel OR AvailableNow), not just source == AvailableNow — see
-        // `serendipity::is_exploration_eligible`. Always correct here
-        // because `partition_pool` only ever puts eligible candidates in
-        // the exploration queue, so whichever queue actually supplied `dc`
-        // this check agrees with.
-        let is_exploration = serendipity::is_exploration_eligible(&dc.candidate);
+        // MUSEX-06: `is_exploration` means "this slot was placed via the
+        // serendipity RESERVATION path (a deliberate exploration
+        // injection)" — i.e. the slot was reserved (`want_exploration`) AND
+        // actually filled from the exploration pool. It is NOT "the
+        // candidate is exploration-eligible": an eligible candidate playing
+        // as an ordinary pick in a non-reserved slot is not an injection.
+        // This is why pure-safe (`serendipity_budget == 0.0`, which never
+        // sets `want_exploration`) yields zero exploration slots regardless
+        // of what the pool contains.
+        let is_exploration = from_exploration_reservation;
         if is_exploration {
             exploration_slot_count += 1;
         }

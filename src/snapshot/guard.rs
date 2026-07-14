@@ -277,7 +277,11 @@ fn is_valid_db_charset(db: &str) -> bool {
 /// The ONE shared, fail-closed DSN parser used by BOTH the load path
 /// (`validate_snapshot_dsn`) and the source path (`validate_not_prod_source`).
 ///
-/// It rejects, BEFORE returning any components:
+/// It isolates the RFC-3986 authority FIRST (up to the first `/`, `?`, or
+/// `#`) and strips userinfo only WITHIN that authority -- so an `@` inside the
+/// path or query can never hijack the host/db parse (the effective host/db
+/// always match what sqlx/libpq connect to). It then rejects, BEFORE
+/// returning any components:
 /// - a non-`postgres(ql)://` scheme,
 /// - a MULTI-HOST authority (any comma in the host:port section) -- sqlx/
 ///   libpq failover DSNs have no legitimate use for a single isolated
@@ -307,14 +311,26 @@ fn parse_and_canonicalize_dsn(dsn: &str) -> Result<CanonicalDsn, SnapshotGuardEr
         })?;
 
     // rest is: [user[:password]@]host[:port][,host[:port]...][/dbname][?params]
-    let after_auth = match rest.rsplit_once('@') {
-        Some((_userinfo, after)) => after,
-        None => rest,
-    };
+    //
+    // AUTHORITY ISOLATION (RFC-3986): the authority ends at the FIRST `/`,
+    // `?`, or `#`. userinfo (`user@`) exists ONLY within the authority, so we
+    // MUST isolate the authority before stripping userinfo -- otherwise an
+    // `@` inside the path/query (e.g. `.../muse?param=@localhost/muse_test`)
+    // would hijack an `rsplit('@')` over the whole string, making the guard
+    // validate a different host+db than sqlx/libpq actually connect to.
+    let auth_end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let authority_with_userinfo = &rest[..auth_end];
+    // `path_and_query` starts with `/`, `?`, `#`, or is empty.
+    let path_and_query = &rest[auth_end..];
 
-    let (authority, path_and_query) = match after_auth.split_once('/') {
-        Some((h, p)) => (h, p),
-        None => (after_auth, ""),
+    // Strip userinfo ONLY within the isolated authority. A literal `@` in a
+    // password (`user:p@ss@host`) is handled correctly by rsplit_once here,
+    // because we're now operating on the authority alone (no path/query).
+    let authority = match authority_with_userinfo.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority_with_userinfo,
     };
 
     if authority.is_empty() {
@@ -328,10 +344,20 @@ fn parse_and_canonicalize_dsn(dsn: &str) -> Result<CanonicalDsn, SnapshotGuardEr
         });
     }
 
-    let (db_part, query_part) = match path_and_query.split_once('?') {
-        Some((db, q)) => (db, q),
-        None => (path_and_query, ""),
+    // Split path_and_query into the path (db) and the query string. It starts
+    // with `/` (path present), `?` (query, no path), `#` (fragment, no path),
+    // or is empty. Strip a leading `/` to get the raw path; an empty path
+    // yields an empty db (-> MissingDatabaseName downstream).
+    let (path_part, query_part) = {
+        // Drop a fragment if present (postgres ignores it; we never use it).
+        let no_fragment = path_and_query.split('#').next().unwrap_or("");
+        match no_fragment.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (no_fragment, ""),
+        }
     };
+    // The path is either empty, or begins with `/` then the db name.
+    let db_part = path_part.strip_prefix('/').unwrap_or(path_part);
 
     // Reject any non-allowlisted query param (target-overriding), for BOTH
     // paths, before trusting the URL's own host/db components.
@@ -936,6 +962,86 @@ mod tests {
         }
         // Direct unit check of the helper for the v4-compatible form too.
         assert!(host_is_private_ip("::ffff:<internal-ip>")); // pii-test-fixture
+    }
+
+    // -----------------------------------------------------------------
+    // AUTHORITY ISOLATION (RFC-3986): an `@` inside the path/query must NOT
+    // hijack the host/db parse. The effective host/db (what sqlx/libpq use)
+    // must equal what the guard validates.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn at_sign_in_query_cannot_hijack_the_authority() {
+        // `postgres://prod-db/muse?param=@localhost/muse_test`: a naive
+        // rsplit('@') over the whole string would parse host=localhost,
+        // db=muse_test (PASS). RFC-3986: authority=prod-db, db=muse, query
+        // `param=@localhost/muse_test`. Must be REJECTED, never parse to
+        // localhost/muse_test. (Here the disallowed `param` query key trips
+        // first; either way it is rejected.)
+        let dsn = "postgres://prod-db/muse?param=@localhost/muse_test";
+        let err = validate_snapshot_dsn(dsn).expect_err("@-in-query must not hijack the authority");
+        assert!(
+            matches!(
+                err,
+                SnapshotGuardError::DisallowedQueryParam { .. }
+                    | SnapshotGuardError::NonLoopbackLoadHost { .. }
+                    | SnapshotGuardError::DenylistMatch { .. }
+            ),
+            "got {err:?}"
+        );
+        // Prove it did NOT canonicalize to the decoy host/db.
+        let canonical = super::parse_and_canonicalize_dsn(dsn).ok();
+        if let Some(c) = canonical {
+            assert_ne!(
+                c.host, "localhost",
+                "authority must be prod-db, not the decoy"
+            );
+            assert_eq!(c.host, "prod-db");
+            assert_eq!(c.db_name, "muse");
+        }
+    }
+
+    #[test]
+    fn at_sign_in_query_with_allowlisted_param_still_rejected_on_effective_host() {
+        // `?sslmode=require@evil/x`: the query key `sslmode` is allowlisted,
+        // so the query check passes -- but the effective authority is still
+        // `prod-db` (contains the `prod` marker + is non-loopback), so it is
+        // rejected on the host, NOT parsed as localhost/x.
+        let dsn = "postgres://prod-db/muse?sslmode=require@evil/x";
+        let err = validate_snapshot_dsn(dsn)
+            .expect_err("@-in-query with an inert param must still reject on the real host");
+        assert!(
+            matches!(
+                err,
+                SnapshotGuardError::DenylistMatch { field: "host", .. }
+                    | SnapshotGuardError::NonLoopbackLoadHost { .. }
+            ),
+            "got {err:?}"
+        );
+        let c = super::parse_and_canonicalize_dsn(dsn).unwrap();
+        assert_eq!(c.host, "prod-db");
+        assert_eq!(c.db_name, "muse");
+    }
+
+    #[test]
+    fn literal_at_in_password_within_authority_parses_to_the_real_host() {
+        // `user:p@ss@localhost/muse_test`: the `@` in the password is inside
+        // the authority; rsplit within the isolated authority strips userinfo
+        // at the LAST `@`, leaving host=localhost. Still a valid load DSN.
+        let dsn = "postgres://user:p@ss@localhost/muse_test";
+        let c = super::parse_and_canonicalize_dsn(dsn).expect("should parse");
+        assert_eq!(c.host, "localhost");
+        assert_eq!(c.db_name, "muse_test");
+        assert!(validate_snapshot_dsn(dsn).is_ok());
+    }
+
+    #[test]
+    fn normal_userinfo_is_stripped_and_host_db_parse_correctly() {
+        let dsn = "postgres://user:pass@localhost/muse_test";
+        let c = super::parse_and_canonicalize_dsn(dsn).expect("should parse");
+        assert_eq!(c.host, "localhost");
+        assert_eq!(c.db_name, "muse_test");
+        assert!(validate_snapshot_dsn(dsn).is_ok());
     }
 
     // -----------------------------------------------------------------

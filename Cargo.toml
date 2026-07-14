@@ -38,6 +38,10 @@ pgvector = { version = "=0.4.1", features = ["sqlx"] }
 # MUSE-29: `stream!` used to chain per-program ffmpeg child-process stdout
 # into the `/auto/v{channel_id}` HTTP response body.
 async-stream = "0.3"
+# MUSET-03: SHA-256 checksums for snapshot-ingestion provenance records
+# (src/snapshot/provenance.rs) -- a well-established, pure-Rust hashing
+# crate, no new runtime surface (no network, no FFI).
+sha2 = "0.10"
 
 [dev-dependencies]
 httpmock = "0.7"

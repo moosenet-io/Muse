@@ -261,6 +261,17 @@ pub struct Config {
     /// fast enough to justify a tighter loop, and this keeps repeated
     /// `/cultural/*` requests from hammering TMDb/Trakt.
     pub trend_cache_ttl_secs: u64,
+
+    /// MUSEX-13: Discord bot API token (`DISCORD_BOT_TOKEN`). Same posture
+    /// as every other credential in this struct — materialized into the
+    /// process environment from <secret-manager> at runtime, never a literal in
+    /// source/config (S1/S7). `None` means the Discord bot is INERT: no
+    /// live Discord API call is ever made, and
+    /// `discord::client::RealDiscordClient::from_config` returns `None` —
+    /// the bot surface degrades to unavailable rather than blocking
+    /// startup, same graceful-degrade posture as `plex_token`/
+    /// `tmdb_api_key`/every other optional integration here.
+    pub discord_bot_token: Option<String>,
 }
 
 impl Config {
@@ -337,6 +348,8 @@ impl Config {
             trakt_api_key: env_opt("TRAKT_API_KEY"),
             trakt_base_url: env_opt("MUSE_TRAKT_BASE_URL"),
             trend_cache_ttl_secs: env_u64("MUSE_TREND_CACHE_TTL_SECS", 3600),
+
+            discord_bot_token: env_opt("DISCORD_BOT_TOKEN"),
         }
     }
 
@@ -410,6 +423,7 @@ impl Default for Config {
             trakt_api_key: None,
             trakt_base_url: None,
             trend_cache_ttl_secs: 3600,
+            discord_bot_token: None,
         }
     }
 }

@@ -164,7 +164,7 @@ impl PlayStateEvent {
 // --- disambiguation output ---------------------------------------------------
 
 /// The four passive signal kinds this module disambiguates between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignalKind {
     /// A real dislike/taste-mismatch signal (early abandon).
     Negative,

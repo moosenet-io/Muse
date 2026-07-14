@@ -179,8 +179,12 @@ pub enum FastAdaptationKind {
     NoAdaptation,
 }
 
-/// One fast-loop reaction to one [`InterpretedSignal`].
-#[derive(Debug, Clone, PartialEq)]
+/// One fast-loop reaction to one [`InterpretedSignal`]. Deliberately does
+/// NOT derive `PartialEq`: it holds a [`ReasoningTrace`] (which has no
+/// `PartialEq`, and shouldn't grow one just for a test's convenience), and
+/// nothing needs whole-struct equality — callers/tests compare the
+/// meaningful fields (`kind`, `adjusted_plan`, `magnitude`) directly.
+#[derive(Debug, Clone)]
 pub struct FastAdaptation {
     pub kind: FastAdaptationKind,
     /// The resulting next-slot plan — identical to the input `current` when

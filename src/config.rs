@@ -358,6 +358,19 @@ pub struct Config {
     /// [`crate::premiere::engagement::EngagementTier::Curator`] friend earns
     /// (`MUSE_PREMIERE_CURATOR_BUDGET`). Defaults to 6.
     pub premiere_curator_budget: u32,
+
+    // --- MUSEX-16 (Plane TERM #392): watch-history / group-dynamics KG ---
+    /// Minimum cosine similarity `[-1.0, 1.0]` between two opted-in
+    /// friends' persona centroids for
+    /// [`crate::kg::assemble::assemble_shared_graph`] to emit a
+    /// `TasteEdge` between them (`MUSE_KG_TASTE_NEIGHBOR_THRESHOLD`).
+    /// GUI-tunable per the AC — never a bare literal in `crate::kg`, always
+    /// threaded through here, same posture as
+    /// `Config::promotion_match_threshold`. Defaults to `0.5`: a
+    /// deliberately unopinionated starting point (no production corpus has
+    /// tuned this yet, same caveat `promotion_match_threshold`'s own doc
+    /// makes for its default).
+    pub kg_taste_neighbor_threshold: f32,
 }
 
 impl Config {
@@ -470,6 +483,8 @@ impl Config {
             premiere_starter_budget: env_u64("MUSE_PREMIERE_STARTER_BUDGET", 1) as u32,
             premiere_trusted_budget: env_u64("MUSE_PREMIERE_TRUSTED_BUDGET", 3) as u32,
             premiere_curator_budget: env_u64("MUSE_PREMIERE_CURATOR_BUDGET", 6) as u32,
+
+            kg_taste_neighbor_threshold: env_f32("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD", 0.5),
         }
     }
 
@@ -556,6 +571,7 @@ impl Default for Config {
             premiere_starter_budget: 1,
             premiere_trusted_budget: 3,
             premiere_curator_budget: 6,
+            kg_taste_neighbor_threshold: 0.5,
         }
     }
 }
@@ -671,6 +687,7 @@ mod tests {
             "MUSE_PREMIERE_STARTER_BUDGET",
             "MUSE_PREMIERE_TRUSTED_BUDGET",
             "MUSE_PREMIERE_CURATOR_BUDGET",
+            "MUSE_KG_TASTE_NEIGHBOR_THRESHOLD",
         ] {
             std::env::remove_var(key);
         }
@@ -724,6 +741,19 @@ mod tests {
         assert_eq!(cfg.premiere_starter_budget, 1);
         assert_eq!(cfg.premiere_trusted_budget, 3);
         assert_eq!(cfg.premiere_curator_budget, 6);
+        assert!((cfg.kg_taste_neighbor_threshold - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    #[serial]
+    fn musex16_kg_config_reads_taste_neighbor_threshold_from_env() {
+        std::env::set_var("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD", "0.72");
+
+        let cfg = Config::from_env();
+
+        assert!((cfg.kg_taste_neighbor_threshold - 0.72).abs() < f32::EPSILON);
+
+        std::env::remove_var("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD");
     }
 
     #[test]

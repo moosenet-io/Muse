@@ -74,6 +74,16 @@
 //! were a real group pick. `Blended`/`SinglePersona` both reach
 //! [`GroupSessionOutcome::Ready`] with the full [`LOBBY_PRESETS`] spread.
 
+/// MUSEX-09 (Plane `TERM #385`): playback-sync delegation + coordinated-start
+/// fallback for a [`GroupSession`]'s [`LockedPick`] — see the module's own
+/// doc comment for the full design (delegate to a server sync primitive
+/// where the capability map allows, coordinated-start fallback otherwise,
+/// mixed groups always coordinate). Deliberately a sibling module, not
+/// folded into this file: this file stays server-agnostic per its own
+/// module doc, while `sync` is exactly the server-adapter seam that doc
+/// calls out as a later, separate concern.
+pub mod sync;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 

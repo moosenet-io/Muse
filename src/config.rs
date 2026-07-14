@@ -27,6 +27,16 @@ pub struct Config {
     // --- External service placeholders (Phase 0+ integrations) ---
     pub plex_url: Option<String>,
     pub plex_token: Option<String>,
+    /// MUSEX-09: Jellyfin base URL, used only to config-gate the (currently
+    /// unverified-stub) `JellyfinSyncPlay` server-sync-primitive adapter —
+    /// see `watch_together::sync`. Same graceful-degrade posture as every
+    /// other optional integration in this struct: `None` means the
+    /// delegated-sync path simply isn't available, never a hardcoded
+    /// fallback URL. Muse has no other Jellyfin footprint yet (per the
+    /// MUSEX-01 server-abstraction audit).
+    pub jellyfin_url: Option<String>,
+    /// MUSEX-09: Jellyfin API key, paired with [`Config::jellyfin_url`].
+    pub jellyfin_token: Option<String>,
     /// MUSE-07: session-poller cadence in seconds (`MUSE_PLEX_POLL_SECS`).
     /// `None` when unset/unparseable — the poller falls back to its own
     /// default (10s, see `tracker::poller`) rather than this module
@@ -266,6 +276,8 @@ impl Config {
             plex_url: env_opt("PLEX_URL"),
             plex_token: env_opt("PLEX_TOKEN"),
             plex_poll_secs: env_opt("MUSE_PLEX_POLL_SECS").and_then(|v| v.parse().ok()),
+            jellyfin_url: env_opt("JELLYFIN_URL"),
+            jellyfin_token: env_opt("JELLYFIN_TOKEN"),
             tautulli_url: env_opt("TAUTULLI_URL"),
             tautulli_api_key: env_opt("TAUTULLI_API_KEY"),
             radarr_url: env_opt("RADARR_URL"),
@@ -353,6 +365,8 @@ impl Default for Config {
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             plex_url: None,
             plex_token: None,
+            jellyfin_url: None,
+            jellyfin_token: None,
             tautulli_url: None,
             tautulli_api_key: None,
             radarr_url: None,

@@ -218,6 +218,39 @@ pub struct Config {
     /// taste-quality findings is an operator/deploy decision, not something
     /// this crate should guess at or bake in.
     pub taste_finding_plane_project: Option<String>,
+
+    // --- MUSEX-07 (Plane TERM #383): what's-hot / "the talk" cultural layer ---
+    /// Trakt API client id (`TRAKT_CLIENT_ID`), Trakt's required
+    /// `trakt-api-key` header credential. `None` (the default) keeps
+    /// [`crate::cultural::source::TraktTrendSource`] uninstantiable — the
+    /// Trakt half of the cultural layer is entirely inert (no live call, no
+    /// startup impact) unless this is explicitly set, same graceful/opt-in
+    /// posture as `Config::tmdb_api_key`/`Config::chord_url`. Never a
+    /// literal (S1); materialized from <secret-manager> at runtime (S7).
+    pub trakt_client_id: Option<String>,
+    /// Optional Trakt OAuth bearer token (`TRAKT_API_KEY`) for endpoints
+    /// that need user-level auth. The trending/talk pulls this module
+    /// actually uses are Trakt's PUBLIC endpoints (no user context), so
+    /// this is independently optional even when `trakt_client_id` is set —
+    /// same posture as `Config::news_api_key` being optional alongside
+    /// `Config::news_url`. Never a literal (S1/S7).
+    pub trakt_api_key: Option<String>,
+    /// Trakt API base URL override (`MUSE_TRAKT_BASE_URL`). `None` — the
+    /// default — means `crate::cultural::source::TraktTrendSource::from_config`
+    /// uses Trakt's public API host (`TRAKT_DEFAULT_BASE_URL`). Exists so a
+    /// test (httpmock server) or an on-prem Trakt proxy can point the client
+    /// elsewhere without recompiling — the exact same override seam
+    /// `TmdbClient::new(base_url, ..)` already provides for TMDb. Not
+    /// secret-shaped (a host, not a credential); still read from env at
+    /// runtime, never a literal here.
+    pub trakt_base_url: Option<String>,
+    /// How long a [`crate::cultural::cache::TrendCache`] pull stays fresh
+    /// before the next call re-hits the configured `TrendSource`
+    /// (`MUSE_TREND_CACHE_TTL_SECS`) — the rate-limit-respecting cache the
+    /// AC requires. Defaults to an hour: trending/talk data doesn't move
+    /// fast enough to justify a tighter loop, and this keeps repeated
+    /// `/cultural/*` requests from hammering TMDb/Trakt.
+    pub trend_cache_ttl_secs: u64,
 }
 
 impl Config {
@@ -287,6 +320,11 @@ impl Config {
             taste_finding_sink_url: env_opt("MUSE_TASTE_FINDING_SINK_URL"),
             taste_finding_sink_api_key: env_opt("MUSE_TASTE_FINDING_SINK_API_KEY"),
             taste_finding_plane_project: env_opt("MUSE_TASTE_FINDING_PLANE_PROJECT"),
+
+            trakt_client_id: env_opt("TRAKT_CLIENT_ID"),
+            trakt_api_key: env_opt("TRAKT_API_KEY"),
+            trakt_base_url: env_opt("MUSE_TRAKT_BASE_URL"),
+            trend_cache_ttl_secs: env_u64("MUSE_TREND_CACHE_TTL_SECS", 3600),
         }
     }
 
@@ -354,6 +392,10 @@ impl Default for Config {
             taste_finding_sink_url: None,
             taste_finding_sink_api_key: None,
             taste_finding_plane_project: None,
+            trakt_client_id: None,
+            trakt_api_key: None,
+            trakt_base_url: None,
+            trend_cache_ttl_secs: 3600,
         }
     }
 }

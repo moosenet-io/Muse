@@ -11,6 +11,7 @@
 pub mod artwork;
 pub mod graph;
 pub mod guide;
+pub mod settings;
 
 use std::sync::Arc;
 
@@ -34,4 +35,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/graph/group-dynamics", post(graph::group_dynamics_handler))
         .route("/api/graph/watch-history", post(graph::watch_history_handler))
         .route("/api/graph/taste-clusters", post(graph::taste_clusters_handler))
+        // MUSEX-18: the Constellation GUI control + tuning panel surface —
+        // see `settings`'s module doc.
+        .route(
+            "/api/settings",
+            get(settings::get_settings_handler).put(settings::put_settings_handler),
+        )
 }

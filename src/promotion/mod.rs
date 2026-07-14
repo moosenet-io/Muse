@@ -47,6 +47,50 @@ pub mod targeting;
 
 pub use targeting::{dispatch_promotions, promote_new_title, TargetedPromotion};
 
+/// MUSEX-18 (Plane TERM #394): the settings-gated entry point for the
+/// whole promote-then-dispatch flow — the AC's "pick a representative
+/// subsystem whose entry point you can drive in a unit/db_gated test"
+/// candidate. Wraps [`promote_new_title`] + [`dispatch_promotions`] behind
+/// [`crate::settings::ExperienceSettings::is_discord_bot_enabled`]: when
+/// the master switch is off, OR `discord_bot.enabled` is off, this returns
+/// `Ok(Vec::new())` immediately, BEFORE touching `pool` or `discord` at
+/// all. That "before touching pool" property is what makes the disabled
+/// path provable without a live database (see
+/// `crate::promotion::tests::run_promotion_dispatch_is_fully_inert_when_disabled`):
+/// a `PgPool::connect_lazy` to an unreachable address only ever errors once
+/// a real query is attempted, so if this gate were bypassed, the disabled-
+/// path test below would fail with a connection error instead of quietly
+/// returning `Ok(vec![])`.
+///
+/// `settings.discord_bot.promotion_match_threshold` replaces the threshold
+/// a caller previously had to supply by hand to [`promote_new_title`] —
+/// the settings panel is now the source of truth for that tunable too.
+pub async fn run_promotion_dispatch(
+    pool: &sqlx::PgPool,
+    settings: &crate::settings::ExperienceSettings,
+    friends: &crate::discord::identity::TrustedFriends,
+    media_item_id: i64,
+    chord: Option<&crate::taste_model::chord_client::ChordClient>,
+    public_base_url: Option<&str>,
+    discord: &dyn crate::discord::client::DiscordClient,
+) -> crate::error::MuseResult<Vec<TargetedPromotion>> {
+    if !settings.is_discord_bot_enabled() {
+        return Ok(Vec::new());
+    }
+
+    let promotions = promote_new_title(
+        pool,
+        friends,
+        media_item_id,
+        settings.discord_bot.promotion_match_threshold,
+        chord,
+        public_base_url,
+    )
+    .await?;
+    dispatch_promotions(discord, &promotions).await?;
+    Ok(promotions)
+}
+
 /// Cosine similarity between two equal-length vectors, mapped onto the same
 /// `[0.0, 1.0]` "match" scale `curation::candidates::gather_taste_candidates`
 /// uses for a pgvector cosine distance. Returns `0.0` — never panics, never
@@ -130,5 +174,105 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![2.0, 4.0, 6.0];
         assert!((cosine_similarity_01(&a, &b) - 1.0).abs() < 1e-9);
+    }
+
+    // --- MUSEX-18: run_promotion_dispatch is inert when disabled -----------
+    //
+    // The load-bearing negative test the AC calls for. `pool` is a
+    // `connect_lazy` handle to an address nothing is listening on (same
+    // idiom `crate::web::graph::tests::test_state`/
+    // `crate::endpoint_tests::lazy_test_pool` use): `connect_lazy` never
+    // fails synchronously, it only errors the first time a real query is
+    // attempted. That makes this pool a reliable "did the gate actually
+    // short-circuit before touching the database" probe -- if
+    // `run_promotion_dispatch` ever called `promote_new_title` on the
+    // disabled path, this test would observe an `Err` (a connection
+    // failure), not a quiet `Ok(vec![])`.
+
+    use crate::discord::client::MockDiscordClient;
+    use crate::discord::identity::{FriendIdentity, TrustedFriends};
+    use crate::settings::{DiscordBotSettings, ExperienceSettings};
+
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@127.0.0.1:1/muse_test_lazy")
+            .expect("connect_lazy should never fail synchronously")
+    }
+
+    fn one_opted_in_friend() -> TrustedFriends {
+        TrustedFriends::from_friends([FriendIdentity::new("discord-1", "Alex").opt_in(42)])
+    }
+
+    #[tokio::test]
+    async fn run_promotion_dispatch_is_fully_inert_when_discord_bot_disabled() {
+        let pool = unreachable_pool();
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot = DiscordBotSettings {
+            enabled: false,
+            ..settings.discord_bot
+        };
+        let friends = one_opted_in_friend();
+        let mock = MockDiscordClient::new();
+
+        let result = run_promotion_dispatch(&pool, &settings, &friends, 1, None, None, &mock).await;
+
+        assert!(result.is_ok(), "expected Ok(vec![]), got {result:?}");
+        assert!(result.unwrap().is_empty());
+        assert_eq!(mock.reply_call_count(), 0);
+        assert_eq!(mock.embed_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_promotion_dispatch_is_fully_inert_when_master_switch_off() {
+        // Even with discord_bot.enabled = true, the master switch alone
+        // must be enough to make this fully inert -- the AND gate
+        // `ExperienceSettings::is_discord_bot_enabled` documents.
+        let pool = unreachable_pool();
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = false;
+        settings.discord_bot = DiscordBotSettings {
+            enabled: true,
+            ..settings.discord_bot
+        };
+        let friends = one_opted_in_friend();
+        let mock = MockDiscordClient::new();
+
+        let result = run_promotion_dispatch(&pool, &settings, &friends, 1, None, None, &mock).await;
+
+        assert!(result.is_ok(), "expected Ok(vec![]), got {result:?}");
+        assert!(result.unwrap().is_empty());
+        assert_eq!(mock.reply_call_count(), 0);
+        assert_eq!(mock.embed_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_promotion_dispatch_touches_the_pool_when_enabled() {
+        // The mirror-image sanity check: WITH the gate enabled, this test
+        // asserts the opposite property -- it hits the unreachable pool and
+        // genuinely fails with a database error, proving the two disabled-
+        // path tests above are asserting something real (a working gate),
+        // not an accidental Ok from a code path that never touches the
+        // database at all regardless of settings.
+        let pool = unreachable_pool();
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot = DiscordBotSettings {
+            enabled: true,
+            ..settings.discord_bot
+        };
+        let friends = one_opted_in_friend();
+        let mock = MockDiscordClient::new();
+
+        let result = run_promotion_dispatch(&pool, &settings, &friends, 1, None, None, &mock).await;
+
+        assert!(
+            result.is_err(),
+            "expected a database connection error proving the enabled path really \
+             reaches the pool, got Ok({:?})",
+            result.ok()
+        );
+        assert_eq!(mock.reply_call_count(), 0);
+        assert_eq!(mock.embed_call_count(), 0);
     }
 }

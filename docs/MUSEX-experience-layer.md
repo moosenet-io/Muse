@@ -301,8 +301,15 @@ following this document's layout.
 
 **Status:** MUSEX-02 has since landed the real `persona/` module (see the §1.2 update above) — the
 `persona/` row of the §3.1 layout is now built (`mod.rs` = persona definition + `explain()`,
-`derive.rs` = context-cluster + explicit derivation; `blend.rs` remains for MUSEX-03). The
-`media_server/`, `assistant/`, and `discord/` modules remain unbuilt scaffold plan.
+`derive.rs` = context-cluster + explicit derivation). MUSEX-03 has since landed `blend.rs`
+(`persona::blend::blend_personas`): an agreement-weighted intersection of N personas' centroids
+into one session taste vector for group watching (up-weights embedding dimensions the personas
+agree on, suppresses ones they diverge on — deliberately not a naive average), with an
+explanation built from the personas' shared `defining_signals.top_genres`, a `SinglePersona`
+degrade for one input, and a cosine-similarity-based `NoOverlap` detector (weakest pairwise
+persona-centroid similarity at/below 0.0) that surfaces a genuinely-divergent group instead of
+silently blending it. The `persona/` row of §3.1 is now fully built. The `media_server/`,
+`assistant/`, and `discord/` modules remain unbuilt scaffold plan.
 
 ---
 

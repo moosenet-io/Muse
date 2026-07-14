@@ -60,10 +60,20 @@ Downstream of the brain, already shipped:
 
 ### 1.2 Where the S118 experience-layer items fit on top
 
-None of personas, channel-director-as-agent (beyond MUSE-24's composer), watch-together, real-time
-adaptation, a conversational assistant, Discord integration, or a KG/graph surface exist in the
-repo today (verified: no hits for `persona`/`Persona` as a taste concept, `WatchTogether`,
-`SyncPlay`, or `discord`/`Discord` anywhere under `src/`). The build map:
+**Update (MUSEX-02, Plane TERM #378 — landed).** The `persona/` module now EXISTS: `src/persona/`
+(`mod.rs` + `derive.rs`), `src/repo/persona.rs`, `src/models/persona.rs`, and
+`migrations/0100_personas.sql` (a `personas` table with a `vector(768)` taste centroid + a
+`persona_members` table for shared/household personas). It implements the MUSEX-02 slice — derived
+(context-cluster) and explicit personas, the addressable list/get-by-id/get-by-name seam MUSEX-03
+blending consumes, deterministic derivation, and per-persona explainability — reusing
+`taste_model::profile`'s embedding/centroid code (a new shared `mean_embedding` helper) rather than
+a second taste store. The description of the 02/03/04 row below remains the design intent; the voice
+layer (`ChordClient`-backed) and the blend/select surface are the parts MUSEX-03/04 still add on top
+of this foundation. The rest of the list — channel-director-as-agent (beyond MUSE-24's composer),
+watch-together, real-time adaptation, a conversational assistant, Discord integration, and a KG/graph
+surface — still does not exist in the repo (verified at MUSEX-01 time: no hits for `WatchTogether`,
+`SyncPlay`, or `discord`/`Discord` anywhere under `src/`; and, before MUSEX-02, no `persona`/`Persona`
+taste concept either). The build map:
 
 | MUSEX item(s) | Builds on | Why that dependency |
 |---|---|---|
@@ -278,16 +288,21 @@ src/
    does not attempt to design that integration (out of grounded-evidence scope — no existing Muse
    code touches Atlas today).
 
-### 3.4 Scaffold: not added in this change
+### 3.4 Scaffold: not added *by MUSEX-01* (persona/ since landed in MUSEX-02)
 
-No Rust scaffold files were added alongside this document. Rationale: every proposed new module in
-§3.1 (`persona/`, `media_server/`, `assistant/`, `discord/`) has zero existing code to hang an
-empty stub off safely without guessing at a `mod.rs` shape that a later MUSEX item would just
-delete and redo — an empty `pub mod persona;` with no types would not save the implementer real
-work and risks becoming stale/misleading before MUSEX-02 actually lands. The module layout above
-is the scaffold plan; MUSEX-02 (first persona item) and the MUSEX-08 adapter-contract groundwork
-item should create their own `mod.rs` files as part of real implementation, following this
-document's layout.
+No Rust scaffold files were added alongside *this MUSEX-01 document*. Rationale: every proposed new
+module in §3.1 (`persona/`, `media_server/`, `assistant/`, `discord/`) had zero existing code to
+hang an empty stub off safely without guessing at a `mod.rs` shape that a later MUSEX item would
+just delete and redo — an empty `pub mod persona;` with no types would not have saved the
+implementer real work and risked becoming stale/misleading before MUSEX-02 actually landed. The
+module layout above is the scaffold plan; MUSEX-02 (first persona item) and the MUSEX-08
+adapter-contract groundwork item create their own `mod.rs` files as part of real implementation,
+following this document's layout.
+
+**Status:** MUSEX-02 has since landed the real `persona/` module (see the §1.2 update above) — the
+`persona/` row of the §3.1 layout is now built (`mod.rs` = persona definition + `explain()`,
+`derive.rs` = context-cluster + explicit derivation; `blend.rs` remains for MUSEX-03). The
+`media_server/`, `assistant/`, and `discord/` modules remain unbuilt scaffold plan.
 
 ---
 

@@ -142,7 +142,11 @@ pub async fn list_members(pool: &PgPool, persona_id: i64) -> MuseResult<Vec<i64>
 // account is a member of (`persona_members`).
 
 /// Every persona addressable by `account_id` — owned directly or shared via
-/// membership. Ordered by name for a stable, deterministic listing.
+/// membership. Ordered by the fully-deterministic `(name, kind, id)` — `id`
+/// is the unique tiebreak, so two personas with the same name (e.g. a
+/// direct and a shared persona, or two kinds under one name) always come
+/// back in a totally-ordered, stable sequence rather than whatever order
+/// the planner happens to emit.
 pub async fn list_for_account(pool: &PgPool, account_id: i64) -> MuseResult<Vec<Persona>> {
     sqlx::query_as::<_, Persona>(
         r#"
@@ -153,7 +157,7 @@ pub async fn list_for_account(pool: &PgPool, account_id: i64) -> MuseResult<Vec<
             JOIN persona_members pm ON pm.persona_id = p.id
             WHERE pm.account_id = $1
         ) addressable
-        ORDER BY name
+        ORDER BY name, kind, id
         "#,
     )
     .bind(account_id)
@@ -173,6 +177,18 @@ pub async fn get_by_id(pool: &PgPool, persona_id: i64) -> MuseResult<Option<Pers
 /// The persona named `name` addressable by `account_id` (owned directly or
 /// via a shared membership) — the name-based half of the addressability
 /// seam, alongside [`get_by_id`].
+///
+/// A single account CAN legitimately hold more than one persona under a
+/// given `name`: the `personas_account_name_kind_uniq` index only forbids a
+/// duplicate `(account_id, name, kind)`, so a `derived` and an `explicit`
+/// persona can share a name, and a directly-owned and a shared persona can
+/// too. Rather than forbid that (a name is a human label, not a key), this
+/// selects deterministically: the `ORDER BY name, kind, id` is applied to
+/// the UNION *before* `LIMIT 1`, so the persona returned for an ambiguous
+/// name is always the same one (lowest `(kind, id)`), never planner-order
+/// roulette. Callers needing a specific one of several same-named personas
+/// should address it by id via [`get_by_id`] (or enumerate with
+/// [`list_for_account`]).
 pub async fn get_by_name_for_account(
     pool: &PgPool,
     account_id: i64,
@@ -180,11 +196,14 @@ pub async fn get_by_name_for_account(
 ) -> MuseResult<Option<Persona>> {
     sqlx::query_as::<_, Persona>(
         r#"
-        SELECT p.* FROM personas p WHERE p.account_id = $1 AND p.name = $2
-        UNION
-        SELECT p.* FROM personas p
-        JOIN persona_members pm ON pm.persona_id = p.id
-        WHERE pm.account_id = $1 AND p.name = $2
+        SELECT * FROM (
+            SELECT p.* FROM personas p WHERE p.account_id = $1 AND p.name = $2
+            UNION
+            SELECT p.* FROM personas p
+            JOIN persona_members pm ON pm.persona_id = p.id
+            WHERE pm.account_id = $1 AND p.name = $2
+        ) addressable
+        ORDER BY name, kind, id
         LIMIT 1
         "#,
     )

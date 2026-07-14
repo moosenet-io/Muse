@@ -47,6 +47,7 @@ pub mod tautulli;
 mod tracker;
 mod trending;
 mod tuner;
+pub mod watch_together;
 mod web;
 mod workers;
 

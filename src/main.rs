@@ -247,7 +247,15 @@ async fn run_snapshot_acquire_cli() -> anyhow::Result<()> {
         acquired += 1;
     }
 
-    if config.source_postgres_url.is_some() {
+    if let Some(source_url) = config.source_postgres_url.as_deref() {
+        // Lighter defensive check on the acquisition SOURCE DSN: reading a
+        // live source is by-design (that's what acquisition is), but a bare
+        // `muse`/prod-marked source is almost certainly a misconfiguration.
+        // This is NOT the load-path guard (that protects the isolated test
+        // DB the pipeline connects to); it's a nicety on the operator's
+        // source input.
+        snapshot::guard::validate_not_prod_source(source_url)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let dump_path = output_dir.join("muse-postgres.dump");
         let pg_dump = acquisition::PgDumpCommand::new(&config, dump_path.clone())?;
         let status = pg_dump.spawn()?;

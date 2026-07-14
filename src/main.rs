@@ -31,6 +31,8 @@ mod recall;
 pub mod repo;
 mod snapshot;
 mod streaming;
+#[cfg(test)]
+mod taste_mechanics_tests;
 pub mod taste_model;
 pub mod tautulli;
 mod tracker;

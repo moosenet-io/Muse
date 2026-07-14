@@ -18,24 +18,50 @@
 //! titles" section; wiring a real request ledger once one exists is a
 //! natural follow-up, not done in this pass.
 //!
+//! ## Consent, by construction (Phase F) — a non-opted-in friend earns NO tier/budget
+//! Earning a tier + budget is itself taste-derived output, so it goes
+//! through the SAME Phase-F consent gate
+//! `crate::premiere::schedule::PremiereEvent::rsvp` and
+//! `crate::premiere::discussion::post_message` use: the ONLY public path
+//! from an account/friend to a request budget is [`resolve_friend_budget`]
+//! (DB-backed) / [`resolve_friend_budget_from_counts`] (pure), and BOTH
+//! return `None` — no tier, no budget — for a friend who is not
+//! `TrustedFriends::get`-allowlisted AND `FriendIdentity::is_opted_in`. The
+//! resulting budget is carried in a [`RequestBudget`] whose numeric value is
+//! PRIVATE and has no public constructor, so
+//! [`submit_with_engagement_budget`] physically cannot be handed a budget
+//! for a friend who never cleared the gate — the same "construction proves
+//! the invariant" posture `crate::discord::identity::FriendIdentity`'s
+//! private consent fields and `crate::promotion::targeting`'s
+//! `opted_in_friends`-only fan-out already use. The raw [`compute_tier`] /
+//! [`budget_for_tier`] / [`gather_engagement_counts`] primitives stay public
+//! (they're pure/mechanical building blocks the gate composes), but none of
+//! them can reach the request sink without first being wrapped in a
+//! consent-gated [`RequestBudget`]. All consent checks read only the
+//! accessors (`opted_in_friends`/`is_opted_in`/`linked_account`), never a
+//! private field.
+//!
 //! ## Budgets modulate, never bypass, `arr::request`
 //! [`submit_with_engagement_budget`] calls
 //! [`crate::arr::request::classify_tier`] FIRST — the exact same pure
 //! classification `crate::conversational::handle_conversational_request`
 //! uses — and only ever adjusts [`crate::arr::request::RequestTier::AutoApprovable`]
 //! DOWN to [`crate::arr::request::RequestTier::NeedsReview`] when the friend
-//! is over budget. It can never turn a structural
-//! [`crate::arr::request::RequestTier::Blocked`] into anything else, and it
-//! can never turn `NeedsReview`/`Blocked` INTO `AutoApprovable` — budget is
-//! strictly a brake, never an accelerator, which is what makes "does not
-//! bypass the gate" a property of the call graph (`classify_tier` is always
-//! consulted first), not just of a returned value.
+//! is over budget (a non-opted-in friend's `None` budget resolves to ZERO,
+//! which is always "over," so they can never auto-approve). It can never
+//! turn a structural [`crate::arr::request::RequestTier::Blocked`] into
+//! anything else, and it can never turn `NeedsReview`/`Blocked` INTO
+//! `AutoApprovable` — budget is strictly a brake, never an accelerator,
+//! which is what makes "does not bypass the gate" a property of the call
+//! graph (`classify_tier` is always consulted first), not just of a returned
+//! value.
 
 use sqlx::PgPool;
 
 use crate::arr::request::{
     classify_tier, MediaRequestDraft, MediaRequestOutcome, MediaRequestSink, RequestTier,
 };
+use crate::discord::identity::TrustedFriends;
 use crate::error::MuseResult;
 use crate::models::availability::Availability;
 use crate::repo;
@@ -138,6 +164,111 @@ pub fn budget_for_tier(tier: EngagementTier, config: &EngagementTierConfig) -> u
     }
 }
 
+/// A CONSENT-RESOLVED request budget for one friend — the tier they earned
+/// plus its numeric budget. The numeric value is PRIVATE and there is NO
+/// public constructor: the only ways to build one are the consent-gated
+/// [`resolve_friend_budget`] / [`resolve_friend_budget_from_counts`], which
+/// return `None` for a friend who is not opted-in AND allowlisted. Because
+/// [`submit_with_engagement_budget`] takes an `Option<RequestBudget>`, a
+/// caller physically cannot hand it a budget for a friend who never cleared
+/// the Phase-F gate — the same "construction proves the invariant" posture
+/// `crate::discord::identity::FriendIdentity`'s private consent fields use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudget {
+    tier: EngagementTier,
+    budget: u32,
+}
+
+impl RequestBudget {
+    pub fn tier(&self) -> EngagementTier {
+        self.tier
+    }
+
+    /// The numeric request budget this friend earned this window.
+    pub fn budget(&self) -> u32 {
+        self.budget
+    }
+
+    /// TEST-ONLY constructor — the sole way to fabricate a [`RequestBudget`]
+    /// outside the consent-gated resolvers, gated behind `#[cfg(test)]` so
+    /// production code has NO path to a budget except through the opt-in +
+    /// allowlist gate (mirrors
+    /// `crate::discord::identity::FriendIdentity::from_parts_for_test`).
+    #[cfg(test)]
+    pub(crate) fn for_test(tier: EngagementTier, budget: u32) -> Self {
+        Self { tier, budget }
+    }
+}
+
+/// PURE consent gate: map an ALREADY-GATHERED [`EngagementCounts`] to a
+/// [`RequestBudget`], but ONLY for `discord_user_id` if they are both
+/// `friends`-allowlisted (`TrustedFriends::get`) AND
+/// `FriendIdentity::is_opted_in`. Returns `None` — no tier, no budget — for
+/// anyone who fails either check, enforced BEFORE any tier/budget is
+/// produced, via the accessors only (never a private consent field). This
+/// is the pure counterpart to [`resolve_friend_budget`] the negative test
+/// exercises without a DB.
+pub fn resolve_friend_budget_from_counts(
+    friends: &TrustedFriends,
+    discord_user_id: &str,
+    counts: &EngagementCounts,
+    config: &EngagementTierConfig,
+) -> Option<RequestBudget> {
+    // Allowlist gate first, then opt-in gate — both via the accessors, the
+    // same order `crate::premiere::discussion::post_message` uses.
+    let friend = friends.get(discord_user_id)?;
+    if !friend.is_opted_in() {
+        return None;
+    }
+    let tier = compute_tier(counts, config);
+    Some(RequestBudget {
+        tier,
+        budget: budget_for_tier(tier, config),
+    })
+}
+
+/// DB-backed consent gate: the public account→tier/budget entry point.
+/// Resolves `discord_user_id` through `friends` (allowlist + opt-in +
+/// `linked_account`), gathers that linked account's real engagement counts,
+/// and maps them to a [`RequestBudget`] — or returns `None` (no tier, no
+/// budget) for a friend who is not opted-in+allowlisted, or who is opted-in
+/// but (impossible in production, see
+/// `crate::discord::identity::FriendIdentity`) has no linked account. Never
+/// gathers counts for, or produces a budget for, a non-consenting friend:
+/// the gate runs BEFORE `gather_engagement_counts` is even called.
+pub async fn resolve_friend_budget(
+    pool: &PgPool,
+    friends: &TrustedFriends,
+    discord_user_id: &str,
+    household_account_ids: &[i64],
+    config: &EngagementTierConfig,
+    loved_rating_threshold: f32,
+) -> MuseResult<Option<RequestBudget>> {
+    let Some(friend) = friends.get(discord_user_id) else {
+        return Ok(None);
+    };
+    if !friend.is_opted_in() {
+        return Ok(None);
+    }
+    let Some(account_id) = friend.linked_account() else {
+        return Ok(None);
+    };
+
+    let counts = gather_engagement_counts(
+        pool,
+        account_id,
+        household_account_ids,
+        loved_rating_threshold,
+    )
+    .await?;
+    Ok(resolve_friend_budget_from_counts(
+        friends,
+        discord_user_id,
+        &counts,
+        config,
+    ))
+}
+
 /// Gather the real counts behind a friend's engagement score for
 /// `account_id` (their linked Muse account — see
 /// `discord::identity::FriendIdentity::linked_account`), cross-referenced
@@ -191,24 +322,40 @@ pub async fn gather_engagement_counts(
 
 /// Budget-aware wrapper around [`crate::arr::request::classify_tier`] +
 /// [`crate::arr::request::submit_if_appropriate`]'s own dispatch logic — see
-/// the module doc's "Budgets modulate, never bypass" section for the exact
-/// contract. `requests_used_this_window` is the friend's already-consumed
-/// request count for whatever window the caller tracks (this function takes
-/// no opinion on the window's length — that's `Config::premiere_announce_cadence_secs`
-/// or an operator's own bookkeeping, not this pure/DB-light function's
-/// concern).
+/// the module doc's "Budgets modulate, never bypass" and "Consent, by
+/// construction" sections for the exact contract.
+///
+/// `budget` is a CONSENT-RESOLVED [`RequestBudget`] (from
+/// [`resolve_friend_budget`] / [`resolve_friend_budget_from_counts`]) or
+/// `None`. `None` means the requesting friend never cleared the Phase-F gate
+/// (not opted-in / not allowlisted) — it resolves to a ZERO effective
+/// budget, which is always "over budget," so any otherwise-`AutoApprovable`
+/// request is capped to `NeedsReview` and the sink is never touched. There
+/// is no way to pass a positive budget for a non-consenting friend, because
+/// `RequestBudget` has no public constructor.
+///
+/// `requests_used_this_window` is the friend's already-consumed request
+/// count for whatever window the caller tracks (this function takes no
+/// opinion on the window's length — that's
+/// `Config::premiere_announce_cadence_secs` or an operator's own
+/// bookkeeping, not this pure/DB-light function's concern).
 pub async fn submit_with_engagement_budget(
     sink: &dyn MediaRequestSink,
     draft: MediaRequestDraft,
     auto_tier_enabled: bool,
     availability: Option<&Availability>,
     has_matching_arr_instance: bool,
-    budget: u32,
+    budget: Option<RequestBudget>,
     requests_used_this_window: u32,
 ) -> MuseResult<MediaRequestOutcome> {
     let base_tier = classify_tier(auto_tier_enabled, availability, has_matching_arr_instance);
 
-    let over_budget = requests_used_this_window >= budget;
+    // A non-opted-in/non-allowlisted friend has `None` here -> a zero
+    // effective budget. `requests_used >= 0` is always true, so they are
+    // always "over budget" and can never reach the AutoApprovable arm.
+    let has_consent = budget.is_some();
+    let effective_budget = budget.map(|b| b.budget()).unwrap_or(0);
+    let over_budget = requests_used_this_window >= effective_budget;
     let tier = if base_tier == RequestTier::AutoApprovable && over_budget {
         RequestTier::NeedsReview
     } else {
@@ -227,11 +374,15 @@ pub async fn submit_with_engagement_budget(
         RequestTier::NeedsReview => Ok(MediaRequestOutcome {
             tier,
             submitted: false,
-            reason: if base_tier == RequestTier::AutoApprovable && over_budget {
+            reason: if base_tier == RequestTier::AutoApprovable && !has_consent {
+                "would auto-approve, but the requesting friend is not an opted-in, allowlisted \
+                 friend — no engagement budget, routed to manual review instead"
+                    .to_string()
+            } else if base_tier == RequestTier::AutoApprovable && over_budget {
                 format!(
                     "would auto-approve, but the requesting friend is over their engagement \
-                     budget ({requests_used_this_window}/{budget} used this window) — routed to \
-                     manual review instead"
+                     budget ({requests_used_this_window}/{effective_budget} used this window) — \
+                     routed to manual review instead"
                 )
             } else {
                 "queued for manual review — auto-tier is disabled or availability wasn't \
@@ -247,7 +398,7 @@ pub async fn submit_with_engagement_budget(
                 reason: format!(
                     "auto-approved: operator opted in, MUSE-16 confirmed it's grabbable right \
                      now, and the requesting friend is within their engagement budget \
-                     ({requests_used_this_window}/{budget} used this window)"
+                     ({requests_used_this_window}/{effective_budget} used this window)"
                 ),
             })
         }
@@ -258,6 +409,7 @@ pub async fn submit_with_engagement_budget(
 mod tests {
     use super::*;
     use crate::arr::request::MockMediaRequestSink;
+    use crate::discord::identity::FriendIdentity;
     use crate::models::media_metadata::MediaKind;
 
     fn config() -> EngagementTierConfig {
@@ -364,7 +516,7 @@ mod tests {
             true,
             Some(&availability(5)),
             true,
-            /* budget */ 2,
+            Some(RequestBudget::for_test(EngagementTier::Trusted, 2)),
             /* requests_used_this_window */ 2,
         )
         .await
@@ -388,7 +540,7 @@ mod tests {
             true,
             Some(&availability(5)),
             true,
-            /* budget */ 3,
+            Some(RequestBudget::for_test(EngagementTier::Trusted, 3)),
             /* requests_used_this_window */ 1,
         )
         .await
@@ -410,7 +562,7 @@ mod tests {
             true,
             Some(&availability(5)),
             /* has_matching_arr_instance */ false,
-            /* budget */ 1000,
+            Some(RequestBudget::for_test(EngagementTier::Curator, 1000)),
             /* requests_used_this_window */ 0,
         )
         .await
@@ -431,7 +583,7 @@ mod tests {
             false,
             Some(&availability(5)),
             true,
-            /* budget */ 1000,
+            Some(RequestBudget::for_test(EngagementTier::Curator, 1000)),
             /* requests_used_this_window */ 0,
         )
         .await
@@ -440,6 +592,98 @@ mod tests {
         assert_eq!(outcome.tier, RequestTier::NeedsReview);
         assert!(!outcome.submitted);
         assert_eq!(sink.submitted_count(), 0);
+    }
+
+    // --- Phase-F consent gate: a non-opted-in friend earns NO tier/budget ----
+
+    #[test]
+    fn a_non_opted_in_friend_with_high_engagement_counts_earns_no_tier_or_budget() {
+        let cfg = config();
+        let counts = high_engagement_counts();
+
+        // NON-VACUOUS: prove the counts genuinely ARE high — an opted-in
+        // friend with exactly these counts would earn Curator, the top tier.
+        // So the test below can't pass merely because the engagement is low.
+        assert_eq!(
+            compute_tier(&counts, &cfg),
+            EngagementTier::Curator,
+            "fixture sanity: these counts are genuinely high (would be Curator if opted in)"
+        );
+        assert!(counts.watch_through_rate() > 0.8);
+        assert!(counts.household_love_rate() > 0.8);
+
+        // Allowlisted but NOT opted in -> no tier, no budget.
+        let allowlisted_not_opted_in =
+            TrustedFriends::from_friends([FriendIdentity::new("discord-jamie", "Jamie")]);
+        assert!(
+            !allowlisted_not_opted_in
+                .get("discord-jamie")
+                .unwrap()
+                .is_opted_in(),
+            "sanity: allowlisted but not opted in"
+        );
+        assert!(
+            resolve_friend_budget_from_counts(
+                &allowlisted_not_opted_in,
+                "discord-jamie",
+                &counts,
+                &cfg
+            )
+            .is_none(),
+            "a non-opted-in friend earns NO tier/budget even with genuinely high engagement"
+        );
+
+        // Not allowlisted at all -> also no tier, no budget.
+        let empty = TrustedFriends::new();
+        assert!(
+            resolve_friend_budget_from_counts(&empty, "discord-unknown", &counts, &cfg).is_none(),
+            "a non-allowlisted friend earns NO tier/budget"
+        );
+
+        // An OPTED-IN friend with the same counts DOES earn a budget — proving
+        // the gate, not the counts, is what suppresses the two above.
+        let opted_in =
+            TrustedFriends::from_friends([FriendIdentity::new("discord-alex", "Alex").opt_in(7)]);
+        let resolved = resolve_friend_budget_from_counts(&opted_in, "discord-alex", &counts, &cfg)
+            .expect("an opted-in friend with high engagement must earn a budget");
+        assert_eq!(resolved.tier(), EngagementTier::Curator);
+        assert_eq!(resolved.budget(), cfg.curator_budget);
+    }
+
+    #[tokio::test]
+    async fn a_non_opted_in_friend_cannot_be_auto_approved_even_when_the_request_is_otherwise_eligible(
+    ) {
+        let cfg = config();
+        let counts = high_engagement_counts();
+
+        // Allowlisted but not opted in -> the consent gate returns `None`.
+        let friends = TrustedFriends::from_friends([FriendIdentity::new("discord-jamie", "Jamie")]);
+        let budget = resolve_friend_budget_from_counts(&friends, "discord-jamie", &counts, &cfg);
+        assert!(budget.is_none(), "sanity: non-opted-in -> no budget");
+
+        // Every classify_tier input says AutoApprovable, and the friend has
+        // used ZERO requests — but with `None` (zero) budget they still can't
+        // reach the sink.
+        let sink = MockMediaRequestSink::new();
+        let outcome = submit_with_engagement_budget(
+            &sink,
+            draft(),
+            true,
+            Some(&availability(5)),
+            true,
+            budget,
+            /* requests_used_this_window */ 0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.tier, RequestTier::NeedsReview);
+        assert!(!outcome.submitted);
+        assert_eq!(
+            sink.submitted_count(),
+            0,
+            "a non-opted-in friend must never reach the request sink, even at zero requests used"
+        );
     }
 }
 

@@ -42,7 +42,8 @@ pub mod engagement;
 pub mod schedule;
 
 pub use engagement::{
-    budget_for_tier, compute_tier, gather_engagement_counts, submit_with_engagement_budget,
-    EngagementCounts, EngagementTier, EngagementTierConfig,
+    budget_for_tier, compute_tier, gather_engagement_counts, resolve_friend_budget,
+    resolve_friend_budget_from_counts, submit_with_engagement_budget, EngagementCounts,
+    EngagementTier, EngagementTierConfig, RequestBudget,
 };
 pub use schedule::{build_announce_embed, schedule_premiere, PremiereEvent, RsvpStatus};

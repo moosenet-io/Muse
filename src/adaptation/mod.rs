@@ -331,6 +331,13 @@ pub struct SessionSignal {
     pub session_id: String,
     pub kind: SignalKind,
     pub confidence: f32,
+    /// The REAL `InterpretedSignal.rationale` this session produced —
+    /// preserved (not dropped) so the durable-move trace can quote the actual
+    /// interpreter reasons that drove a consolidation, exactly as the fast
+    /// loop's trace quotes the signal that drove a next-slot shift. Without
+    /// this, the slow-loop trace would fabricate generic descriptions rather
+    /// than carrying the grounded "why."
+    pub rationale: String,
 }
 
 impl SessionSignal {
@@ -339,6 +346,7 @@ impl SessionSignal {
             session_id: session_id.into(),
             kind: signal.kind,
             confidence: signal.confidence,
+            rationale: signal.rationale.clone(),
         }
     }
 }
@@ -491,14 +499,29 @@ pub fn slow_consolidate(
         }
     };
 
-    // Average confidence across the dominant kind's qualifying sessions,
-    // scaled by aggressiveness and capped at MAX_DURABLE_WEIGHT_DELTA.
-    let confidences: Vec<f32> = sessions
+    // The dominant kind's qualifying sessions, in a STABLE order (by
+    // session_id) and deduplicated to one entry per distinct session (the
+    // first signal seen for that session after sorting) — so the trace has
+    // exactly one grounded contribution per contributing session, listed
+    // deterministically regardless of input order.
+    let mut qualifying: Vec<&SessionSignal> = sessions
         .iter()
         .filter(|s| s.kind == dominant_kind && s.confidence >= MIN_EVIDENCE_CONFIDENCE)
-        .map(|s| s.confidence)
         .collect();
-    let avg_confidence = confidences.iter().sum::<f32>() / confidences.len().max(1) as f32;
+    qualifying.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let mut seen: HashSet<&str> = HashSet::new();
+    let distinct_qualifying: Vec<&SessionSignal> = qualifying
+        .into_iter()
+        .filter(|s| seen.insert(s.session_id.as_str()))
+        .collect();
+
+    // Average confidence across the distinct qualifying sessions, scaled by
+    // aggressiveness and capped at MAX_DURABLE_WEIGHT_DELTA.
+    let avg_confidence = distinct_qualifying
+        .iter()
+        .map(|s| s.confidence)
+        .sum::<f32>()
+        / distinct_qualifying.len().max(1) as f32;
     let weight_delta = sign * avg_confidence * aggressiveness.value() * MAX_DURABLE_WEIGHT_DELTA;
 
     DurableTasteUpdate {
@@ -514,15 +537,17 @@ pub fn slow_consolidate(
             score: avg_confidence as f64,
             taste_fit: avg_confidence as f64,
             source_weight: 1.0,
-            signals: confidences
+            // One grounded contribution per contributing session, carrying
+            // that session's REAL InterpretedSignal rationale + confidence —
+            // never a synthesized "session #N exhibiting X" placeholder — so
+            // the durable "why I switched" is auditable back to the actual
+            // interpreter reasons, mirroring the fast loop's grounded trace.
+            signals: distinct_qualifying
                 .iter()
-                .enumerate()
-                .map(|(i, c)| SignalContribution {
+                .map(|s| SignalContribution {
                     signal: format!("{dominant_kind:?}"),
-                    weight: *c as f64,
-                    description: format!(
-                        "session #{i} of {dominant_session_count} distinct sessions exhibiting {dominant_kind:?}"
-                    ),
+                    weight: s.confidence as f64,
+                    description: format!("session {}: {}", s.session_id, s.rationale),
                 })
                 .collect(),
             path: format!(
@@ -547,6 +572,14 @@ mod tests {
             confidence,
             rationale: format!("test signal: {kind:?} @ {confidence}"),
         }
+    }
+
+    /// Build a `SessionSignal` through the REAL `from_interpreted` path (not
+    /// a bare struct literal) so every test session carries a genuine
+    /// `InterpretedSignal.rationale` — exercising exactly the rationale-
+    /// preservation the slow-loop trace now depends on.
+    fn sess(id: &str, kind: SignalKind, confidence: f32) -> SessionSignal {
+        SessionSignal::from_interpreted(id, &signal(kind, confidence))
     }
 
     fn base_plan() -> NextSlotPlan {
@@ -708,21 +741,9 @@ mod tests {
         // One session, but MANY strong negative signals within it — all
         // sharing one session_id.
         let sessions = vec![
-            SessionSignal {
-                session_id: "sess-1".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.95,
-            },
-            SessionSignal {
-                session_id: "sess-1".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.9,
-            },
-            SessionSignal {
-                session_id: "sess-1".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.99,
-            },
+            sess("sess-1", SignalKind::Negative, 0.95),
+            sess("sess-1", SignalKind::Negative, 0.9),
+            sess("sess-1", SignalKind::Negative, 0.99),
         ];
         let update = slow_consolidate(&sessions, Aggressiveness::BOLD);
 
@@ -741,16 +762,8 @@ mod tests {
     #[test]
     fn two_sessions_are_still_not_enough_to_move_durable_taste() {
         let sessions = vec![
-            SessionSignal {
-                session_id: "sess-1".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.9,
-            },
-            SessionSignal {
-                session_id: "sess-2".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.9,
-            },
+            sess("sess-1", SignalKind::Negative, 0.9),
+            sess("sess-2", SignalKind::Negative, 0.9),
         ];
         let update = slow_consolidate(&sessions, Aggressiveness::BOLD);
         assert!(!update.moved);
@@ -762,21 +775,9 @@ mod tests {
     #[test]
     fn sustained_negative_pattern_across_three_sessions_moves_durable_taste_negative() {
         let sessions = vec![
-            SessionSignal {
-                session_id: "sess-1".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.8,
-            },
-            SessionSignal {
-                session_id: "sess-2".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.85,
-            },
-            SessionSignal {
-                session_id: "sess-3".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.9,
-            },
+            sess("sess-1", SignalKind::Negative, 0.8),
+            sess("sess-2", SignalKind::Negative, 0.85),
+            sess("sess-3", SignalKind::Negative, 0.9),
         ];
         let update = slow_consolidate(&sessions, Aggressiveness::STANDARD);
 
@@ -793,11 +794,7 @@ mod tests {
     #[test]
     fn sustained_engagement_pattern_moves_durable_taste_positive() {
         let sessions: Vec<SessionSignal> = (1..=4)
-            .map(|i| SessionSignal {
-                session_id: format!("sess-{i}"),
-                kind: SignalKind::Engagement,
-                confidence: 0.85,
-            })
+            .map(|i| sess(&format!("sess-{i}"), SignalKind::Engagement, 0.85))
             .collect();
         let update = slow_consolidate(&sessions, Aggressiveness::STANDARD);
 
@@ -817,11 +814,7 @@ mod tests {
         // distinct sessions exhibit it.
         for kind in [SignalKind::Fatigue, SignalKind::Interruption] {
             let sessions: Vec<SessionSignal> = (1..=5)
-                .map(|i| SessionSignal {
-                    session_id: format!("sess-{i}"),
-                    kind,
-                    confidence: 0.9,
-                })
+                .map(|i| sess(&format!("sess-{i}"), kind, 0.9))
                 .collect();
             let update = slow_consolidate(&sessions, Aggressiveness::BOLD);
             assert!(
@@ -837,11 +830,7 @@ mod tests {
         // Five distinct sessions, but every signal is below
         // MIN_EVIDENCE_CONFIDENCE — none should count as evidence.
         let sessions: Vec<SessionSignal> = (1..=5)
-            .map(|i| SessionSignal {
-                session_id: format!("sess-{i}"),
-                kind: SignalKind::Negative,
-                confidence: 0.3,
-            })
+            .map(|i| sess(&format!("sess-{i}"), SignalKind::Negative, 0.3))
             .collect();
         let update = slow_consolidate(&sessions, Aggressiveness::BOLD);
         assert!(!update.moved);
@@ -860,11 +849,7 @@ mod tests {
     #[test]
     fn slow_loop_aggressiveness_scales_weight_delta_magnitude_not_whether_it_moves() {
         let sessions: Vec<SessionSignal> = (1..=3)
-            .map(|i| SessionSignal {
-                session_id: format!("sess-{i}"),
-                kind: SignalKind::Negative,
-                confidence: 0.9,
-            })
+            .map(|i| sess(&format!("sess-{i}"), SignalKind::Negative, 0.9))
             .collect();
 
         let gentle = slow_consolidate(&sessions, Aggressiveness::GENTLE);
@@ -885,11 +870,7 @@ mod tests {
         // taste_model::signals::WEIGHT_FINISH (1.0) — corroborating
         // evidence, not a replacement for explicit behavior.
         let sessions: Vec<SessionSignal> = (1..=6)
-            .map(|i| SessionSignal {
-                session_id: format!("sess-{i}"),
-                kind: SignalKind::Engagement,
-                confidence: 0.99,
-            })
+            .map(|i| sess(&format!("sess-{i}"), SignalKind::Engagement, 0.99))
             .collect();
         let update = slow_consolidate(&sessions, Aggressiveness::BOLD);
         assert!(update.weight_delta.abs() < crate::taste_model::signals::WEIGHT_FINISH);
@@ -900,34 +881,100 @@ mod tests {
     #[test]
     fn durable_update_trace_documents_the_sustained_pattern() {
         let sessions = vec![
-            SessionSignal {
-                session_id: "sess-1".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.8,
-            },
-            SessionSignal {
-                session_id: "sess-2".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.8,
-            },
-            SessionSignal {
-                session_id: "sess-3".to_string(),
-                kind: SignalKind::Negative,
-                confidence: 0.8,
-            },
+            sess("sess-1", SignalKind::Negative, 0.8),
+            sess("sess-2", SignalKind::Negative, 0.8),
+            sess("sess-3", SignalKind::Negative, 0.8),
         ];
         let update = slow_consolidate(&sessions, Aggressiveness::STANDARD);
         assert!(update.trace.path.contains("3 distinct sessions"));
         assert_eq!(update.trace.signals.len(), 3);
     }
 
+    /// The codex finding, teeth'd: the durable-move trace must carry the REAL
+    /// `InterpretedSignal.rationale` of each contributing session — NOT a
+    /// synthesized "session #N exhibiting X" placeholder. Uses three sessions
+    /// with DISTINCT, recognizable rationale strings and asserts each appears
+    /// verbatim in the trace's contributions, and that no generic
+    /// "exhibiting" placeholder text is present. Mirrors the fast loop's
+    /// `fast_adaptation_trace_carries_the_real_signal_rationale`.
     #[test]
-    fn no_move_trace_explains_the_one_bad_night_guard() {
-        let sessions = vec![SessionSignal {
-            session_id: "sess-1".to_string(),
+    fn durable_update_trace_carries_the_real_interpreted_rationales_not_generic_text() {
+        let s1 = InterpretedSignal {
+            kind: SignalKind::Negative,
+            confidence: 0.8,
+            rationale: "stopped at 5% (<= 15% early-abandon threshold)".to_string(),
+        };
+        let s2 = InterpretedSignal {
+            kind: SignalKind::Negative,
+            confidence: 0.85,
+            rationale: "stopped at 8% with a hard bail after two minutes".to_string(),
+        };
+        let s3 = InterpretedSignal {
             kind: SignalKind::Negative,
             confidence: 0.9,
-        }];
+            rationale: "stopped at 3% right after the cold open".to_string(),
+        };
+        let sessions = vec![
+            SessionSignal::from_interpreted("sess-1", &s1),
+            SessionSignal::from_interpreted("sess-2", &s2),
+            SessionSignal::from_interpreted("sess-3", &s3),
+        ];
+        let update = slow_consolidate(&sessions, Aggressiveness::STANDARD);
+        assert!(update.moved);
+
+        let descriptions: Vec<&str> = update
+            .trace
+            .signals
+            .iter()
+            .map(|c| c.description.as_str())
+            .collect();
+        let joined = descriptions.join(" | ");
+
+        // Every real rationale must appear verbatim in the trace.
+        for real in [&s1.rationale, &s2.rationale, &s3.rationale] {
+            assert!(
+                descriptions.iter().any(|d| d.contains(real.as_str())),
+                "durable trace must carry the REAL interpreter rationale {real:?}, got {joined:?}"
+            );
+        }
+        // And the old fabricated placeholder must be gone.
+        assert!(
+            !joined.contains("exhibiting"),
+            "durable trace must not synthesize a generic 'session #N exhibiting X' placeholder, got {joined:?}"
+        );
+        // Each contribution also carries that session's real confidence.
+        assert!(update
+            .trace
+            .signals
+            .iter()
+            .any(|c| (c.weight - 0.9_f64).abs() < 1e-6));
+    }
+
+    /// The durable trace's contributions are in a STABLE session_id order
+    /// regardless of input order (determinism of the grounded trace).
+    #[test]
+    fn durable_update_trace_contributions_are_in_stable_session_id_order() {
+        // Inputs deliberately out of order.
+        let sessions = vec![
+            sess("sess-c", SignalKind::Engagement, 0.8),
+            sess("sess-a", SignalKind::Engagement, 0.8),
+            sess("sess-b", SignalKind::Engagement, 0.8),
+        ];
+        let update = slow_consolidate(&sessions, Aggressiveness::STANDARD);
+        let order: Vec<&str> = update
+            .trace
+            .signals
+            .iter()
+            .map(|c| c.description.as_str())
+            .collect();
+        assert!(order[0].contains("sess-a"));
+        assert!(order[1].contains("sess-b"));
+        assert!(order[2].contains("sess-c"));
+    }
+
+    #[test]
+    fn no_move_trace_explains_the_one_bad_night_guard() {
+        let sessions = vec![sess("sess-1", SignalKind::Negative, 0.9)];
         let update = slow_consolidate(&sessions, Aggressiveness::STANDARD);
         assert!(update
             .trace
@@ -938,12 +985,16 @@ mod tests {
     // --- SessionSignal::from_interpreted reuses the real interpreter output -
 
     #[test]
-    fn session_signal_from_interpreted_carries_the_real_kind_and_confidence() {
+    fn session_signal_from_interpreted_carries_the_real_kind_confidence_and_rationale() {
         let sig = signal(SignalKind::Engagement, 0.77);
         let s = SessionSignal::from_interpreted("sess-42", &sig);
         assert_eq!(s.session_id, "sess-42");
         assert_eq!(s.kind, SignalKind::Engagement);
         assert!((s.confidence - 0.77).abs() < f32::EPSILON);
+        // The rationale must be PRESERVED, not dropped — this is what lets
+        // the slow-loop trace stay grounded.
+        assert_eq!(s.rationale, sig.rationale);
+        assert!(!s.rationale.is_empty());
     }
 
     // --- determinism ----------------------------------------------------------
@@ -951,14 +1002,13 @@ mod tests {
     #[test]
     fn slow_consolidate_is_deterministic_for_identical_inputs() {
         let sessions: Vec<SessionSignal> = (1..=4)
-            .map(|i| SessionSignal {
-                session_id: format!("sess-{i}"),
-                kind: if i % 2 == 0 {
+            .map(|i| {
+                let kind = if i % 2 == 0 {
                     SignalKind::Negative
                 } else {
                     SignalKind::Engagement
-                },
-                confidence: 0.8,
+                };
+                sess(&format!("sess-{i}"), kind, 0.8)
             })
             .collect();
 

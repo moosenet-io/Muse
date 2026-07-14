@@ -68,6 +68,17 @@ pub enum ServerSyncPrimitiveKind {
     /// decision logic can be exercised and tested; it is not claimed to be
     /// production-verified.
     JellyfinSyncPlay,
+    /// Plex's own group-playback ("Watch Together") primitive. Per the
+    /// MUSEX-01 audit (`docs/MUSEX-experience-layer.md` §2.3) this is an
+    /// **[EXTERNAL-API ASSUMPTION — UNVERIFIED]** with a history of limited
+    /// scope/investment — Muse does NOT integrate it and there is no
+    /// adapter for it here. It exists as a named variant purely so
+    /// [`decide_sync_mode`] can represent (and correctly refuse to
+    /// delegate to) a group whose clients disagree on which server
+    /// primitive to use — a mixed-primitive group must fall back to
+    /// coordinated-start, never pick one server's primitive for clients
+    /// registered against another.
+    PlexWatchTogether,
 }
 
 /// One present client's sync capability — sourced from the capability map
@@ -411,6 +422,13 @@ mod tests {
         }
     }
 
+    fn frame_sync_with(id: &str, primitive: ServerSyncPrimitiveKind) -> ClientCapability {
+        ClientCapability {
+            client_id: id.to_string(),
+            capability: SyncCapability::FrameSync { primitive },
+        }
+    }
+
     fn coordinated_only(id: &str) -> ClientCapability {
         ClientCapability {
             client_id: id.to_string(),
@@ -486,6 +504,67 @@ mod tests {
             }
             other => panic!("expected CoordinatedStart for a mixed group, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // All FrameSync-capable but on DIFFERENT primitives: still
+    // coordinated-start (no partial/ambiguous delegation)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn all_frame_sync_but_disagreeing_primitives_falls_back_to_coordinated_start() {
+        // Every client CAN frame-sync, but they're registered against two
+        // different server primitives (one Jellyfin SyncPlay, one Plex
+        // Watch Together). Delegating would mean picking ONE server's
+        // primitive for a client registered against the other -- exactly
+        // the ambiguity `decide_sync_mode` must refuse. This closes the one
+        // untested branch of the load-bearing decision:
+        // all-FrameSync-but-mismatched -> CoordinatedStart, never Delegated.
+        let clients = vec![
+            frame_sync_with("jellyfin-tv", ServerSyncPrimitiveKind::JellyfinSyncPlay),
+            frame_sync_with("plex-tv", ServerSyncPrimitiveKind::PlexWatchTogether),
+        ];
+        let mode = decide_sync_mode(&clients);
+        match mode {
+            SyncMode::CoordinatedStart { client_ids, reason } => {
+                assert_eq!(
+                    client_ids,
+                    vec!["jellyfin-tv", "plex-tv"],
+                    "coordinated start must cover EVERY client even when all are \
+                     frame-sync-capable -- disagreeing primitives means no partial delegation"
+                );
+                assert!(
+                    reason.contains("different server sync primitives"),
+                    "the reason must make the disagreement explicit for the report surface: \
+                     {reason}"
+                );
+            }
+            other => panic!(
+                "all-FrameSync-but-mismatched-primitives must surface as CoordinatedStart, \
+                 never Delegated to one server's primitive: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn disagreeing_primitives_never_trigger_a_frame_sync_attempt() {
+        // Complement to the decision test above: prove (via the same
+        // drive_mode helper the other negative tests use) that NO server
+        // sync primitive is invoked when the clients disagree on which
+        // primitive to use.
+        let mock = MockServerSync::new();
+        let clients = vec![
+            frame_sync_with("jellyfin-tv", ServerSyncPrimitiveKind::JellyfinSyncPlay),
+            frame_sync_with("plex-tv", ServerSyncPrimitiveKind::PlexWatchTogether),
+        ];
+        let mode = decide_sync_mode(&clients);
+        drive_mode(&mode, &mock).await;
+        assert_eq!(
+            mock.call_count(),
+            0,
+            "disagreeing primitives must not delegate to ANY primitive -- coordinated start \
+             covers the whole group"
+        );
     }
 
     #[test]

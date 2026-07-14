@@ -13,6 +13,7 @@ mod config;
 mod cultural;
 pub mod curation;
 mod db;
+pub mod discord;
 pub mod embed;
 #[cfg(test)]
 mod endpoint_tests;

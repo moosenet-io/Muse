@@ -209,6 +209,11 @@ empty until the three recompute write-paths are given a scheduled caller. See
 
 ## Testing
 
+See [`docs/TESTING.md`](docs/TESTING.md) for the *why*: the four gating phases, the
+snapshots-everywhere invariant and its DSN-guard enforcement, the TASTE two-layer model, and the
+shadow-parity retirement gate. This section stays the authoritative *how-to-run* reference (env
+vars, per-phase commands, CI) — the two are cross-referenced, not duplicated.
+
 The suite runs green with **no live database** — every DB-touching integration test is gated on
 `MUSE_TEST_DATABASE_URL` and skips cleanly (does not fail) when it's unset. Point it at a scratch
 Postgres 17 (`vector` + `pg_trgm`) database to actually exercise migrations and the repo layer:

@@ -66,7 +66,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
-use tower::ServiceExt;
+use tower::util::ServiceExt;
 
 use crate::config::Config;
 use crate::http::{router, AppState};

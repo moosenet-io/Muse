@@ -36,11 +36,19 @@
 //!   tagged, persona/time-of-day-aware [`director::ChannelSchedule`], plus
 //!   its own named persona-derived presets ([`director::DirectorPreset`]).
 //!   See that module's doc for how it differs from/relates to `compose`.
+//! - [`serendipity`] (MUSEX-06, Plane TERM #382) — the serendipity/range
+//!   control the director's exploration reservation now runs on: a
+//!   first-class, GUI-tunable [`serendipity::SerendipityRange`] (0-100%)
+//!   plus the "taste-adjacent-but-novel" exploration-eligibility rule
+//!   ([`serendipity::is_exploration_eligible`]) that upgrades `director`'s
+//!   plain `CandidateSource::AvailableNow` split. See that module's doc for
+//!   the full refinement.
 
 pub mod compose;
 pub mod director;
 pub mod presets;
 pub mod routes;
+pub mod serendipity;
 
 pub use compose::{
     adjust_channel_run, compose_channel_run, regenerate_channel_run, ComposeOptions,
@@ -53,3 +61,4 @@ pub use director::{
 };
 pub use presets::{list_presets, resolve_preset, Preset, PresetName};
 pub use routes::compose_handler;
+pub use serendipity::{SerendipityRange, NOVELTY_HIGH, NOVELTY_LOW};

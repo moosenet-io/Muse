@@ -48,11 +48,38 @@
 //! `seed % interval`), never an unseeded `rand` call and never `HashMap`
 //! iteration order (the safe/exploration pools are `VecDeque`s built by a
 //! single stable `Vec::retain`-style partition, preserving caller order).
+//!
+//! ## MUSEX-06 (Plane TERM #382): range control + taste-adjacent-but-novel
+//! Two refinements land on top of the above, both from
+//! [`super::serendipity`]:
+//! - **Exploration SELECTION** is upgraded from a pure `CandidateSource::
+//!   AvailableNow` split to [`serendipity::is_exploration_eligible`] — a
+//!   strict superset that ALSO admits a `Taste`-sourced candidate whose
+//!   `taste_fit` sits in the "adjacency band" (near the taste vector, but
+//!   outside the safe/known core). See that module's doc for the full
+//!   justification of the band bounds and why `OnDeck`/`Gap` stay excluded.
+//! - **The ≥1-unless-pure-safe guarantee**: the old modular reservation
+//!   alone could, for a tiny `serendipity_budget` and a short session,
+//!   reserve zero slots in practice (a huge interval never divides evenly
+//!   into a short slot count). `program_channel` now ALSO attempts
+//!   exploration on every slot until the FIRST exploration slot actually
+//!   lands, for any `serendipity_budget > 0.0` — after which it reverts to
+//!   the configured modular cadence. `serendipity_budget == 0.0` (pure-safe)
+//!   is completely unaffected (the guarantee clause is `budget > 0.0`,
+//!   never true at exactly zero), so every MUSEX-05 zero-budget behavior is
+//!   unchanged byte-for-byte.
+//!
+//! Both refinements are additive: `DirectorConstraints::serendipity_budget`
+//! keeps its existing `f64` (0.0-1.0) shape (no call-site break for the
+//! MUSEX-05 presets below), and at `serendipity_budget: 0.0` — the default
+//! any caller gets by not opting in — `program_channel`'s output is
+//! identical to pre-MUSEX-06 behavior.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::collections::VecDeque;
 
+use super::serendipity;
 use crate::curation::candidates::{Candidate, CandidateSource};
 use crate::curation::recommend::template_rationale;
 use crate::taste_review::because::because_line;
@@ -132,10 +159,16 @@ pub struct DirectorConstraints {
     /// `start_at`; a non-positive budget yields an empty schedule.
     pub end_by: DateTime<Utc>,
     pub time_of_day: TimeOfDay,
-    /// Fraction (0.0-1.0) of slots reserved for exploration picks (the
-    /// `CandidateSource::AvailableNow` pool). `0.0` disables reservation
-    /// entirely (a schedule may then end up all-safe if that's genuinely
-    /// all the pool offers). Values are clamped to `[0.0, 1.0]`.
+    /// Fraction (0.0-1.0) of slots reserved for exploration picks —
+    /// `serendipity::is_exploration_eligible` candidates (MUSEX-06:
+    /// `AvailableNow` unconditionally, plus a `Taste` pick whose
+    /// `taste_fit` sits in the taste-adjacency band). `0.0` (pure-safe)
+    /// disables reservation entirely (a schedule may then end up all-safe
+    /// if that's genuinely all the pool offers) and is the ONE value that
+    /// does not get the MUSEX-06 ≥1-exploration-slot guarantee; any value
+    /// `> 0.0` does. Values are clamped to `[0.0, 1.0]` — construct via
+    /// [`super::serendipity::SerendipityRange`] for the GUI-facing 0-100%
+    /// unit and its validation/clamping.
     pub serendipity_budget: f64,
     /// A hard cap on slot count, independent of the time budget (defends
     /// against a pathologically large budget + tiny-runtime pool spinning
@@ -159,8 +192,10 @@ pub struct Slot {
     pub start_at: DateTime<Utc>,
     pub end_at: DateTime<Utc>,
     pub intent: SlotIntent,
-    /// `true` when this slot was filled from the exploration pool
-    /// (`CandidateSource::AvailableNow`) rather than the safe pool.
+    /// `true` when this slot was filled by an exploration-eligible
+    /// candidate (MUSEX-06: `serendipity::is_exploration_eligible` —
+    /// `AvailableNow`, or a `Taste` pick in the taste-adjacency band)
+    /// rather than a safe/known-core pick.
     pub is_exploration: bool,
     /// Grounded per-slot "why this" — see the module doc's rationale
     /// section. Never fabricated: either MUSEX-04's `because_line` output
@@ -182,18 +217,15 @@ pub struct ChannelSchedule {
 }
 
 /// How many slots apart an exploration reservation lands, given a
-/// `serendipity_budget` fraction. `<= 0.0` (or a non-finite value) disables
-/// reservation (`usize::MAX` — never hit by `%`). `>= 1.0` reserves every
-/// slot. Otherwise the nearest interval to `1.0 / budget`, floored at 1 so
-/// a very high budget still advances.
+/// `serendipity_budget` fraction. Delegates to
+/// [`serendipity::SerendipityRange::reservation_interval`] (MUSEX-06) —
+/// identical shape to the original MUSEX-05 implementation, moved onto the
+/// new range-control type so the cadence math has one owner. `<= 0.0` (or a
+/// non-finite value) disables reservation (`usize::MAX` — never hit by
+/// `%`). `>= 1.0` reserves every slot. Otherwise the nearest interval to
+/// `1.0 / budget`, floored at 1 so a very high budget still advances.
 fn exploration_interval(serendipity_budget: f64) -> usize {
-    if !(serendipity_budget.is_finite()) || serendipity_budget <= 0.0 {
-        return usize::MAX;
-    }
-    if serendipity_budget >= 1.0 {
-        return 1;
-    }
-    ((1.0 / serendipity_budget).round() as usize).max(1)
+    serendipity::SerendipityRange::from_fraction(serendipity_budget).reservation_interval()
 }
 
 /// The arc-position intent for a slot about to start at `fraction_elapsed`
@@ -225,13 +257,20 @@ fn slot_rationale(candidate: &Candidate, score: f64) -> String {
 /// relative order (a stable partition, not a `HashMap`-keyed one) so
 /// "highest score first" ordering upstream (the caller is expected to hand
 /// in an already-`rank_candidates`-sorted pool) survives into each queue.
+///
+/// MUSEX-06: classification is [`serendipity::is_exploration_eligible`] —
+/// a strict superset of the original MUSEX-05 `source ==
+/// CandidateSource::AvailableNow` rule (every `AvailableNow` candidate is
+/// still unconditionally exploration-eligible) that ALSO admits a
+/// `Taste`-sourced candidate whose `taste_fit` sits in the taste-adjacency
+/// band — see that function's doc for the full rule.
 fn partition_pool(
     pool: Vec<DirectorCandidate>,
 ) -> (VecDeque<DirectorCandidate>, VecDeque<DirectorCandidate>) {
     let mut safe = VecDeque::new();
     let mut exploration = VecDeque::new();
     for dc in pool {
-        if dc.candidate.source == CandidateSource::AvailableNow {
+        if serendipity::is_exploration_eligible(&dc.candidate) {
             exploration.push_back(dc);
         } else {
             safe.push_back(dc);
@@ -295,7 +334,22 @@ pub fn program_channel(
             break;
         }
 
-        let want_exploration = interval != usize::MAX && idx % interval == offset;
+        // MUSEX-06 (Plane TERM #382): the ≥1-unless-pure-safe guarantee. In
+        // ADDITION to the normal modular reservation, attempt exploration on
+        // EVERY slot for as long as `serendipity_budget > 0.0` (never true
+        // at exactly 0.0, so pure-safe is completely unaffected) AND no
+        // exploration slot has landed yet this session. This is a one-time
+        // floor, not a promise of ongoing cadence: once the first
+        // exploration slot actually lands (below), the OR-clause goes false
+        // and subsequent slots revert to the configured modular reservation
+        // only. If the exploration queue has nothing that fits (e.g. a
+        // genuinely empty/exhausted pool), the attempt cleanly falls back to
+        // the safe queue below — same as any other exploration attempt —
+        // and the guarantee simply cannot be met (there is nothing to
+        // guarantee into), which is the correct degrade, not a bug.
+        let guarantee_pending = serendipity_budget > 0.0 && exploration_slot_count == 0;
+        let want_exploration =
+            (interval != usize::MAX && idx % interval == offset) || guarantee_pending;
 
         let picked = if want_exploration {
             pop_first_fitting(&mut exploration, remaining_ms)
@@ -320,7 +374,13 @@ pub fn program_channel(
             0.0
         };
         let intent = slot_intent(idx, fraction_elapsed, constraints.time_of_day);
-        let is_exploration = dc.candidate.source == CandidateSource::AvailableNow;
+        // MUSEX-06: reflects real exploration-eligibility (taste-adjacent-
+        // but-novel OR AvailableNow), not just source == AvailableNow — see
+        // `serendipity::is_exploration_eligible`. Always correct here
+        // because `partition_pool` only ever puts eligible candidates in
+        // the exploration queue, so whichever queue actually supplied `dc`
+        // this check agrees with.
+        let is_exploration = serendipity::is_exploration_eligible(&dc.candidate);
         if is_exploration {
             exploration_slot_count += 1;
         }
@@ -681,6 +741,118 @@ mod tests {
             4,
             "still schedules from the safe pool, doesn't just stop"
         );
+    }
+
+    // --- MUSEX-06: range control guarantee + taste-adjacent-but-novel ------
+
+    #[test]
+    fn tiny_serendipity_fraction_still_guarantees_at_least_one_exploration_slot() {
+        // A 1% budget: the old pure-modular reservation (interval ~100)
+        // would reserve ~0 slots across a short, few-slot session. The
+        // MUSEX-06 guarantee must still land at least one.
+        let mut pool: Vec<DirectorCandidate> = (1..=6)
+            .map(|i| dc(i, CandidateSource::Taste, 0.9, THIRTY_MIN_MS))
+            .collect();
+        pool.extend((100..=102).map(|i| dc(i, CandidateSource::AvailableNow, 0.3, THIRTY_MIN_MS)));
+
+        let mut constraints = base_constraints(4, TimeOfDay::Evening); // 8 slots' worth of budget
+        constraints.serendipity_budget = 0.01;
+
+        let schedule = program_channel(pool, &constraints);
+        assert!(
+            schedule.exploration_slot_count >= 1,
+            "a tiny-but-nonzero serendipity_budget must still guarantee >=1 exploration slot, got {}",
+            schedule.exploration_slot_count
+        );
+    }
+
+    #[test]
+    fn pure_safe_budget_of_exactly_zero_never_triggers_the_guarantee() {
+        // Boundary: 0.0 (pure-safe) must NOT be swept up by the >=1
+        // guarantee — it is the one explicit exception the AC calls for.
+        let mut pool: Vec<DirectorCandidate> = (1..=6)
+            .map(|i| dc(i, CandidateSource::Taste, 0.9, THIRTY_MIN_MS))
+            .collect();
+        pool.extend((100..=102).map(|i| dc(i, CandidateSource::AvailableNow, 0.3, THIRTY_MIN_MS)));
+
+        let mut constraints = base_constraints(4, TimeOfDay::Evening);
+        constraints.serendipity_budget = 0.0;
+
+        let schedule = program_channel(pool, &constraints);
+        assert_eq!(
+            schedule.exploration_slot_count, 0,
+            "budget exactly 0.0 (pure-safe) must never schedule an exploration slot"
+        );
+    }
+
+    #[test]
+    fn near_full_serendipity_budget_yields_near_all_exploration() {
+        // Every candidate exploration-eligible (AvailableNow), and the pool
+        // exactly covers the 8-slot budget: budget 1.0 must fill all of it
+        // from exploration.
+        let pool: Vec<DirectorCandidate> = (100..=107)
+            .map(|i| dc(i, CandidateSource::AvailableNow, 0.3, THIRTY_MIN_MS))
+            .collect();
+
+        let mut constraints = base_constraints(4, TimeOfDay::Evening); // 8 slots' worth
+        constraints.serendipity_budget = 1.0;
+
+        let schedule = program_channel(pool, &constraints);
+        assert_eq!(
+            schedule.exploration_slot_count,
+            schedule.slots.len(),
+            "budget 1.0 must reserve every slot for exploration when the exploration pool covers it"
+        );
+        assert_eq!(schedule.slots.len(), 8);
+    }
+
+    #[test]
+    fn exploration_picks_land_in_the_adjacency_band_not_the_safe_core_or_random() {
+        // A taste-tier candidate at 0.5 (mid-band) must be treated as
+        // exploration-eligible; one at 0.9 (the safe/known core) must NOT —
+        // proving the selection is band-gated, not arbitrary/random.
+        let pool = vec![
+            dc(1, CandidateSource::Taste, 0.5, THIRTY_MIN_MS), // in adjacency band
+            dc(2, CandidateSource::Taste, 0.9, THIRTY_MIN_MS), // safe core, excluded
+        ];
+        let mut constraints = base_constraints(2, TimeOfDay::Evening);
+        constraints.serendipity_budget = 1.0; // attempt exploration on every slot
+
+        let schedule = program_channel(pool, &constraints);
+        // The 0.5 candidate must be scheduled AS exploration; the 0.9
+        // candidate, even though it's also eligible to fill a slot, must
+        // never be flagged is_exploration (it's outside the band).
+        let by_id = |id: i64| schedule.slots.iter().find(|s| s.media_metadata_id == id);
+        let in_band = by_id(1).expect("in-band candidate scheduled");
+        assert!(
+            in_band.is_exploration,
+            "a mid-band (0.5) taste candidate must be scheduled as exploration"
+        );
+        if let Some(safe_core) = by_id(2) {
+            assert!(
+                !safe_core.is_exploration,
+                "a safe-core (0.9) taste candidate must never be flagged is_exploration, \
+                 even when scheduled"
+            );
+        }
+    }
+
+    #[test]
+    fn too_dissimilar_candidate_is_not_treated_as_exploration() {
+        // A near-zero taste_fit candidate would be indistinguishable from a
+        // random pick — it must land in the safe pool (never scheduled as
+        // exploration), proving the band excludes the "too far" tail too.
+        let pool = vec![dc(1, CandidateSource::Taste, 0.02, THIRTY_MIN_MS)];
+        let mut constraints = base_constraints(1, TimeOfDay::Evening);
+        constraints.serendipity_budget = 1.0;
+
+        let schedule = program_channel(pool, &constraints);
+        let slot = &schedule.slots[0];
+        assert!(
+            !slot.is_exploration,
+            "a too-dissimilar (0.02) taste candidate must never be flagged is_exploration"
+        );
+        assert_eq!(schedule.exploration_slot_count, 0);
     }
 
     // --- rationale reuse (MUSEX-04) ------------------------------------------

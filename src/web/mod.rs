@@ -9,11 +9,15 @@
 //! HTTP server or app state.
 
 pub mod artwork;
+pub mod graph;
 pub mod guide;
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 
 use crate::http::AppState;
 
@@ -25,4 +29,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/channels", get(guide::list_channels_handler))
         .route("/api/channels/:id/lineup", get(guide::lineup_handler))
         .route("/art/:kind/:id", get(artwork::art_handler))
+        // MUSEX-17: graph-visualization endpoints — see `graph`'s module doc.
+        .route("/api/graph/taste-map", post(graph::taste_map_handler))
+        .route("/api/graph/group-dynamics", post(graph::group_dynamics_handler))
+        .route("/api/graph/watch-history", post(graph::watch_history_handler))
+        .route("/api/graph/taste-clusters", post(graph::taste_clusters_handler))
 }

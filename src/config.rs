@@ -371,6 +371,18 @@ pub struct Config {
     /// tuned this yet, same caveat `promotion_match_threshold`'s own doc
     /// makes for its default).
     pub kg_taste_neighbor_threshold: f32,
+
+    // --- MUSEX-17 (Plane TERM #393): graph-visualization endpoints ---
+    /// Max number of entries `crate::kg::viz::build_watch_history` returns
+    /// (`MUSE_KG_VIZ_WATCH_HISTORY_LIMIT`) — the most-recent-first cap on an
+    /// otherwise-unbounded temporal series, so a long-lived household's
+    /// watch history can't blow up the response payload. GUI-tunable per
+    /// the AC — never a bare literal in `crate::kg::viz`/`crate::web::graph`,
+    /// same posture as `Config::kg_taste_neighbor_threshold`. Defaults to
+    /// 200: a deliberately unopinionated starting point (no production
+    /// corpus has tuned this yet, same caveat `kg_taste_neighbor_threshold`'s
+    /// own doc makes for its default).
+    pub kg_viz_watch_history_limit: u64,
 }
 
 impl Config {
@@ -485,6 +497,7 @@ impl Config {
             premiere_curator_budget: env_u64("MUSE_PREMIERE_CURATOR_BUDGET", 6) as u32,
 
             kg_taste_neighbor_threshold: env_f32("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD", 0.5),
+            kg_viz_watch_history_limit: env_u64("MUSE_KG_VIZ_WATCH_HISTORY_LIMIT", 200),
         }
     }
 
@@ -572,6 +585,7 @@ impl Default for Config {
             premiere_trusted_budget: 3,
             premiere_curator_budget: 6,
             kg_taste_neighbor_threshold: 0.5,
+            kg_viz_watch_history_limit: 200,
         }
     }
 }
@@ -742,6 +756,7 @@ mod tests {
         assert_eq!(cfg.premiere_trusted_budget, 3);
         assert_eq!(cfg.premiere_curator_budget, 6);
         assert!((cfg.kg_taste_neighbor_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.kg_viz_watch_history_limit, 200);
     }
 
     #[test]
@@ -754,6 +769,18 @@ mod tests {
         assert!((cfg.kg_taste_neighbor_threshold - 0.72).abs() < f32::EPSILON);
 
         std::env::remove_var("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD");
+    }
+
+    #[test]
+    #[serial]
+    fn musex17_kg_viz_config_reads_watch_history_limit_from_env() {
+        std::env::set_var("MUSE_KG_VIZ_WATCH_HISTORY_LIMIT", "50");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.kg_viz_watch_history_limit, 50);
+
+        std::env::remove_var("MUSE_KG_VIZ_WATCH_HISTORY_LIMIT");
     }
 
     #[test]

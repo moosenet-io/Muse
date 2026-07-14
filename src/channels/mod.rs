@@ -30,8 +30,15 @@
 //!   Night / 90s Chaos / Comfort Rewatch / Discover / Household Movie
 //!   Night) as data, each resolving to a [`compose::ComposeOptions`] overlay
 //!   via [`presets::Preset::apply`].
+//! - [`director`] (MUSEX-05, Plane TERM #381) — the channel DIRECTOR core: a
+//!   separate, additive feature from `compose` that programs a candidate
+//!   pool (rather than a caller-chosen show list) into a timed, intent-
+//!   tagged, persona/time-of-day-aware [`director::ChannelSchedule`], plus
+//!   its own named persona-derived presets ([`director::DirectorPreset`]).
+//!   See that module's doc for how it differs from/relates to `compose`.
 
 pub mod compose;
+pub mod director;
 pub mod presets;
 pub mod routes;
 
@@ -39,5 +46,10 @@ pub use compose::{
     adjust_channel_run, compose_channel_run, regenerate_channel_run, ComposeOptions,
     EpisodeOrdering,
 };
-pub use routes::compose_handler;
+pub use director::{
+    list_director_presets, program_channel, resolve_director_preset, ChannelSchedule,
+    DirectorCandidate, DirectorConstraints, DirectorPreset, DirectorPresetName, Slot, SlotIntent,
+    TimeOfDay,
+};
 pub use presets::{list_presets, resolve_preset, Preset, PresetName};
+pub use routes::compose_handler;

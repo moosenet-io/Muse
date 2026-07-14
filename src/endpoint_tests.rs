@@ -72,12 +72,13 @@
 //! handler and falls through to the fallback (`not_implemented`/501 for the
 //! nested groups, the router's 404 for the top-level `/channels/{id}/compose`
 //! route). The bug is UNIVERSAL, empirically confirmed on a minimal
-//! axum-0.7 router. Filed as **MUSE-ROUTE-01 (#31)**. All `{param}`-route
-//! tests here are `#[ignore]`d until it lands; only literal-route coverage
-//! is active in this harness. The ignored tests KEEP asserting the CORRECT
-//! contract (real handler behavior), so un-ignoring them flips them green
-//! the moment the routes are corrected — they are live regression guards,
-//! not deleted coverage.
+//! axum-0.7 router. Filed as **MUSE-ROUTE-01 (#31)**. MUSE-ROUTE-01 has now
+//! landed — all route strings were migrated to axum-0.7 `:id` syntax and the
+//! `{param}`-route tests below are active again (their error-path assertions
+//! ran DB-independent; their happy-path assertions stay `db_gated` as
+//! before). They always asserted the CORRECT contract (real handler
+//! behavior), so un-ignoring them just flips them green now that the routes
+//! are corrected — they were live regression guards, not deleted coverage.
 
 use std::sync::Arc;
 
@@ -286,7 +287,6 @@ async fn proactive_pending_error_path_missing_account_id_is_client_error() {
 }
 
 #[tokio::test]
-#[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — brace routes hit not_implemented fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
 async fn proactive_ack_error_path_invalid_outcome_value_is_4xx_not_5xx() {
     // Well-formed JSON, but `outcome` isn't "sent"/"dismissed". The exact
     // 400 for a bad `outcome` value is covered at handler level by
@@ -309,7 +309,6 @@ async fn proactive_ack_error_path_invalid_outcome_value_is_4xx_not_5xx() {
 }
 
 #[tokio::test]
-#[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — brace routes hit not_implemented fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
 async fn proactive_ack_error_path_missing_outcome_field_is_client_error() {
     // Missing required `outcome` field → axum's `Json` extractor rejects
     // before the handler runs. DB-independent by construction; asserts the
@@ -324,7 +323,6 @@ async fn proactive_ack_error_path_missing_outcome_field_is_client_error() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — brace routes hit the not_implemented/404 fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
 async fn channels_compose_error_path_empty_show_list_is_400() {
     // Correct-contract assertion (held for post-MUSE-ROUTE-01): `compose_handler`
     // validates the empty show list BEFORE any DB lookup, so under correct
@@ -344,7 +342,6 @@ async fn channels_compose_error_path_empty_show_list_is_400() {
 }
 
 #[tokio::test]
-#[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — brace routes hit the not_implemented/404 fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
 async fn channels_compose_error_path_non_positive_session_length_is_400() {
     // Correct-contract assertion: `compose_handler` validates
     // `target_session_ms <= 0` before the DB lookup → exact 400.
@@ -360,7 +357,6 @@ async fn channels_compose_error_path_non_positive_session_length_is_400() {
 }
 
 #[tokio::test]
-#[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — brace routes hit the not_implemented/404 fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
 async fn channels_compose_error_path_missing_required_field_is_client_error() {
     // Correct-contract assertion: missing required `show_media_item_ids` →
     // axum's `Json` extractor rejects (4xx) before the handler runs.
@@ -374,7 +370,6 @@ async fn channels_compose_error_path_missing_required_field_is_client_error() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — /art/{kind}/{id} hits the not_implemented/404 fallback, so this test can't reach the real art handler. Un-ignore when the route-syntax fix lands."]
 async fn art_proxy_contract_always_serves_an_image_never_errors_even_with_db_down() {
     // Correct-contract assertion (held for post-MUSE-ROUTE-01): per its own
     // doc contract, cache-miss + no Plex configured must fall back to the
@@ -534,7 +529,8 @@ mod db_gated {
             get("/recommend/gaps?account_id=-1"),
             get("/proactive/pending?account_id=-1"),
             get("/api/channels"),
-            // {param} read routes (/art/{kind}/{id}, /api/channels/{id}/lineup) are omitted from this sweep until MUSE-ROUTE-01 (#31) lands — under the axum-0.7 brace bug they hit the fallback, so sweeping them here would assert non-mutation of the fallback, not the real handler. Re-add them (and the ignored param happy-path tests) when the route fix lands.
+            get("/api/channels/-1/lineup"),
+            get("/art/poster/-1"),
         ];
 
         for req in reads {
@@ -686,11 +682,11 @@ mod db_gated {
     /// channel-director's guide/metadata surface) against a real seeded
     /// channel, plus the nonexistent-channel error path.
     ///
-    /// `#[ignore]`d: the `/api/channels/{id}/lineup` assertions depend on the
-    /// `{id}` route reaching its real handler, which the MUSE-ROUTE-01 bug
-    /// prevents. Assertions kept at the correct contract for post-fix.
+    /// Was `#[ignore]`d: the `/api/channels/{id}/lineup` assertions depended
+    /// on the `{id}` route reaching its real handler, which the
+    /// MUSE-ROUTE-01 bug prevented. Active now that the route is fixed;
+    /// still `db_gated` (skips cleanly without a DB).
     #[tokio::test]
-    #[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — /api/channels/{id}/lineup hits the not_implemented/404 fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
     async fn channel_guide_metadata_happy_path() {
         let Some(pool) = test_pool_or_skip("channel_guide_metadata_happy_path").await else {
             return;
@@ -829,11 +825,10 @@ mod db_gated {
     /// assert-it-DID-write test rather than being folded into
     /// `read_endpoints_never_mutate_the_database` above.
     ///
-    /// `#[ignore]`d: depends on the `/channels/{id}/compose` `{id}` route
-    /// reaching its real handler (MUSE-ROUTE-01). Assertions kept at the
-    /// correct contract for post-fix.
+    /// Was `#[ignore]`d: depended on the `/channels/{id}/compose` `{id}`
+    /// route reaching its real handler (MUSE-ROUTE-01). Active now that the
+    /// route is fixed; still `db_gated` (skips cleanly without a DB).
     #[tokio::test]
-    #[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — /channels/{id}/compose hits the not_implemented/404 fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
     async fn channels_compose_happy_path_creates_exactly_one_run() {
         let Some(pool) =
             test_pool_or_skip("channels_compose_happy_path_creates_exactly_one_run").await
@@ -1066,11 +1061,10 @@ mod db_gated {
     /// `status`), asserted here rather than folded into the non-mutation
     /// check above.
     ///
-    /// `#[ignore]`d: depends on the `/proactive/{id}/ack` `{id}` route
-    /// reaching its real handler (MUSE-ROUTE-01). Assertions kept at the
-    /// correct contract for post-fix.
+    /// Was `#[ignore]`d: depended on the `/proactive/{id}/ack` `{id}` route
+    /// reaching its real handler (MUSE-ROUTE-01). Active now that the route
+    /// is fixed; still `db_gated` (skips cleanly without a DB).
     #[tokio::test]
-    #[ignore = "BLOCKED by MUSE-ROUTE-01 (#31): {param} axum-0.7 route bug — /proactive/{id}/ack hits the not_implemented fallback, so this test can't reach its real handler. Un-ignore when the route-syntax fix lands."]
     async fn proactive_ack_happy_path_marks_item_dismissed() {
         let Some(pool) = test_pool_or_skip("proactive_ack_happy_path_marks_item_dismissed").await
         else {

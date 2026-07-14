@@ -85,7 +85,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(tuner_routes())
         // MUSE-31: the on-demand channel composer trigger (MUSE-24's
         // `compose_channel_run` had no HTTP surface until now).
-        .route("/channels/{id}/compose", post(crate::channels::compose_handler))
+        .route("/channels/:id/compose", post(crate::channels::compose_handler))
         // MUSE-31: on-demand ops routes -- manual triggers for the same
         // routines the background maintenance/trending workers run on a
         // schedule (see `crate::maintenance`). Mainly for priming a fresh
@@ -116,7 +116,7 @@ fn tuner_routes() -> Router<Arc<AppState>> {
         .route("/lineup.json", get(crate::tuner::hdhr::lineup_json))
         .route("/muse.m3u", get(crate::tuner::m3u::muse_m3u))
         .route("/xmltv.xml", get(crate::tuner::xmltv::xmltv_xml))
-        .route("/auto/v{channel_id}", get(crate::streaming::stream_channel))
+        .route("/auto/v:channel_id", get(crate::streaming::stream_channel))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -158,7 +158,7 @@ fn query_routes() -> Router<Arc<AppState>> {
 fn proactive_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/pending", get(crate::proactive::pending_handler))
-        .route("/{id}/ack", post(crate::proactive::ack_handler))
+        .route("/:id/ack", post(crate::proactive::ack_handler))
         .fallback(not_implemented)
 }
 

@@ -54,7 +54,16 @@
 //! back into a structured [`PersonaExplanation`] rather than recomputing
 //! anything, so "why this persona" always matches the vector actually
 //! stored even if the account's live taste has since moved on.
+//!
+//! ## Blending ([`blend`], MUSEX-03)
+//! [`blend::blend_personas`] folds several of the above into one SESSION
+//! taste vector for group watching — the addressability seam this module
+//! doc already flagged ([`crate::repo::persona::list_for_account`]/
+//! `get_by_id`) is exactly how a caller resolves the [`Persona`] rows it
+//! hands to `blend_personas`. See `blend`'s module doc for the
+//! intersection-not-average formula and the no-overlap rule.
 
+pub mod blend;
 pub mod derive;
 
 use serde_json::Value as Json;

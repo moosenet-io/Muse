@@ -37,6 +37,31 @@ pub struct LoadedFixture {
     pub items: Vec<(MediaMetadata, MediaItem)>,
     /// Number of `watch_stats` rows written (one per `WatchSignal`).
     pub signals_inserted: usize,
+    /// The per-run UUID suffix applied to every unique key this load
+    /// created (library name/root, tmdb ids, plex account id, and the
+    /// genre names) — so a caller can scope assertions to exactly this
+    /// load's rows.
+    pub suffix: String,
+    /// The `genres` row ids [`load`] created for this fixture (each genre
+    /// name is UUID-suffixed, so these rows are private to this load and
+    /// never a shared/pre-existing reference genre). [`cleanup`] deletes
+    /// exactly these, leaving shared genre reference data untouched.
+    pub genre_ids: Vec<i64>,
+    /// The genre names this fixture uses, mapped to the actual
+    /// UUID-suffixed name written to `genres` — so a caller can relate a
+    /// computed `genre_affinity` key (which is the suffixed name) back to
+    /// the fixture's base genre name.
+    pub genre_names: std::collections::BTreeMap<String, String>,
+}
+
+impl LoadedFixture {
+    /// The suffixed genre name actually stored in `genres` for a fixture's
+    /// base genre name (e.g. `"comfort-drama"` -> `"comfort-drama-<uuid>"`),
+    /// which is also the key a taste `genre_affinity` map uses. Returns
+    /// `None` if this load never seeded that base genre.
+    pub fn suffixed_genre(&self, base: &str) -> Option<&str> {
+        self.genre_names.get(base).map(|s| s.as_str())
+    }
 }
 
 fn path_safe(title: &str) -> String {
@@ -63,6 +88,9 @@ pub async fn load(pool: &PgPool, fixture: &AccountProfileFixture) -> MuseResult<
     };
     let library = repo::library::create(pool, &new_library).await?;
 
+    let mut genre_ids: Vec<i64> = Vec::new();
+    let mut genre_names: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut items = Vec::with_capacity(fixture.library.items.len());
     for (idx, seed) in fixture.library.items.iter().enumerate() {
         let new_metadata = NewMediaMetadata {
@@ -86,6 +114,16 @@ pub async fn load(pool: &PgPool, fixture: &AccountProfileFixture) -> MuseResult<
         let metadata = repo::media_metadata::upsert_by_tmdb(pool, &new_metadata).await?;
 
         for genre_name in seed.genres {
+            // Suffix the genre name with the per-run UUID so the `genres`
+            // row is PRIVATE to this load — never a shared/pre-existing
+            // reference genre. This is what makes `cleanup` able to delete
+            // exactly the rows this load created without touching any
+            // reference data (and avoids cross-run contention on a shared
+            // `(name)` row). The suffixed name is also the key the taste
+            // `genre_affinity` map will use (the taste query returns
+            // `genres.name`), so `genre_names` records the base->suffixed
+            // mapping for callers to relate the two.
+            let suffixed = format!("{genre_name}-{suffix}");
             let genre_id: i64 = sqlx::query_scalar(
                 r#"
                 INSERT INTO genres (name) VALUES ($1)
@@ -93,10 +131,15 @@ pub async fn load(pool: &PgPool, fixture: &AccountProfileFixture) -> MuseResult<
                 RETURNING id
                 "#,
             )
-            .bind(genre_name)
+            .bind(&suffixed)
             .fetch_one(pool)
             .await
             .map_err(MuseError::Database)?;
+
+            if !genre_ids.contains(&genre_id) {
+                genre_ids.push(genre_id);
+            }
+            genre_names.insert((*genre_name).to_string(), suffixed);
 
             sqlx::query(
                 "INSERT INTO media_metadata_genres (media_metadata_id, genre_id) \
@@ -183,22 +226,33 @@ pub async fn load(pool: &PgPool, fixture: &AccountProfileFixture) -> MuseResult<
         library,
         items,
         signals_inserted,
+        suffix,
+        genre_ids,
+        genre_names,
     })
 }
 
-/// Remove everything [`load`] wrote for `loaded`. Deleting the library
-/// cascades its `media_items`, which in turn cascades their
-/// `watch_stats`/`ratings`/`watchlist` rows (all `ON DELETE CASCADE` on
-/// `media_item_id` — see `migrations/0017_watch_stats_ratings_watchlist.sql`).
-/// Deleting the account cascades `taste_signals`/`taste_profile`/
-/// `taste_context_centroids` (`migrations/0019_taste_profile.sql`,
-/// `migrations/0020_taste_signals.sql`). Deleting each `media_metadata` row
-/// cascades its `media_metadata_genres` join rows; the shared `genres` rows
-/// themselves are left in place (harmless, reusable, not per-fixture-owned)
-/// — matching the cleanup posture of `crate::snapshot::db_gated`'s tests.
+/// Remove everything [`load`] wrote for `loaded`, leaving the DB exactly as
+/// it was found (a load->cleanup round-trip nets zero rows in every table
+/// the loader touches). Deletions run in FK-safe order:
+/// 1. **library** — cascades its `media_items`, which cascade their
+///    `watch_stats`/`ratings`/`watchlist` rows (all `ON DELETE CASCADE` on
+///    `media_item_id` — see `migrations/0017_watch_stats_ratings_watchlist.sql`).
+/// 2. **media_metadata** (each row this load created) — cascades its
+///    `media_metadata_genres` join rows (`migrations/0011`), so the join
+///    rows are gone before the `genres` rows they reference are deleted.
+/// 3. **genres** (`loaded.genre_ids`) — each genre name was UUID-suffixed at
+///    load time, so these rows are PRIVATE to this load; deleting exactly
+///    them removes the fixture's genre state without touching any shared or
+///    pre-existing reference genre. Runs AFTER (2) so no join row still
+///    references them.
+/// 4. **account** — cascades `taste_signals`/`taste_profile`/
+///    `taste_context_centroids` (`migrations/0019`, `migrations/0020`).
+///
 /// Best-effort (`.ok()` on each statement, same as every other db_gated
 /// cleanup in this crate) so a partial failure never panics a test's
-/// teardown.
+/// teardown — the reversal test below asserts the round-trip actually nets
+/// zero rows, including in `genres`/`media_metadata_genres`.
 pub async fn cleanup(pool: &PgPool, loaded: &LoadedFixture) -> MuseResult<()> {
     sqlx::query("DELETE FROM libraries WHERE id = $1")
         .bind(loaded.library.id)
@@ -208,6 +262,16 @@ pub async fn cleanup(pool: &PgPool, loaded: &LoadedFixture) -> MuseResult<()> {
     for (metadata, _) in &loaded.items {
         sqlx::query("DELETE FROM media_metadata WHERE id = $1")
             .bind(metadata.id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+    // Delete exactly this load's (UUID-suffixed, hence private) genre rows,
+    // now that their `media_metadata_genres` join rows are gone with the
+    // media_metadata above. Never touches shared/pre-existing genre rows.
+    if !loaded.genre_ids.is_empty() {
+        sqlx::query("DELETE FROM genres WHERE id = ANY($1)")
+            .bind(&loaded.genre_ids)
             .execute(pool)
             .await
             .ok();
@@ -301,9 +365,16 @@ mod tests {
                 .await
                 .expect("computing genre affinity should succeed");
         let (top, _, _) = top_genre_and_shares(&genre_affinity);
+        // The affinity map's key is the actual (UUID-suffixed) genre name
+        // stored in `genres`, so relate the fixture's base expectation to
+        // this load's suffixed name before comparing.
+        let expected_top = fixture
+            .expectation
+            .expected_top_genre
+            .and_then(|base| loaded.suffixed_genre(base))
+            .map(|s| s.to_string());
         assert_eq!(
-            top.as_deref(),
-            fixture.expectation.expected_top_genre,
+            top, expected_top,
             "the rewatched title's genre must dominate the affinity map"
         );
 
@@ -430,6 +501,207 @@ mod tests {
         assert_eq!(genre_affinity, Json::Object(Default::default()));
 
         cleanup(&pool, &loaded).await.ok();
+    }
+
+    /// Count rows matching a `name/tmdb`-style `LIKE '%<suffix>'` predicate.
+    async fn count_like(pool: &PgPool, sql: &str, like: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(sql)
+            .bind(like)
+            .fetch_one(pool)
+            .await
+            .expect("scoped count query should succeed")
+    }
+
+    /// Count rows matching a single `= <id>` predicate.
+    async fn count_by_id(pool: &PgPool, sql: &str, id: i64) -> i64 {
+        sqlx::query_scalar::<_, i64>(sql)
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("scoped count query should succeed")
+    }
+
+    /// The blocking finding from review (codex): `cleanup` must fully
+    /// reverse `load` — a load->cleanup round-trip must net ZERO rows in
+    /// EVERY table the loader touches, INCLUDING `genres` and the
+    /// `media_metadata_genres` join. Uses `heavy_rewatcher` (the fixture
+    /// that exercises genres + multiple signal types), derives taste_signals
+    /// too, then asserts each scoped row exists after load and is gone after
+    /// cleanup. Scoping every count to this load's UUID suffix / account id
+    /// keeps the assertion correct even under cargo's parallel test
+    /// execution (a concurrent fixture load has a different suffix, so it
+    /// never perturbs these counts).
+    #[tokio::test]
+    async fn cleanup_fully_reverses_load_including_genres() {
+        let Some(pool) = fixture_pool_or_skip("cleanup_fully_reverses_load_including_genres").await
+        else {
+            return;
+        };
+        let fixture = super::super::heavy_rewatcher();
+        let loaded = load(&pool, &fixture).await.expect("fixture should load");
+        // Also derive taste_signals, so the round-trip must reverse those.
+        replace_derived_signals(&pool, loaded.account.id)
+            .await
+            .expect("deriving taste_signals should succeed");
+
+        // Suffix-at-end predicate (genre names, tmdb ids, library name,
+        // plex account id all END with the suffix); `like_contains` is for
+        // `media_items.path`, where the suffix sits mid-string.
+        let like = format!("%{}", loaded.suffix);
+        let like_contains = format!("%{}%", loaded.suffix);
+
+        // --- After load: the fixture's scoped rows all exist. ---
+        assert!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM genres WHERE name LIKE $1",
+                &like
+            )
+            .await
+                > 0,
+            "load should have created this fixture's (suffixed) genre rows"
+        );
+        assert!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM media_metadata_genres mmg \
+                 JOIN media_metadata mm ON mm.id = mmg.media_metadata_id \
+                 WHERE mm.tmdb_id LIKE $1",
+                &like,
+            )
+            .await
+                > 0,
+            "load should have created media_metadata_genres join rows"
+        );
+        assert!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM media_metadata WHERE tmdb_id LIKE $1",
+                &like
+            )
+            .await
+                > 0
+        );
+        assert!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM libraries WHERE name LIKE $1",
+                &like
+            )
+            .await
+                > 0
+        );
+        assert!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM accounts WHERE plex_account_id LIKE $1",
+                &like
+            )
+            .await
+                > 0
+        );
+        assert!(
+            count_by_id(
+                &pool,
+                "SELECT count(*) FROM taste_signals WHERE account_id = $1",
+                loaded.account.id
+            )
+            .await
+                > 0,
+            "deriving signals should have created taste_signals rows"
+        );
+        assert!(
+            count_by_id(
+                &pool,
+                "SELECT count(*) FROM watch_stats WHERE account_id = $1",
+                loaded.account.id
+            )
+            .await
+                > 0
+        );
+
+        // --- After cleanup: every scoped row is gone (DB as we found it). ---
+        cleanup(&pool, &loaded)
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM genres WHERE name LIKE $1",
+                &like
+            )
+            .await,
+            0,
+            "cleanup must delete the fixture's genre rows (the review finding)"
+        );
+        assert_eq!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM media_metadata_genres mmg \
+                 JOIN media_metadata mm ON mm.id = mmg.media_metadata_id \
+                 WHERE mm.tmdb_id LIKE $1",
+                &like,
+            )
+            .await,
+            0,
+            "cleanup must leave no media_metadata_genres join rows"
+        );
+        assert_eq!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM media_metadata WHERE tmdb_id LIKE $1",
+                &like
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM media_items WHERE path LIKE $1",
+                &like_contains
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM libraries WHERE name LIKE $1",
+                &like
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_like(
+                &pool,
+                "SELECT count(*) FROM accounts WHERE plex_account_id LIKE $1",
+                &like
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_by_id(
+                &pool,
+                "SELECT count(*) FROM watch_stats WHERE account_id = $1",
+                loaded.account.id
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_by_id(
+                &pool,
+                "SELECT count(*) FROM taste_signals WHERE account_id = $1",
+                loaded.account.id
+            )
+            .await,
+            0,
+            "cleanup must leave no taste_signals rows"
+        );
     }
 
     #[test]

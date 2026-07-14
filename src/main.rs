@@ -29,6 +29,7 @@ mod prowlarr;
 mod radar;
 mod recall;
 pub mod repo;
+mod shadow;
 mod snapshot;
 mod streaming;
 #[cfg(test)]
@@ -62,6 +63,17 @@ async fn main() -> anyhow::Result<()> {
     // bootstrap below runs.
     if std::env::args().nth(1).as_deref() == Some("snapshot-acquire") {
         return run_snapshot_acquire_cli().await;
+    }
+
+    // MUSET-08: the shadow-runner operator CLI. Gated behind an explicit
+    // subcommand argument -- `muse shadow-run` -- exactly like
+    // `snapshot-acquire` above: it NEVER runs as part of normal service
+    // startup, and it returns before any server bootstrap runs. It connects
+    // ONLY through the guarded snapshot path (`snapshot::load`) -- never
+    // `MUSE_DATABASE_URL` -- and never writes anything back (see
+    // `shadow::run`'s doc comment for the non-authoritative guarantee).
+    if std::env::args().nth(1).as_deref() == Some("shadow-run") {
+        return run_shadow_run_cli().await;
     }
 
     let config = Config::from_env();
@@ -157,6 +169,50 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("http server error: {e}"))?;
+
+    Ok(())
+}
+
+/// MUSET-08 operator CLI: `muse shadow-run`.
+///
+/// Runs the shadow-mode Tautulli-replacement analytics pass
+/// (`shadow::run`) against the guarded snapshot/test database
+/// (`MUSE_SNAPSHOT_DATABASE_URL`/`MUSE_TEST_DATABASE_URL`, same guard as
+/// every other snapshot entry point -- see `snapshot::load`). Prints a
+/// summary and exits; never invoked by normal service startup (see the gate
+/// in `main` above) and never invoked by the test suite (the shadow
+/// runner's own tests connect directly, same as `snapshot::db_gated`).
+///
+/// This subcommand is READ-ONLY end to end: it never writes anything back
+/// to `play_sessions`/`watch_stats`, and it never touches
+/// `MUSE_DATABASE_URL` (the live application database) at all -- shadow
+/// mode only ever computes-and-reports, it does not take over the live
+/// watch-data function.
+async fn run_shadow_run_cli() -> anyhow::Result<()> {
+    use crate::snapshot::load;
+
+    init_tracing("info");
+
+    let Some(pool) = load::connect_snapshot_db_from_env().await? else {
+        anyhow::bail!(
+            "neither {} nor {} is set -- shadow-run has no snapshot/test database to read from",
+            load::SNAPSHOT_DATABASE_URL_VAR,
+            load::TEST_DATABASE_URL_VAR,
+        );
+    };
+    load::migrate_snapshot_db(&pool).await?;
+
+    let result = shadow::run(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("shadow run failed: {e}"))?;
+
+    tracing::info!(
+        computed_at = %result.computed_at,
+        session_keys_considered = result.session_keys_considered,
+        sessions_folded = result.sessions_folded,
+        stats_produced = result.stats.len(),
+        "shadow run complete (non-authoritative -- nothing was written back)"
+    );
 
     Ok(())
 }

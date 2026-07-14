@@ -58,3 +58,23 @@ pub async fn list_recent(pool: &PgPool, limit: i64) -> MuseResult<Vec<PlayEvent>
         .await
         .map_err(MuseError::Database)
 }
+
+/// Every `play_events` row with a non-null `session_key`, ordered so that a
+/// caller can fold consecutive rows into per-session groups with one linear
+/// pass (`(session_key, received_at)` — the same ordering
+/// [`crate::tracker::reconstruct::fold_events`] re-sorts within a session
+/// anyway, but grouping-by-adjacent-rows is cheaper when the whole table is
+/// already in this order).
+///
+/// A read-only, unbounded listing — used by the MUSET-08 shadow runner
+/// (`crate::shadow`) to fold an entire snapshot's ingested play data in one
+/// pass; NOT used by the live webhook/poller path (which always folds one
+/// `session_key` at a time via [`list_for_session`]) or exposed over HTTP.
+pub async fn list_all_with_session_key(pool: &PgPool) -> MuseResult<Vec<PlayEvent>> {
+    sqlx::query_as::<_, PlayEvent>(
+        "SELECT * FROM play_events WHERE session_key IS NOT NULL ORDER BY session_key, received_at",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}

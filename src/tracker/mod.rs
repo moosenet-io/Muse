@@ -15,7 +15,11 @@
 //! reconstruction algorithm, not one per source.
 
 pub mod poller;
-mod reconstruct;
+// MUSET-08: widened from a bare `mod` to `pub(crate)` so the shadow runner
+// (`crate::shadow`) can reuse the real fold/resolve analytics
+// (`fold_events`, `resolve_rating_key`) instead of reimplementing them.
+// Still crate-private -- no new public API surface outside this crate.
+pub(crate) mod reconstruct;
 pub mod webhook;
 
 #[cfg(test)]

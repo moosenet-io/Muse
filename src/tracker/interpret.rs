@@ -21,9 +21,16 @@
 //! Jellyfin webhook plugin's `Playback*` `NotificationType` vocabulary — see
 //! `config.rs`'s `jellyfin_url`/`jellyfin_token`, the only other Jellyfin
 //! footprint in this crate today per MUSEX-09) maps its own event names
-//! into this ONE vocabulary at the boundary. Everything below normalization
-//! — [`SessionPattern`], [`interpret_play_state`] — only ever sees
-//! [`PlayStateEventKind`]/[`SignalKind`], never a Plex or Jellyfin string.
+//! into this ONE vocabulary at the boundary.
+//!
+//! The ingest entry point [`interpret_from_events`] normalizes EVERY incoming
+//! event through this boundary FIRST (see [`normalize_to_fold_vocab`]),
+//! dispatching on the event's `source`, so a Jellyfin `PlaybackStop` actually
+//! flows into a stopped session end-to-end — not just in an isolated name
+//! test. The shared, Plex-keyed fold ([`super::reconstruct::fold_events`],
+//! also used by MUSET-08's shadow runner) is left untouched: normalization
+//! re-expresses each kind as the Plex-vocabulary `event_type` the fold
+//! already understands ([`PlayStateEventKind::to_plex_event_type`]).
 //!
 //! ## READ-ONLY, always
 //!
@@ -88,6 +95,27 @@ impl PlayStateEventKind {
             "PlaybackStop" => Some(Self::Stop),
             "PlaybackProgress" => Some(Self::Seek),
             _ => None,
+        }
+    }
+
+    /// Map a normalized kind BACK to the Plex-vocabulary `event_type` string
+    /// that the shared fold ([`reconstruct::fold_events`]) and
+    /// [`longest_single_pause_ms`] key on. This is the boundary shim that
+    /// makes the ingest path server-agnostic end-to-end WITHOUT touching the
+    /// shared, Plex-keyed fold (which MUSET-08's shadow runner also depends
+    /// on): a Jellyfin `PlaybackStop` → [`Self::Stop`] → `"media.stop"` folds
+    /// into a stopped session exactly like a native Plex `media.stop`. A
+    /// `Seek`/progress tick maps to `"media.play"` — the fold treats it as a
+    /// "still playing" snapshot that advances the view offset, which is
+    /// exactly Plex's own model of a seek (Plex has no distinct seek event).
+    pub fn to_plex_event_type(self) -> &'static str {
+        match self {
+            Self::Start => "media.play",
+            Self::Resume => "media.resume",
+            Self::Pause => "media.pause",
+            Self::Seek => "media.play",
+            Self::Stop => "media.stop",
+            Self::Complete => "media.scrobble",
         }
     }
 }
@@ -249,18 +277,61 @@ pub fn longest_single_pause_ms(events: &[PlayEvent]) -> i64 {
     longest
 }
 
-/// Fold a session's raw events (reusing `reconstruct::fold_events` — the
-/// one real fold algorithm, not reinvented here) and interpret the result.
-/// `episode_streak` is caller-supplied (cross-session context this crate's
-/// caller — e.g. a future ingest hook — is expected to track). Returns
-/// `None` only when there's nothing to fold (`events` empty) or the session
-/// hasn't stopped yet.
+/// The SERVER-AGNOSTIC ingest boundary. Normalize a raw event stream into
+/// the shared Plex-vocabulary the fold keys on, dispatching each event on its
+/// `source` (Plex vs Jellyfin). This is what makes ingest server-agnostic
+/// *end to end* rather than only in the isolated name helpers: a Jellyfin
+/// `PlaybackStop` (source `jellyfin_webhook`) is normalized to
+/// [`PlayStateEventKind::Stop`] then re-expressed as `"media.stop"`, so the
+/// shared, Plex-keyed [`reconstruct::fold_events`]/[`longest_single_pause_ms`]
+/// fold it into a stopped session exactly like a native Plex event. Without
+/// this, those raw Jellyfin strings fall through the fold's Plex-string match
+/// and no stop/pause is ever detected.
+///
+/// Preserves native Plex behavior byte-for-byte: a recognized Plex event
+/// normalizes to its own identical `event_type` (identity rewrite), and an
+/// UNRECOGNIZED event (Plex or otherwise — e.g. `media.rate`, a future event
+/// type) is passed through UNCHANGED rather than dropped, so the fold's own
+/// `advance()`/`_ => {}` handling of it is identical to feeding the raw
+/// stream. `reconstruct::fold_events` is never modified.
+fn normalize_to_fold_vocab(events: &[PlayEvent]) -> Vec<PlayEvent> {
+    events
+        .iter()
+        .map(|ev| {
+            let kind = if ev.source.contains("jellyfin") {
+                PlayStateEventKind::from_jellyfin_notification_type(&ev.event_type)
+            } else {
+                PlayStateEventKind::from_plex_event_type(&ev.event_type)
+            };
+            match kind {
+                Some(k) => {
+                    let mut normalized = ev.clone();
+                    normalized.event_type = k.to_plex_event_type().to_string();
+                    normalized
+                }
+                // Unrecognized: pass through untouched so the shared fold's
+                // existing handling is unchanged (Plex behavior preserved).
+                None => ev.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Ingest a session's raw events (from EITHER server) and interpret the
+/// result. Normalizes the stream through the server-agnostic boundary
+/// ([`normalize_to_fold_vocab`]) FIRST, then reuses `reconstruct::fold_events`
+/// — the one real fold algorithm, not reinvented here — for the
+/// finished/percent/stopped judgment. `episode_streak` is caller-supplied
+/// (cross-session context this crate's caller — e.g. a future ingest hook —
+/// is expected to track). Returns `None` only when there's nothing to fold
+/// (`events` empty) or the session hasn't stopped yet.
 pub fn interpret_from_events(
     events: &[PlayEvent],
     episode_streak: u32,
 ) -> Option<InterpretedSignal> {
-    let fold = reconstruct::fold_events(events)?;
-    let pause_ms = longest_single_pause_ms(events);
+    let normalized = normalize_to_fold_vocab(events);
+    let fold = reconstruct::fold_events(&normalized)?;
+    let pause_ms = longest_single_pause_ms(&normalized);
     let pattern = SessionPattern::from_fold(&fold, pause_ms, episode_streak)?;
     Some(interpret_play_state(&pattern))
 }
@@ -633,6 +704,133 @@ mod tests {
             sig.kind,
             SignalKind::Fatigue,
             "82%@23:20 after 2 episodes via real fold_events output"
+        );
+    }
+
+    #[test]
+    fn jellyfin_stream_flows_end_to_end_and_matches_plex() {
+        // The fatigue case — 82% stop at 23:40 after 2 episodes — but
+        // delivered as JELLYFIN `PlaybackStart`/`PlaybackStop` events (source
+        // `jellyfin_webhook`), NOT Plex `media.*` strings. Proves the whole
+        // ingest -> interpret path is server-agnostic: without the
+        // normalization shim, the raw-Plex-keyed fold would ignore these and
+        // never produce a stopped session at all.
+        let t0 = t(23, 20);
+        let dur = serde_json::json!({ "duration": 100_000 });
+
+        let mut j_start = raw_event(1, t0, "PlaybackStart", "jellyfin_webhook", Some(0));
+        j_start.raw = dur.clone();
+        let mut j_stop = raw_event(
+            2,
+            t0 + chrono::Duration::minutes(20),
+            "PlaybackStop",
+            "jellyfin_webhook",
+            Some(82_000),
+        );
+        j_stop.raw = dur.clone();
+        let jellyfin = vec![j_start, j_stop];
+
+        let jelly_sig = interpret_from_events(&jellyfin, 2)
+            .expect("a JELLYFIN stop must produce a stopped, interpretable session end-to-end");
+        assert_eq!(
+            jelly_sig.kind,
+            SignalKind::Fatigue,
+            "82%@23:40 after 2 episodes over Jellyfin must read as fatigue"
+        );
+
+        // The identical pattern delivered as a PLEX stream must interpret the
+        // same way — server-agnostic, not Plex-only.
+        let mut p_start = raw_event(1, t0, "media.play", "plex_webhook", Some(0));
+        p_start.raw = dur.clone();
+        let mut p_stop = raw_event(
+            2,
+            t0 + chrono::Duration::minutes(20),
+            "media.stop",
+            "plex_webhook",
+            Some(82_000),
+        );
+        p_stop.raw = dur.clone();
+        let plex = vec![p_start, p_stop];
+
+        let plex_sig = interpret_from_events(&plex, 2).expect("plex stream should interpret");
+        assert_eq!(
+            jelly_sig.kind, plex_sig.kind,
+            "a Jellyfin and a Plex stream of the same pattern must interpret identically"
+        );
+        assert!(
+            (jelly_sig.confidence - plex_sig.confidence).abs() < 1e-6,
+            "identical patterns from different servers must also yield identical confidence"
+        );
+    }
+
+    #[test]
+    fn raw_jellyfin_stop_is_ignored_by_the_fold_but_flows_after_normalization() {
+        // Documents WHY the shim is load-bearing (this is exactly the gap the
+        // review caught): feeding the raw Jellyfin vocabulary straight to
+        // `fold_events` (as the pre-shim code did) yields NO stopped session,
+        // because the fold keys on Plex strings.
+        let t0 = t(23, 20);
+        let mut j_stop = raw_event(
+            2,
+            t0 + chrono::Duration::minutes(20),
+            "PlaybackStop",
+            "jellyfin_webhook",
+            Some(82_000),
+        );
+        j_stop.raw = serde_json::json!({ "duration": 100_000 });
+        let raw = vec![
+            raw_event(1, t0, "PlaybackStart", "jellyfin_webhook", Some(0)),
+            j_stop,
+        ];
+
+        let raw_fold = reconstruct::fold_events(&raw).expect("fold produces a struct");
+        assert!(
+            raw_fold.stopped_at.is_none(),
+            "raw Jellyfin PlaybackStop is not a Plex media.stop; the fold ignores it (the bug the shim fixes)"
+        );
+
+        // Through the normalization boundary it DOES fold into a stop.
+        let normalized = normalize_to_fold_vocab(&raw);
+        let norm_fold = reconstruct::fold_events(&normalized).expect("fold");
+        assert!(
+            norm_fold.stopped_at.is_some(),
+            "a normalized Jellyfin stop must fold into a stopped session"
+        );
+    }
+
+    #[test]
+    fn normalization_preserves_native_plex_fold_output_exactly() {
+        // A recognized Plex event normalizes to its own identical event_type,
+        // and an unrecognized one is passed through untouched — so folding the
+        // normalized Plex stream is byte-identical to folding the raw one
+        // (native Plex behavior preserved; reconstruct.rs untouched).
+        let t0 = t(21, 0);
+        let raw = vec![
+            {
+                let mut e = raw_event(1, t0, "media.play", "plex_webhook", Some(0));
+                e.raw = serde_json::json!({ "duration": 200_000 });
+                e
+            },
+            raw_event(
+                2,
+                t0 + chrono::Duration::seconds(30),
+                "media.rate",
+                "plex_webhook",
+                Some(30_000),
+            ),
+            raw_event(
+                3,
+                t0 + chrono::Duration::seconds(60),
+                "media.stop",
+                "plex_webhook",
+                Some(60_000),
+            ),
+        ];
+        let normalized = normalize_to_fold_vocab(&raw);
+        assert_eq!(
+            reconstruct::fold_events(&raw),
+            reconstruct::fold_events(&normalized),
+            "normalizing a Plex stream must not change the fold's output"
         );
     }
 

@@ -55,17 +55,21 @@ use crate::taste_review::trace::ReasoningTrace;
 const MAX_BECAUSE_SIGNALS: usize = 2;
 
 /// Build the concise "because…" narration line for one recommendation's
-/// reasoning trace. Deterministic (same trace in, same string out) and
-/// grounded ONLY in `trace.signals` — see the module doc for the exact
-/// grounding contract. A trace with no signals (e.g. a candidate whose
-/// source produced no facts) degrades to a neutral, still-truthful line
-/// that names no signal at all rather than fabricating one.
-pub fn because_line(trace: &ReasoningTrace) -> String {
+/// reasoning trace, or `None` when the trace carries no signals to ground
+/// one in. Deterministic (same trace in, same output out) and grounded
+/// ONLY in `trace.signals` — see the module doc for the exact grounding
+/// contract.
+///
+/// A trace with no signals yields `None`, NOT an invented line: the honest
+/// behavior is "no grounded reason → no because line." This function must
+/// never reference `trace.title`, a score, or any quality claim that isn't
+/// the verbatim `description` of a real [`crate::taste_review::trace::SignalContribution`];
+/// synthesizing a "still looks like a solid pick" style reason for a
+/// signal-less trace would be exactly the fabrication the grounding
+/// contract forbids, so the empty case is a `None`, full stop.
+pub fn because_line(trace: &ReasoningTrace) -> Option<String> {
     if trace.signals.is_empty() {
-        return format!(
-            "Because \"{}\" still looks like a solid pick right now.",
-            trace.title
-        );
+        return None;
     }
 
     let reasons: Vec<&str> = trace
@@ -75,7 +79,7 @@ pub fn because_line(trace: &ReasoningTrace) -> String {
         .map(|signal| signal.description.as_str())
         .collect();
 
-    format!("Because {}.", reasons.join(" and "))
+    Some(format!("Because {}.", reasons.join(" and ")))
 }
 
 #[cfg(test)]
@@ -113,8 +117,10 @@ mod tests {
         let because = because_line(&trace);
 
         assert_eq!(
-            because,
-            "Because it's a 92% match to your overall taste profile and you rate sci-fi highly."
+            because.as_deref(),
+            Some(
+                "Because it's a 92% match to your overall taste profile and you rate sci-fi highly."
+            )
         );
     }
 
@@ -145,7 +151,7 @@ mod tests {
             0.92,
         );
         let trace = build_reasoning_trace(&candidate, 0.5);
-        let because = because_line(&trace);
+        let because = because_line(&trace).expect("a trace with signals must yield a because line");
 
         assert!(because.contains("92% match"));
         assert!(because.contains("sci-fi"));
@@ -174,7 +180,7 @@ mod tests {
             0.92,
         );
         let trace = build_reasoning_trace(&candidate, 0.644);
-        let because = because_line(&trace);
+        let because = because_line(&trace).expect("a trace with signals must yield a because line");
 
         // Vocabulary drawn from signal categories genuinely absent from
         // this trace's `signals` (on-deck / gap / trending / availability
@@ -198,20 +204,25 @@ mod tests {
         }
     }
 
+    /// Anti-fabrication guard for the EMPTY case: a trace with no signals
+    /// has nothing real to ground a reason in, so `because_line` must
+    /// return `None` — never a synthesized "still looks like a solid pick"
+    /// line or anything referencing `trace.title`. "No grounded reason →
+    /// no because line" is the honest behavior; inventing a reason here
+    /// would be exactly the fabrication the grounding contract forbids.
     #[test]
-    fn because_line_degrades_neutrally_when_the_trace_has_no_signals() {
+    fn because_line_returns_none_and_never_fabricates_when_the_trace_has_no_signals() {
         let candidate = candidate_with(CandidateSource::Taste, vec![], 0.5);
         let trace = build_reasoning_trace(&candidate, 0.35);
-        let because = because_line(&trace);
 
+        // The trace genuinely carries no signals, and the title alone is
+        // not a grounded reason — so there is no because line at all.
+        assert!(trace.signals.is_empty());
         assert_eq!(
-            because,
-            "Because \"Arrival\" still looks like a solid pick right now."
+            because_line(&trace),
+            None,
+            "an empty-signal trace must yield NO because line, never an invented one"
         );
-        // No invented signal vocabulary when there are no real signals to
-        // ground one in.
-        assert!(!because.contains("match"));
-        assert!(!because.contains("through it"));
     }
 
     #[test]
@@ -222,7 +233,7 @@ mod tests {
             0.61,
         );
         let trace = build_reasoning_trace(&candidate, 0.55);
-        let because = because_line(&trace);
+        let because = because_line(&trace).expect("a trace with signals must yield a because line");
 
         assert_eq!(because, "Because you're 61% through it — pick it back up.");
         assert!(!because.contains("taste profile"));

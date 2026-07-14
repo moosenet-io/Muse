@@ -222,8 +222,12 @@ async fn score_and_explain(
         // never a second source of truth for "which signals drove this."
         let full_trace =
             (include_trace || include_because).then(|| build_reasoning_trace(&candidate, score));
+        // `because_line` itself returns `None` for a signal-less trace
+        // (no grounded reason → no line), so a `.and_then` here yields
+        // `None` both when the caller didn't opt in AND when there's
+        // nothing real to ground a "because…" in — never a fabricated one.
         let because = if include_because {
-            full_trace.as_ref().map(because_line)
+            full_trace.as_ref().and_then(because_line)
         } else {
             None
         };
@@ -549,7 +553,8 @@ mod tests {
         // no separate/divergent computation path.
         let c = candidate(CandidateSource::Taste, 0.92, None);
         let score = score_candidate(&c);
-        let expected = because_line(&build_reasoning_trace(&c, score));
+        let expected = because_line(&build_reasoning_trace(&c, score))
+            .expect("this candidate has real facts, so a because line exists");
 
         let ranked = rank_candidates(vec![c]);
         let items = score_and_explain(None, ranked, 10, false, true).await;

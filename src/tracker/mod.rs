@@ -9,11 +9,16 @@
 //! - [`reconstruct`] — (C) folds the raw `play_events` stream (written by
 //!   both A and B) into a single, idempotent, late-event-tolerant
 //!   `play_sessions` row per session_key.
+//! - [`interpret`] — (D) MUSEX-10: INTERPRETS a stopped session's pattern
+//!   (built on top of (C)'s fold) — disambiguating dislike vs fatigue vs
+//!   interruption vs delight — as the passive signal a future adaptation
+//!   loop (MUSEX-11) consumes. Read-only w.r.t. any live server.
 //!
 //! Both ingest paths funnel through the same `play_events` table and the
 //! same [`reconstruct::reconstruct_and_persist`] — there is exactly one
 //! reconstruction algorithm, not one per source.
 
+pub(crate) mod interpret;
 pub mod poller;
 // MUSET-08: widened from a bare `mod` to `pub(crate)` so the shadow runner
 // (`crate::shadow`) can reuse the real fold/resolve analytics

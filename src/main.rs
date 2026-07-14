@@ -11,9 +11,9 @@ mod config;
 pub mod curation;
 mod db;
 pub mod embed;
-pub mod enrichment;
 #[cfg(test)]
 mod endpoint_tests;
+pub mod enrichment;
 mod error;
 mod http;
 #[cfg(test)]
@@ -27,9 +27,10 @@ mod prowlarr;
 mod radar;
 mod recall;
 pub mod repo;
+mod snapshot;
 mod streaming;
-pub mod tautulli;
 pub mod taste_model;
+pub mod tautulli;
 mod tracker;
 mod trending;
 mod tuner;
@@ -45,6 +46,17 @@ use crate::http::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // MUSET-03: the snapshot-acquisition operator CLI. Gated behind an
+    // explicit subcommand argument -- `muse snapshot-acquire` -- so it can
+    // NEVER run as part of normal service startup (systemd/the container
+    // entrypoint invoke `muse` with no arguments). This is the only path in
+    // this binary that touches `snapshot::acquisition`'s process-spawning /
+    // live-source-reading code; it returns before any of the server
+    // bootstrap below runs.
+    if std::env::args().nth(1).as_deref() == Some("snapshot-acquire") {
+        return run_snapshot_acquire_cli().await;
+    }
+
     let config = Config::from_env();
 
     init_tracing(&config.log_level);
@@ -55,7 +67,10 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to construct database pool: {e}"))?;
 
     let plex_client = crate::plex::PlexClient::from_config(&config);
-    tracing::info!(plex_configured = plex_client.is_some(), "plex client initialized");
+    tracing::info!(
+        plex_configured = plex_client.is_some(),
+        "plex client initialized"
+    );
 
     let prowlarr_client = crate::prowlarr::ProwlarrClient::from_config(&config);
     tracing::info!(
@@ -84,14 +99,20 @@ async fn main() -> anyhow::Result<()> {
     // trending-ingest worker that calls `trending::snapshot_trending` on a
     // cadence is a follow-on wiring item — see `src/trending/mod.rs`.
     let tmdb_client = crate::trending::TmdbClient::from_config(&config);
-    tracing::info!(tmdb_configured = tmdb_client.is_some(), "tmdb client initialized");
+    tracing::info!(
+        tmdb_configured = tmdb_client.is_some(),
+        "tmdb client initialized"
+    );
 
     // MUSE-09: the query-embedding side of the MUSE-08 embed client. Reuses
     // the same `OllamaEmbedClient` type the embedder pipeline uses to embed
     // `media_item`s, just pointed at a caller's free-text query instead of
     // a title's composed source text.
     let embed_client = crate::embed::OllamaEmbedClient::from_config(&config);
-    tracing::info!(embed_configured = embed_client.is_some(), "embed client initialized");
+    tracing::info!(
+        embed_configured = embed_client.is_some(),
+        "embed client initialized"
+    );
 
     // MUSE-14: forum/critic sentiment + "does it get good" + renewal/
     // trailer news, cached into `external_enrichment`. Both sub-clients
@@ -129,6 +150,145 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("http server error: {e}"))?;
+
+    Ok(())
+}
+
+/// MUSET-03 operator CLI: `muse snapshot-acquire`.
+///
+/// Runs the out-of-band, read-only acquisition step (AC1) -- copies any
+/// configured SQLite sources, and/or runs `pg_dump` against a configured
+/// source Postgres -- entirely from env-sourced configuration
+/// (`snapshot::acquisition::AcquisitionConfig::from_env`). Never invoked by
+/// `muse`'s normal service startup (see the gate in `main` above) and never
+/// invoked by the test suite -- an operator runs this deliberately, out of
+/// band, exactly as AC1 requires.
+///
+/// If a snapshot/test database DSN is ALSO configured
+/// (`MUSE_SNAPSHOT_DATABASE_URL`/`MUSE_TEST_DATABASE_URL`), each successful
+/// acquisition records a provenance row (AC4) -- guard-checked (AC5) via the
+/// same `snapshot::load::connect_snapshot_db` path everything else in this
+/// pipeline uses. Without one configured, acquisition still runs and prints
+/// each artifact's checksum, but records no provenance (loading + normalizing
+/// into the isolated DB is a separate operator step, `snapshot::normalize`).
+async fn run_snapshot_acquire_cli() -> anyhow::Result<()> {
+    use crate::snapshot::{acquisition, load, provenance};
+
+    init_tracing("info");
+
+    let config = acquisition::AcquisitionConfig::from_env();
+    let snapshot_db = load::connect_snapshot_db_from_env().await?;
+    if let Some(pool) = &snapshot_db {
+        load::migrate_snapshot_db(pool).await?;
+    } else {
+        tracing::warn!(
+            "no {}/{} configured -- acquisition will run but no provenance will be recorded",
+            load::SNAPSHOT_DATABASE_URL_VAR,
+            load::TEST_DATABASE_URL_VAR,
+        );
+    }
+
+    let Some(output_dir) = config.output_dir.clone() else {
+        anyhow::bail!("MUSE_SNAPSHOT_OUTPUT_DIR is not set -- nowhere to write acquired artifacts");
+    };
+
+    let sqlite_sources: &[(
+        Option<std::path::PathBuf>,
+        provenance::SnapshotSourceKind,
+        &str,
+    )] = &[
+        (
+            config.plex_sqlite_path.clone(),
+            provenance::SnapshotSourceKind::PlexSqlite,
+            "plex-library.sqlite",
+        ),
+        (
+            config.tautulli_sqlite_path.clone(),
+            provenance::SnapshotSourceKind::TautulliSqlite,
+            "tautulli-history.sqlite",
+        ),
+        (
+            config.arr_sqlite_path.clone(),
+            provenance::SnapshotSourceKind::ArrSqlite,
+            "arr.sqlite",
+        ),
+    ];
+
+    let mut acquired = 0usize;
+    for (source_path, source_kind, dest_name) in sqlite_sources {
+        let Some(source_path) = source_path else {
+            continue;
+        };
+        let dest_path = output_dir.join(dest_name);
+        let copied = acquisition::copy_sqlite_snapshot(*source_kind, source_path, &dest_path)?;
+        let checksum = provenance::checksum_file(&copied.dest_path)?;
+        tracing::info!(
+            source = %source_kind,
+            dest = %copied.dest_path.display(),
+            bytes = copied.bytes_copied,
+            checksum = %checksum,
+            "acquired snapshot artifact"
+        );
+        if let Some(pool) = &snapshot_db {
+            provenance::record(
+                pool,
+                &provenance::NewSnapshotProvenance {
+                    source_identity: source_kind.as_str().to_string(),
+                    source_kind: *source_kind,
+                    snapshot_taken_at: chrono::Utc::now(),
+                    checksum_sha256: checksum,
+                    notes: Some(format!(
+                        "acquired via `muse snapshot-acquire` ({dest_name})"
+                    )),
+                },
+            )
+            .await?;
+        }
+        acquired += 1;
+    }
+
+    if let Some(source_url) = config.source_postgres_url.as_deref() {
+        // Lighter defensive check on the acquisition SOURCE DSN: reading a
+        // live source is by-design (that's what acquisition is), but a bare
+        // `muse`/prod-marked source is almost certainly a misconfiguration.
+        // This is NOT the load-path guard (that protects the isolated test
+        // DB the pipeline connects to); it's a nicety on the operator's
+        // source input.
+        snapshot::guard::validate_not_prod_source(source_url)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let dump_path = output_dir.join("muse-postgres.dump");
+        let pg_dump = acquisition::PgDumpCommand::new(&config, dump_path.clone())?;
+        let status = pg_dump.spawn()?;
+        if !status.success() {
+            anyhow::bail!("pg_dump exited with status: {status}");
+        }
+        let checksum = provenance::checksum_file(&dump_path)?;
+        tracing::info!(dest = %dump_path.display(), checksum = %checksum, "acquired muse-postgres pg_dump snapshot");
+        if let Some(pool) = &snapshot_db {
+            provenance::record(
+                pool,
+                &provenance::NewSnapshotProvenance {
+                    source_identity: provenance::SnapshotSourceKind::MusePostgres
+                        .as_str()
+                        .to_string(),
+                    source_kind: provenance::SnapshotSourceKind::MusePostgres,
+                    snapshot_taken_at: chrono::Utc::now(),
+                    checksum_sha256: checksum,
+                    notes: Some("acquired via `muse snapshot-acquire` (pg_dump)".to_string()),
+                },
+            )
+            .await?;
+        }
+        acquired += 1;
+    }
+
+    if acquired == 0 {
+        tracing::warn!(
+            "no snapshot sources were configured (MUSE_SNAPSHOT_PLEX_SQLITE_PATH / \
+             MUSE_SNAPSHOT_TAUTULLI_SQLITE_PATH / MUSE_SNAPSHOT_ARR_SQLITE_PATH / \
+             MUSE_SNAPSHOT_SOURCE_POSTGRES_URL) -- nothing to acquire"
+        );
+    }
 
     Ok(())
 }

@@ -209,6 +209,11 @@ empty until the three recompute write-paths are given a scheduled caller. See
 
 ## Testing
 
+See [`docs/TESTING.md`](docs/TESTING.md) for the *why*: the four gating phases, the
+snapshots-everywhere invariant and its DSN-guard enforcement, the TASTE two-layer model, and the
+shadow-parity retirement gate. This section stays the authoritative *how-to-run* reference (env
+vars, per-phase commands, CI) — the two are cross-referenced, not duplicated.
+
 The suite runs green with **no live database** — every DB-touching integration test is gated on
 `MUSE_TEST_DATABASE_URL` and skips cleanly (does not fail) when it's unset. Point it at a scratch
 Postgres 17 (`vector` + `pg_trgm`) database to actually exercise migrations and the repo layer:
@@ -334,8 +339,16 @@ export MUSE_TEST_DATABASE_URL=postgres://user:pass@localhost/muse_dev_test
 cargo test -- --test-threads=1
 ```
 
-Never point either var at a real/shared host — the guard rejects any non-loopback host outright,
-so this is enforced, not just a convention.
+Never point either var at a real/shared host. For the **snapshot-family** DB access (everything
+routed through `snapshot::load::connect_snapshot_db`, i.e. the snapshot/fixtures/taste/shadow/
+parity tests) this is code-enforced, not just a convention — `snapshot::guard::validate_snapshot_dsn`
+rejects any non-loopback host (and any db name lacking a `test`/`snapshot`/`scratch` marker)
+outright. The older `MUSE_TEST_DATABASE_URL`-direct paths (`endpoint_tests::db_gated`,
+`integration_tests.rs`, `http::ops`, channel tests) connect via `PgPoolOptions::connect` and are
+**not** routed through that guard, so for those the loopback-only rule is a documented convention;
+what structurally keeps them safe is that none of them ever configures a real upstream client. See
+[`docs/TESTING.md`](docs/TESTING.md#2-the-cardinal-invariant-snapshots-everywhere-never-a-live-read)
+for the full scope of what the guard does and does not enforce.
 
 ### CI (`.gitea/workflows/`, MUSET-10)
 

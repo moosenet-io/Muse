@@ -246,7 +246,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.sqlite");
         let dest = dir.join("nested").join("dest.sqlite");
-        std::fs::write(&source, b"fake sqlite bytes").unwrap();
+        // Derive the expected byte count from the fixture itself so the
+        // assertion can never drift out of sync with the content.
+        let content: &[u8] = b"fake sqlite bytes";
+        std::fs::write(&source, content).unwrap();
 
         // Make the source read-only on disk to prove the copy path never
         // needs write access to it.
@@ -255,8 +258,8 @@ mod tests {
         std::fs::set_permissions(&source, perms).unwrap();
 
         let result = copy_sqlite_snapshot(SnapshotSourceKind::PlexSqlite, &source, &dest).unwrap();
-        assert_eq!(result.bytes_copied, 18);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"fake sqlite bytes");
+        assert_eq!(result.bytes_copied, content.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
 
         // Restore write perms so the temp dir can be cleaned up.
         let mut perms = std::fs::metadata(&source).unwrap().permissions();

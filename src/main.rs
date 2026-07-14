@@ -5,6 +5,7 @@
 //! harness. No domain logic lives here yet — see the founding spec
 //! `specs/S96-muse-foundation.md`.
 
+pub mod adaptation;
 pub mod arr;
 pub mod channels;
 mod config;

@@ -320,13 +320,18 @@ cargo test shadow::
 cargo test parity::
 ```
 
-To exercise the DB-gated cases in any of them, point `MUSE_TEST_DATABASE_URL` (or
-`MUSE_SNAPSHOT_DATABASE_URL`) at a **local scratch** Postgres 17 with `vector` + `pg_trgm`
-available, whose database name carries an explicit `test`/`snapshot`/`scratch` marker (per the
-MUSET-03 guard above) — e.g.:
+To exercise the DB-gated cases in any of them, point a **local scratch** Postgres 17 with
+`vector` + `pg_trgm` available, whose database name carries an explicit
+`test`/`snapshot`/`scratch` marker (per the MUSET-03 guard above). Set **both** env vars to the
+same DSN: the snapshot-family tests prefer `MUSE_SNAPSHOT_DATABASE_URL` (falling back to
+`MUSE_TEST_DATABASE_URL`), while `endpoint_tests.rs`'s `db_gated` module, `integration_tests.rs`,
+and `http::ops` read `MUSE_TEST_DATABASE_URL` directly — so exporting both is what exercises
+*every* DB-gated test in one pass rather than only the subset keyed off one var:
 
 ```
-MUSE_TEST_DATABASE_URL=postgres://user:pass@localhost/muse_dev_test cargo test -- --test-threads=1
+export MUSE_SNAPSHOT_DATABASE_URL=postgres://user:pass@localhost/muse_dev_test
+export MUSE_TEST_DATABASE_URL=postgres://user:pass@localhost/muse_dev_test
+cargo test -- --test-threads=1
 ```
 
 Never point either var at a real/shared host — the guard rejects any non-loopback host outright,

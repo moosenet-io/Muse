@@ -308,6 +308,56 @@ pub struct Config {
     /// a request is classified into, never whether `crate::arr` itself
     /// gains a live write call.
     pub arr_request_auto_tier_enabled: bool,
+
+    // --- MUSEX-15 (Plane TERM #391): premiere events + engagement tiers ---
+    /// How often (seconds) a premiere-announce sweep is intended to run
+    /// (`MUSE_PREMIERE_ANNOUNCE_CADENCE_SECS`) — GUI-tunable per the AC,
+    /// same "not yet wired to a scheduled worker" posture
+    /// `Config::promotion_cadence_secs` documents for itself: MUSEX-15 ships
+    /// `premiere::schedule`/`premiere::discussion`/`premiere::engagement`
+    /// and this tunable, but a periodic driver is a separate, follow-up
+    /// item. Defaults to a week (604800s) — premieres are inherently
+    /// low-frequency events.
+    pub premiere_announce_cadence_secs: u64,
+    /// Weight `[0.0, 1.0]` `premiere::engagement::compute_tier` gives a
+    /// friend's own watch-through rate in the composite engagement score
+    /// (`MUSE_PREMIERE_ENGAGEMENT_WATCH_THROUGH_WEIGHT`). Defaults to 0.5 —
+    /// an even split with `premiere_engagement_household_love_weight`, a
+    /// deliberately unopinionated starting point (no production corpus has
+    /// tuned these yet, same caveat `promotion_match_threshold`'s own doc
+    /// makes for its default).
+    pub premiere_engagement_watch_through_weight: f64,
+    /// Weight `[0.0, 1.0]` `premiere::engagement::compute_tier` gives the
+    /// household-loved rate in the composite engagement score
+    /// (`MUSE_PREMIERE_ENGAGEMENT_HOUSEHOLD_LOVE_WEIGHT`). Defaults to 0.5.
+    pub premiere_engagement_household_love_weight: f64,
+    /// Composite engagement score `[0.0, 1.0]` at/above which a friend earns
+    /// [`crate::premiere::engagement::EngagementTier::Trusted`]
+    /// (`MUSE_PREMIERE_ENGAGEMENT_TRUSTED_THRESHOLD`). Defaults to 0.4.
+    pub premiere_engagement_trusted_threshold: f64,
+    /// Composite engagement score `[0.0, 1.0]` at/above which a friend earns
+    /// [`crate::premiere::engagement::EngagementTier::Curator`]
+    /// (`MUSE_PREMIERE_ENGAGEMENT_CURATOR_THRESHOLD`). Defaults to 0.7.
+    pub premiere_engagement_curator_threshold: f64,
+    /// The `ratings.rating` value (0-10 scale, see
+    /// `migrations/0017_watch_stats_ratings_watchlist.sql`) at/above which a
+    /// household rating counts as "loved" for
+    /// [`crate::premiere::engagement::gather_engagement_counts`]
+    /// (`MUSE_PREMIERE_LOVED_RATING_THRESHOLD`). Defaults to 7.0.
+    pub premiere_loved_rating_threshold: f32,
+    /// Request budget (per tracking window) a
+    /// [`crate::premiere::engagement::EngagementTier::Starter`] friend earns
+    /// (`MUSE_PREMIERE_STARTER_BUDGET`). Defaults to 1 — a friend with no
+    /// track record yet gets minimal, not zero, headroom.
+    pub premiere_starter_budget: u32,
+    /// Request budget a
+    /// [`crate::premiere::engagement::EngagementTier::Trusted`] friend earns
+    /// (`MUSE_PREMIERE_TRUSTED_BUDGET`). Defaults to 3.
+    pub premiere_trusted_budget: u32,
+    /// Request budget a
+    /// [`crate::premiere::engagement::EngagementTier::Curator`] friend earns
+    /// (`MUSE_PREMIERE_CURATOR_BUDGET`). Defaults to 6.
+    pub premiere_curator_budget: u32,
 }
 
 impl Config {
@@ -394,6 +444,32 @@ impl Config {
             arr_request_auto_tier_enabled: env_opt("MUSE_ARR_REQUEST_AUTO_TIER_ENABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+
+            premiere_announce_cadence_secs: env_u64("MUSE_PREMIERE_ANNOUNCE_CADENCE_SECS", 604_800),
+            premiere_engagement_watch_through_weight: env_opt(
+                "MUSE_PREMIERE_ENGAGEMENT_WATCH_THROUGH_WEIGHT",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.5),
+            premiere_engagement_household_love_weight: env_opt(
+                "MUSE_PREMIERE_ENGAGEMENT_HOUSEHOLD_LOVE_WEIGHT",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.5),
+            premiere_engagement_trusted_threshold: env_opt(
+                "MUSE_PREMIERE_ENGAGEMENT_TRUSTED_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.4),
+            premiere_engagement_curator_threshold: env_opt(
+                "MUSE_PREMIERE_ENGAGEMENT_CURATOR_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.7),
+            premiere_loved_rating_threshold: env_f32("MUSE_PREMIERE_LOVED_RATING_THRESHOLD", 7.0),
+            premiere_starter_budget: env_u64("MUSE_PREMIERE_STARTER_BUDGET", 1) as u32,
+            premiere_trusted_budget: env_u64("MUSE_PREMIERE_TRUSTED_BUDGET", 3) as u32,
+            premiere_curator_budget: env_u64("MUSE_PREMIERE_CURATOR_BUDGET", 6) as u32,
         }
     }
 
@@ -471,6 +547,15 @@ impl Default for Config {
             promotion_match_threshold: 0.55,
             promotion_cadence_secs: 21_600,
             arr_request_auto_tier_enabled: false,
+            premiere_announce_cadence_secs: 604_800,
+            premiere_engagement_watch_through_weight: 0.5,
+            premiere_engagement_household_love_weight: 0.5,
+            premiere_engagement_trusted_threshold: 0.4,
+            premiere_engagement_curator_threshold: 0.7,
+            premiere_loved_rating_threshold: 7.0,
+            premiere_starter_budget: 1,
+            premiere_trusted_budget: 3,
+            premiere_curator_budget: 6,
         }
     }
 }
@@ -577,6 +662,15 @@ mod tests {
             "MUSE_PROMOTION_MATCH_THRESHOLD",
             "MUSE_PROMOTION_CADENCE_SECS",
             "MUSE_ARR_REQUEST_AUTO_TIER_ENABLED",
+            "MUSE_PREMIERE_ANNOUNCE_CADENCE_SECS",
+            "MUSE_PREMIERE_ENGAGEMENT_WATCH_THROUGH_WEIGHT",
+            "MUSE_PREMIERE_ENGAGEMENT_HOUSEHOLD_LOVE_WEIGHT",
+            "MUSE_PREMIERE_ENGAGEMENT_TRUSTED_THRESHOLD",
+            "MUSE_PREMIERE_ENGAGEMENT_CURATOR_THRESHOLD",
+            "MUSE_PREMIERE_LOVED_RATING_THRESHOLD",
+            "MUSE_PREMIERE_STARTER_BUDGET",
+            "MUSE_PREMIERE_TRUSTED_BUDGET",
+            "MUSE_PREMIERE_CURATOR_BUDGET",
         ] {
             std::env::remove_var(key);
         }
@@ -621,6 +715,55 @@ mod tests {
         assert!((cfg.promotion_match_threshold - 0.55).abs() < f64::EPSILON);
         assert_eq!(cfg.promotion_cadence_secs, 21_600);
         assert!(!cfg.arr_request_auto_tier_enabled);
+        assert_eq!(cfg.premiere_announce_cadence_secs, 604_800);
+        assert!((cfg.premiere_engagement_watch_through_weight - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.premiere_engagement_household_love_weight - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.premiere_engagement_trusted_threshold - 0.4).abs() < f64::EPSILON);
+        assert!((cfg.premiere_engagement_curator_threshold - 0.7).abs() < f64::EPSILON);
+        assert!((cfg.premiere_loved_rating_threshold - 7.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.premiere_starter_budget, 1);
+        assert_eq!(cfg.premiere_trusted_budget, 3);
+        assert_eq!(cfg.premiere_curator_budget, 6);
+    }
+
+    #[test]
+    #[serial]
+    fn musex15_premiere_config_reads_from_env_when_set() {
+        std::env::set_var("MUSE_PREMIERE_ANNOUNCE_CADENCE_SECS", "3600");
+        std::env::set_var("MUSE_PREMIERE_ENGAGEMENT_WATCH_THROUGH_WEIGHT", "0.6");
+        std::env::set_var("MUSE_PREMIERE_ENGAGEMENT_HOUSEHOLD_LOVE_WEIGHT", "0.4");
+        std::env::set_var("MUSE_PREMIERE_ENGAGEMENT_TRUSTED_THRESHOLD", "0.3");
+        std::env::set_var("MUSE_PREMIERE_ENGAGEMENT_CURATOR_THRESHOLD", "0.6");
+        std::env::set_var("MUSE_PREMIERE_LOVED_RATING_THRESHOLD", "8.5");
+        std::env::set_var("MUSE_PREMIERE_STARTER_BUDGET", "2");
+        std::env::set_var("MUSE_PREMIERE_TRUSTED_BUDGET", "5");
+        std::env::set_var("MUSE_PREMIERE_CURATOR_BUDGET", "9");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.premiere_announce_cadence_secs, 3600);
+        assert!((cfg.premiere_engagement_watch_through_weight - 0.6).abs() < f64::EPSILON);
+        assert!((cfg.premiere_engagement_household_love_weight - 0.4).abs() < f64::EPSILON);
+        assert!((cfg.premiere_engagement_trusted_threshold - 0.3).abs() < f64::EPSILON);
+        assert!((cfg.premiere_engagement_curator_threshold - 0.6).abs() < f64::EPSILON);
+        assert!((cfg.premiere_loved_rating_threshold - 8.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.premiere_starter_budget, 2);
+        assert_eq!(cfg.premiere_trusted_budget, 5);
+        assert_eq!(cfg.premiere_curator_budget, 9);
+
+        for key in [
+            "MUSE_PREMIERE_ANNOUNCE_CADENCE_SECS",
+            "MUSE_PREMIERE_ENGAGEMENT_WATCH_THROUGH_WEIGHT",
+            "MUSE_PREMIERE_ENGAGEMENT_HOUSEHOLD_LOVE_WEIGHT",
+            "MUSE_PREMIERE_ENGAGEMENT_TRUSTED_THRESHOLD",
+            "MUSE_PREMIERE_ENGAGEMENT_CURATOR_THRESHOLD",
+            "MUSE_PREMIERE_LOVED_RATING_THRESHOLD",
+            "MUSE_PREMIERE_STARTER_BUDGET",
+            "MUSE_PREMIERE_TRUSTED_BUDGET",
+            "MUSE_PREMIERE_CURATOR_BUDGET",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]

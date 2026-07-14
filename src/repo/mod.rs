@@ -20,6 +20,7 @@ pub mod media_metadata;
 pub mod persona;
 pub mod play_event;
 pub mod play_session;
+pub mod premiere_discussion;
 pub mod proactive_item;
 pub mod quality;
 pub mod release;

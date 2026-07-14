@@ -33,6 +33,7 @@ pub mod persona;
 mod persona_mechanics_tests;
 mod plex;
 mod plex_control;
+pub mod premiere;
 pub mod proactive;
 pub mod promotion;
 mod prowlarr;

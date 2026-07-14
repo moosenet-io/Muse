@@ -14,10 +14,11 @@
 //!
 //! ## The four pieces (mirrors the seam pattern established by
 //! `crate::cultural::source::TrendSource` / `crate::watch_together::sync::ServerSyncPrimitive`)
-//! - [`identity`] — the per-Discord-user record: an explicit, DEFAULT-FALSE
-//!   `taste_opt_in` flag and an optional linked Muse account, plus the
-//!   [`identity::TrustedFriends`] allowlist that scopes who is served at
-//!   all.
+//! - [`identity`] — the per-Discord-user record: PRIVATE, DEFAULT-FALSE
+//!   consent (`taste_opt_in` + the linked Muse account, granted only,
+//!   atomically, via `FriendIdentity::opt_in` and read via
+//!   `is_opted_in`/`linked_account`), plus the [`identity::TrustedFriends`]
+//!   allowlist that scopes who is served at all.
 //! - [`client`] — the [`client::DiscordClient`] trait: a real,
 //!   `DISCORD_BOT_TOKEN`-config-gated implementation (inert when
 //!   unconfigured — Muse has no live Discord integration yet, so this is a

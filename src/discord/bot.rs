@@ -78,10 +78,10 @@ pub fn decide_response_mode(friend: Option<&FriendIdentity>) -> ResponseMode {
     let Some(friend) = friend else {
         return ResponseMode::NotServed;
     };
-    if !friend.taste_opt_in {
+    if !friend.is_opted_in() {
         return ResponseMode::Generic;
     }
-    match friend.muse_account_id {
+    match friend.linked_account() {
         Some(muse_account_id) => ResponseMode::TasteAware { muse_account_id },
         // Opted in but not yet linked to an account: there is genuinely no
         // taste to draw on, so this degrades to Generic rather than
@@ -238,16 +238,14 @@ mod tests {
 
     #[test]
     fn opted_in_but_unlinked_account_is_still_generic() {
-        // Can't be constructed via the public API (opt_in always sets the
-        // account together with the flag) -- but decide_response_mode must
-        // still degrade safely if that combination is ever reached by a
-        // future refactor, so this constructs it via struct-update to
-        // pin the defensive behavior.
-        let friend = FriendIdentity {
-            taste_opt_in: true,
-            muse_account_id: None,
-            ..FriendIdentity::new("discord-1", "Alex")
-        };
+        // Can't be constructed via the production API (opt_in always sets
+        // the account together with the flag, and the consent fields are
+        // private) -- but decide_response_mode must still degrade safely if
+        // that combination is ever reached by a future refactor. The
+        // test-only `from_parts_for_test` constructor is the sole way to
+        // build this impossible-in-production state, precisely because
+        // production code has no path to it.
+        let friend = FriendIdentity::from_parts_for_test("discord-1", "Alex", true, None);
         assert_eq!(decide_response_mode(Some(&friend)), ResponseMode::Generic);
     }
 
@@ -546,16 +544,20 @@ mod db_gated {
         let (account_id, seeded_title) = seed_on_deck_account(&pool).await;
 
         // Allowlisted (so this isn't just NotServed) but the account link
-        // exists ONLY via a direct struct construction to simulate "we
+        // exists ONLY via the test-only constructor to simulate "we
         // technically know the account" WITHOUT ever calling opt_in() --
-        // taste_opt_in stays at its default false. This is the strictest
-        // version of the negative test: even a friend record that knows
-        // the account id must not leak it without the explicit opt-in.
-        let friend = FriendIdentity {
-            muse_account_id: Some(account_id),
-            ..FriendIdentity::new("discord-not-opted-in", "Sam")
-        };
-        assert!(!friend.taste_opt_in, "sanity: default is not opted in");
+        // taste_opt_in stays false. This is the strictest version of the
+        // negative test: even a friend record that knows the account id must
+        // not leak it without the explicit opt-in. Note production code
+        // cannot even build this state (the consent fields are private and
+        // opt_in() sets both together) -- only from_parts_for_test can.
+        let friend = FriendIdentity::from_parts_for_test(
+            "discord-not-opted-in",
+            "Sam",
+            false,
+            Some(account_id),
+        );
+        assert!(!friend.is_opted_in(), "sanity: default is not opted in");
         let friends = TrustedFriends::from_friends([friend]);
 
         let reply = respond(&friends, "discord-not-opted-in", &pool, None, None)

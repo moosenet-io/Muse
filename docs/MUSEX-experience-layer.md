@@ -26,9 +26,9 @@ with a real, shipped implementation:
 
 | Layer | Module | Entry point | What it does |
 |---|---|---|---|
-| **Signal capture** | `src/taste_model/signals.rs` | `recency_weight` | Turns watch/rating/watchlist facts into `taste_signals` rows with fixed base weights (finish `+1.0`, rewatch `+2.5`, abandon `-1.5`, rating scaled around midpoint, watchlist add `+0.3`). Stored **undecayed**; exponential half-life decay (default 180 days) is applied at read time, never baked into storage. |
+| **Signal capture** | `src/taste_model/signals.rs` | `recency_weight`, `rating_weight` | Turns watch/rating/watchlist facts into `taste_signals` rows with fixed base weights defined as named consts in `signals.rs` (`WEIGHT_FINISH`, `WEIGHT_REWATCH_PER`, `WEIGHT_ABANDON`, `RATING_MIDPOINT` + `RATING_WEIGHT_SCALE` for the rating-around-midpoint scaling via `rating_weight`, `WEIGHT_WATCHLIST_ADD`, `WEIGHT_WATCHLIST_FULFILLED_BONUS`) — cite those consts rather than copying the numbers, which can drift. Stored **undecayed**; exponential half-life decay (`DEFAULT_HALF_LIFE_DAYS`, ~6 months) is applied at read time via `recency_weight`, never baked into storage. |
 | **Profile aggregation** | `src/taste_model/profile.rs` | `aggregate_weighted`, called from `src/taste_model/recompute.rs::recompute_taste` | Recency-weighted sums folded into `taste_profile`'s `genre_affinity`/`person_affinity`/`keyword_affinity` (decade affinity is nested under `keyword_affinity.decades` — a documented schema divergence, see the module doc comment) plus `overall_centroid` (embedding mean of finished titles) and `taste_context_centroids` (weekend/weekday × time-of-day embedding buckets). Strictly per-`account_id` — taste is **never blended across accounts** (this is stated three times in the source: `taste_model/mod.rs`, `profile.rs`, and the MUSE-03 schema comment — treat it as a hard invariant any persona/blending work must respect explicitly, not silently break). |
-| **Curation / recommend** | `src/curation/candidates.rs` + `src/curation/recommend.rs` | `recommend_handler`, `on_deck_handler`, `gaps_handler` (mounted via `src/curation/mod.rs`) | Four candidate sources (`CandidateSource::OnDeck`/`Gap`/`Taste`/`AvailableNow`) merged and de-duped, then `score_candidate` blends a fixed source-tier weight (on-deck `1.0` > gap `0.85` > taste `0.7` > not-in-library `0.6`, see `recommend.rs::source_weight`) with the candidate's own `taste_fit` and an availability bonus/penalty (`AVAILABILITY_GRABBABLE_BONUS` / penalty consts in the same file). Rationale generation (`build_rationale`) **always** starts from a deterministic `template_rationale` built only from `Candidate::facts`, then optionally asks Chord's LLM to rephrase — never invents beyond the facts, and any Chord failure degrades to the template, never to a hard error. |
+| **Curation / recommend** | `src/curation/candidates.rs` + `src/curation/recommend.rs` | `recommend_handler`, `on_deck_handler`, `gaps_handler` (mounted via `src/curation/mod.rs`) | Four candidate sources (`CandidateSource::OnDeck`/`Gap`/`Taste`/`AvailableNow`) merged and de-duped, then `score_candidate` blends a fixed per-source tier weight from `recommend.rs::source_weight` (ordering, highest first: `OnDeck` > `Gap` > `Taste` > `AvailableNow` — read the exact factors in that function rather than trusting a copied number here, they can drift) with the candidate's own `taste_fit` and an availability adjustment (`AVAILABILITY_GRABBABLE_BONUS` added for a grabbable not-in-library pick, `AVAILABILITY_UNAVAILABLE_PENALTY` subtracted for one checked-and-unavailable — both consts in the same file). Rationale generation (`build_rationale`) **always** starts from a deterministic `template_rationale` built only from `Candidate::facts`, then optionally asks Chord's LLM to rephrase — never invents beyond the facts, and any Chord failure degrades to the template, never to a hard error. |
 
 Supporting the brain: `src/taste_model/chord_client.rs` (`ChordClient`, `DEFAULT_MODEL`) is the
 one LLM call surface for `model_notes` generation, reused by `curation::recommend`'s rationale
@@ -100,10 +100,17 @@ Grep across `src/` for `plex`/`jellyfin`/`media server`/`adapter`/`MediaServer` 
   - `src/plex_control/` — `PlexControlClient` (in `client.rs`), a **write/control** client for the
     Plex Companion protocol (play/pause/stop/skip/timeline poll, player discovery, play-queue
     building). Explicitly documented as never mutating the Plex library (`plex_control/mod.rs:7`).
-  - Both are constructed independently from `Config` (`PlexClient::from_config`,
-    `PlexControlClient::from_config`), both degrade gracefully when `PLEX_URL`/`PLEX_TOKEN` are
-    unset, and neither implements a trait shared with the other or with anything hypothetical for
-    another server.
+  - Both are constructed independently from `Config`, but with **different missing-config
+    postures** (verified in source — this matters for the adapter contract in §2.2):
+    `PlexClient::from_config` returns `Option<Self>` and degrades to `None` when
+    `PLEX_URL`/`PLEX_TOKEN` are unset (read path is optional-by-default), whereas
+    `PlexControlClient::from_config` returns `MuseResult<Self>` and **errors**
+    (`MuseError::Config("PLEX_URL is not set")` / `"PLEX_TOKEN is not set"`) on missing config —
+    there is no call site wrapping it in a graceful-degrade path. So the control/playback seam is
+    **not** optional-by-default the way the read seam is; a `MediaServerClient`+`CastController`
+    adapter must decide deliberately how to treat an unconfigured control path (see §2.2), not
+    assume it silently no-ops. Neither client implements a trait shared with the other or with
+    anything hypothetical for another server.
 - **One seam already exists, and it's the right shape to build on:** `src/plex_control/cast.rs`
   defines `pub trait CastController: Send + Sync` — an async trait with `play_media`, `play`,
   `pause`, `stop`, `skip_next`, `poll_timeline` — implemented today only by `PlexControlClient`.

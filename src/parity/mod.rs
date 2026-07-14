@@ -183,14 +183,44 @@ pub fn aggregate_tautulli_stats(events: &[PlayEvent]) -> Vec<TautulliWatchStat> 
         .collect()
 }
 
-/// One itemized field-level mismatch between the Muse side and the
-/// Tautulli side for a single `(account_ref, rating_key)` entity — the
-/// AC's "divergences ITEMIZED (so they're fixable before retirement)"
-/// requirement. Every field carries both raw values plus the computed
-/// delta so a reader doesn't have to recompute anything to see how far
-/// apart the two sides landed.
+/// What KIND of divergence a [`Divergence`] records. Two categories, both
+/// blocking for retirement:
+///
+/// - **`FieldValue`**: both sides have this entity, but a field's value
+///   differs beyond tolerance — a *correctness* gap on shared data.
+/// - **Coverage gaps**: the two sides don't even agree on *which entities
+///   exist*. This is the false-ready blind spot a naive intersection-only
+///   diff misses: Muse could compute a handful of Tautulli's entities
+///   perfectly (100% field parity on the overlap) while silently missing
+///   the vast majority. For a *retirement*-readiness report that is
+///   dangerous, so an entity present on only one side is itself a
+///   first-class divergence:
+///   - **`CoverageMissingOnMuse`**: Tautulli has this entity, Muse computed
+///     nothing for it — Muse would *lose* watch-data if Tautulli were
+///     retired now.
+///   - **`CoverageMissingOnTautulli`**: Muse computed an entity Tautulli
+///     never had — a spurious/extra aggregate that also signals the two
+///     sides disagree on the entity set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum DivergenceKind {
+    FieldValue,
+    CoverageMissingOnMuse,
+    CoverageMissingOnTautulli,
+}
+
+/// One itemized mismatch between the Muse side and the Tautulli side for a
+/// single `(account_ref, rating_key)` entity — the AC's "divergences
+/// ITEMIZED (so they're fixable before retirement)" requirement. Covers
+/// both per-field value drift (`kind = FieldValue`, `field` naming the
+/// diverging field) and entity-set coverage gaps (`kind =
+/// CoverageMissingOn*`, `field = "coverage"`, with `muse_value` or
+/// `tautulli_value` set to `"absent"` for the side that has no counterpart).
+/// Every field carries both raw values plus a delta/description so a reader
+/// doesn't have to recompute anything to see how far apart the two sides
+/// landed.
 #[derive(Debug, Clone, Serialize)]
 pub struct Divergence {
+    pub kind: DivergenceKind,
     pub account_ref: Option<String>,
     pub rating_key: Option<String>,
     pub field: &'static str,
@@ -247,19 +277,38 @@ impl ParityMetrics {
 pub enum ReadinessAssessment {
     /// Parity data suggests Tautulli could reasonably be retired for this
     /// function. Still just a recommendation.
-    RecommendReady { overall_parity_pct: f64 },
-    /// Parity data shows divergences that should be fixed first.
+    RecommendReady {
+        overall_parity_pct: f64,
+        coverage_pct: f64,
+    },
+    /// Parity data shows divergences (field-value and/or coverage) that
+    /// should be fixed first.
     RecommendNotReady {
         overall_parity_pct: f64,
+        coverage_pct: f64,
         blocking_divergence_count: usize,
     },
 }
 
-/// Overall parity threshold used only to color the *recommendation* text —
-/// it has no effect on any system state and authorizes nothing. Chosen high
-/// (99%) because "sustained parity ... over a window" (per the AC) is meant
-/// to be a strong signal, not a bare majority.
+/// Overall (field-value) parity threshold used only to color the
+/// *recommendation* text — it has no effect on any system state and
+/// authorizes nothing. Chosen high (99%) because "sustained parity ... over
+/// a window" (per the AC) is meant to be a strong signal, not a bare
+/// majority. NOTE: this only governs the *overlap* — see
+/// [`COVERAGE_COMPLETE_THRESHOLD_PCT`] for the entity-set gate that closes
+/// the false-ready blind spot.
 const RECOMMEND_READY_PARITY_THRESHOLD_PCT: f64 = 99.0;
+
+/// Entity-set coverage threshold. A retirement-readiness recommendation
+/// requires FULL coverage (100%): every entity Tautulli has must also exist
+/// on the Muse side, and vice-versa. This is deliberately stricter than the
+/// field-parity threshold and carries NO tolerance band — matching 3 of
+/// Tautulli's 1000 watch-stats perfectly is not "ready to retire," it is a
+/// 0.3%-coverage report, and retiring Tautulli against it would silently
+/// drop 997 entities' worth of watch data. If a justified coverage tolerance
+/// is ever wanted (e.g. to ignore a known-unmappable long tail), it must be
+/// introduced here explicitly and defended in review — never assumed.
+const COVERAGE_COMPLETE_THRESHOLD_PCT: f64 = 100.0;
 
 /// The retirement-readiness evidence report: parity %, itemized
 /// divergences, and the window/vintage the comparison ran over. This type
@@ -282,6 +331,19 @@ pub struct RetirementReadinessReport {
     pub muse_side_entities: usize,
     pub tautulli_side_entities: usize,
     pub entities_present_on_both_sides: usize,
+    /// Entities Muse computed that Tautulli never had (spurious/extra) —
+    /// each also itemized as a `CoverageMissingOnTautulli` divergence.
+    pub muse_only_entities: usize,
+    /// Entities Tautulli has that Muse computed nothing for (a Tautulli
+    /// function Muse does not yet replicate) — each also itemized as a
+    /// `CoverageMissingOnMuse` divergence. This is the count that makes a
+    /// "100% parity on the overlap" report honest.
+    pub tautulli_only_entities: usize,
+    /// Fraction of the entity UNION present on both sides, as a percentage:
+    /// `100 * both / (both + muse_only + tautulli_only)`. 100.0 means the
+    /// two sides agree on exactly which entities exist; anything less means
+    /// there are coverage gaps regardless of how well the overlap matches.
+    pub coverage_pct: f64,
     pub metrics: Vec<ParityMetrics>,
     pub divergences: Vec<Divergence>,
     pub overall_parity_pct: f64,
@@ -296,18 +358,26 @@ impl RetirementReadinessReport {
     /// than a recommendation.
     pub fn headline(&self) -> String {
         let recommendation = match &self.assessment {
-            ReadinessAssessment::RecommendReady { overall_parity_pct } => format!(
-                "parity {overall_parity_pct:.2}% over {} with {} itemized divergence(s) \
+            ReadinessAssessment::RecommendReady {
+                overall_parity_pct,
+                coverage_pct,
+            } => format!(
+                "overlap parity {overall_parity_pct:.2}% at {coverage_pct:.2}% entity coverage \
+                 over {} with {} itemized divergence(s) \
                  -- recommend ready to retire Tautulli for this function",
                 self.window_description,
                 self.divergences.len()
             ),
             ReadinessAssessment::RecommendNotReady {
                 overall_parity_pct,
+                coverage_pct,
                 blocking_divergence_count,
             } => format!(
-                "parity {overall_parity_pct:.2}% over {} with {} itemized divergence(s) \
+                "overlap parity {overall_parity_pct:.2}% at {coverage_pct:.2}% entity coverage \
+                 ({} muse-only, {} tautulli-only) over {} with {} itemized divergence(s) \
                  ({blocking_divergence_count} blocking) -- NOT ready to retire Tautulli for this function",
+                self.muse_only_entities,
+                self.tautulli_only_entities,
                 self.window_description,
                 self.divergences.len()
             ),
@@ -392,69 +462,136 @@ pub fn build_report(
 
     let mut divergences = Vec::new();
     let mut both_sides_count = 0usize;
+    let mut muse_only_entities = 0usize;
+    let mut tautulli_only_entities = 0usize;
 
-    for (key, muse_stat) in &muse_by_key {
-        let Some(tautulli_stat) = tautulli_by_key.get(key) else {
-            continue;
-        };
-        both_sides_count += 1;
+    // Iterate the UNION of keys, not just the intersection. An
+    // intersection-only walk would silently ignore every entity present on
+    // exactly one side -- the false-ready blind spot. `BTreeMap` keys are
+    // sorted, so a merge over the two key sets is both complete and
+    // deterministic.
+    let union_keys: std::collections::BTreeSet<&(Option<String>, Option<String>)> =
+        muse_by_key.keys().chain(tautulli_by_key.keys()).collect();
 
-        let play_count_match = approx_eq_i32(muse_stat.play_count, tautulli_stat.play_count);
-        play_count_metric.record(play_count_match);
-        if !play_count_match {
-            divergences.push(Divergence {
-                account_ref: key.0.clone(),
-                rating_key: key.1.clone(),
-                field: "play_count",
-                muse_value: muse_stat.play_count.to_string(),
-                tautulli_value: tautulli_stat.play_count.to_string(),
-                delta_description: (muse_stat.play_count - tautulli_stat.play_count).to_string(),
-            });
-        }
+    for key in union_keys {
+        match (muse_by_key.get(key), tautulli_by_key.get(key)) {
+            (Some(muse_stat), Some(tautulli_stat)) => {
+                both_sides_count += 1;
 
-        let finished_match = approx_eq_i32(muse_stat.finished_count, tautulli_stat.finished_count);
-        finished_count_metric.record(finished_match);
-        if !finished_match {
-            divergences.push(Divergence {
-                account_ref: key.0.clone(),
-                rating_key: key.1.clone(),
-                field: "finished_count",
-                muse_value: muse_stat.finished_count.to_string(),
-                tautulli_value: tautulli_stat.finished_count.to_string(),
-                delta_description: (muse_stat.finished_count - tautulli_stat.finished_count)
-                    .to_string(),
-            });
-        }
+                let play_count_match =
+                    approx_eq_i32(muse_stat.play_count, tautulli_stat.play_count);
+                play_count_metric.record(play_count_match);
+                if !play_count_match {
+                    divergences.push(Divergence {
+                        kind: DivergenceKind::FieldValue,
+                        account_ref: key.0.clone(),
+                        rating_key: key.1.clone(),
+                        field: "play_count",
+                        muse_value: muse_stat.play_count.to_string(),
+                        tautulli_value: tautulli_stat.play_count.to_string(),
+                        delta_description: (muse_stat.play_count - tautulli_stat.play_count)
+                            .to_string(),
+                    });
+                }
 
-        let watched_ms_match =
-            approx_eq_watched_ms(muse_stat.total_watched_ms, tautulli_stat.total_watched_ms);
-        watched_ms_metric.record(watched_ms_match);
-        if !watched_ms_match {
-            divergences.push(Divergence {
-                account_ref: key.0.clone(),
-                rating_key: key.1.clone(),
-                field: "total_watched_ms",
-                muse_value: muse_stat.total_watched_ms.to_string(),
-                tautulli_value: tautulli_stat.total_watched_ms.to_string(),
-                delta_description: (muse_stat.total_watched_ms - tautulli_stat.total_watched_ms)
-                    .to_string(),
-            });
-        }
+                let finished_match =
+                    approx_eq_i32(muse_stat.finished_count, tautulli_stat.finished_count);
+                finished_count_metric.record(finished_match);
+                if !finished_match {
+                    divergences.push(Divergence {
+                        kind: DivergenceKind::FieldValue,
+                        account_ref: key.0.clone(),
+                        rating_key: key.1.clone(),
+                        field: "finished_count",
+                        muse_value: muse_stat.finished_count.to_string(),
+                        tautulli_value: tautulli_stat.finished_count.to_string(),
+                        delta_description: (muse_stat.finished_count
+                            - tautulli_stat.finished_count)
+                            .to_string(),
+                    });
+                }
 
-        let percent_match = approx_eq_percent(muse_stat.avg_percent, tautulli_stat.avg_percent);
-        avg_percent_metric.record(percent_match);
-        if !percent_match {
-            divergences.push(Divergence {
-                account_ref: key.0.clone(),
-                rating_key: key.1.clone(),
-                field: "avg_percent",
-                muse_value: format!("{:?}", muse_stat.avg_percent),
-                tautulli_value: format!("{:?}", tautulli_stat.avg_percent),
-                delta_description: match (muse_stat.avg_percent, tautulli_stat.avg_percent) {
-                    (Some(m), Some(t)) => format!("{:.4}", m - t),
-                    _ => "not comparable (missing on one side)".to_string(),
-                },
-            });
+                let watched_ms_match = approx_eq_watched_ms(
+                    muse_stat.total_watched_ms,
+                    tautulli_stat.total_watched_ms,
+                );
+                watched_ms_metric.record(watched_ms_match);
+                if !watched_ms_match {
+                    divergences.push(Divergence {
+                        kind: DivergenceKind::FieldValue,
+                        account_ref: key.0.clone(),
+                        rating_key: key.1.clone(),
+                        field: "total_watched_ms",
+                        muse_value: muse_stat.total_watched_ms.to_string(),
+                        tautulli_value: tautulli_stat.total_watched_ms.to_string(),
+                        delta_description: (muse_stat.total_watched_ms
+                            - tautulli_stat.total_watched_ms)
+                            .to_string(),
+                    });
+                }
+
+                let percent_match =
+                    approx_eq_percent(muse_stat.avg_percent, tautulli_stat.avg_percent);
+                avg_percent_metric.record(percent_match);
+                if !percent_match {
+                    divergences.push(Divergence {
+                        kind: DivergenceKind::FieldValue,
+                        account_ref: key.0.clone(),
+                        rating_key: key.1.clone(),
+                        field: "avg_percent",
+                        muse_value: format!("{:?}", muse_stat.avg_percent),
+                        tautulli_value: format!("{:?}", tautulli_stat.avg_percent),
+                        delta_description: match (muse_stat.avg_percent, tautulli_stat.avg_percent)
+                        {
+                            (Some(m), Some(t)) => format!("{:.4}", m - t),
+                            _ => "not comparable (missing on one side)".to_string(),
+                        },
+                    });
+                }
+            }
+            // Tautulli has this entity, Muse computed nothing for it -- a
+            // coverage gap that would LOSE watch data if Tautulli were
+            // retired now. First-class blocking divergence.
+            (None, Some(tautulli_stat)) => {
+                tautulli_only_entities += 1;
+                divergences.push(Divergence {
+                    kind: DivergenceKind::CoverageMissingOnMuse,
+                    account_ref: key.0.clone(),
+                    rating_key: key.1.clone(),
+                    field: "coverage",
+                    muse_value: "absent".to_string(),
+                    tautulli_value: format!(
+                        "play_count={}, finished_count={}, total_watched_ms={}",
+                        tautulli_stat.play_count,
+                        tautulli_stat.finished_count,
+                        tautulli_stat.total_watched_ms
+                    ),
+                    delta_description:
+                        "entity present in Tautulli but MISSING from Muse's shadow output"
+                            .to_string(),
+                });
+            }
+            // Muse computed an entity Tautulli never had -- spurious/extra.
+            // Also a coverage disagreement, also blocking.
+            (Some(muse_stat), None) => {
+                muse_only_entities += 1;
+                divergences.push(Divergence {
+                    kind: DivergenceKind::CoverageMissingOnTautulli,
+                    account_ref: key.0.clone(),
+                    rating_key: key.1.clone(),
+                    field: "coverage",
+                    muse_value: format!(
+                        "play_count={}, finished_count={}, total_watched_ms={}",
+                        muse_stat.play_count, muse_stat.finished_count, muse_stat.total_watched_ms
+                    ),
+                    tautulli_value: "absent".to_string(),
+                    delta_description:
+                        "entity present in Muse's shadow output but MISSING from Tautulli"
+                            .to_string(),
+                });
+            }
+            // Impossible: a union key came from at least one of the two maps.
+            (None, None) => unreachable!("union key must exist on at least one side"),
         }
     }
 
@@ -480,14 +617,39 @@ pub fn build_report(
         metrics.iter().map(|m| m.agreement_pct).sum::<f64>() / metrics.len() as f64
     };
 
+    // Coverage = fraction of the entity UNION present on both sides. Full
+    // coverage (100%) means the two sides agree on which entities exist;
+    // anything less means the report is over an incomplete slice and cannot
+    // support retiring Tautulli no matter how well the overlap matches.
+    let union_size = both_sides_count + muse_only_entities + tautulli_only_entities;
+    let coverage_pct = if union_size > 0 {
+        100.0 * both_sides_count as f64 / union_size as f64
+    } else {
+        // No entities on either side is "no evidence," not "perfect
+        // coverage" -- reported as 0.0 so an empty report can never present
+        // as ready.
+        0.0
+    };
+
+    // Readiness now GATES on entity-set coverage in addition to overlap
+    // parity: RecommendReady requires (1) at least one comparable entity,
+    // (2) NO divergences of ANY kind -- which, because coverage gaps are
+    // themselves divergences, already implies full coverage, but we also
+    // (3) assert coverage_pct explicitly so the gate is legible and robust
+    // to future divergence-collection changes, and (4) high overlap parity.
     let assessment = if both_sides_count > 0
         && divergences.is_empty()
+        && coverage_pct >= COVERAGE_COMPLETE_THRESHOLD_PCT
         && overall_parity_pct >= RECOMMEND_READY_PARITY_THRESHOLD_PCT
     {
-        ReadinessAssessment::RecommendReady { overall_parity_pct }
+        ReadinessAssessment::RecommendReady {
+            overall_parity_pct,
+            coverage_pct,
+        }
     } else {
         ReadinessAssessment::RecommendNotReady {
             overall_parity_pct,
+            coverage_pct,
             blocking_divergence_count: divergences.len(),
         }
     };
@@ -498,6 +660,9 @@ pub fn build_report(
         muse_side_entities: muse_by_key.len(),
         tautulli_side_entities: tautulli_by_key.len(),
         entities_present_on_both_sides: both_sides_count,
+        muse_only_entities,
+        tautulli_only_entities,
+        coverage_pct,
         metrics,
         divergences,
         overall_parity_pct,
@@ -625,6 +790,9 @@ mod tests {
             report.divergences
         );
         assert_eq!(report.entities_present_on_both_sides, 1);
+        assert_eq!(report.muse_only_entities, 0);
+        assert_eq!(report.tautulli_only_entities, 0);
+        assert_eq!(report.coverage_pct, 100.0, "full entity coverage");
         assert_eq!(report.overall_parity_pct, 100.0);
         assert!(matches!(
             report.assessment,
@@ -662,7 +830,10 @@ mod tests {
     }
 
     #[test]
-    fn build_report_with_no_overlapping_entities_is_not_ready() {
+    fn build_report_with_no_overlapping_entities_itemizes_coverage_gaps_and_is_not_ready() {
+        // Two entities, one on each side, NO overlap. Previously this
+        // produced zero divergences (the intersection-only blind spot);
+        // now each one-sided entity is a first-class coverage divergence.
         let muse = ShadowResult {
             computed_at: Utc::now(),
             session_keys_considered: 0,
@@ -687,16 +858,112 @@ mod tests {
 
         let report = build_report(&muse, &tautulli, "unit test fixture, no overlap");
         assert_eq!(report.entities_present_on_both_sides, 0);
-        assert!(
-            report.divergences.is_empty(),
-            "nothing to diff when there's no overlap"
+        assert_eq!(report.muse_only_entities, 1);
+        assert_eq!(report.tautulli_only_entities, 1);
+        assert_eq!(report.coverage_pct, 0.0, "no entity is on both sides");
+        assert_eq!(
+            report.divergences.len(),
+            2,
+            "each one-sided entity must be itemized as a coverage divergence"
         );
+        assert!(report
+            .divergences
+            .iter()
+            .any(|d| d.kind == DivergenceKind::CoverageMissingOnMuse
+                && d.rating_key.as_deref() == Some("rk-only-on-tautulli")
+                && d.muse_value == "absent"));
+        assert!(report
+            .divergences
+            .iter()
+            .any(|d| d.kind == DivergenceKind::CoverageMissingOnTautulli
+                && d.rating_key.as_deref() == Some("rk-only-on-muse")
+                && d.tautulli_value == "absent"));
         assert!(
             matches!(
                 report.assessment,
                 ReadinessAssessment::RecommendNotReady { .. }
             ),
-            "an empty comparison must never present as ready"
+            "an empty/zero-coverage comparison must never present as ready"
+        );
+    }
+
+    #[test]
+    fn build_report_perfect_overlap_but_incomplete_coverage_is_not_ready() {
+        // THE false-ready blind spot, directly: Muse computes ONE of
+        // Tautulli's THREE entities, and matches that one perfectly. An
+        // intersection-only report would say 100% parity, zero divergences,
+        // "ready to retire" -- while silently missing 2 of 3 entities. The
+        // coverage gate must catch this.
+        let muse = ShadowResult {
+            computed_at: Utc::now(),
+            session_keys_considered: 1,
+            sessions_folded: 1,
+            stats: vec![shadow_stat("user-1", "rk-1", 3, 2, 300_000, Some(0.9))],
+        };
+        let tautulli = vec![
+            TautulliWatchStat {
+                account_ref: Some("user-1".to_string()),
+                rating_key: Some("rk-1".to_string()),
+                play_count: 3,
+                finished_count: 2,
+                total_watched_ms: 300_000,
+                avg_percent: Some(0.9),
+            },
+            TautulliWatchStat {
+                account_ref: Some("user-1".to_string()),
+                rating_key: Some("rk-2".to_string()),
+                play_count: 5,
+                finished_count: 5,
+                total_watched_ms: 500_000,
+                avg_percent: Some(0.95),
+            },
+            TautulliWatchStat {
+                account_ref: Some("user-2".to_string()),
+                rating_key: Some("rk-3".to_string()),
+                play_count: 1,
+                finished_count: 0,
+                total_watched_ms: 20_000,
+                avg_percent: Some(0.1),
+            },
+        ];
+
+        let report = build_report(&muse, &tautulli, "one-of-three coverage fixture");
+
+        // The overlap is PERFECT -- proves the not-ready verdict is driven
+        // by coverage, not by any field-value mismatch.
+        assert_eq!(
+            report.overall_parity_pct, 100.0,
+            "the single overlapping entity matches on every field"
+        );
+        assert_eq!(report.entities_present_on_both_sides, 1);
+        assert_eq!(
+            report.tautulli_only_entities, 2,
+            "rk-2 and rk-3 are missing on Muse"
+        );
+        assert_eq!(report.muse_only_entities, 0);
+        assert!(
+            (report.coverage_pct - (100.0 / 3.0)).abs() < 1e-9,
+            "1 of 3 union entities on both sides == ~33.3% coverage, got {}",
+            report.coverage_pct
+        );
+
+        // Both missing Tautulli entities are itemized so they're fixable.
+        let missing: Vec<_> = report
+            .divergences
+            .iter()
+            .filter(|d| d.kind == DivergenceKind::CoverageMissingOnMuse)
+            .map(|d| d.rating_key.as_deref())
+            .collect();
+        assert!(missing.contains(&Some("rk-2")));
+        assert!(missing.contains(&Some("rk-3")));
+
+        // And despite perfect overlap parity, the verdict is NOT ready.
+        assert!(
+            matches!(
+                report.assessment,
+                ReadinessAssessment::RecommendNotReady { .. }
+            ),
+            "perfect overlap parity at 33% coverage must NOT be ready to retire Tautulli"
         );
     }
 
@@ -751,13 +1018,16 @@ mod tests {
 
         let report = build_report(&muse, &tautulli, "perfect-parity fixture");
 
-        // Sanity: this really is a perfect-parity report, not an accidental
-        // pass -- otherwise the negative test below would be vacuous.
+        // Sanity: this really is a perfect-parity, FULL-coverage report,
+        // not an accidental pass -- otherwise the negative test below would
+        // be vacuous.
         assert!(report.divergences.is_empty());
         assert_eq!(report.overall_parity_pct, 100.0);
+        assert_eq!(report.coverage_pct, 100.0);
         assert!(matches!(
             report.assessment,
-            ReadinessAssessment::RecommendReady { overall_parity_pct } if overall_parity_pct == 100.0
+            ReadinessAssessment::RecommendReady { overall_parity_pct, coverage_pct }
+                if overall_parity_pct == 100.0 && coverage_pct == 100.0
         ));
 
         // The actual negative assertions:

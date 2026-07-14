@@ -597,7 +597,9 @@ mod tests {
 
     #[test]
     fn post_watch_reaction_none_is_always_valid_and_silent() {
-        assert_eq!(record_post_watch_reaction(None), None);
+        // `InterpretedSignal` (the shared MUSEX-10 type) deliberately has no
+        // `PartialEq`, so assert on the Option's emptiness, not `== None`.
+        assert!(record_post_watch_reaction(None).is_none());
     }
 
     #[test]

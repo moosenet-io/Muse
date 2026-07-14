@@ -1,0 +1,3 @@
+{
+  "error": "invalid ack outcome \"definitely_not_valid\": expected \"sent\" or \"dismissed\""
+}

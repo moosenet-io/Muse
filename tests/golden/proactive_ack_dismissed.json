@@ -1,0 +1,20 @@
+{
+  "item": {
+    "account_id": "<redacted>",
+    "body": {
+      "rationale": "golden fixture"
+    },
+    "created_at": "<redacted>",
+    "dedup_key": null,
+    "delivered_at": null,
+    "dismissed_at": "<redacted>",
+    "earliest_at": null,
+    "expires_at": null,
+    "headline": "MUSET-02 golden ack fixture",
+    "id": "<redacted>",
+    "kind": "muset02_golden_ack",
+    "media_item_id": null,
+    "priority": 1,
+    "status": "dismissed"
+  }
+}

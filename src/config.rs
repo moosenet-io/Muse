@@ -185,6 +185,39 @@ pub struct Config {
     /// endpoints, so an unbounded pass could turn into a request storm
     /// against a self-hosted instance.
     pub maintenance_enrichment_limit: i64,
+
+    // --- MUSET-07 (Plane TERM #372): adversarial reasoning review ---
+    /// Base URL of a configured adversarial reasoning-critique panel
+    /// endpoint (`MUSE_REASONING_PANEL_URL`). `None` (the default) keeps
+    /// [`crate::taste_review::panel::TerminusReasoningPanel`] uninstantiable
+    /// — the whole MUSET-07 feature is inert (no live calls, no startup
+    /// impact) unless this is explicitly set. Same graceful/opt-in posture
+    /// as `chord_url`/`searxng_url` above; never a literal (S1).
+    pub reasoning_panel_url: Option<String>,
+    /// Optional bearer credential for [`Config::reasoning_panel_url`],
+    /// materialized from <secret-manager> at runtime (S7) — never a literal.
+    pub reasoning_panel_api_key: Option<String>,
+    /// Model name the reasoning panel should use, when the configured
+    /// endpoint is model-selectable (`MUSE_REASONING_PANEL_MODEL`). A model
+    /// NAME, not an infra value — same posture as
+    /// `taste_model::chord_client::DEFAULT_MODEL`.
+    pub reasoning_panel_model: Option<String>,
+    /// Base URL of the sanctioned Terminus finding-filing surface MUSET-07
+    /// uses to file a taste-quality Plane issue on panel consensus
+    /// (`MUSE_TASTE_FINDING_SINK_URL`) — the ONE sanctioned Plane door (S9).
+    /// `None` (the default) keeps
+    /// [`crate::taste_review::sink::TerminusPlaneFindingSink`]
+    /// uninstantiable, same opt-in posture as every other integration here.
+    pub taste_finding_sink_url: Option<String>,
+    /// Optional bearer credential for [`Config::taste_finding_sink_url`],
+    /// materialized from <secret-manager> at runtime (S7) — never a literal.
+    pub taste_finding_sink_api_key: Option<String>,
+    /// Plane project identifier a filed taste-quality finding is tagged
+    /// with (`MUSE_TASTE_FINDING_PLANE_PROJECT`) — deliberately not a
+    /// hardcoded literal here (S1): which Plane project owns Muse
+    /// taste-quality findings is an operator/deploy decision, not something
+    /// this crate should guess at or bake in.
+    pub taste_finding_plane_project: Option<String>,
 }
 
 impl Config {
@@ -247,6 +280,13 @@ impl Config {
             trending_tick_secs: env_u64("MUSE_TRENDING_TICK_SECS", 86400),
             embed_batch_size: env_u64("MUSE_EMBED_BATCH_SIZE", 50) as usize,
             maintenance_enrichment_limit: env_i64("MUSE_MAINTENANCE_ENRICHMENT_LIMIT", 10),
+
+            reasoning_panel_url: env_opt("MUSE_REASONING_PANEL_URL"),
+            reasoning_panel_api_key: env_opt("MUSE_REASONING_PANEL_API_KEY"),
+            reasoning_panel_model: env_opt("MUSE_REASONING_PANEL_MODEL"),
+            taste_finding_sink_url: env_opt("MUSE_TASTE_FINDING_SINK_URL"),
+            taste_finding_sink_api_key: env_opt("MUSE_TASTE_FINDING_SINK_API_KEY"),
+            taste_finding_plane_project: env_opt("MUSE_TASTE_FINDING_PLANE_PROJECT"),
         }
     }
 
@@ -308,6 +348,12 @@ impl Default for Config {
             trending_tick_secs: 86400,
             embed_batch_size: 50,
             maintenance_enrichment_limit: 10,
+            reasoning_panel_url: None,
+            reasoning_panel_api_key: None,
+            reasoning_panel_model: None,
+            taste_finding_sink_url: None,
+            taste_finding_sink_api_key: None,
+            taste_finding_plane_project: None,
         }
     }
 }
@@ -404,6 +450,12 @@ mod tests {
             "MUSE_TRENDING_TICK_SECS",
             "MUSE_EMBED_BATCH_SIZE",
             "MUSE_MAINTENANCE_ENRICHMENT_LIMIT",
+            "MUSE_REASONING_PANEL_URL",
+            "MUSE_REASONING_PANEL_API_KEY",
+            "MUSE_REASONING_PANEL_MODEL",
+            "MUSE_TASTE_FINDING_SINK_URL",
+            "MUSE_TASTE_FINDING_SINK_API_KEY",
+            "MUSE_TASTE_FINDING_PLANE_PROJECT",
         ] {
             std::env::remove_var(key);
         }
@@ -438,6 +490,58 @@ mod tests {
         assert_eq!(cfg.trending_tick_secs, 86400);
         assert_eq!(cfg.embed_batch_size, 50);
         assert_eq!(cfg.maintenance_enrichment_limit, 10);
+        assert!(cfg.reasoning_panel_url.is_none());
+        assert!(cfg.reasoning_panel_api_key.is_none());
+        assert!(cfg.reasoning_panel_model.is_none());
+        assert!(cfg.taste_finding_sink_url.is_none());
+        assert!(cfg.taste_finding_sink_api_key.is_none());
+        assert!(cfg.taste_finding_plane_project.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_muset07_reasoning_review_overrides_from_env() {
+        std::env::set_var("MUSE_REASONING_PANEL_URL", "http://192.0.2.30:8300");
+        std::env::set_var("MUSE_REASONING_PANEL_API_KEY", "test-panel-key");
+        std::env::set_var("MUSE_REASONING_PANEL_MODEL", "qwen3-coder:30b");
+        std::env::set_var("MUSE_TASTE_FINDING_SINK_URL", "http://192.0.2.30:8310");
+        std::env::set_var("MUSE_TASTE_FINDING_SINK_API_KEY", "test-sink-key");
+        std::env::set_var("MUSE_TASTE_FINDING_PLANE_PROJECT", "TESTPROJ");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(
+            cfg.reasoning_panel_url.as_deref(),
+            Some("http://192.0.2.30:8300")
+        );
+        assert_eq!(
+            cfg.reasoning_panel_api_key.as_deref(),
+            Some("test-panel-key")
+        );
+        assert_eq!(
+            cfg.reasoning_panel_model.as_deref(),
+            Some("qwen3-coder:30b")
+        );
+        assert_eq!(
+            cfg.taste_finding_sink_url.as_deref(),
+            Some("http://192.0.2.30:8310")
+        );
+        assert_eq!(
+            cfg.taste_finding_sink_api_key.as_deref(),
+            Some("test-sink-key")
+        );
+        assert_eq!(cfg.taste_finding_plane_project.as_deref(), Some("TESTPROJ"));
+
+        for key in [
+            "MUSE_REASONING_PANEL_URL",
+            "MUSE_REASONING_PANEL_API_KEY",
+            "MUSE_REASONING_PANEL_MODEL",
+            "MUSE_TASTE_FINDING_SINK_URL",
+            "MUSE_TASTE_FINDING_SINK_API_KEY",
+            "MUSE_TASTE_FINDING_PLANE_PROJECT",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]
@@ -499,7 +603,10 @@ mod tests {
 
         let cfg = Config::from_env();
 
-        assert_eq!(cfg.public_base_url.as_deref(), Some("http://192.0.2.10:8090"));
+        assert_eq!(
+            cfg.public_base_url.as_deref(),
+            Some("http://192.0.2.10:8090")
+        );
         assert_eq!(cfg.hdhr_device_id, "MUSETEST1");
         assert_eq!(cfg.channel_guide_window_hours, 24);
         assert_eq!(cfg.channel_scheduler_tick_secs, 60);

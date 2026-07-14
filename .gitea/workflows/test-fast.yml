@@ -1,0 +1,68 @@
+name: muse-test-fast
+
+# MUSET-10 (Plane TERM #375): the standing FAST proof gate — every push and
+# every PR, no exceptions, no external dependencies. Deliberately does NOT
+# set MUSE_SNAPSHOT_DATABASE_URL / MUSE_TEST_DATABASE_URL: every DB-gated
+# test in this crate (snapshot::db_gated, endpoint_tests::db_gated,
+# taste_mechanics_tests, taste_golden_set, shadow, parity, fixtures::loader
+# — see README.md "Testing") already skips cleanly (never fails) when those
+# two env vars are unset, per each module's own `*_pool_or_skip` helper. So
+# "fast CI" needs no service container at all: it's the same `cargo test`
+# invocation a contributor runs locally with no DB configured, just
+# automated on every change.
+#
+# No secrets, no live-fleet DSNs, nothing to leak (S1/S7) — this job never
+# touches a database.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Deliberately UNSET (not referenced at all): MUSE_SNAPSHOT_DATABASE_URL,
+      # MUSE_TEST_DATABASE_URL, MUSE_DATABASE_URL. Leaving them unset is what
+      # makes every DB-gated test in this crate skip cleanly instead of
+      # attempting a connection — see src/snapshot/load.rs and each module's
+      # `*_pool_or_skip` helper.
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-toolchain.toml pins channel = "1.97.0" (S117 BLD-02: one
+          # rustc fleet-wide) -- rustup picks this up automatically from the
+          # checked-out file, this just guarantees rustfmt/clippy components
+          # are present alongside it.
+          toolchain: "1.97.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-muse-fast-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-muse-fast-
+
+      - name: rustfmt --check
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test (DB env unset -> DB-gated tests skip cleanly)
+        # config.rs's env-reading tests use `serial_test` (process-global
+        # env) -- single-threaded avoids cross-test env races, same
+        # invocation documented in README.md's "Testing" section.
+        run: cargo test -- --test-threads=1

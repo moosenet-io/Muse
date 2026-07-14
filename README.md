@@ -270,3 +270,88 @@ exactly.
   `golden::golden_diff_mechanism_detects_a_deliberately_altered_response` exercises the real
   comparison function against a deliberately mutated response (in a self-contained scratch
   file, never a committed golden) and asserts it panics.
+
+### Snapshot ingestion, fixtures, TASTE, reasoning review, shadow, parity (MUSET-03..09)
+
+Everything below reuses the SAME "skip cleanly, never fail" gate as the sections above —
+`MUSE_SNAPSHOT_DATABASE_URL` (preferred) or `MUSE_TEST_DATABASE_URL` (fallback), resolved by
+`snapshot::load::snapshot_database_url_from_env`. Every DB-gated test in every module below runs
+`snapshot::load::connect_snapshot_db`/`connect_snapshot_db_from_env` first, which validates the
+DSN through `snapshot::guard::validate_snapshot_dsn` (MUSET-03 AC5) BEFORE connecting: the DSN
+must be loopback-hosted and carry an explicit `test`/`snapshot`/`scratch` marker in the database
+name, or the guard refuses it outright. This is structurally airtight against ever touching a
+live media DB or the production `muse` DB, even from a misconfigured env var. Each helper
+(`*_pool_or_skip`) also runs this crate's own migrations against the connected pool, so no
+separate migration step is needed — set the env var, run `cargo test`.
+
+- **Snapshot ingestion pipeline** (`src/snapshot/`, MUSET-03): `snapshot::db_gated` round-trips a
+  loaded snapshot (normalize → load → provenance) against the isolated Postgres. Guard unit tests
+  (`snapshot::guard::tests`) are pure string/IP checks with no DB and always run.
+- **Real-data fixtures** (`src/fixtures/`, MUSET-04): reusable seeded-account fixtures
+  (`heavy_rewatcher`, `multi_genre`, `cold_start_empty`, `sparse_metadata`) + their
+  `ProfileExpectation`s, gated via `fixtures::loader::tests::fixture_pool_or_skip`.
+- **TASTE mechanics** (`src/taste_mechanics_tests.rs`, MUSET-05): the deterministic floor
+  (embedding/pgvector ops, context-bucketing, scoring/ranking consistency). DB-gated cases go
+  through `mechanics_pool_or_skip`; the pure-math determinism assertions run unconditionally.
+- **TASTE golden-set regression** (`src/taste_golden_set.rs`, MUSET-06): hand-computed
+  known-good taste-lean values a regression must not drift away from. Grader-sanity,
+  tolerance-math, and negative-perturbation tests run with no DB; `golden_pool_or_skip`-gated
+  cases need the scratch DB.
+- **Adversarial reasoning review** (`src/taste_review/`, MUSET-07): trace + panel-critique +
+  finding-sink tests all run against `panel::MockReasoningPanel`/`sink::MockFindingSink` — fully
+  in-process, no network, no DB, no Terminus client (Muse has no live Terminus integration yet)
+  — so this module's suite runs in the FAST phase, not the full/snapshot phase.
+- **Shadow runner** (`src/shadow/`, MUSET-08): read-only Tautulli-replacement analytics computed
+  from snapshot `play_events`. DB-gated (`shadow::tests::db_gated`) via `snapshot_pool_or_skip`;
+  asserts the runner performs zero writes.
+- **Parity diff + retirement evidence** (`src/parity/`, MUSET-09): diffs shadow output against
+  snapshot Tautulli-origin numbers. The core diff/report-building tests are pure in-memory data
+  transforms with no DB; the seeding/overlap tests (`parity::tests::db_gated`, if present) use
+  the same `snapshot_pool_or_skip` idiom as `shadow`.
+
+Run any single phase locally the same way as the sections above, e.g.:
+
+```
+cargo test snapshot::
+cargo test taste_mechanics_tests
+cargo test taste_golden_set
+cargo test taste_review
+cargo test shadow::
+cargo test parity::
+```
+
+To exercise the DB-gated cases in any of them, point `MUSE_TEST_DATABASE_URL` (or
+`MUSE_SNAPSHOT_DATABASE_URL`) at a **local scratch** Postgres 17 with `vector` + `pg_trgm`
+available, whose database name carries an explicit `test`/`snapshot`/`scratch` marker (per the
+MUSET-03 guard above) — e.g.:
+
+```
+MUSE_TEST_DATABASE_URL=postgres://user:pass@localhost/muse_dev_test cargo test -- --test-threads=1
+```
+
+Never point either var at a real/shared host — the guard rejects any non-loopback host outright,
+so this is enforced, not just a convention.
+
+### CI (`.gitea/workflows/`, MUSET-10)
+
+Two Gitea Actions workflows wire the phases above into CI as the standing proof gate, splitting
+on cost the same way the sections above split on DB-gating:
+
+- **`test-fast.yml`** — runs on **every push and every pull request**, any branch.
+  `rustfmt --check`, `clippy --all-targets -D warnings`, then `cargo test -- --test-threads=1`
+  with `MUSE_SNAPSHOT_DATABASE_URL`/`MUSE_TEST_DATABASE_URL` left **unset** — every DB-gated test
+  above skips cleanly (per its own `*_pool_or_skip`), so this job needs no service container and
+  covers the endpoint/golden/mechanics/golden-set/reasoning-review fast tests on every change,
+  with no live dependency at all.
+- **`test-full.yml`** — runs **on demand** (`workflow_dispatch`) and **nightly**
+  (`schedule: cron`). Brings up a `pgvector/pgvector:pg17` service container local to the CI
+  runner (`localhost:5432`, throwaway `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` values
+  scoped to the job's lifetime only — not a fleet secret, never a literal prod DSN), points
+  `MUSE_SNAPSHOT_DATABASE_URL`/`MUSE_TEST_DATABASE_URL` at
+  `postgres://muse_ci:muse_ci_scratch@localhost:5432/muse_ci_test`, and runs the full suite. That
+  DSN is loopback-hosted with an explicit `_test` marker in the db name, so it independently
+  satisfies MUSET-03's `snapshot::guard::validate_snapshot_dsn` guard — the same structural
+  guarantee a human running the suite locally gets, not a CI-only exception.
+
+Neither workflow embeds a real hostname, credential, or fleet DSN (S1/S7) — the full job's
+Postgres exists only inside that job's runner for that job's duration.

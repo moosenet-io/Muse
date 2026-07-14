@@ -1,0 +1,106 @@
+name: muse-test-full
+
+# MUSET-10 (Plane TERM #375): the FULL/SNAPSHOT gate — the DB-gated phases
+# (snapshot ingestion round-trip, MUSET-04 fixtures, TASTE mechanics +
+# golden-set regression, shadow runner, parity diff) that need a real
+# Postgres + pgvector. These are deliberately NOT run on every push (they
+# need a service container to spin up and run migrations, so they're
+# slower) -- this job is ON DEMAND (manual dispatch) and SCHEDULED
+# (nightly), matching the "snapshot/TASTE/parity tests ... run ON DEMAND or
+# SCHEDULED" requirement.
+#
+# The service Postgres below is a THROWAWAY, CI-local container -- not a
+# fleet host, not a secret. It exists for the lifetime of this job only, on
+# `localhost` inside the runner, and is never reachable from outside it. Its
+# username/password are the disposable defaults of the `pgvector/pgvector`
+# image itself, not a credential from <secret-manager> or any real system (S1/S7:
+# nothing here is a live secret to leak). No literal prod DSN, host, or
+# credential appears anywhere in this file.
+#
+# MUSET-03's DSN guard (src/snapshot/guard.rs) independently enforces that
+# whatever DSN IS used can never be live-shaped, so even a misconfigured
+# workflow could not point this suite at a real system:
+#   1. loopback host only  -- `localhost` (this service container), never a
+#      private-network fleet address
+#   2. explicit test/snapshot/scratch marker in the db name -- the db name
+#      below is `muse_ci_test`
+#   3. no live-system name/host substring, no connection-overriding query
+#      params
+# The DSN constructed below satisfies all three by construction.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Nightly, matching the fleet's "build-on-dest nightly" cadence used
+    # elsewhere (constellation-updater) -- adjust the hour if it collides
+    # with another scheduled fleet job.
+    - cron: "17 3 * * *"
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    services:
+      postgres:
+        # Postgres 17 with the pgvector extension pre-installed -- matches
+        # README.md's documented local dev requirement ("Postgres 17
+        # (vector + pg_trgm)"). pg_trgm ships in every stock postgres image
+        # (contrib); migrations 0013/0040 (`CREATE EXTENSION IF NOT EXISTS
+        # vector`) enable both extensions themselves, this job does not
+        # need to pre-create them.
+        image: pgvector/pgvector:pg17
+        env:
+          # Throwaway CI-container credentials only (see file header) --
+          # never used outside this job's lifetime, never a fleet secret.
+          POSTGRES_USER: muse_ci
+          POSTGRES_PASSWORD: muse_ci_scratch
+          POSTGRES_DB: muse_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U muse_ci -d muse_ci_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
+
+      - name: Cache cargo registry + target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-muse-full-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-muse-full-
+
+      - name: Run full suite against the scratch Postgres
+        env:
+          # Loopback host ("localhost", the service container above) +
+          # `_test` marker in the db name -- satisfies MUSET-03's guard
+          # (src/snapshot/guard.rs) by construction. Set both vars: the
+          # snapshot-family DB-gated tests prefer MUSE_SNAPSHOT_DATABASE_URL
+          # and fall back to MUSE_TEST_DATABASE_URL
+          # (src/snapshot/load.rs::snapshot_database_url_from_env), while
+          # endpoint_tests.rs's db_gated module reads MUSE_TEST_DATABASE_URL
+          # directly -- setting both covers every DB-gated entry point in
+          # one pass. Each `*_pool_or_skip` helper runs this crate's own
+          # migrations against the pool itself (`sqlx::migrate!("./migrations")`
+          # via `snapshot::load::migrate_snapshot_db`), so no separate
+          # migration step is needed here.
+          MUSE_SNAPSHOT_DATABASE_URL: postgres://muse_ci:muse_ci_scratch@localhost:5432/muse_ci_test
+          MUSE_TEST_DATABASE_URL: postgres://muse_ci:muse_ci_scratch@localhost:5432/muse_ci_test
+        # Single-threaded: config.rs's env-reading tests use `serial_test`
+        # (process-global env) -- same posture as the fast job and the
+        # README-documented local invocation.
+        run: cargo test -- --test-threads=1

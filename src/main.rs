@@ -41,6 +41,7 @@ mod prowlarr;
 mod radar;
 mod recall;
 pub mod repo;
+pub mod settings;
 mod shadow;
 mod snapshot;
 mod streaming;

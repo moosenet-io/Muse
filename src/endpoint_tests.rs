@@ -111,15 +111,17 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body should be readable");
+    // JSON endpoints answer with a JSON body; axum's built-in extractor
+    // rejections (malformed `Json`, missing `Query` params, etc.) answer
+    // with a `text/plain` body instead. The error-path tests assert only on
+    // the status code, so a non-JSON body must NOT panic here — fall back to
+    // the raw text as a `Value::String` so those tests can still inspect the
+    // status. Empty bodies become `Value::Null`.
     let body: Value = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!(
-                "response body should be valid JSON: {e} (bytes: {:?})",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     (status, body)
 }
@@ -400,6 +402,11 @@ async fn unimplemented_proactive_subroute_returns_501_not_implemented() {
 // =======================================================================
 
 mod db_gated {
+    // `use super::*` does NOT re-export the parent's non-`pub` `use`
+    // bindings, so this inner scope needs the trait imported directly for
+    // its own `.oneshot(...)` call sites.
+    use tower::util::ServiceExt;
+
     use super::*;
 
     async fn test_pool_or_skip(test_name: &str) -> Option<sqlx::PgPool> {

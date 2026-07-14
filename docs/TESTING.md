@@ -25,10 +25,12 @@ through — TASTE mechanics, the golden set, and the shadow runner all load fixt
 snapshot rows via the exact same guarded connection path MUSET-03 established
 (`snapshot::load::connect_snapshot_db`/`connect_snapshot_db_from_env`). Phase 3's mechanics floor
 (3a) has to hold before the golden-set regression (3b) means anything — a numeric drift assertion
-is meaningless on top of a pipeline that isn't even deterministic yet. And Phase 4's parity
-evidence (MUSET-09) is only trustworthy because it's diffing against Phase 3's already-validated
-taste/recommend output, not a black box. Each phase is a foundation the next is built on, which is
-why the suite is described as four *gating* phases rather than four independent test buckets.
+is meaningless on top of a pipeline that isn't even deterministic yet. And Phase 4's shadow runner
+(MUSET-08) computes its watch analytics by folding the same snapshot `play_events` the Phase-2
+harness loads, so MUSET-09's parity diff (Muse's shadow-computed watch numbers vs. Tautulli's own
+numbers from the snapshot) rests on that same guarded, snapshot-only data path — not a black box.
+Each phase is a foundation the next is built on, which is why the suite is described as four
+*gating* phases rather than four independent test buckets.
 
 For exact run commands per phase (`cargo test endpoint_tests`, `cargo test snapshot::`, etc.) and
 the two DB env vars, see [README.md § Testing](../README.md#testing) — not duplicated here.
@@ -55,10 +57,10 @@ review.
 
 ### The enforcement mechanism: MUSET-03's fail-closed DSN guard
 
-[`snapshot::guard::validate_snapshot_dsn`] (`src/snapshot/guard.rs`) is the single choke point
-every DB-gated test in every phase passes through before connecting — it's called from
+[`snapshot::guard::validate_snapshot_dsn`] (`src/snapshot/guard.rs`) is the choke point every
+**snapshot-family** DB-gated test passes through before connecting — it's called from
 `snapshot::load::connect_snapshot_db`/`connect_snapshot_db_from_env`, which every `*_pool_or_skip`
-helper in every module (`snapshot`, `fixtures::loader`, `taste_mechanics_tests`,
+helper in the snapshot-family modules (`snapshot`, `fixtures::loader`, `taste_mechanics_tests`,
 `taste_golden_set`, `shadow`, `parity`) calls first. It fails **loud and closed**, never
 "quiet and permissive": a DSN that even plausibly looks live-shaped is rejected outright with a
 descriptive `SnapshotGuardError`, rather than allowed through with a warning. Four checks, all
@@ -83,6 +85,18 @@ must pass:
 every `cargo test`, including in the fast CI job. The guard's own negative tests are what makes
 "a live-DB connection string in a test is a spec violation" an enforced, tested property rather
 than a documentation claim.
+
+**One honest caveat about scope.** The guard covers the snapshot-family DB access described above,
+which is every test built from MUSET-03 onward. The *older* Phase-1 endpoint tests
+(`endpoint_tests::db_gated::test_pool_or_skip`) — along with `integration_tests.rs`, `http::ops`,
+and the channel tests — predate the snapshot guard and connect **directly** via
+`PgPoolOptions::connect` after reading `MUSE_TEST_DATABASE_URL`, *not* routed through
+`validate_snapshot_dsn`. For those paths the loopback-only/marker invariant is a convention (and
+the documented example DSNs honor it), not a code-enforced gate. What keeps them safe in practice
+is a different structural property: none of those tests ever configures a real
+Plex/Prowlarr/TMDb/Tautulli/arr/Ollama/Chord client, so they can't reach a live *upstream* even by
+accident — the guard's airtight enforcement applies specifically to the snapshot-family Postgres
+connections, and the doc doesn't claim more than that.
 
 ## 3. TASTE's two layers, and why both are needed
 
@@ -159,19 +173,26 @@ Full, current run commands and env vars live in [README.md § Testing](../README
 section only summarizes the shape so this doc doesn't drift out of sync with the authoritative
 copy:
 
-- **No database needed at all**: `cargo test` — every DB-touching test across every phase is
-  gated on `MUSE_SNAPSHOT_DATABASE_URL` (preferred) / `MUSE_TEST_DATABASE_URL` (fallback) and
-  skips cleanly (never fails) when both are unset, per each module's own `*_pool_or_skip` helper.
-  This includes 3a's pure-math determinism tests, all of 3c (`taste_review`, fully mocked,
-  network- and DB-free), and the DB-independent golden responses in Phase 1.
+- **No database needed at all**: `cargo test` — every DB-touching test across every phase skips
+  cleanly (never fails) when its env var is unset, per each module's own `*_pool_or_skip` helper.
+  Note the gating is **not uniform**: the snapshot-family tests (Phase 2, plus 3a/3b's
+  pgvector-backed cases, and Phase 4's shadow/parity) read `MUSE_SNAPSHOT_DATABASE_URL`
+  (preferred), falling back to `MUSE_TEST_DATABASE_URL`; the older Phase-1
+  endpoint/`integration_tests`/`http::ops`/channel DB-gated tests read **only**
+  `MUSE_TEST_DATABASE_URL`. With neither var set, all of them skip. This DB-free run includes 3a's
+  pure-math determinism tests, all of 3c (`taste_review`, fully mocked, network- and DB-free), and
+  the DB-independent golden responses in Phase 1.
 - **DB-gated cases** (Phase 1's happy-path/non-mutation goldens, Phase 2's snapshot round-trip +
   fixtures, 3a/3b's pgvector-backed tests, Phase 4's shadow/parity seeding tests): point a local
   **scratch** Postgres 17 with `vector` + `pg_trgm`, whose database name carries an explicit
-  `test`/`snapshot`/`scratch` marker (enforced by the §2 guard — a real/shared host is rejected,
-  not just discouraged), and export **both** `MUSE_SNAPSHOT_DATABASE_URL` and
-  `MUSE_TEST_DATABASE_URL` to that same loopback DSN, then run
-  `cargo test -- --test-threads=1` (single-threaded because `config.rs`'s env-reading tests use
-  `serial_test` against process-global env).
+  `test`/`snapshot`/`scratch` marker (for the snapshot-family tests this is enforced by the §2
+  guard — a real/shared host is rejected outright; for the direct-connect endpoint/integration
+  tests it's the documented convention). Because the two families key off different env vars,
+  export **both** `MUSE_SNAPSHOT_DATABASE_URL` and `MUSE_TEST_DATABASE_URL` to that same loopback
+  DSN to run the *whole* DB-gated suite in one pass — setting only one exercises just that family.
+  Then run `cargo test -- --test-threads=1` (single-threaded because `config.rs`'s env-reading
+  tests use `serial_test` against process-global env). This dual-export is exactly why MUSET-10's
+  `test-full.yml` sets both vars.
 - **Per-phase / per-module runs** (e.g. `cargo test taste_golden_set`, `cargo test shadow::`) work
   the same way — DB-gated cases within that module skip or run depending on whether the env vars
   above are set.

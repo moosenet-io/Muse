@@ -339,8 +339,16 @@ export MUSE_TEST_DATABASE_URL=postgres://user:pass@localhost/muse_dev_test
 cargo test -- --test-threads=1
 ```
 
-Never point either var at a real/shared host — the guard rejects any non-loopback host outright,
-so this is enforced, not just a convention.
+Never point either var at a real/shared host. For the **snapshot-family** DB access (everything
+routed through `snapshot::load::connect_snapshot_db`, i.e. the snapshot/fixtures/taste/shadow/
+parity tests) this is code-enforced, not just a convention — `snapshot::guard::validate_snapshot_dsn`
+rejects any non-loopback host (and any db name lacking a `test`/`snapshot`/`scratch` marker)
+outright. The older `MUSE_TEST_DATABASE_URL`-direct paths (`endpoint_tests::db_gated`,
+`integration_tests.rs`, `http::ops`, channel tests) connect via `PgPoolOptions::connect` and are
+**not** routed through that guard, so for those the loopback-only rule is a documented convention;
+what structurally keeps them safe is that none of them ever configures a real upstream client. See
+[`docs/TESTING.md`](docs/TESTING.md#2-the-cardinal-invariant-snapshots-everywhere-never-a-live-read)
+for the full scope of what the guard does and does not enforce.
 
 ### CI (`.gitea/workflows/`, MUSET-10)
 

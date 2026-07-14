@@ -217,13 +217,30 @@ fn parse_postgres_dsn(dsn: &str) -> Result<DsnParts, SnapshotGuardError> {
 /// the hostname denylist instead). The isolated test Postgres is required to
 /// live on loopback, so rejecting ALL RFC-1918/ULA hosts is correct, not
 /// over-broad.
+///
+/// IPv4-in-IPv6 forms are handled explicitly: an `::ffff:a.b.c.d`
+/// (v4-mapped) or `::a.b.c.d` (deprecated v4-compatible) host connects to
+/// the embedded IPv4 address, so the RFC-1918 check MUST run on that
+/// embedded address -- otherwise a `::ffff:<rfc1918-addr>` host would slip
+/// past a v6-only ULA check and reach the fleet address. Loopback forms
+/// (`::1`, `::`) map into the `0.0.0.x` block, which is not `is_private()`,
+/// so loopback is correctly NOT rejected here.
 fn host_is_private_ip(host: &str) -> bool {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_private(),
-        // IPv6 unique-local addresses are fc00::/7 -- i.e. the top 7 bits are
-        // 1111110. `is_unique_local()` is unstable on stable Rust, so test
-        // the prefix directly on the first octet.
-        Ok(std::net::IpAddr::V6(v6)) => (v6.octets()[0] & 0xfe) == 0xfc,
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // Reject a private RFC-1918 address embedded in a v4-mapped
+            // (`::ffff:a.b.c.d`) or v4-compatible (`::a.b.c.d`) IPv6 host.
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                if v4.is_private() {
+                    return true;
+                }
+            }
+            // IPv6 unique-local addresses are fc00::/7 -- i.e. the top 7
+            // bits are 1111110. `is_unique_local()` is unstable on stable
+            // Rust, so test the prefix directly on the first octet.
+            (v6.octets()[0] & 0xfe) == 0xfc
+        }
         Err(_) => false,
     }
 }
@@ -445,11 +462,36 @@ mod tests {
 
     #[test]
     fn accepts_ipv6_loopback_with_marked_db() {
-        // ::1 loopback is NOT unique-local -- the isolated test DB on
-        // loopback must still be allowed.
+        // ::1 loopback is NOT unique-local and does NOT map to a private
+        // IPv4 -- the isolated test DB on loopback must still be allowed,
+        // even after the v4-mapped/compatible embedding check was added.
         assert!(!host_is_private_ip("::1"));
         let dsn = "postgres://user:pass@[::1]:5432/muse_test";
         assert!(validate_snapshot_dsn(dsn).is_ok());
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_private_host() {
+        // An RFC-1918 address embedded in a v4-mapped (`::ffff:a.b.c.d`) or
+        // v4-compatible (`::a.b.c.d`) IPv6 host connects to that private
+        // IPv4 -- so it must be rejected on the embedded address, not slip
+        // past the v6-only ULA check. Bracketed as in a real DSN authority.
+        for host in [
+            "[::ffff:<internal-ip>]", // pii-test-fixture
+            "[::ffff:<internal-ip>]",      // pii-test-fixture
+            "[::ffff:<internal-ip>]",    // pii-test-fixture
+        ] {
+            let dsn = format!("postgres://user:pass@{host}:5432/muse_test");
+            let err = validate_snapshot_dsn(&dsn).expect_err(&format!(
+                "expected {host} (v4-mapped private IPv6) to be rejected"
+            ));
+            assert!(
+                matches!(err, SnapshotGuardError::DenylistMatch { field: "host", .. }),
+                "{host} should reject as a host denylist match, got {err:?}"
+            );
+        }
+        // Direct unit check of the helper for the v4-compatible form too.
+        assert!(host_is_private_ip("::ffff:<internal-ip>")); // pii-test-fixture
     }
 
     // -----------------------------------------------------------------

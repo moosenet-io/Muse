@@ -7,6 +7,7 @@
 
 pub mod adaptation;
 pub mod arr;
+pub mod assistant;
 pub mod channels;
 mod config;
 mod cultural;

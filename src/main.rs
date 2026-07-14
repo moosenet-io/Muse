@@ -23,6 +23,9 @@ mod integration_tests;
 pub mod maintenance;
 pub mod models;
 mod parity;
+pub mod persona;
+#[cfg(test)]
+mod persona_mechanics_tests;
 mod plex;
 mod plex_control;
 pub mod proactive;

@@ -17,6 +17,7 @@ pub mod library;
 pub mod media_file;
 pub mod media_item;
 pub mod media_metadata;
+pub mod persona;
 pub mod play_event;
 pub mod play_session;
 pub mod proactive_item;

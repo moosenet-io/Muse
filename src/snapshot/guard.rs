@@ -56,6 +56,14 @@ pub enum SnapshotGuardError {
     /// other non-allowlisted param) -- so the effective target may not equal
     /// the URL components the rest of the guard validated. Rejected outright.
     DisallowedQueryParam { param: String },
+    /// The DSN authority is a comma-separated MULTI-HOST / failover list.
+    /// sqlx/libpq would connect to one of several hosts, only one of which
+    /// this guard could validate -- rejected fail-closed.
+    MultiHost { authority: String },
+    /// The DSN's host did not cleanly parse as either a single hostname or a
+    /// single IP literal (e.g. a mangled authority with a residual `:`).
+    /// Rejected fail-closed rather than allowed to fall through.
+    UnparseableHost { host: String },
 }
 
 impl fmt::Display for SnapshotGuardError {
@@ -85,6 +93,18 @@ impl fmt::Display for SnapshotGuardError {
                  override the connection target -- only inert params (sslmode, connect_timeout, \
                  application_name) are permitted, refusing this DSN so the effective target \
                  cannot differ from the validated host/database"
+            ),
+            SnapshotGuardError::MultiHost { authority } => write!(
+                f,
+                "snapshot DSN guard: DSN authority ({authority:?}) is a comma-separated \
+                 multi-host/failover list -- a single isolated test/snapshot DB (or acquisition \
+                 source) must name exactly one host, refusing it so sqlx cannot connect to an \
+                 unvalidated failover host"
+            ),
+            SnapshotGuardError::UnparseableHost { host } => write!(
+                f,
+                "snapshot DSN guard: host ({host:?}) did not parse as a single hostname or IP \
+                 address -- refusing fail-closed rather than treating an unparseable host as safe"
             ),
         }
     }
@@ -127,42 +147,51 @@ const SNAPSHOT_MARKERS: &[&str] = &["test", "snapshot", "scratch"];
 /// override bypass. Case-insensitive.
 const ALLOWED_QUERY_PARAMS: &[&str] = &["sslmode", "connect_timeout", "application_name"];
 
-/// A DSN split into the pieces this guard validates. Deliberately minimal --
-/// this is NOT a general-purpose connection-string parser; it extracts just
-/// enough to run the checks, and fails closed (`Unparseable`) on anything it
-/// isn't confident about rather than guessing.
-struct DsnParts {
-    /// The bare host, port stripped and IPv6 brackets removed (e.g.
-    /// `"127.0.0.1"`, `"localhost"`, `"::1"`).
+/// A DSN reduced to its canonical connection-target components by
+/// [`parse_and_canonicalize_dsn`]. Because that parser is FAIL-CLOSED
+/// (rejecting multi-host authorities, disallowed query params, and any host
+/// that doesn't cleanly parse as a single hostname or IP), each field here is
+/// guaranteed to be the ACTUAL effective connection target -- so the two
+/// callers can apply their own policy to these components without worrying
+/// about a hidden override or a second failover host.
+struct CanonicalDsn {
+    /// Exactly one host: a bare hostname (alphanumerics/dots/hyphens) or a
+    /// single IP literal (IPv6 brackets already removed). Never empty, never
+    /// contains a residual `:`/`,`/`@`.
     host: String,
     db_name: String,
-    /// The query-param KEYS present on the DSN (lowercased), for the
-    /// override-allowlist check.
-    query_param_keys: Vec<String>,
 }
 
-/// Strip a trailing `:port` from a host authority, correctly handling
-/// bracketed IPv6 (`[::1]:5432` -> `::1`, `[fc00::1]` -> `fc00::1`).
-fn strip_port(host_and_port: &str) -> &str {
-    if let Some(after_bracket) = host_and_port.strip_prefix('[') {
-        // Bracketed IPv6: take everything up to the closing `]`.
-        return after_bracket.split(']').next().unwrap_or(after_bracket);
-    }
-    // Bare host[:port]. A colon only means "port" for a hostname/IPv4; a raw
-    // (unbracketed) IPv6 literal is not valid authority syntax here, so a
-    // single trailing `:digits` is a port. Use rsplit_once so an accidental
-    // extra colon still trims only the last segment.
-    match host_and_port.rsplit_once(':') {
-        Some((h, maybe_port))
-            if !maybe_port.is_empty() && maybe_port.chars().all(|c| c.is_ascii_digit()) =>
-        {
-            h
-        }
-        _ => host_and_port,
-    }
+/// True if `host` is a syntactically-clean bare hostname: non-empty,
+/// alphanumerics/dots/hyphens/underscores only (no residual `:`, `,`, `@`,
+/// `[`, `]`, or whitespace). An IP literal is validated separately by an
+/// `IpAddr` parse; this covers the non-IP case so a mangled authority can't
+/// fall through to "allowed."
+fn is_clean_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
-fn parse_postgres_dsn(dsn: &str) -> Result<DsnParts, SnapshotGuardError> {
+/// The ONE shared, fail-closed DSN parser used by BOTH the load path
+/// (`validate_snapshot_dsn`) and the source path (`validate_not_prod_source`).
+///
+/// It rejects, BEFORE returning any components:
+/// - a non-`postgres(ql)://` scheme,
+/// - a MULTI-HOST authority (any comma in the host:port section) -- sqlx/
+///   libpq failover DSNs have no legitimate use for a single isolated
+///   test/snapshot DB or a single acquisition source, and letting one through
+///   means sqlx could connect to a host this guard never validated,
+/// - any query param outside [`ALLOWED_QUERY_PARAMS`] (host/hostaddr/dbname/
+///   port/user/password/etc. all override the connection target),
+/// - a host that parses as neither a single clean hostname NOR a single
+///   `IpAddr` (fail-closed: a mangled/unparseable host is rejected, never
+///   passed through as "not private, so allowed").
+///
+/// On success the returned host/db_name ARE the effective connection target,
+/// so each caller only has to apply its own host/db policy.
+fn parse_and_canonicalize_dsn(dsn: &str) -> Result<CanonicalDsn, SnapshotGuardError> {
     // Accept both `postgres://` and `postgresql://` schemes (both valid per
     // libpq), reject anything else outright.
     let rest = dsn
@@ -172,19 +201,26 @@ fn parse_postgres_dsn(dsn: &str) -> Result<DsnParts, SnapshotGuardError> {
             SnapshotGuardError::Unparseable("missing postgres:// / postgresql:// scheme".into())
         })?;
 
-    // rest is: [user[:password]@]host[:port][/dbname][?params]
+    // rest is: [user[:password]@]host[:port][,host[:port]...][/dbname][?params]
     let after_auth = match rest.rsplit_once('@') {
         Some((_userinfo, after)) => after,
         None => rest,
     };
 
-    let (host_and_port, path_and_query) = match after_auth.split_once('/') {
+    let (authority, path_and_query) = match after_auth.split_once('/') {
         Some((h, p)) => (h, p),
         None => (after_auth, ""),
     };
 
-    if host_and_port.is_empty() {
+    if authority.is_empty() {
         return Err(SnapshotGuardError::Unparseable("empty host segment".into()));
+    }
+
+    // FAIL-CLOSED: reject any comma-separated multi-host / failover authority.
+    if authority.contains(',') {
+        return Err(SnapshotGuardError::MultiHost {
+            authority: authority.to_string(),
+        });
     }
 
     let (db_part, query_part) = match path_and_query.split_once('?') {
@@ -192,21 +228,63 @@ fn parse_postgres_dsn(dsn: &str) -> Result<DsnParts, SnapshotGuardError> {
         None => (path_and_query, ""),
     };
 
-    let query_param_keys = if query_part.is_empty() {
-        Vec::new()
-    } else {
-        query_part
-            .split('&')
-            .filter(|kv| !kv.is_empty())
-            .map(|kv| kv.split('=').next().unwrap_or("").to_lowercase())
-            .collect()
-    };
+    // Reject any non-allowlisted query param (target-overriding), for BOTH
+    // paths, before trusting the URL's own host/db components.
+    if !query_part.is_empty() {
+        for kv in query_part.split('&').filter(|kv| !kv.is_empty()) {
+            let key = kv.split('=').next().unwrap_or("").to_lowercase();
+            if !ALLOWED_QUERY_PARAMS.contains(&key.as_str()) {
+                return Err(SnapshotGuardError::DisallowedQueryParam { param: key });
+            }
+        }
+    }
 
-    Ok(DsnParts {
-        host: strip_port(host_and_port).to_string(),
+    // Extract exactly one host, port stripped, IPv6 brackets removed.
+    let host = strip_single_host(authority)?;
+
+    // FAIL-CLOSED host validation: must be EITHER a clean hostname OR a
+    // single parseable IpAddr. Anything else (a residual colon from a
+    // mangled authority, stray punctuation, empty) is rejected, never
+    // allowed to fall through.
+    if !is_clean_hostname(&host) && host.parse::<std::net::IpAddr>().is_err() {
+        return Err(SnapshotGuardError::UnparseableHost { host });
+    }
+
+    Ok(CanonicalDsn {
+        host,
         db_name: db_part.to_string(),
-        query_param_keys,
     })
+}
+
+/// Strip exactly one `:port` from a single-host authority, correctly handling
+/// bracketed IPv6 (`[::1]:5432` -> `::1`, `[fc00::1]` -> `fc00::1`). The
+/// authority is already known comma-free (multi-host rejected upstream), so
+/// this only has to deal with one host.
+fn strip_single_host(authority: &str) -> Result<String, SnapshotGuardError> {
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        // Bracketed IPv6: everything up to the closing `]`.
+        let (inner, _after) =
+            after_bracket
+                .split_once(']')
+                .ok_or_else(|| SnapshotGuardError::UnparseableHost {
+                    host: authority.to_string(),
+                })?;
+        return Ok(inner.to_string());
+    }
+    // Bare host[:port]. An UNBRACKETED host containing a colon is only valid
+    // as host:port -- split off exactly the trailing `:digits` port; if the
+    // remaining host still contains a colon it's a raw (illegal here) IPv6 or
+    // a mangled authority and the fail-closed host check downstream rejects
+    // it.
+    let host = match authority.rsplit_once(':') {
+        Some((h, maybe_port))
+            if !maybe_port.is_empty() && maybe_port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            h
+        }
+        _ => authority,
+    };
+    Ok(host.to_string())
 }
 
 /// True if `host` parses as an IP address that belongs to a
@@ -266,28 +344,23 @@ fn host_is_private_ip(host: &str) -> bool {
 /// not something tests or normal startup ever do. See
 /// `validate_not_prod_source` for the lighter check applied to that path.
 pub fn validate_snapshot_dsn(dsn: &str) -> Result<(), SnapshotGuardError> {
-    let parts = parse_postgres_dsn(dsn)?;
+    // Shared fail-closed parse: rejects multi-host, target-overriding query
+    // params, and any unparseable host BEFORE we trust host/db_name below.
+    let canonical = parse_and_canonicalize_dsn(dsn)?;
 
-    // (1) Reject any query param that could override the connection target,
-    // BEFORE trusting the URL's own host/db components.
-    for key in &parts.query_param_keys {
-        if !ALLOWED_QUERY_PARAMS.contains(&key.as_str()) {
-            return Err(SnapshotGuardError::DisallowedQueryParam { param: key.clone() });
-        }
-    }
+    let host_lower = canonical.host.to_lowercase();
+    let db_lower = canonical.db_name.to_lowercase();
 
-    let host_lower = parts.host.to_lowercase();
-    let db_lower = parts.db_name.to_lowercase();
-
-    // (2a) Host as a real IP: reject any RFC-1918 / IPv6-ULA private address.
+    // LOAD policy (a): host must NOT be a private RFC-1918 / IPv6-ULA fleet
+    // address -- the isolated test DB lives on loopback.
     if host_is_private_ip(&host_lower) {
         return Err(SnapshotGuardError::DenylistMatch {
             field: "host",
-            matched: parts.host.clone(),
+            matched: canonical.host.clone(),
         });
     }
 
-    // (2b/3) Hostname + db-name identity markers.
+    // LOAD policy (b): hostname + db-name identity markers.
     for needle in LIVE_DENYLIST {
         if host_lower.contains(needle) {
             return Err(SnapshotGuardError::DenylistMatch {
@@ -303,6 +376,7 @@ pub fn validate_snapshot_dsn(dsn: &str) -> Result<(), SnapshotGuardError> {
         }
     }
 
+    // LOAD policy (c): db name MUST affirmatively be a test/snapshot target.
     let has_marker = SNAPSHOT_MARKERS.iter().any(|m| db_lower.contains(m));
     if !has_marker {
         return Err(SnapshotGuardError::NoSnapshotMarker);
@@ -311,23 +385,25 @@ pub fn validate_snapshot_dsn(dsn: &str) -> Result<(), SnapshotGuardError> {
     Ok(())
 }
 
-/// A lighter check for the acquisition SOURCE DSN
-/// (`MUSE_SNAPSHOT_SOURCE_POSTGRES_URL`). Reading a live source DB is the
-/// intended purpose of acquisition, so this does NOT apply the full
-/// snapshot-DB guard -- it only asserts the source is not itself an
-/// unmarked/production-marked muse database being mistaken for a source
-/// (a defensive nicety, not the blocking load-path guard). Best-effort:
-/// returns `Ok(())` for any DSN that isn't obviously the prod muse DB.
+/// The acquisition SOURCE DSN check (`MUSE_SNAPSHOT_SOURCE_POSTGRES_URL`).
+///
+/// Reading a live source DB is the INTENDED purpose of acquisition and the
+/// source legitimately lives on the private fleet network, so this does NOT
+/// apply the load-path host policy (no private-IP / marker requirement). But
+/// it uses the SAME fail-closed [`parse_and_canonicalize_dsn`] -- so it
+/// inherits the multi-host rejection AND the query-param override rejection
+/// (closing `…/muse_source_export?dbname=muse` reaching the prod DB via
+/// libpq). Its ONLY additional policy: the effective db name must not be the
+/// bare/production `muse` database (almost certainly a misconfiguration --
+/// acquisition reads Plex/Tautulli/*arr or a deliberately-named muse source,
+/// not the live prod db by that bare name).
 pub fn validate_not_prod_source(dsn: &str) -> Result<(), SnapshotGuardError> {
-    let parts = parse_postgres_dsn(dsn)?;
-    let db_lower = parts.db_name.to_lowercase();
-    // A bare `muse` (or explicitly production-marked) db as the SOURCE is
-    // almost certainly a mistake -- acquisition reads Plex/Tautulli/*arr or a
-    // deliberately-named muse source, not the live prod db by that bare name.
+    let canonical = parse_and_canonicalize_dsn(dsn)?;
+    let db_lower = canonical.db_name.to_lowercase();
     if db_lower == "muse" || db_lower.contains("prod") || db_lower.contains("muse_live") {
         return Err(SnapshotGuardError::DenylistMatch {
             field: "source database name",
-            matched: parts.db_name,
+            matched: canonical.db_name,
         });
     }
     Ok(())
@@ -406,6 +482,46 @@ mod tests {
         let dsn = "not-a-postgres-url-at-all";
         let err = validate_snapshot_dsn(dsn).expect_err("must fail closed on garbage input");
         assert!(matches!(err, SnapshotGuardError::Unparseable(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // FAIL-CLOSED shared-parser gaps: multi-host / failover authority and
+    // unparseable hosts must be rejected before any policy check, on BOTH
+    // paths, so sqlx/libpq can never connect to a host the guard didn't see.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rejects_multi_host_failover_dsn_on_load_path() {
+        // sqlx/libpq would connect to the FIRST host (a private fleet
+        // address); the whole authority must be rejected fail-closed.
+        let dsn = "postgres://<internal-ip>:5432,localhost:5432/muse_test"; // pii-test-fixture
+        let err = validate_snapshot_dsn(dsn).expect_err("multi-host authority must be rejected");
+        assert!(
+            matches!(err, SnapshotGuardError::MultiHost { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_comma_authority() {
+        let dsn = "postgres://localhost,otherhost/muse_test";
+        assert!(matches!(
+            validate_snapshot_dsn(dsn),
+            Err(SnapshotGuardError::MultiHost { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_host_that_wont_parse_fail_closed() {
+        // A mangled authority with a residual colon (not host:port, not a
+        // valid IP) is neither a clean hostname nor a single IpAddr, so it
+        // must be rejected fail-closed, not passed through as "not private".
+        let dsn = "postgres://foo:bar:baz/muse_test";
+        let err = validate_snapshot_dsn(dsn).expect_err("mangled host must be rejected");
+        assert!(
+            matches!(err, SnapshotGuardError::UnparseableHost { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -579,9 +695,43 @@ mod tests {
     #[test]
     fn validate_not_prod_source_allows_a_real_source_db() {
         // A Plex/Tautulli/*arr-shaped source, or a deliberately-named muse
-        // source snapshot, is fine to read from.
+        // source snapshot, is fine to read from. The source legitimately
+        // lives on the private fleet network, so a private-IP host is NOT
+        // rejected here (unlike the load path).
         assert!(validate_not_prod_source("postgres://source-host:5432/tautulli").is_ok());
         assert!(validate_not_prod_source("postgres://source-host:5432/muse_source_export").is_ok());
+        let private_source = "postgres://<internal-ip>:5432/tautulli"; // pii-test-fixture
+        assert!(validate_not_prod_source(private_source).is_ok());
+    }
+
+    #[test]
+    fn validate_not_prod_source_rejects_dbname_query_param_override() {
+        // GAP 2: the URL db is a benign `muse_source_export`, but
+        // ?dbname=muse would make pg_dump/libpq read the prod DB. The shared
+        // fail-closed parser rejects the override before the db-name policy
+        // even runs.
+        let dsn = "postgres://source-host:5432/muse_source_export?dbname=muse";
+        let err =
+            validate_not_prod_source(dsn).expect_err("source dbname override must be rejected");
+        assert!(
+            matches!(err, SnapshotGuardError::DisallowedQueryParam { ref param } if param == "dbname"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_not_prod_source_rejects_multi_host() {
+        let dsn = "postgres://source-a:5432,source-b:5432/tautulli";
+        assert!(matches!(
+            validate_not_prod_source(dsn),
+            Err(SnapshotGuardError::MultiHost { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_not_prod_source_allows_inert_query_params() {
+        let dsn = "postgres://source-host:5432/tautulli?sslmode=require&connect_timeout=5";
+        assert!(validate_not_prod_source(dsn).is_ok());
     }
 
     // -----------------------------------------------------------------

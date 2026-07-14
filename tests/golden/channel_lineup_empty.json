@@ -1,0 +1,15 @@
+{
+  "channel": {
+    "channel_number": null,
+    "enabled": true,
+    "id": "<redacted>",
+    "kind": "personal",
+    "mode": "on_demand",
+    "name": "<redacted>"
+  },
+  "generated_at": "<redacted>",
+  "now_program_id": null,
+  "programs": [],
+  "window_end": "<redacted>",
+  "window_start": "<redacted>"
+}

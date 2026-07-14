@@ -240,3 +240,33 @@ opposite assertion in their own tests: that they write exactly the one row they 
 in this module ever configures a real Plex/Prowlarr/TMDb/Tautulli/arr/Ollama/Chord client, so it
 can never reach a live upstream even by accident — same posture as every other test in this crate.
 Run with `cargo test endpoint_tests`.
+
+### Golden-response regression baseline (MUSET-02)
+
+On top of the contract/error-path/happy-path coverage above, the `golden`/`golden_support`
+modules at the bottom of `src/endpoint_tests.rs` (plus a nested `golden` module inside
+`db_gated` for the endpoints whose representative response needs a seeded row) add a
+**golden-response baseline**: the exact, canonicalized JSON — or raw bytes, for the artwork
+proxy's placeholder PNG — a representative request currently returns, committed under
+[`tests/golden/`](tests/golden) and diffed on every `cargo test` run. This catches drift in
+response *content*, not just status code. Non-deterministic fields (timestamps, generated ids,
+per-run-unique fixture names) are redacted to a stable `"<redacted>"` placeholder via JSON
+Pointer before comparison, rather than skipped — the rest of the shape is still asserted
+exactly.
+
+- **Regenerate a baseline** after an intentionally changed response:
+  `MUSE_UPDATE_GOLDEN=1 cargo test endpoint_tests`. Never hand-edit a `tests/golden/*.json`
+  file — golden tests are otherwise strictly read-only/comparison-only.
+- **DB-independent goldens** (`health`, `/query/resolve`'s empty-query short-circuit, the
+  `/ops/ingest/*` unconfigured 503s, the `/ingest`\|`/query`\|`/proactive` 501 fallback, the two
+  `/proactive/{id}/ack` and `/channels/{id}/compose` 400 error bodies, and the artwork proxy's
+  placeholder PNG) run in the default `cargo test` invocation, no `MUSE_TEST_DATABASE_URL`
+  needed.
+- **DB-gated goldens** (the `/recommend` family for a signal-empty account, an `/api/channels`
+  + `/api/channels/{id}/lineup` shape for a real seeded channel, and a
+  `/proactive/{id}/ack`-dismissed persisted+returned shape) skip cleanly without
+  `MUSE_TEST_DATABASE_URL`, same posture as the rest of the suite.
+- **Proof the mechanism actually catches drift**:
+  `golden::golden_diff_mechanism_detects_a_deliberately_altered_response` exercises the real
+  comparison function against a deliberately mutated response (in a self-contained scratch
+  file, never a committed golden) and asserts it panics.

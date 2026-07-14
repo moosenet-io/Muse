@@ -79,6 +79,23 @@
 //! before). They always asserted the CORRECT contract (real handler
 //! behavior), so un-ignoring them just flips them green now that the routes
 //! are corrected — they were live regression guards, not deleted coverage.
+//!
+//! ## MUSET-02: golden-response regression baseline
+//! On top of MUSET-01's contract/error-path/happy-path coverage above, the
+//! `golden_support` + `golden` modules at the bottom of this file (plus
+//! `golden::golden` nested inside `db_gated` for the seeded-row endpoints)
+//! add a **golden-response baseline**: the exact, canonicalized JSON (or raw
+//! bytes, for the artwork proxy) a representative request currently returns,
+//! committed under `tests/golden/` and diffed on every run — so a change to
+//! response *content*, not just status code, surfaces as a failing test.
+//! Non-deterministic fields (timestamps, generated ids, per-run-unique
+//! fixture names) are redacted to a stable `"<redacted>"` placeholder before
+//! comparison (see `golden_support::redact`) rather than skipped, so the
+//! rest of the shape is still asserted exactly. Regenerate an intentionally
+//! changed baseline with `MUSE_UPDATE_GOLDEN=1 cargo test endpoint_tests`
+//! (never hand-edit a `tests/golden/*.json` file). See
+//! `golden::golden_diff_mechanism_detects_a_deliberately_altered_response`
+//! for a self-contained proof that the comparison actually catches drift.
 
 use std::sync::Arc;
 
@@ -1209,5 +1226,591 @@ mod db_gated {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    // ===================================================================
+    // MUSET-02: golden-response baseline for the endpoints whose happy
+    // path needs seeded rows. Nested here (rather than in the top-level
+    // `golden` module below) purely so these tests can reuse `db_gated`'s
+    // own private `test_pool_or_skip`/`state_for` helpers via `use
+    // super::*` — same DB-gated skip-cleanly posture as every other test
+    // in this module.
+    // ===================================================================
+    mod golden {
+        use uuid::Uuid;
+
+        use crate::endpoint_tests::golden_support::*;
+
+        use super::*;
+
+        /// `/recommend` + `/recommend/on_deck` + `/recommend/gaps` against a
+        /// real, signal-empty account — the response never echoes
+        /// `account_id` back, so all three come back byte-for-byte
+        /// deterministic (`{"items": []}`) with no redaction needed.
+        #[tokio::test]
+        async fn recommend_family_empty_account_matches_golden_baseline() {
+            let Some(pool) =
+                test_pool_or_skip("recommend_family_empty_account_matches_golden_baseline").await
+            else {
+                return;
+            };
+
+            let suffix = Uuid::new_v4().simple().to_string();
+            let account = crate::repo::account::create(
+                &pool,
+                &crate::models::account::NewAccount {
+                    plex_account_id: Some(format!("muset02-golden-recommend-{suffix}")),
+                    username: Some(format!("muset02_golden_recommend_{suffix}")),
+                    friendly_name: Some("MUSET-02 Golden Recommend".to_string()),
+                    is_home_user: false,
+                    is_primary: false,
+                },
+            )
+            .await
+            .expect("create account");
+
+            let app = router(state_for(pool.clone()));
+
+            let (status, recommend) = send(
+                app.clone(),
+                post_json("/recommend", json!({"account_id": account.id})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            let (status, on_deck) = send(
+                app.clone(),
+                get(&format!("/recommend/on_deck?account_id={}", account.id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            let (status, gaps) = send(
+                app.clone(),
+                get(&format!("/recommend/gaps?account_id={}", account.id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            assert_json_golden(
+                "recommend_family_empty_account.json",
+                &json!({
+                    "recommend": recommend,
+                    "on_deck": on_deck,
+                    "gaps": gaps,
+                }),
+            );
+
+            sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(account.id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+
+        /// `GET /api/channels` shape for a real seeded channel — id/name
+        /// are non-deterministic (fresh per test run, to avoid colliding
+        /// with concurrent suites against the same scratch DB), so both
+        /// are redacted before comparison; every other field
+        /// (kind/mode/channel_number/enabled) is asserted exactly.
+        #[tokio::test]
+        async fn channel_summary_shape_matches_golden_baseline() {
+            let Some(pool) =
+                test_pool_or_skip("channel_summary_shape_matches_golden_baseline").await
+            else {
+                return;
+            };
+
+            use crate::models::channel::{ChannelKind, ChannelMode, NewChannel};
+
+            let suffix = Uuid::new_v4().simple().to_string();
+            let channel = crate::repo::channel::create_channel(
+                &pool,
+                &NewChannel {
+                    account_id: None,
+                    name: format!("muset02-golden-channel-{suffix}"),
+                    kind: ChannelKind::Personal,
+                    mode: ChannelMode::OnDemand,
+                    channel_number: None,
+                    target_client_id: None,
+                    directive: None,
+                    rules: json!({}),
+                    is_preset: false,
+                },
+            )
+            .await
+            .expect("create channel");
+
+            let app = router(state_for(pool.clone()));
+            let (status, body) = send(app.clone(), get("/api/channels")).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let entry = body
+                .as_array()
+                .expect("api/channels returns a JSON array")
+                .iter()
+                .find(|c| c["id"] == json!(channel.id))
+                .cloned()
+                .expect("seeded channel should appear in /api/channels");
+
+            assert_json_golden("channel_summary.json", &redact(entry, &["/id", "/name"]));
+
+            sqlx::query("DELETE FROM channels WHERE id = $1")
+                .bind(channel.id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+
+        /// `GET /api/channels/{id}/lineup` shape for a real seeded channel
+        /// with no programs in-window — deterministic once id/name/
+        /// generated_at/window_start/window_end are redacted:
+        /// `now_program_id` is `null` and `programs` is `[]` by
+        /// construction (no `channel_programs` rows exist for this
+        /// channel).
+        #[tokio::test]
+        async fn channel_lineup_empty_shape_matches_golden_baseline() {
+            let Some(pool) =
+                test_pool_or_skip("channel_lineup_empty_shape_matches_golden_baseline").await
+            else {
+                return;
+            };
+
+            use crate::models::channel::{ChannelKind, ChannelMode, NewChannel};
+
+            let suffix = Uuid::new_v4().simple().to_string();
+            let channel = crate::repo::channel::create_channel(
+                &pool,
+                &NewChannel {
+                    account_id: None,
+                    name: format!("muset02-golden-lineup-{suffix}"),
+                    kind: ChannelKind::Personal,
+                    mode: ChannelMode::OnDemand,
+                    channel_number: None,
+                    target_client_id: None,
+                    directive: None,
+                    rules: json!({}),
+                    is_preset: false,
+                },
+            )
+            .await
+            .expect("create channel");
+
+            let app = router(state_for(pool.clone()));
+            let (status, body) = send(
+                app.clone(),
+                get(&format!("/api/channels/{}/lineup", channel.id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            let redacted = redact(
+                body,
+                &[
+                    "/channel/id",
+                    "/channel/name",
+                    "/generated_at",
+                    "/window_start",
+                    "/window_end",
+                ],
+            );
+            assert_json_golden("channel_lineup_empty.json", &redacted);
+
+            sqlx::query("DELETE FROM channels WHERE id = $1")
+                .bind(channel.id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+
+        /// `POST /proactive/{id}/ack` (`outcome: "dismissed"`) against a
+        /// real seeded item — id/account_id/created_at/dismissed_at are
+        /// non-deterministic and redacted; every other field (status
+        /// transition, the untouched-null columns, the body/kind/headline/
+        /// priority the fixture set) is asserted exactly, proving the
+        /// persisted+returned shape byte-for-byte.
+        #[tokio::test]
+        async fn proactive_ack_dismissed_shape_matches_golden_baseline() {
+            let Some(pool) =
+                test_pool_or_skip("proactive_ack_dismissed_shape_matches_golden_baseline").await
+            else {
+                return;
+            };
+
+            use crate::models::account::NewAccount;
+            use crate::models::proactive_item::NewProactiveItem;
+
+            let suffix = Uuid::new_v4().simple().to_string();
+            let account = crate::repo::account::create(
+                &pool,
+                &NewAccount {
+                    plex_account_id: Some(format!("muset02-golden-ack-{suffix}")),
+                    username: Some(format!("muset02_golden_ack_{suffix}")),
+                    friendly_name: Some("MUSET-02 Golden Ack".to_string()),
+                    is_home_user: false,
+                    is_primary: false,
+                },
+            )
+            .await
+            .expect("create account");
+
+            let item = crate::repo::proactive_item::create(
+                &pool,
+                &NewProactiveItem {
+                    account_id: Some(account.id),
+                    kind: "muset02_golden_ack".to_string(),
+                    media_item_id: None,
+                    headline: "MUSET-02 golden ack fixture".to_string(),
+                    body: Some(json!({"rationale": "golden fixture"})),
+                    priority: 1,
+                    earliest_at: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .expect("create proactive item");
+
+            let app = router(state_for(pool.clone()));
+            let (status, body) = send(
+                app,
+                post_json(
+                    &format!("/proactive/{}/ack", item.id),
+                    json!({"outcome": "dismissed"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            let redacted = redact(
+                body,
+                &[
+                    "/item/id",
+                    "/item/account_id",
+                    "/item/created_at",
+                    "/item/dismissed_at",
+                ],
+            );
+            assert_json_golden("proactive_ack_dismissed.json", &redacted);
+
+            sqlx::query("DELETE FROM proactive_items WHERE id = $1")
+                .bind(item.id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(account.id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+    }
+}
+
+// ===========================================================================
+// MUSET-02: golden-baseline support (file I/O + redaction + comparison) and
+// the DB-independent golden tests. `golden_support` is a private `mod` (not
+// `pub`), so per ordinary Rust visibility rules its `pub(super)` items are
+// reachable from every descendant of `endpoint_tests` — including
+// `db_gated::golden` above, which needs the same helpers for its
+// seeded-row goldens.
+// ===========================================================================
+
+mod golden_support {
+    use std::path::{Path, PathBuf};
+
+    use serde_json::Value;
+
+    /// `tests/golden/` at the crate root — resolved via `CARGO_MANIFEST_DIR`
+    /// (a build-time constant, not a hardcoded path) so this works
+    /// regardless of the worktree/checkout location.
+    pub(super) fn golden_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
+    }
+
+    pub(super) fn golden_path(name: &str) -> PathBuf {
+        golden_dir().join(name)
+    }
+
+    /// `MUSE_UPDATE_GOLDEN=1` is the one sanctioned way to regenerate a
+    /// baseline after an intentional behavior change — golden tests are
+    /// otherwise strictly read-only/comparison-only.
+    pub(super) fn update_golden_enabled() -> bool {
+        std::env::var("MUSE_UPDATE_GOLDEN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Replace the value at each of the given JSON Pointers (RFC 6901, e.g.
+    /// `"/channel/id"`) with the literal string `"<redacted>"`, so
+    /// non-deterministic fields (timestamps, generated ids, per-run-unique
+    /// fixture names) don't break golden comparison while every other field
+    /// is still asserted exactly. A pointer that doesn't resolve (field
+    /// absent/already-null-shaped differently) is silently skipped rather
+    /// than panicking, so callers can pass a superset of "fields that might
+    /// need redacting" defensively.
+    pub(super) fn redact(mut value: Value, pointers: &[&str]) -> Value {
+        for p in pointers {
+            if let Some(slot) = value.pointer_mut(p) {
+                *slot = Value::String("<redacted>".to_string());
+            }
+        }
+        value
+    }
+
+    /// The actual diff/panic logic every golden comparison bottoms out in —
+    /// factored out from `assert_json_golden` so
+    /// `golden::golden_diff_mechanism_detects_a_deliberately_altered_response`
+    /// can exercise this exact code path directly (bypassing the
+    /// `MUSE_UPDATE_GOLDEN` branch) as its proof that drift is actually
+    /// caught, not just asserted to be caught.
+    pub(super) fn compare_or_panic(name: &str, path: &Path, rendered: &str) {
+        let expected = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "golden file {path:?} for {name:?} is missing or unreadable ({e}); run with \
+                 MUSE_UPDATE_GOLDEN=1 to (re)generate it. Rendered value was:\n{rendered}"
+            )
+        });
+        assert_eq!(
+            expected.trim_end(),
+            rendered.trim_end(),
+            "response for golden {name:?} drifted from the committed baseline at {path:?} — if \
+             this drift is an intentional behavior change, re-run with \
+             `MUSE_UPDATE_GOLDEN=1 cargo test endpoint_tests` to update the baseline; otherwise \
+             this is a regression"
+        );
+    }
+
+    /// Compare `actual` (already redacted as needed) against the committed
+    /// golden file `name` under `tests/golden/`. Golden files are
+    /// pretty-printed JSON with alphabetically-sorted keys — this crate does
+    /// not enable serde_json's `preserve_order` feature, so `Value`'s `Map`
+    /// is a `BTreeMap` and `to_string_pretty`'s key order is reproducible
+    /// across machines/runs by construction, not by convention.
+    pub(super) fn assert_json_golden(name: &str, actual: &Value) {
+        let path = golden_path(name);
+        let rendered =
+            serde_json::to_string_pretty(actual).expect("golden value must serialize") + "\n";
+
+        if update_golden_enabled() {
+            std::fs::create_dir_all(golden_dir()).expect("create tests/golden");
+            std::fs::write(&path, &rendered).expect("write golden file");
+            return;
+        }
+
+        compare_or_panic(name, &path, &rendered);
+    }
+
+    /// Byte-for-byte binary golden comparison, for non-JSON bodies (the
+    /// artwork proxy's placeholder PNG). Same `MUSE_UPDATE_GOLDEN=1`
+    /// regeneration mechanism as `assert_json_golden`.
+    pub(super) fn assert_bytes_golden(name: &str, actual: &[u8]) {
+        let path = golden_path(name);
+
+        if update_golden_enabled() {
+            std::fs::create_dir_all(golden_dir()).expect("create tests/golden");
+            std::fs::write(&path, actual).expect("write golden file");
+            return;
+        }
+
+        let expected = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "golden file {path:?} for {name:?} is missing or unreadable ({e}); run with \
+                 MUSE_UPDATE_GOLDEN=1 to (re)generate it"
+            )
+        });
+        assert_eq!(
+            expected, actual,
+            "binary response for golden {name:?} drifted from the committed baseline at \
+             {path:?} — if this drift is intentional, re-run with \
+             `MUSE_UPDATE_GOLDEN=1 cargo test endpoint_tests`; otherwise this is a regression"
+        );
+    }
+}
+
+/// MUSET-02: DB-independent golden-response tests — every endpoint here
+/// needs no seeded row and no `MUSE_TEST_DATABASE_URL`, so these run in the
+/// default `cargo test` invocation same as the rest of this module's
+/// contract/error-path tests. The equivalent goldens for endpoints whose
+/// representative response needs a real seeded row live in
+/// `db_gated::golden` above (same skip-cleanly-without-a-DB posture as
+/// every other `db_gated` test).
+mod golden {
+    use super::golden_support::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn health_response_matches_golden_baseline() {
+        let (status, body) = send(app_no_db(), get("/health")).await;
+        assert_eq!(status, StatusCode::OK);
+        // `version` tracks `CARGO_PKG_VERSION` and legitimately changes
+        // across releases — redacted so the baseline doesn't churn on every
+        // version bump while `status`/`db` are still asserted exactly.
+        assert_json_golden("health.json", &redact(body, &["/version"]));
+    }
+
+    #[tokio::test]
+    async fn query_resolve_empty_query_matches_golden_baseline() {
+        let (status, body) = send(
+            app_no_db(),
+            post_json("/query/resolve", json!({"query": ""})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_json_golden("query_resolve_empty.json", &body);
+    }
+
+    #[tokio::test]
+    async fn ops_ingest_arr_unconfigured_matches_golden_baseline() {
+        let (status, body) = send(app_no_db(), post_empty("/ops/ingest/arr")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_json_golden("ops_ingest_arr_unconfigured.json", &body);
+    }
+
+    #[tokio::test]
+    async fn ops_ingest_tautulli_unconfigured_matches_golden_baseline() {
+        let (status, body) = send(app_no_db(), post_empty("/ops/ingest/tautulli")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_json_golden("ops_ingest_tautulli_unconfigured.json", &body);
+    }
+
+    #[tokio::test]
+    async fn unimplemented_ingest_subroute_matches_golden_baseline() {
+        let (status, body) = send(app_no_db(), post_empty("/ingest/some-future-source")).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_json_golden("not_implemented.json", &body);
+    }
+
+    #[tokio::test]
+    async fn unimplemented_query_subroute_matches_golden_baseline() {
+        let (status, body) = send(app_no_db(), get("/query/some-future-query")).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_json_golden("not_implemented.json", &body);
+    }
+
+    #[tokio::test]
+    async fn unimplemented_proactive_subroute_matches_golden_baseline() {
+        let (status, body) = send(app_no_db(), get("/proactive/some-future-thing")).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_json_golden("not_implemented.json", &body);
+    }
+
+    #[tokio::test]
+    async fn proactive_ack_invalid_outcome_matches_golden_baseline() {
+        let (status, body) = send(
+            app_no_db(),
+            post_json(
+                "/proactive/1/ack",
+                json!({"outcome": "definitely_not_valid"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_json_golden("proactive_ack_invalid_outcome.json", &body);
+    }
+
+    #[tokio::test]
+    async fn channels_compose_empty_show_list_matches_golden_baseline() {
+        let (status, body) = send(
+            app_no_db(),
+            post_json("/channels/1/compose", json!({"show_media_item_ids": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_json_golden("channels_compose_empty_show_list.json", &body);
+    }
+
+    #[tokio::test]
+    async fn channels_compose_non_positive_session_matches_golden_baseline() {
+        let (status, body) = send(
+            app_no_db(),
+            post_json(
+                "/channels/1/compose",
+                json!({"show_media_item_ids": [1], "target_session_ms": 0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_json_golden("channels_compose_non_positive_session.json", &body);
+    }
+
+    /// The artwork proxy's placeholder path is fully deterministic — a
+    /// fixed, embedded 1x1 PNG (`web::artwork::PLACEHOLDER_PNG`) — so this
+    /// goes further than a JSON golden and byte-for-byte compares the
+    /// actual response body against a committed binary golden, plus asserts
+    /// the two headers that mark it as the placeholder path.
+    #[tokio::test]
+    async fn art_proxy_placeholder_bytes_and_headers_match_golden_baseline() {
+        let response = app_no_db()
+            .oneshot(get("/art/poster/1"))
+            .await
+            .expect("router should answer");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-muse-artwork-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("placeholder")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        assert_bytes_golden("art_placeholder.png", &bytes);
+    }
+
+    /// MUSET-02's acceptance criterion "a regression is detected on a
+    /// deliberate change": exercises `golden_support::compare_or_panic` —
+    /// the exact function every golden test above bottoms out in — directly
+    /// and self-contained (a scratch golden file under `std::env::temp_dir`,
+    /// never a committed `tests/golden/*.json`), proving two things: (1) an
+    /// unchanged response compared against its own golden does NOT panic
+    /// (no false positive), and (2) a deliberately altered response
+    /// compared against the SAME unmodified golden DOES panic (drift is
+    /// actually caught, not just asserted-to-be-caught).
+    #[test]
+    fn golden_diff_mechanism_detects_a_deliberately_altered_response() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "muset02-golden-regression-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch golden dir");
+        let path = dir.join("scratch.json");
+
+        let baseline = json!({"status": "ok", "tier": "none"});
+        let baseline_rendered = serde_json::to_string_pretty(&baseline).unwrap() + "\n";
+        std::fs::write(&path, &baseline_rendered).expect("seed scratch golden");
+
+        // No false positive: comparing the (unmodified) baseline against
+        // itself must not panic.
+        compare_or_panic("scratch-unchanged", &path, &baseline_rendered);
+
+        // The actual regression proof: a deliberately altered "current"
+        // response — same shape, `tier` flipped from `"none"` to
+        // `"vector"`, exactly the class of drift a real behavior change
+        // (e.g. an accidental resolution-tier rename) would produce —
+        // diffed against the SAME unmodified golden file must panic.
+        let mutated = json!({"status": "ok", "tier": "vector"});
+        let mutated_rendered = serde_json::to_string_pretty(&mutated).unwrap() + "\n";
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compare_or_panic("scratch-mutated", &path, &mutated_rendered);
+        }));
+        assert!(
+            result.is_err(),
+            "the golden-diff mechanism failed to detect a deliberately altered response — \
+             drift detection is broken"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

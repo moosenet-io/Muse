@@ -64,6 +64,12 @@ pub enum SnapshotGuardError {
     /// single IP literal (e.g. a mangled authority with a residual `:`).
     /// Rejected fail-closed rather than allowed to fall through.
     UnparseableHost { host: String },
+    /// The DSN carries no explicit, non-empty path database name. libpq/
+    /// `pg_dump` would resolve the target via connection defaults (commonly
+    /// the username, or `PGDATABASE`) -- an unvalidated effective target.
+    /// Rejected fail-closed so the effective db can never differ from what
+    /// the guard checked.
+    MissingDatabaseName,
 }
 
 impl fmt::Display for SnapshotGuardError {
@@ -105,6 +111,12 @@ impl fmt::Display for SnapshotGuardError {
                 f,
                 "snapshot DSN guard: host ({host:?}) did not parse as a single hostname or IP \
                  address -- refusing fail-closed rather than treating an unparseable host as safe"
+            ),
+            SnapshotGuardError::MissingDatabaseName => write!(
+                f,
+                "snapshot DSN guard: DSN carries no explicit database name -- libpq/pg_dump would \
+                 default the target (to the username or PGDATABASE), an unvalidated effective DB, \
+                 so an explicit non-empty database name is required"
             ),
         }
     }
@@ -351,6 +363,13 @@ pub fn validate_snapshot_dsn(dsn: &str) -> Result<(), SnapshotGuardError> {
     let host_lower = canonical.host.to_lowercase();
     let db_lower = canonical.db_name.to_lowercase();
 
+    // Belt-and-suspenders: reject an empty/omitted db name (the marker check
+    // below already requires a non-empty, marked db name, but make the
+    // no-libpq-defaulting rule explicit and shared with the source path).
+    if db_lower.is_empty() {
+        return Err(SnapshotGuardError::MissingDatabaseName);
+    }
+
     // LOAD policy (a): host must NOT be a private RFC-1918 / IPv6-ULA fleet
     // address -- the isolated test DB lives on loopback.
     if host_is_private_ip(&host_lower) {
@@ -393,13 +412,26 @@ pub fn validate_snapshot_dsn(dsn: &str) -> Result<(), SnapshotGuardError> {
 /// it uses the SAME fail-closed [`parse_and_canonicalize_dsn`] -- so it
 /// inherits the multi-host rejection AND the query-param override rejection
 /// (closing `…/muse_source_export?dbname=muse` reaching the prod DB via
-/// libpq). Its ONLY additional policy: the effective db name must not be the
-/// bare/production `muse` database (almost certainly a misconfiguration --
-/// acquisition reads Plex/Tautulli/*arr or a deliberately-named muse source,
-/// not the live prod db by that bare name).
+/// libpq). Its policy on the canonical components:
+/// - the DSN MUST carry an explicit, non-empty path database name. An omitted
+///   db name would let libpq/`pg_dump` default the target -- commonly to the
+///   USERNAME (or `PGDATABASE`) -- so e.g. `postgres://muse@source-host`
+///   (empty path db) would effectively read the `muse` DB AFTER passing a
+///   bare-name check. Rejecting empty removes all reliance on libpq defaults.
+/// - that explicit db name must not be the bare/production `muse` database
+///   (almost certainly a misconfiguration -- acquisition reads Plex/Tautulli/
+///   *arr or a deliberately-named muse source, not the live prod db).
+///
+/// The source legitimately lives on the private fleet network, so a
+/// private-IP host is NOT rejected here (unlike the load path).
 pub fn validate_not_prod_source(dsn: &str) -> Result<(), SnapshotGuardError> {
     let canonical = parse_and_canonicalize_dsn(dsn)?;
     let db_lower = canonical.db_name.to_lowercase();
+    // FAIL-CLOSED: require an explicit db name -- never let libpq default it
+    // (which would resolve to the username, e.g. `muse`, reaching prod).
+    if db_lower.is_empty() {
+        return Err(SnapshotGuardError::MissingDatabaseName);
+    }
     if db_lower == "muse" || db_lower.contains("prod") || db_lower.contains("muse_live") {
         return Err(SnapshotGuardError::DenylistMatch {
             field: "source database name",
@@ -522,6 +554,25 @@ mod tests {
             matches!(err, SnapshotGuardError::UnparseableHost { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn load_path_rejects_an_empty_database_name() {
+        // Belt-and-suspenders: an omitted/empty db name is rejected as
+        // MissingDatabaseName (before the marker check would also catch it),
+        // so libpq can never default the load target.
+        for dsn in [
+            "postgres://localhost:5433",
+            "postgres://localhost:5433/",
+            "postgres://localhost:5433/?sslmode=disable",
+        ] {
+            let err =
+                validate_snapshot_dsn(dsn).expect_err(&format!("{dsn} (no db) must be rejected"));
+            assert!(
+                matches!(err, SnapshotGuardError::MissingDatabaseName),
+                "{dsn} -> {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -732,6 +783,32 @@ mod tests {
     fn validate_not_prod_source_allows_inert_query_params() {
         let dsn = "postgres://source-host:5432/tautulli?sslmode=require&connect_timeout=5";
         assert!(validate_not_prod_source(dsn).is_ok());
+    }
+
+    #[test]
+    fn validate_not_prod_source_rejects_omitted_db_defaulting_to_username() {
+        // `postgres://muse@source-host` has an EMPTY path db, but libpq/
+        // pg_dump would default the target to the username `muse` -> prod.
+        // Reject fail-closed on the empty db, before any bare-name check.
+        for dsn in [
+            "postgres://muse@source-host",
+            "postgres://source-host",
+            "postgres://source-host/",
+            "postgres://user@source-host:5432/",
+        ] {
+            let err = validate_not_prod_source(dsn)
+                .expect_err(&format!("{dsn} (no explicit db) must be rejected"));
+            assert!(
+                matches!(err, SnapshotGuardError::MissingDatabaseName),
+                "{dsn} -> {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_not_prod_source_allows_an_explicit_non_prod_source_db() {
+        // A valid, explicit source db passes even with a username present.
+        assert!(validate_not_prod_source("postgres://user@source-host/plex_library").is_ok());
     }
 
     // -----------------------------------------------------------------

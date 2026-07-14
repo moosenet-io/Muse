@@ -425,10 +425,13 @@ mod tests {
     }
 
     fn high_engagement_counts() -> EngagementCounts {
+        // Both rates genuinely > 0.8 (watch-through 9/10 = 0.9, household-love
+        // 9/10 = 0.9): a friend with these counts is unambiguously top-tier
+        // (`Curator`), so the negative test's non-vacuity guard holds honestly.
         EngagementCounts {
             watched: 9,
             touched: 10,
-            household_loved: 8,
+            household_loved: 9,
             household_rated: 10,
         }
     }

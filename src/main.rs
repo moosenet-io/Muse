@@ -15,6 +15,8 @@ pub mod embed;
 mod endpoint_tests;
 pub mod enrichment;
 mod error;
+#[cfg(test)]
+mod fixtures;
 mod http;
 #[cfg(test)]
 mod integration_tests;

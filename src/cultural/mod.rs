@@ -11,22 +11,34 @@
 //! [`cache::TrendCache`] to respect API rate limits.
 //!
 //! That trending/talk data is then INTERSECTED with the account's actual
-//! library ownership (`media_items`) and taste signal (`taste_profile`,
+//! library ownership (`media_items`) AND taste signal (`taste_profile`,
 //! `crate::persona::blend::cosine_similarity` against the same embeddings
 //! `curation::candidates::gather_taste_candidates` already reuses) to
 //! produce [`CulturalPick`]s: titles that are culturally live AND owned AND
-//! (when a taste signal exists) taste-relevant — the "the talk" surface
-//! ([`CulturalPick::headline`]) is exactly this list.
+//! taste-relevant. All three legs are HARD gates — a trending title you own
+//! but whose taste relevance is below [`TASTE_RELEVANCE_MIN`] (or has no
+//! computable taste signal at all) is DROPPED, not merely ranked lower, so
+//! the "the talk" surface ([`CulturalPick::headline`]) is a genuine
+//! three-way intersection, not "everything you own that's trending, sorted
+//! by taste."
 //!
-//! ## Cold-start
-//! When an account's `taste_profile` is SPARSE ([`is_profile_sparse`]),
-//! `curation::candidates::gather_taste_candidates` already returns nothing
-//! (see that function's doc) — this module's [`select_cold_start_picks`] /
-//! [`cold_start_recommendations`] is the fallback: trend entries, ranked by
-//! a TASTE-NEIGHBOR signal (a persona centroid, when the account has one —
-//! see `crate::persona`) where available, plain trend popularity otherwise.
-//! Either way it still returns something, closing the "brand-new account
-//! has nothing to recommend" gap.
+//! ## Entry point + cold-start routing
+//! [`recommend_cultural`] is the single entry point a channel/GUI calls; it
+//! is where [`is_profile_sparse`] actually TRIGGERS the fallback. It loads
+//! the account's `taste_profile` once and branches:
+//! - **not sparse** → [`the_talk_surface`], the trending ∩ library ∩ taste
+//!   intersection above;
+//! - **sparse** (no profile / no centroid / thin genre affinity) →
+//!   [`cold_start_recommendations`], since the intersection has no usable
+//!   centroid and [`build_cultural_picks`]'s taste filter would drop
+//!   everything. The fallback surfaces trend entries ranked by a
+//!   TASTE-NEIGHBOR signal (a persona centroid, when the account has one —
+//!   see `crate::persona`) where available, plain trend popularity
+//!   otherwise — "what's hot that people like you love," degrading to
+//!   "what's hot," but never nothing. This closes the "brand-new account
+//!   has nothing to recommend" gap.
+//! The routing is proven wired (not dead code) by
+//! `live_tests::sparse_profile_routes_to_cold_start_while_rich_profile_uses_the_intersection`.
 //!
 //! ## No-PII-egress
 //! Every DB-touching function in this module resolves account-scoped data
@@ -92,6 +104,27 @@ pub fn is_profile_sparse(profile: Option<&TasteProfile>) -> bool {
         }
     }
 }
+
+/// Minimum cosine similarity (`crate::persona::blend::cosine_similarity`,
+/// range `[-1.0, 1.0]`) between an owned trending title's embedding and the
+/// account's taste centroid for that title to count as TASTE-RELEVANT — the
+/// third leg of the trending ∩ library ∩ taste intersection. A title that
+/// is trending and owned but scores below this (or has no computable taste
+/// signal at all — no embedding yet, in the non-cold-start path) is DROPPED
+/// from `the_talk_surface`, not merely ranked lower: the AC asks for
+/// "culturally live that YOU OWN *and would like*," which is an
+/// intersection, not "everything you own, sorted by taste."
+///
+/// `0.2` is a conservative, deliberately-inclusive floor (matching the
+/// hedged posture of `Config::recall_vector_max_distance`'s doc): raw
+/// `nomic-embed-text` cosine similarities between genuinely related titles
+/// run well above it, while it still excludes the near-orthogonal
+/// (`~0.0`) and anti-correlated (`< 0.0`) matches that would make the
+/// surface "trending and owned" rather than "trending, owned, and to your
+/// taste." Not tuned against a production corpus yet — a later item can
+/// raise it once real distributions are observed, same as
+/// `recall_vector_max_distance`.
+pub const TASTE_RELEVANCE_MIN: f32 = 0.2;
 
 // --- the intersection: trending ∩ library ∩ taste ---------------------
 
@@ -170,17 +203,24 @@ impl CulturalPick {
 /// the ranked [`CulturalPick`] list. No DB access, no `TrendSource` call —
 /// see the module doc's "pure core / DB-wrapper split".
 ///
-/// A trend entry not present in `library` is dropped — this function's
-/// whole point is the INTERSECTION, "trending titles you own," not
-/// trending in general (that's `curation::candidates::gather_available_now_candidates`'s
-/// job for the not-in-library half).
+/// This enforces the FULL three-way intersection, not just two legs:
+/// 1. A trend entry not present in `library` is dropped (not owned).
+/// 2. An owned entry whose taste relevance is below [`TASTE_RELEVANCE_MIN`]
+///    — including one with NO computable taste signal at all (no
+///    `taste_centroid`, or no embedding for the title) — is ALSO dropped.
+///    This is the leg finding #2 added: the result is "trending titles you
+///    own AND would like," never "everything you own that's trending,
+///    ranked by taste." (The cold-start path in
+///    [`select_cold_start_picks`] is the deliberate exception — it runs
+///    precisely when there's no usable taste centroid to intersect against.)
 ///
-/// Ranking: taste-fit descending (unknown taste-fit sorts last, not as
-/// `0.0` — an unknown signal must never outrank or equal a real low-taste
-/// match), then talk-score descending, then raw popularity descending. Ties
-/// beyond that are insertion-order stable (`sort_by`'s own guarantee),
-/// matching `curation::recommend::rank_candidates`'s own "no invented
-/// tiebreak" posture.
+/// Every surviving pick therefore has a real `taste_fit >=
+/// TASTE_RELEVANCE_MIN`. Ranking among survivors: taste-fit descending,
+/// then talk-score descending, then raw popularity descending — popularity
+/// is only ever a tiebreak among already-taste-relevant picks, never a way
+/// to surface a taste-irrelevant one. Ties beyond that are insertion-order
+/// stable (`sort_by`'s own guarantee), matching
+/// `curation::recommend::rank_candidates`'s "no invented tiebreak" posture.
 pub fn build_cultural_picks(
     entries: &[TrendEntry],
     library: &HashMap<String, LibraryMatch>,
@@ -191,13 +231,20 @@ pub fn build_cultural_picks(
     let mut picks: Vec<CulturalPick> = entries
         .iter()
         .filter_map(|entry| {
+            // Leg 1: owned?
             let lib = library.get(&entry.external_id)?;
 
+            // Leg 3: taste-relevant? Requires BOTH a centroid to compare
+            // against AND an embedding for this title; a missing either =
+            // no computable taste signal = not taste-relevant = dropped.
             let taste_fit = taste_centroid.and_then(|centroid| {
                 embeddings
                     .get(&entry.external_id)
                     .map(|item_vec| cosine_similarity(item_vec, centroid))
-            });
+            })?;
+            if taste_fit < TASTE_RELEVANCE_MIN {
+                return None;
+            }
 
             let talk_signal = talk.get(&entry.external_id).map(|t| TalkSignal {
                 talk_score: t.talk_score,
@@ -213,7 +260,7 @@ pub fn build_cultural_picks(
                 kind: entry.kind,
                 popularity: entry.popularity,
                 talk: talk_signal,
-                taste_fit,
+                taste_fit: Some(taste_fit),
             })
         })
         .collect();
@@ -228,14 +275,14 @@ pub fn build_cultural_picks(
     picks
 }
 
-/// Total-orderable rank tuple for [`build_cultural_picks`]'s sort: an
-/// unknown `taste_fit` sorts as the WORST possible bucket (never `0.0`,
-/// which would tie with or beat a real negative-cosine match), then
-/// present-taste-fit descending (via a millipoint integer — `f32` isn't
-/// `Ord`), then talk-score descending (same integer trick).
-fn rank_key(pick: &CulturalPick) -> (u8, i64, i64) {
-    let taste_bucket: u8 = if pick.taste_fit.is_some() { 0 } else { 1 };
-    // Descending sort on a value achieved by negating a scaled integer.
+/// Total-orderable rank tuple for [`build_cultural_picks`]'s sort. Every
+/// pick reaching this point has already passed the [`TASTE_RELEVANCE_MIN`]
+/// filter, so `taste_fit` is always `Some` here; the `unwrap_or` is a
+/// defensive floor, never exercised in the wired path. Taste-fit
+/// descending (via a millipoint integer — `f32` isn't `Ord`), then
+/// talk-score descending (same integer trick).
+fn rank_key(pick: &CulturalPick) -> (i64, i64) {
+    // Descending sort achieved by negating a scaled integer.
     let taste_rank = pick
         .taste_fit
         .map(|f| -((f * 1_000_000.0) as i64))
@@ -244,7 +291,7 @@ fn rank_key(pick: &CulturalPick) -> (u8, i64, i64) {
         .talk
         .map(|t| -((t.talk_score * 1_000_000.0) as i64))
         .unwrap_or(0);
-    (taste_bucket, taste_rank, talk_rank)
+    (taste_rank, talk_rank)
 }
 
 /// DB-touching wrapper: resolve `entries` against the account's library +
@@ -484,6 +531,57 @@ pub async fn cold_start_recommendations(
     ))
 }
 
+// --- entry point: sparse-aware routing --------------------------------
+
+/// What [`recommend_cultural`] returned, tagged with WHICH path produced it
+/// — so a caller (and the routing test) can tell a sparse-profile
+/// cold-start result from a rich-profile taste-intersection one, rather
+/// than the two collapsing into an untyped list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CulturalRecommendations {
+    /// Rich-profile path: the trending ∩ library ∩ taste intersection
+    /// ([`the_talk_surface`] / [`build_cultural_picks`]).
+    TasteIntersection(Vec<CulturalPick>),
+    /// Sparse-profile cold-start fallback ([`cold_start_recommendations`] /
+    /// [`select_cold_start_picks`]): trend + taste-neighbor / popularity.
+    ColdStart(Vec<ColdStartPick>),
+}
+
+/// The single cultural-layer entry point a channel/GUI calls. THIS is where
+/// [`is_profile_sparse`] actually triggers the cold-start fallback (finding
+/// #3): it loads the account's `taste_profile` and branches —
+///
+/// - **sparse** (no profile / no centroid / thin genre affinity) →
+///   [`cold_start_recommendations`] ("what's hot that people like you love,"
+///   degrading to "what's hot"), because the normal taste-intersection has
+///   no usable centroid to intersect against and
+///   [`build_cultural_picks`]'s [`TASTE_RELEVANCE_MIN`] filter would drop
+///   everything;
+/// - **not sparse** → [`the_talk_surface`], the real trending ∩ library ∩
+///   taste intersection.
+///
+/// Loading the profile once here and branching (rather than letting
+/// `the_talk_surface` re-derive sparsity) keeps the decision in one place
+/// and makes it directly testable — see
+/// `live_tests::sparse_profile_routes_to_cold_start_while_rich_profile_uses_the_intersection`.
+pub async fn recommend_cultural(
+    pool: &PgPool,
+    account_id: i64,
+    source: &dyn TrendSource,
+    cache: &TrendCache,
+    region: &str,
+) -> MuseResult<CulturalRecommendations> {
+    let profile = repo::taste::get_profile(pool, account_id).await?;
+
+    if is_profile_sparse(profile.as_ref()) {
+        let picks = cold_start_recommendations(pool, account_id, source, cache, region).await?;
+        Ok(CulturalRecommendations::ColdStart(picks))
+    } else {
+        let picks = the_talk_surface(pool, account_id, source, cache, region).await?;
+        Ok(CulturalRecommendations::TasteIntersection(picks))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +642,9 @@ mod tests {
 
     // --- build_cultural_picks: the intersection --------------------------
 
+    /// Leg 1 of the intersection: a trending title not owned is dropped
+    /// even when it IS taste-relevant (embedding present + above the
+    /// cutoff) — ownership is a hard gate, not a soft signal.
     #[test]
     fn intersection_drops_trending_titles_not_in_library() {
         let entries = vec![
@@ -559,15 +660,30 @@ mod tests {
             },
         );
 
-        let picks =
-            build_cultural_picks(&entries, &library, &HashMap::new(), None, &HashMap::new());
+        // Both titles are taste-relevant; only "1" is owned.
+        let centroid = vec![1.0, 0.0];
+        let mut embeddings = HashMap::new();
+        embeddings.insert("1".to_string(), vec![1.0, 0.0]);
+        embeddings.insert("2".to_string(), vec![1.0, 0.0]);
+
+        let picks = build_cultural_picks(
+            &entries,
+            &library,
+            &HashMap::new(),
+            Some(&centroid),
+            &embeddings,
+        );
 
         assert_eq!(picks.len(), 1);
         assert_eq!(picks[0].title, "Owned");
     }
 
+    /// Leg 3, part A: an owned trending title with NO computable taste
+    /// signal (no embedding for it, or no centroid at all) is DROPPED, not
+    /// merely ranked last — that's what makes this a real three-way
+    /// intersection rather than "everything owned, ranked by taste."
     #[test]
-    fn intersection_ranks_known_taste_fit_above_unknown() {
+    fn intersection_drops_owned_titles_without_a_computable_taste_signal() {
         let entries = vec![
             trend_entry("1", "No Embedding", 99.0),
             trend_entry("2", "Embedded", 10.0),
@@ -589,7 +705,7 @@ mod tests {
         );
 
         let mut embeddings = HashMap::new();
-        embeddings.insert("2".to_string(), vec![1.0, 0.0]);
+        embeddings.insert("2".to_string(), vec![1.0, 0.0]); // only "2" has an embedding
         let centroid = vec![1.0, 0.0]; // identical vector -> cosine similarity 1.0
 
         let picks = build_cultural_picks(
@@ -601,39 +717,68 @@ mod tests {
         );
 
         assert_eq!(
-            picks[0].title, "Embedded",
-            "a real, known taste-fit match must outrank an unknown one even at lower popularity"
+            picks.len(),
+            1,
+            "the owned-but-un-embedded title must be dropped, not surfaced with a null taste signal"
         );
+        assert_eq!(picks[0].title, "Embedded");
         assert!(picks[0].taste_fit.is_some());
-        assert!(picks[1].taste_fit.is_none());
+
+        // With no centroid at all, EVERY owned title is dropped (the
+        // non-cold-start intersection has nothing to intersect against).
+        let picks_no_centroid =
+            build_cultural_picks(&entries, &library, &HashMap::new(), None, &embeddings);
+        assert!(
+            picks_no_centroid.is_empty(),
+            "with no taste centroid, the taste-intersection path yields nothing (cold-start is the exception)"
+        );
     }
 
+    /// Leg 3, part B: an owned trending title BELOW [`TASTE_RELEVANCE_MIN`]
+    /// is dropped even at very high popularity, and popularity is only a
+    /// tiebreak AMONG the taste-relevant survivors — never a way to surface
+    /// a taste-irrelevant one.
     #[test]
-    fn intersection_falls_back_to_popularity_with_no_taste_signal_at_all() {
+    fn intersection_drops_taste_irrelevant_titles_and_keeps_popularity_as_tiebreak() {
         let entries = vec![
-            trend_entry("1", "Less Popular", 10.0),
-            trend_entry("2", "More Popular", 90.0),
+            trend_entry("1", "Popular But Off-Taste", 99.0),
+            trend_entry("2", "Relevant Lower Pop", 40.0),
+            trend_entry("3", "Relevant Higher Pop", 80.0),
         ];
         let mut library = HashMap::new();
-        library.insert(
-            "1".to_string(),
-            LibraryMatch {
-                media_metadata_id: 1,
-                media_item_id: 1,
-            },
-        );
-        library.insert(
-            "2".to_string(),
-            LibraryMatch {
-                media_metadata_id: 2,
-                media_item_id: 2,
-            },
+        for id in ["1", "2", "3"] {
+            library.insert(
+                id.to_string(),
+                LibraryMatch {
+                    media_metadata_id: id.parse().unwrap(),
+                    media_item_id: id.parse().unwrap(),
+                },
+            );
+        }
+
+        let centroid = vec![1.0, 0.0];
+        let mut embeddings = HashMap::new();
+        embeddings.insert("1".to_string(), vec![0.0, 1.0]); // orthogonal -> cosine 0.0 < 0.2, dropped
+        embeddings.insert("2".to_string(), vec![1.0, 0.0]); // cosine 1.0
+        embeddings.insert("3".to_string(), vec![1.0, 0.0]); // cosine 1.0
+
+        let picks = build_cultural_picks(
+            &entries,
+            &library,
+            &HashMap::new(),
+            Some(&centroid),
+            &embeddings,
         );
 
-        let picks =
-            build_cultural_picks(&entries, &library, &HashMap::new(), None, &HashMap::new());
-
-        assert_eq!(picks[0].title, "More Popular");
+        assert_eq!(
+            picks.len(),
+            2,
+            "the off-taste title is dropped despite the highest popularity"
+        );
+        assert!(picks.iter().all(|p| p.title != "Popular But Off-Taste"));
+        // Equal taste_fit + no talk -> popularity tiebreak among relevants.
+        assert_eq!(picks[0].title, "Relevant Higher Pop");
+        assert_eq!(picks[1].title, "Relevant Lower Pop");
     }
 
     #[test]

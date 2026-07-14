@@ -235,6 +235,15 @@ pub struct Config {
     /// same posture as `Config::news_api_key` being optional alongside
     /// `Config::news_url`. Never a literal (S1/S7).
     pub trakt_api_key: Option<String>,
+    /// Trakt API base URL override (`MUSE_TRAKT_BASE_URL`). `None` — the
+    /// default — means `crate::cultural::source::TraktTrendSource::from_config`
+    /// uses Trakt's public API host (`TRAKT_DEFAULT_BASE_URL`). Exists so a
+    /// test (httpmock server) or an on-prem Trakt proxy can point the client
+    /// elsewhere without recompiling — the exact same override seam
+    /// `TmdbClient::new(base_url, ..)` already provides for TMDb. Not
+    /// secret-shaped (a host, not a credential); still read from env at
+    /// runtime, never a literal here.
+    pub trakt_base_url: Option<String>,
     /// How long a [`crate::cultural::cache::TrendCache`] pull stays fresh
     /// before the next call re-hits the configured `TrendSource`
     /// (`MUSE_TREND_CACHE_TTL_SECS`) — the rate-limit-respecting cache the
@@ -314,6 +323,7 @@ impl Config {
 
             trakt_client_id: env_opt("TRAKT_CLIENT_ID"),
             trakt_api_key: env_opt("TRAKT_API_KEY"),
+            trakt_base_url: env_opt("MUSE_TRAKT_BASE_URL"),
             trend_cache_ttl_secs: env_u64("MUSE_TREND_CACHE_TTL_SECS", 3600),
         }
     }
@@ -384,6 +394,7 @@ impl Default for Config {
             taste_finding_plane_project: None,
             trakt_client_id: None,
             trakt_api_key: None,
+            trakt_base_url: None,
             trend_cache_ttl_secs: 3600,
         }
     }

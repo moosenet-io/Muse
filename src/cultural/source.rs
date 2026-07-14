@@ -179,7 +179,12 @@ pub struct TraktTrendSource {
     api_key: Option<String>,
 }
 
-const TRAKT_DEFAULT_BASE_URL: &str = "https://api.trakt.tv";
+/// Trakt's public API host — the default `from_config` uses when
+/// `Config::trakt_base_url` (`MUSE_TRAKT_BASE_URL`) is unset. Public (like
+/// `TmdbClient`'s own default base URL is a fine literal) since it's an
+/// API endpoint, not a credential; `from_config` still lets it be
+/// overridden for tests/proxying.
+pub const TRAKT_DEFAULT_BASE_URL: &str = "https://api.trakt.tv";
 const TRAKT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl TraktTrendSource {
@@ -201,17 +206,22 @@ impl TraktTrendSource {
         })
     }
 
-    /// Build from `Config` (`TRAKT_CLIENT_ID` + `TRAKT_API_KEY`). Returns
-    /// `None` when `trakt_client_id` isn't set — the Trakt half of the
-    /// cultural layer simply doesn't run, same graceful-degrade posture as
-    /// `TmdbClient::from_config`.
+    /// Build from `Config` (`TRAKT_CLIENT_ID` + `TRAKT_API_KEY` +
+    /// `MUSE_TRAKT_BASE_URL`). Returns `None` when `trakt_client_id` isn't
+    /// set — the Trakt half of the cultural layer simply doesn't run, same
+    /// graceful-degrade posture as `TmdbClient::from_config`.
+    ///
+    /// The base URL is `Config::trakt_base_url` when set (a test's httpmock
+    /// server, or an on-prem Trakt proxy), otherwise [`TRAKT_DEFAULT_BASE_URL`]
+    /// — the same overridable-default seam `TmdbClient::new(base_url, ..)`
+    /// provides for TMDb.
     pub fn from_config(config: &Config) -> Option<Self> {
         let client_id = config.trakt_client_id.clone()?;
-        match Self::new(
-            TRAKT_DEFAULT_BASE_URL,
-            client_id,
-            config.trakt_api_key.clone(),
-        ) {
+        let base_url = config
+            .trakt_base_url
+            .clone()
+            .unwrap_or_else(|| TRAKT_DEFAULT_BASE_URL.to_string());
+        match Self::new(base_url, client_id, config.trakt_api_key.clone()) {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::warn!(error = %e, "MUSEX-07: failed to construct Trakt client; talk/trending via Trakt will degrade");
@@ -514,5 +524,53 @@ mod tests {
             ..Default::default()
         };
         assert!(TraktTrendSource::from_config(&config).is_some());
+    }
+
+    /// The base-URL override seam (matching `TmdbClient`'s httpmock test):
+    /// `from_config` must honor `Config::trakt_base_url`, so a test server
+    /// (here httpmock) — never the live `api.trakt.tv` — receives the
+    /// request. Also asserts the required `trakt-api-key` header carries
+    /// the configured client id and NO account-scoped param rides along
+    /// (the query is a bare public trending endpoint).
+    #[tokio::test]
+    async fn trakt_from_config_honors_base_url_override_and_sends_client_id_header() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/shows/trending")
+                .header("trakt-api-key", "test-client-id");
+            then.status(200).header("content-type", "application/json").body(
+                r#"[
+                    {"watchers": 4200, "show": {"title": "Severance", "year": 2022, "ids": {"tmdb": 95396, "trakt": 152041}}}
+                ]"#,
+            );
+        });
+
+        // Build the way production does — through `from_config` — but with
+        // the base URL pointed at the mock server via the new override.
+        let config = Config {
+            trakt_client_id: Some("test-client-id".to_string()),
+            trakt_base_url: Some(server.base_url()),
+            ..Default::default()
+        };
+        let source =
+            TraktTrendSource::from_config(&config).expect("configured Trakt source should build");
+
+        let entries = source
+            .trending(&TrendQuery {
+                region: "US".to_string(),
+                window: TrendingWindow::Day,
+                kind: Some(MediaKind::Show),
+            })
+            .await
+            .expect("trakt trending should parse against the mock server");
+
+        mock.assert(); // proves the mock base URL was honored, not api.trakt.tv
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].external_id, "95396"); // TMDb id preferred over trakt id
+        assert_eq!(entries[0].title, "Severance");
+        assert_eq!(entries[0].popularity, 4200.0);
     }
 }

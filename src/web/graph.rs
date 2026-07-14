@@ -24,7 +24,10 @@
 //! opt-in filter is now structurally in the ONLY path from request to
 //! response, a non-opted-in entity present in the source inputs is stripped
 //! by `assemble_shared_graph` before any viz sees it, and therefore cannot
-//! appear in the output. See `tests::privacy_is_enforced_at_the_http_boundary`.
+//! appear in the output. See `tests::privacy_is_enforced_by_the_real_async_handlers`,
+//! which drives the actual `async fn` endpoints (not the inner helpers) and
+//! asserts both the exclusion of a non-opted-in user and the inclusion of
+//! opted-in users across all four responses.
 //!
 //! ## Source provenance (unchanged, documented)
 //! As of MUSEX-17 nothing in this crate persists a live [`TrustedFriends`]
@@ -281,158 +284,226 @@ pub async fn taste_clusters_handler(
 mod tests {
     use super::*;
     use crate::kg::model::{person_node_id, title_node_id};
+    use serde_json::json;
 
-    /// Source inputs where a NON-opted-in friend (Jamie) genuinely has
-    /// watch/co-view/persona relations — the same shape as
-    /// `crate::kg::assemble`'s and `crate::kg::viz`'s negative tests, but
-    /// expressed as the CLIENT-FACING [`GraphSourceInput`] a handler
-    /// receives. Alex and Sam are opted in; Jamie is allowlisted but not.
-    fn source_with_opted_out_jamie() -> GraphSourceInput {
-        let now = Utc::now();
-        GraphSourceInput {
-            friends: vec![
-                FriendInput {
-                    discord_user_id: "discord-alex".to_string(),
-                    display_name: "Alex".to_string(),
-                    opted_in_account_id: Some(1),
-                },
-                FriendInput {
-                    discord_user_id: "discord-sam".to_string(),
-                    display_name: "Sam".to_string(),
-                    opted_in_account_id: Some(2),
-                },
-                // Allowlisted, but NOT opted in — no account id.
-                FriendInput {
-                    discord_user_id: "discord-jamie".to_string(),
-                    display_name: "Jamie".to_string(),
-                    opted_in_account_id: None,
-                },
+    /// A raw JSON REQUEST BODY (the flattened [`GraphSourceInput`] shape a
+    /// client actually POSTs) where a NON-opted-in friend (Jamie) genuinely
+    /// has watch/co-view/persona relations. Alex and Sam are opted in
+    /// (`opted_in_account_id` present); Jamie is allowlisted but not (the
+    /// key is omitted → `None` via `#[serde(default)]`). Returned as JSON —
+    /// not a pre-built struct — so each test deserializes it through the
+    /// real serde path (including `#[serde(flatten)]`) before handing it to
+    /// the actual async handler, exactly as an HTTP request would. Alex's
+    /// and Sam's persona centroids are near-identical (they must cluster /
+    /// be taste-neighbors); Jamie's is near-identical to Alex's too, so a
+    /// bypassed filter WOULD leak Jamie into taste output — making the
+    /// exclusion assertions genuine, not vacuous.
+    fn source_json_with_opted_out_jamie() -> serde_json::Value {
+        json!({
+            "friends": [
+                {"discord_user_id": "discord-alex", "display_name": "Alex", "opted_in_account_id": 1},
+                {"discord_user_id": "discord-sam", "display_name": "Sam", "opted_in_account_id": 2},
+                // Allowlisted but NOT opted in — key omitted → None.
+                {"discord_user_id": "discord-jamie", "display_name": "Jamie"}
             ],
-            watches: vec![
-                WatchInput {
-                    discord_user_id: "discord-alex".to_string(),
-                    media_item_id: 100,
-                    title: "Severance".to_string(),
-                    watched_at: now,
-                },
-                WatchInput {
-                    discord_user_id: "discord-jamie".to_string(),
-                    media_item_id: 200,
-                    title: "Jamie's Secret Show".to_string(),
-                    watched_at: now,
-                },
+            "watches": [
+                {"discord_user_id": "discord-alex", "media_item_id": 100, "title": "Severance", "watched_at": "2026-07-14T10:00:00Z"},
+                {"discord_user_id": "discord-jamie", "media_item_id": 200, "title": "Jamie's Secret Show", "watched_at": "2026-07-14T10:00:00Z"}
             ],
-            co_views: vec![
-                CoViewInput {
-                    person_a: "discord-alex".to_string(),
-                    person_b: "discord-sam".to_string(),
-                    session_key: "sess-alex-sam".to_string(),
-                    media_item_id: 100,
-                    title: "Severance".to_string(),
-                    watched_at: now,
-                },
+            "co_views": [
+                {"person_a": "discord-alex", "person_b": "discord-sam", "session_key": "sess-alex-sam", "media_item_id": 100, "title": "Severance", "watched_at": "2026-07-14T10:00:00Z"},
                 // Jamie co-viewed WITH an opted-in friend — must still be
                 // excluded because Jamie's own end isn't opted in.
-                CoViewInput {
-                    person_a: "discord-alex".to_string(),
-                    person_b: "discord-jamie".to_string(),
-                    session_key: "sess-alex-jamie".to_string(),
-                    media_item_id: 100,
-                    title: "Severance".to_string(),
-                    watched_at: now,
-                },
+                {"person_a": "discord-alex", "person_b": "discord-jamie", "session_key": "sess-alex-jamie", "media_item_id": 100, "title": "Severance", "watched_at": "2026-07-14T10:00:00Z"}
             ],
-            personas: vec![
-                PersonaInput {
-                    discord_user_id: "discord-alex".to_string(),
-                    persona_id: 1,
-                    persona_name: "alex-primary".to_string(),
-                    centroid: {
-                        let mut v = vec![0.0; 8];
-                        v[0] = 1.0;
-                        v
-                    },
-                },
-                PersonaInput {
-                    discord_user_id: "discord-jamie".to_string(),
-                    persona_id: 3,
-                    persona_name: "jamie-primary".to_string(),
-                    // Deliberately near-identical to Alex's — if the filter
-                    // were bypassed this WOULD produce a taste edge/cluster
-                    // membership, so this genuinely tests the filter.
-                    centroid: {
-                        let mut v = vec![0.0; 8];
-                        v[0] = 1.0;
-                        v
-                    },
-                },
-            ],
-        }
+            "personas": [
+                {"discord_user_id": "discord-alex", "persona_id": 1, "persona_name": "alex-primary", "centroid": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+                {"discord_user_id": "discord-sam", "persona_id": 2, "persona_name": "sam-primary", "centroid": [0.98, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02]},
+                {"discord_user_id": "discord-jamie", "persona_id": 3, "persona_name": "jamie-primary", "centroid": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+            ]
+        })
     }
 
-    /// The load-bearing WEB-LAYER privacy test: feed the endpoint the
-    /// client-facing source inputs (which genuinely contain a non-opted-in
-    /// user's relations) and assert every endpoint's viz output contains
-    /// NONE of that user's nodes/edges. This proves the opt-in filter is
-    /// enforced at the HTTP boundary — because the handler assembles the
-    /// graph itself via `GraphSourceInput::assemble` (→
-    /// `assemble_shared_graph`) rather than trusting a client graph — not
-    /// merely inside the pure builder (which `crate::kg::viz::tests::privacy`
-    /// already covers). Exercises the assembly-and-viz path each handler
-    /// runs, without needing a live `AppState`/DB.
-    #[test]
-    fn privacy_is_enforced_at_the_http_boundary() {
+    /// Merge a selector field (e.g. `discord_user_id`) into a source-body
+    /// JSON object so it deserializes into a request type that flattens
+    /// [`GraphSourceInput`] alongside a selector.
+    fn with_selector(mut body: serde_json::Value, key: &str, value: &str) -> serde_json::Value {
+        body.as_object_mut()
+            .expect("source body is a JSON object")
+            .insert(key.to_string(), json!(value));
+        body
+    }
+
+    /// A minimal real [`AppState`] for unit-testing the async handlers
+    /// without a live DB. The pool is built with `connect_lazy`, which never
+    /// connects until first use — and these graph handlers never touch
+    /// `state.pool` at all (they read only `state.config`), so no DB is
+    /// required. Same DB-free handler-unit-test pattern as
+    /// `crate::channels::routes`'s `compose_handler` test. Uses the default
+    /// config (threshold `0.5`, watch-history limit `200`), so the test also
+    /// exercises the config-backed values flowing from `State`.
+    fn test_state() -> Arc<AppState> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@127.0.0.1:1/muse_test_lazy")
+            .expect("connect_lazy never fails synchronously");
+        let config = crate::config::Config::default();
+        Arc::new(AppState {
+            pool,
+            enrichment: crate::enrichment::EnrichmentService::from_config(&config),
+            config,
+            plex: None,
+            prowlarr: None,
+            arr_instances: Vec::new(),
+            tmdb: None,
+            embed: None,
+        })
+    }
+
+    /// The load-bearing WEB-LAYER privacy test — it drives the REAL async
+    /// handler functions end to end (deserialize a JSON request body → call
+    /// the `async fn` with a hand-built `State` → inspect the JSON response),
+    /// not the inner `assemble`/`build_*` helpers, so it exercises exactly
+    /// the path production traffic takes: `#[serde(flatten)]` request
+    /// deserialization, the config-backed threshold/limit pulled from
+    /// `State`, the `discord_user_id → person:` selector mapping, and
+    /// `Json` response construction. For every one of the four endpoints it
+    /// asserts BOTH directions:
+    ///   (a) non-opted-in Jamie's nodes/edges/titles appear in NONE of the
+    ///       responses (the filter is enforced at the HTTP boundary), and
+    ///   (b) the opted-in users' data DOES appear (so it's a real filter,
+    ///       not a filter-everything bug).
+    #[tokio::test]
+    async fn privacy_is_enforced_by_the_real_async_handlers() {
         let jamie_id = person_node_id("discord-jamie");
         let alex_id = person_node_id("discord-alex");
+        let sam_id = person_node_id("discord-sam");
         let jamie_title_id = title_node_id(200);
+        let state = test_state();
 
-        // Sanity: the CLIENT INPUT genuinely carries Jamie's relations, so
-        // the assertions below test the filter, not empty input.
-        let probe = source_with_opted_out_jamie();
-        assert!(probe
-            .watches
+        // Sanity: the raw request body genuinely carries Jamie's relations,
+        // so the assertions below test the FILTER, not empty input.
+        let probe = source_json_with_opted_out_jamie();
+        assert!(probe["watches"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|w| w.discord_user_id == "discord-jamie"));
-        assert!(probe
-            .co_views
+            .any(|w| w["discord_user_id"] == "discord-jamie"));
+        assert!(probe["co_views"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|c| c.person_a == "discord-jamie" || c.person_b == "discord-jamie"));
-        assert!(probe
-            .personas
+            .any(|c| c["person_a"] == "discord-jamie" || c["person_b"] == "discord-jamie"));
+        assert!(probe["personas"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|p| p.discord_user_id == "discord-jamie"));
+            .any(|p| p["discord_user_id"] == "discord-jamie"));
 
-        // 1. taste-map (as Jamie): degrades to no-data, never leaks Jamie's
-        //    real personas.
-        let jamie_map =
-            viz::build_taste_map(&source_with_opted_out_jamie().assemble(0.5), &jamie_id);
+        // 1. taste-map AS ALEX, through the real handler.
+        let body = with_selector(
+            source_json_with_opted_out_jamie(),
+            "discord_user_id",
+            "discord-alex",
+        );
+        let req: TasteMapRequest =
+            serde_json::from_value(body).expect("taste-map body deserializes (flatten)");
+        let Json(alex_map) = taste_map_handler(State(state.clone()), Json(req)).await;
+        // (b) inclusion: Alex's own persona + opted-in Sam as a neighbor.
+        assert_eq!(alex_map.label.as_deref(), Some("Alex"));
+        assert!(alex_map.personas.iter().any(|p| p.label == "alex-primary"));
+        assert!(
+            alex_map.neighbors.iter().any(|n| n.person_id == sam_id),
+            "opted-in Sam must appear as Alex's taste-neighbor: {:?}",
+            alex_map.neighbors
+        );
+        // (a) exclusion: Jamie never a neighbor.
+        assert!(!alex_map.neighbors.iter().any(|n| n.person_id == jamie_id));
+
+        // taste-map AS JAMIE → degrades to no-data (never leaks personas).
+        let body = with_selector(
+            source_json_with_opted_out_jamie(),
+            "discord_user_id",
+            "discord-jamie",
+        );
+        let req: TasteMapRequest = serde_json::from_value(body).unwrap();
+        let Json(jamie_map) = taste_map_handler(State(state.clone()), Json(req)).await;
         assert!(jamie_map.label.is_none());
         assert!(jamie_map.personas.is_empty());
         assert!(jamie_map.neighbors.is_empty());
 
-        // taste-map (as Alex): Jamie never appears as a neighbor.
-        let alex_map = viz::build_taste_map(&source_with_opted_out_jamie().assemble(0.5), &alex_id);
-        assert!(!alex_map.neighbors.iter().any(|n| n.person_id == jamie_id));
-
-        // 2. group-dynamics: no node/edge references Jamie; Alex still present.
-        let gd = viz::build_group_dynamics(&source_with_opted_out_jamie().assemble(0.5));
+        // 2. group-dynamics, through the real handler.
+        let req: GroupDynamicsRequest =
+            serde_json::from_value(source_json_with_opted_out_jamie()).unwrap();
+        let Json(gd) = group_dynamics_handler(State(state.clone()), Json(req)).await;
+        // (b) inclusion: opted-in Alex+Sam nodes and their co-view edge.
+        assert!(gd.nodes.iter().any(|n| n.id == alex_id));
+        assert!(gd.nodes.iter().any(|n| n.id == sam_id));
+        assert!(
+            gd.edges
+                .iter()
+                .any(|e| (e.source == alex_id && e.target == sam_id)
+                    || (e.source == sam_id && e.target == alex_id)),
+            "opted-in Alex<->Sam co-view edge must be present: {:?}",
+            gd.edges
+        );
+        // (a) exclusion: no node/edge references Jamie.
         assert!(!gd.nodes.iter().any(|n| n.id == jamie_id));
         assert!(!gd
             .edges
             .iter()
             .any(|e| e.source == jamie_id || e.target == jamie_id));
-        assert!(gd.nodes.iter().any(|n| n.id == alex_id));
 
-        // 3. watch-history (all people): Jamie's title never appears.
-        let wh = viz::build_watch_history(&source_with_opted_out_jamie().assemble(0.5), None, 100);
+        // 3. watch-history (ALL opted-in people), through the real handler.
+        let req: WatchHistoryRequest =
+            serde_json::from_value(source_json_with_opted_out_jamie()).unwrap();
+        let Json(wh) = watch_history_handler(State(state.clone()), Json(req)).await;
+        // (b) inclusion: opted-in Alex's watch appears.
+        assert!(
+            wh.entries
+                .iter()
+                .any(|e| e.person_id == alex_id && e.title == "Severance"),
+            "opted-in Alex's watch must appear: {:?}",
+            wh.entries
+        );
+        // (a) exclusion: none of Jamie's history (by person, title, or id).
         assert!(!wh.entries.iter().any(|e| e.person_id == jamie_id));
         assert!(!wh.entries.iter().any(|e| e.title == "Jamie's Secret Show"));
         assert!(!wh.entries.iter().any(|e| e.title_id == jamie_title_id));
-        assert!(wh.entries.iter().any(|e| e.person_id == alex_id));
 
-        // 4. taste-clusters: no cluster contains Jamie, despite the
-        //    near-identical seeded centroid.
-        let tc = viz::build_taste_clusters(&source_with_opted_out_jamie().assemble(0.5));
+        // watch-history SCOPED to Alex → exercises the selector→node-id
+        // mapping in the handler; result must contain only Alex.
+        let body = with_selector(
+            source_json_with_opted_out_jamie(),
+            "discord_user_id",
+            "discord-alex",
+        );
+        let req: WatchHistoryRequest = serde_json::from_value(body).unwrap();
+        let Json(wh_alex) = watch_history_handler(State(state.clone()), Json(req)).await;
+        assert!(!wh_alex.entries.is_empty());
+        assert!(
+            wh_alex.entries.iter().all(|e| e.person_id == alex_id),
+            "scoped watch-history must contain only Alex: {:?}",
+            wh_alex.entries
+        );
+
+        // 4. taste-clusters, through the real handler.
+        let req: TasteClustersRequest =
+            serde_json::from_value(source_json_with_opted_out_jamie()).unwrap();
+        let Json(tc) = taste_clusters_handler(State(state.clone()), Json(req)).await;
+        // (b) inclusion: opted-in Alex+Sam (near-identical taste) cluster
+        //     together.
+        let alex_cluster = tc
+            .clusters
+            .iter()
+            .find(|c| c.iter().any(|m| m.person_id == alex_id))
+            .expect("Alex must appear in some cluster");
+        assert!(
+            alex_cluster.iter().any(|m| m.person_id == sam_id),
+            "opted-in Alex+Sam must cluster together: {:?}",
+            tc.clusters
+        );
+        // (a) exclusion: no cluster contains Jamie, despite the near-
+        //     identical seeded centroid.
         assert!(!tc
             .clusters
             .iter()

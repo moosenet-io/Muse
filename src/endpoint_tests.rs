@@ -534,7 +534,7 @@ mod db_gated {
             get("/recommend/gaps?account_id=-1"),
             get("/proactive/pending?account_id=-1"),
             get("/api/channels"),
-            get("/art/poster/-1"),
+            // {param} read routes (/art/{kind}/{id}, /api/channels/{id}/lineup) are omitted from this sweep until MUSE-ROUTE-01 (#31) lands — under the axum-0.7 brace bug they hit the fallback, so sweeping them here would assert non-mutation of the fallback, not the real handler. Re-add them (and the ignored param happy-path tests) when the route fix lands.
         ];
 
         for req in reads {

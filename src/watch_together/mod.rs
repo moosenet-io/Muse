@@ -417,7 +417,7 @@ mod tests {
 
     const THIRTY_MIN_MS: i64 = 30 * 60_000;
 
-    fn base_constraints() -> GroupSessionConstraints {
+    pub(super) fn base_constraints() -> GroupSessionConstraints {
         let start = DateTime::parse_from_rfc3339("2026-07-14T18:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -910,6 +910,7 @@ mod tests {
 /// `curation::live_tests`) -- never a live system, never a hardcoded DSN.
 #[cfg(test)]
 mod live_tests {
+    use super::tests::base_constraints;
     use super::*;
     use crate::models::account::NewAccount;
     use crate::models::persona::{NewPersona, PERSONA_KIND_EXPLICIT};

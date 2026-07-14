@@ -30,6 +30,7 @@ use crate::http::AppState;
 use crate::models::availability::Availability;
 use crate::models::media_metadata::MediaKind;
 use crate::taste_model::chord_client::{ChordClient, DEFAULT_MODEL};
+use crate::taste_review::trace::{build_reasoning_trace, ReasoningTrace};
 
 pub const DEFAULT_RECOMMEND_LIMIT: i64 = 10;
 pub const MAX_RECOMMEND_LIMIT: i64 = 50;
@@ -44,7 +45,7 @@ const DEFAULT_TRENDING_REGION: &str = "US";
 /// you started" (on-deck) outranks "there's probably more of this"  (gap),
 /// which outranks a fresh "you'd love this" (taste), which outranks a
 /// not-in-library pick (real, but requires acquiring something first).
-fn source_weight(source: CandidateSource) -> f64 {
+pub(crate) fn source_weight(source: CandidateSource) -> f64 {
     match source {
         CandidateSource::OnDeck => 1.0,
         CandidateSource::Gap => 0.85,
@@ -167,6 +168,15 @@ pub struct RecommendationItem {
     pub score: f64,
     pub rationale: String,
     pub availability: Option<Availability>,
+    /// MUSET-07 (Plane TERM #372): the INTERROGABLE reasoning trace behind
+    /// this recommendation — which signals drove it, their weights, and the
+    /// path/rule that produced it (see `crate::taste_review::trace`). Only
+    /// populated when the caller opts in via `RecommendRequest::include_trace`
+    /// / the on-deck/gap query's `include_trace`; `None` (and therefore
+    /// omitted from the JSON entirely) otherwise, so a normal caller's
+    /// response shape is byte-for-byte unchanged by this feature existing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<ReasoningTrace>,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,10 +188,12 @@ async fn score_and_explain(
     chord: Option<&ChordClient>,
     ranked: Vec<(Candidate, f64)>,
     limit: i64,
+    include_trace: bool,
 ) -> Vec<RecommendationItem> {
     let mut items = Vec::with_capacity(ranked.len().min(limit.max(0) as usize));
     for (candidate, score) in ranked.into_iter().take(limit.max(0) as usize) {
         let rationale = build_rationale(chord, &candidate).await;
+        let trace = include_trace.then(|| build_reasoning_trace(&candidate, score));
         items.push(RecommendationItem {
             media_metadata_id: candidate.media_metadata_id,
             media_item_id: candidate.media_item_id,
@@ -192,6 +204,7 @@ async fn score_and_explain(
             score,
             rationale,
             availability: candidate.availability,
+            trace,
         });
     }
     items
@@ -215,6 +228,12 @@ pub struct RecommendRequest {
     /// than merely deprioritized — most callers want actionable picks only.
     #[serde(default)]
     pub include_unavailable: bool,
+    /// MUSET-07: when `true`, each returned item carries its
+    /// [`RecommendationItem::trace`] — the interrogable reasoning trace an
+    /// adversarial review can critique. Defaults to `false` (omitted),
+    /// keeping the default response shape unchanged.
+    #[serde(default)]
+    pub include_trace: bool,
 }
 
 /// `POST /recommend` — the full MUSE-11 ranked list: on-deck + gap + taste +
@@ -252,7 +271,7 @@ pub async fn recommend_handler(
     let ranked = rank_candidates(deduped);
 
     let chord = ChordClient::from_config(&state.config);
-    let items = score_and_explain(chord.as_ref(), ranked, limit).await;
+    let items = score_and_explain(chord.as_ref(), ranked, limit, req.include_trace).await;
 
     Ok(Json(RecommendResponse { items }))
 }
@@ -262,6 +281,9 @@ pub struct AccountLimitQuery {
     pub account_id: i64,
     #[serde(default)]
     pub limit: Option<i64>,
+    /// MUSET-07: same opt-in trace flag as `RecommendRequest::include_trace`.
+    #[serde(default)]
+    pub include_trace: bool,
 }
 
 /// `GET /recommend/on_deck?account_id=` — continue-watching only.
@@ -274,7 +296,7 @@ pub async fn on_deck_handler(
         candidates::gather_on_deck_candidates(&state.pool, q.account_id, limit).await?;
     let ranked = rank_candidates(candidates);
     let chord = ChordClient::from_config(&state.config);
-    let items = score_and_explain(chord.as_ref(), ranked, limit).await;
+    let items = score_and_explain(chord.as_ref(), ranked, limit, q.include_trace).await;
     Ok(Json(RecommendResponse { items }))
 }
 
@@ -287,7 +309,7 @@ pub async fn gaps_handler(
     let candidates = candidates::gather_gap_candidates(&state.pool, q.account_id, limit).await?;
     let ranked = rank_candidates(candidates);
     let chord = ChordClient::from_config(&state.config);
-    let items = score_and_explain(chord.as_ref(), ranked, limit).await;
+    let items = score_and_explain(chord.as_ref(), ranked, limit, q.include_trace).await;
     Ok(Json(RecommendResponse { items }))
 }
 

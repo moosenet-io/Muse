@@ -70,6 +70,12 @@ pub enum SnapshotGuardError {
     /// Rejected fail-closed so the effective db can never differ from what
     /// the guard checked.
     MissingDatabaseName,
+    /// The DSN's database name contains a character outside the plain
+    /// `[A-Za-z0-9_-]` allowlist (most importantly `%`) -- since postgres/
+    /// libpq percent-DECODE URI components, an encoded name could make the
+    /// validated string differ from the effective target. Rejected
+    /// fail-closed to keep validated == effective.
+    InvalidDatabaseName { db_name: String },
 }
 
 impl fmt::Display for SnapshotGuardError {
@@ -117,6 +123,13 @@ impl fmt::Display for SnapshotGuardError {
                 "snapshot DSN guard: DSN carries no explicit database name -- libpq/pg_dump would \
                  default the target (to the username or PGDATABASE), an unvalidated effective DB, \
                  so an explicit non-empty database name is required"
+            ),
+            SnapshotGuardError::InvalidDatabaseName { db_name } => write!(
+                f,
+                "snapshot DSN guard: database name ({db_name:?}) contains a character outside the \
+                 plain [A-Za-z0-9_-] allowlist -- postgres percent-decodes URI components, so an \
+                 encoded name could differ from the effective target; refusing it so the \
+                 validated name equals what postgres will use"
             ),
         }
     }
@@ -186,6 +199,25 @@ fn is_clean_hostname(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
+/// True if `db` is a plain, un-encoded database name: `^[A-Za-z0-9_-]+$`
+/// (letters, digits, underscore, hyphen). This is the load-bearing
+/// ENCODING-class defense: PostgreSQL/libpq percent-DECODE URI components
+/// before use, so a raw path db-name like `muse_%70rod_test` would validate
+/// (no raw `prod` substring, has `test`) yet resolve to the effective
+/// `muse_prod_test`. Rejecting `%` (and `/`, whitespace, NUL, backslash,
+/// unicode, etc.) by charset means the validated string is GUARANTEED equal
+/// to the effective decoded value -- no percent-encoding (or any future
+/// encoding vector) can survive, so the guard never validates a name
+/// different from what postgres will use. A legitimate test/snapshot DB name
+/// never needs any character outside this set. Empty is handled separately
+/// (`MissingDatabaseName`), so this is only applied to a non-empty name.
+fn is_valid_db_charset(db: &str) -> bool {
+    !db.is_empty()
+        && db
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
 /// The ONE shared, fail-closed DSN parser used by BOTH the load path
 /// (`validate_snapshot_dsn`) and the source path (`validate_not_prod_source`).
 ///
@@ -199,10 +231,15 @@ fn is_clean_hostname(host: &str) -> bool {
 ///   port/user/password/etc. all override the connection target),
 /// - a host that parses as neither a single clean hostname NOR a single
 ///   `IpAddr` (fail-closed: a mangled/unparseable host is rejected, never
-///   passed through as "not private, so allowed").
+///   passed through as "not private, so allowed"),
+/// - a non-empty db name containing any character outside the plain
+///   `[A-Za-z0-9_-]` allowlist (closes the percent-encoding / any-encoding
+///   vector: postgres decodes URI components, so an encoded name is rejected
+///   rather than allowed to differ from the effective target).
 ///
-/// On success the returned host/db_name ARE the effective connection target,
-/// so each caller only has to apply its own host/db policy.
+/// On success the returned host/db_name ARE the effective connection target
+/// (plain, un-encoded), so each caller only has to apply its own host/db
+/// policy.
 fn parse_and_canonicalize_dsn(dsn: &str) -> Result<CanonicalDsn, SnapshotGuardError> {
     // Accept both `postgres://` and `postgresql://` schemes (both valid per
     // libpq), reject anything else outright.
@@ -260,6 +297,17 @@ fn parse_and_canonicalize_dsn(dsn: &str) -> Result<CanonicalDsn, SnapshotGuardEr
     // allowed to fall through.
     if !is_clean_hostname(&host) && host.parse::<std::net::IpAddr>().is_err() {
         return Err(SnapshotGuardError::UnparseableHost { host });
+    }
+
+    // FAIL-CLOSED db-name charset (closes the percent-encoding / ANY encoding
+    // vector by construction): a NON-EMPTY db name must be plain
+    // `[A-Za-z0-9_-]+`, so the validated name equals postgres's effective
+    // (decoded) name. An empty name is left to each caller's
+    // `MissingDatabaseName` check.
+    if !db_part.is_empty() && !is_valid_db_charset(db_part) {
+        return Err(SnapshotGuardError::InvalidDatabaseName {
+            db_name: db_part.to_string(),
+        });
     }
 
     Ok(CanonicalDsn {
@@ -573,6 +621,94 @@ mod tests {
                 "{dsn} -> {err:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // ENCODING class: postgres percent-DECODES URI components, so the guard
+    // must reject any db name that isn't already the plain effective value.
+    // A strict [A-Za-z0-9_-] charset closes percent-encoding AND any future
+    // encoding vector by construction.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rejects_percent_encoded_db_name_that_would_decode_to_prod() {
+        // `muse_%70rod_test` decodes to `muse_prod_test` -- it has a `test`
+        // marker and no RAW `prod`, so it would slip a substring check. The
+        // charset allowlist rejects the `%` outright.
+        let dsn = "postgres://localhost:5433/muse_%70rod_test";
+        let err = validate_snapshot_dsn(dsn).expect_err("percent-encoded db name must be rejected");
+        assert!(
+            matches!(err, SnapshotGuardError::InvalidDatabaseName { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_percent_encoded_underscore_hiding_muse_live() {
+        // `muse%5flive_test` decodes to `muse_live_test`.
+        let dsn = "postgres://localhost:5433/muse%5flive_test";
+        assert!(matches!(
+            validate_snapshot_dsn(dsn),
+            Err(SnapshotGuardError::InvalidDatabaseName { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_db_names_with_exotic_characters() {
+        for dsn in [
+            "postgres://localhost:5433/muse test",   // space
+            "postgres://localhost:5433/muse%2ftest", // encoded slash
+            "postgres://localhost:5433/muse.test",   // dot
+            "postgres://localhost:5433/muse:test",   // colon
+        ] {
+            let err = validate_snapshot_dsn(dsn)
+                .expect_err(&format!("{dsn} (exotic db char) must be rejected"));
+            assert!(
+                matches!(err, SnapshotGuardError::InvalidDatabaseName { .. }),
+                "{dsn} -> {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_percent_encoded_host() {
+        // `local%68ost` decodes to `localhost` -- the `%` fails the clean
+        // hostname charset and it isn't an IpAddr, so it's rejected.
+        let dsn = "postgres://local%68ost:5433/muse_test";
+        let err = validate_snapshot_dsn(dsn).expect_err("percent-encoded host must be rejected");
+        assert!(
+            matches!(err, SnapshotGuardError::UnparseableHost { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn source_path_rejects_percent_encoded_db_name() {
+        // The encoding defense is shared -- the source path inherits it.
+        let dsn = "postgres://source-host:5432/pl%65x_library"; // decodes to plex_library
+        assert!(matches!(
+            validate_not_prod_source(dsn),
+            Err(SnapshotGuardError::InvalidDatabaseName { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_plain_valid_db_names_and_hosts() {
+        // Plain names (incl. a hyphen) on valid hosts still pass -- the
+        // charset allowlist doesn't over-reject legitimate names.
+        for dsn in [
+            "postgres://localhost:5433/muse_test",
+            "postgres://127.0.0.1:5433/snapshot_x",
+            "postgres://[::1]:5433/scratch-db",
+            "postgres://db-host.internal:5433/muse_snapshot",
+        ] {
+            assert!(
+                validate_snapshot_dsn(dsn).is_ok(),
+                "{dsn} should pass but was rejected"
+            );
+        }
+        // Source path: a plain explicit non-prod source db passes.
+        assert!(validate_not_prod_source("postgres://user@source-host/plex_library").is_ok());
     }
 
     #[test]

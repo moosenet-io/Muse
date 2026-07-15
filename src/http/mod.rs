@@ -77,6 +77,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // MUSE-11: the curation/recommend engine — `POST /recommend`,
         // `GET /recommend/on_deck`, `GET /recommend/gaps`.
         .nest("/recommend", recommend_routes())
+        // MUSEX-WIRE-01 (Plane TERM #398): the wired, settings-gated Discord
+        // response flow — `POST /discord/respond`. See
+        // `crate::discord::bot::discord_respond_handler`.
+        .route("/discord/respond", post(crate::discord::bot::discord_respond_handler))
         // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
         // `/api/channels*`, `/art/{kind}/{id}`).
         .merge(crate::web::routes())

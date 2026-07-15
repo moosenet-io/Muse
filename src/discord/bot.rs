@@ -37,12 +37,20 @@
 //! test — the test below is the runtime confirmation of a guarantee the
 //! types already make.
 
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::Json;
+use serde::{Deserialize, Serialize};
+
 use crate::curation::candidates::Candidate;
 use crate::curation::recommend::{build_rationale, rank_candidates};
 use crate::discord::client::RichEmbed;
 use crate::discord::identity::{FriendIdentity, TrustedFriends};
 use crate::error::MuseResult;
+use crate::http::AppState;
 use crate::models::media_metadata::MediaKind;
+use crate::settings::ExperienceSettings;
 use crate::taste_model::chord_client::ChordClient;
 
 /// How many on-deck candidates to fetch before ranking — small, since the
@@ -204,6 +212,130 @@ pub async fn respond(
     }
 }
 
+/// MUSEX-WIRE-01 (Plane TERM #398, first slice): the settings-gated,
+/// PRODUCTION-WIRED entry point onto [`respond`] — see
+/// [`discord_respond_handler`] for the `POST /discord/respond` route that
+/// calls this. Mirrors `crate::promotion::run_promotion_dispatch`'s
+/// inert-when-off contract EXACTLY: gated on
+/// [`ExperienceSettings::is_discord_bot_enabled`] BEFORE `friends`/`pool` is
+/// touched at all, so the disabled path is provable the same way an
+/// unreachable `connect_lazy` pool proves `run_promotion_dispatch`'s gate
+/// (see the `db_free` tests below) — if this gate were ever bypassed, the
+/// disabled-path test would observe a connection error instead of a quiet
+/// `Ok(None)`.
+///
+/// This does not duplicate or weaken [`respond`]'s own consent gate
+/// ([`decide_response_mode`]) — it wraps it with the SECOND, independent
+/// gate this crate's experience layer requires (MUSEX-18's settings panel):
+/// a friend can be allowlisted and opted in and still get nothing if the
+/// operator has switched the Discord bot subsystem off. Both gates must
+/// clear for a taste-aware reply to ever leave this function.
+pub async fn run_discord_respond(
+    settings: &ExperienceSettings,
+    friends: &TrustedFriends,
+    discord_user_id: &str,
+    pool: &sqlx::PgPool,
+    chord: Option<&ChordClient>,
+    public_base_url: Option<&str>,
+) -> MuseResult<Option<BotReply>> {
+    if !settings.is_discord_bot_enabled() {
+        return Ok(None);
+    }
+    respond(friends, discord_user_id, pool, chord, public_base_url).await
+}
+
+/// The `POST /discord/respond` JSON request body: just the Discord user id
+/// the reply is being computed for. No account id, no taste data — the
+/// whole point of this route is that the SERVER resolves consent, never the
+/// caller.
+#[derive(Debug, Deserialize)]
+pub struct DiscordRespondRequest {
+    pub discord_user_id: String,
+}
+
+/// The `POST /discord/respond` JSON response — a flattened, HTTP-friendly
+/// view of [`BotReply`] (`None` fields throughout when the bot has nothing
+/// to say, e.g. the subsystem is off or the user isn't allowlisted).
+#[derive(Debug, Serialize)]
+pub struct DiscordRespondResponse {
+    pub content: Option<String>,
+    pub embed_title: Option<String>,
+    pub embed_poster_url: Option<String>,
+    pub embed_synopsis: Option<String>,
+}
+
+fn to_response(reply: Option<BotReply>) -> DiscordRespondResponse {
+    match reply {
+        None => DiscordRespondResponse {
+            content: None,
+            embed_title: None,
+            embed_poster_url: None,
+            embed_synopsis: None,
+        },
+        Some(reply) => DiscordRespondResponse {
+            content: Some(reply.content),
+            embed_title: reply.embed.as_ref().map(|e| e.title.clone()),
+            embed_poster_url: reply.embed.as_ref().and_then(|e| e.poster_url.clone()),
+            embed_synopsis: reply.embed.as_ref().map(|e| e.synopsis.clone()),
+        },
+    }
+}
+
+/// `POST /discord/respond` — MUSEX-WIRE-01's flagship wired flow: the
+/// production HTTP door onto [`run_discord_respond`] (settings gate) ->
+/// [`respond`] (consent gate) -> the real MUSE-11
+/// `curation::candidates`/`curation::recommend` pipeline, the same one
+/// `/recommend` uses.
+///
+/// ## Honest seam (be explicit, don't paper over it)
+/// This crate has no persisted per-friend consent store yet —
+/// `crate::discord::identity`'s own module doc says as much ("this module
+/// doesn't prescribe the source, only the shape"). The only roster this
+/// handler can build in production today is
+/// `ExperienceSettings::discord_bot.trusted_friends`, and that settings
+/// document is explicit (see `crate::settings::DiscordBotSettings`'s own
+/// doc) that its roster entries are ALLOWLIST membership only — they can
+/// never themselves grant `taste_opt_in`, which stays gated behind
+/// `FriendIdentity::opt_in`'s private fields. So every identity this
+/// handler resolves is, in production today, at best
+/// `ResponseMode::Generic` — the route is real, reachable, and enforces
+/// both gates correctly end-to-end, but the `TasteAware` arm needs a real
+/// opt-in persistence layer (a separate, natural follow-up item) before a
+/// live Discord friend can reach it. [`run_discord_respond`]'s own tests
+/// exercise the `TasteAware` arm directly against a constructed opted-in
+/// identity, proving the gate + pipeline are correct even though
+/// production can't yet drive a real friend into that state.
+pub async fn discord_respond_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DiscordRespondRequest>,
+) -> MuseResult<Json<DiscordRespondResponse>> {
+    let settings = crate::repo::settings::load(&state.pool).await?;
+
+    // See the module-level "Honest seam" note above: the roster this
+    // handler can build today carries allowlist membership only, never
+    // opt-in.
+    let friends = TrustedFriends::from_friends(
+        settings
+            .discord_bot
+            .trusted_friends
+            .iter()
+            .map(|f| FriendIdentity::new(f.discord_user_id.clone(), f.display_name.clone())),
+    );
+
+    let chord = ChordClient::from_config(&state.config);
+    let reply = run_discord_respond(
+        &settings,
+        &friends,
+        &req.discord_user_id,
+        &state.pool,
+        chord.as_ref(),
+        state.config.public_base_url.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(to_response(reply)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +494,149 @@ mod tests {
         let reply = reply.expect("allowlisted user is served");
         assert!(reply.embed.is_none());
         assert_eq!(reply.content, GENERIC_REPLY_CONTENT);
+    }
+
+    // --- MUSEX-WIRE-01: run_discord_respond is inert when disabled ---------
+    //
+    // Same `connect_lazy`-unreachable-pool idiom as
+    // `crate::promotion::tests`' `run_promotion_dispatch` inertness tests:
+    // an opted-in friend (so if the settings gate were bypassed, the
+    // TasteAware arm WOULD try to touch the pool) proves the disabled path
+    // short-circuits before any DB access, because a real query against
+    // this bogus DSN would surface as an `Err`, not a quiet `Ok(None)`.
+
+    use crate::settings::DiscordBotSettings;
+
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy should never fail synchronously")
+    }
+
+    fn one_opted_in_friend() -> TrustedFriends {
+        TrustedFriends::from_friends([FriendIdentity::new("discord-1", "Alex").opt_in(42)])
+    }
+
+    #[tokio::test]
+    async fn run_discord_respond_is_inert_when_discord_bot_disabled() {
+        let pool = unreachable_pool();
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot = DiscordBotSettings {
+            enabled: false,
+            ..settings.discord_bot
+        };
+        let friends = one_opted_in_friend();
+
+        let result = run_discord_respond(&settings, &friends, "discord-1", &pool, None, None).await;
+
+        assert!(result.is_ok(), "expected Ok(None), got {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "a disabled subsystem must return no reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_discord_respond_is_inert_when_master_switch_off() {
+        // Even with discord_bot.enabled = true, the master switch alone
+        // must be enough — mirrors
+        // `is_discord_bot_enabled`'s AND-gate documented on
+        // `ExperienceSettings`.
+        let pool = unreachable_pool();
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = false;
+        settings.discord_bot = DiscordBotSettings {
+            enabled: true,
+            ..settings.discord_bot
+        };
+        let friends = one_opted_in_friend();
+
+        let result = run_discord_respond(&settings, &friends, "discord-1", &pool, None, None).await;
+
+        assert!(result.is_ok(), "expected Ok(None), got {result:?}");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn run_discord_respond_touches_the_pool_when_enabled_and_opted_in() {
+        // Mirror-image sanity check (same idiom as
+        // `run_promotion_dispatch_touches_the_pool_when_enabled`): WITH the
+        // gate enabled and a genuinely opted-in friend, this must actually
+        // reach the (unreachable) pool and fail with a database error --
+        // proving the two disabled-path tests above assert something real.
+        let pool = unreachable_pool();
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot = DiscordBotSettings {
+            enabled: true,
+            ..settings.discord_bot
+        };
+        let friends = one_opted_in_friend();
+
+        let result = run_discord_respond(&settings, &friends, "discord-1", &pool, None, None).await;
+
+        assert!(
+            result.is_err(),
+            "expected a database connection error proving the enabled+opted-in path really \
+             reaches the pool, got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_discord_respond_returns_generic_for_non_opted_in_friend_even_when_enabled() {
+        // Non-opted-in is a DIFFERENT arm (`ResponseMode::Generic`) that
+        // `respond` itself already proves never touches the DB -- so with
+        // the subsystem enabled but the friend only allowlisted (not opted
+        // in), this must still return the generic reply, not an error and
+        // not taste data, even against an unreachable pool.
+        let pool = unreachable_pool();
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot = DiscordBotSettings {
+            enabled: true,
+            ..settings.discord_bot
+        };
+        let friends = TrustedFriends::from_friends([FriendIdentity::new("discord-1", "Alex")]);
+
+        let result = run_discord_respond(&settings, &friends, "discord-1", &pool, None, None).await;
+
+        let reply = result
+            .expect("Generic arm must never error")
+            .expect("allowlisted user is served");
+        assert!(
+            reply.embed.is_none(),
+            "non-opted-in reply carries no taste data"
+        );
+        assert_eq!(reply.content, GENERIC_REPLY_CONTENT);
+    }
+
+    // --- MUSEX-WIRE-01: DiscordRespondResponse DTO shape --------------------
+
+    #[test]
+    fn to_response_of_none_is_all_none_fields() {
+        let response = to_response(None);
+        assert!(response.content.is_none());
+        assert!(response.embed_title.is_none());
+        assert!(response.embed_poster_url.is_none());
+        assert!(response.embed_synopsis.is_none());
+    }
+
+    #[test]
+    fn to_response_of_a_taste_reply_carries_the_embed_fields() {
+        let c = candidate();
+        let reply = build_taste_reply(&c, "Continue \"Severance\" — you're 42% through it.", None);
+        let response = to_response(Some(reply));
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Continue \"Severance\" — you're 42% through it.")
+        );
+        assert_eq!(response.embed_title.as_deref(), Some("Severance"));
+        assert_eq!(
+            response.embed_synopsis.as_deref(),
+            Some("you're 42% through it")
+        );
     }
 }
 
@@ -522,6 +797,43 @@ mod db_gated {
         );
         let embed = reply.embed.expect("taste-aware reply carries an embed");
         assert_eq!(embed.title, expected_title);
+    }
+
+    /// MUSEX-WIRE-01: the wired, settings-gated entry point produces the
+    /// SAME real, grounded taste reply as `respond` itself when the
+    /// subsystem is enabled — non-vacuous confirmation that
+    /// `run_discord_respond`'s gate is additive, not a second place taste
+    /// data could get lost or substituted.
+    #[tokio::test]
+    async fn run_discord_respond_produces_a_real_grounded_reply_when_enabled_and_opted_in() {
+        let Some(pool) = test_pool_or_skip(
+            "run_discord_respond_produces_a_real_grounded_reply_when_enabled_and_opted_in",
+        )
+        .await
+        else {
+            return;
+        };
+        let (account_id, expected_title) = seed_on_deck_account(&pool).await;
+
+        let mut settings = crate::settings::ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot.enabled = true;
+        let friends =
+            TrustedFriends::from_friends([
+                FriendIdentity::new("discord-opted-in", "Alex").opt_in(account_id)
+            ]);
+
+        let reply = run_discord_respond(&settings, &friends, "discord-opted-in", &pool, None, None)
+            .await
+            .expect("run_discord_respond should not error")
+            .expect("enabled + opted-in friend is served");
+
+        assert!(
+            reply.content.contains(&expected_title),
+            "wired taste-aware reply must be grounded in the real seeded title, got: {}",
+            reply.content
+        );
+        assert!(reply.embed.is_some());
     }
 
     /// LOAD-BEARING PRIVACY NEGATIVE TEST (end-to-end). The seeded account

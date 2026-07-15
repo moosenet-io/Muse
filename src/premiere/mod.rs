@@ -39,6 +39,7 @@
 
 pub mod discussion;
 pub mod engagement;
+pub mod http;
 pub mod schedule;
 
 // MUSEX-WIRE-01 (Plane TERM #398): `compute_tier`/`budget_for_tier`/

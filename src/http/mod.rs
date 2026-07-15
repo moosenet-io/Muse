@@ -89,6 +89,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/conversational",
             post(crate::conversational::conversational_handler),
         )
+        // MUSEX-WIRE-03 (Plane TERM #398): the wired, settings-gated
+        // premiere schedule + RSVP flow — `POST /premiere`, `POST
+        // /premiere/rsvp`. See `crate::premiere::http`.
+        .route("/premiere", post(crate::premiere::http::premiere_schedule_handler))
+        .route("/premiere/rsvp", post(crate::premiere::http::premiere_rsvp_handler))
         // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
         // `/api/channels*`, `/art/{kind}/{id}`).
         .merge(crate::web::routes())

@@ -442,22 +442,38 @@ fn to_http_response(outcome: Option<ConversationalOutcome>) -> ConversationalHtt
 /// `crate::arr::request::classify_tier`'s own doc) and what must change
 /// before it stops being safe.
 ///
-/// ## Consent honest seam (same limitation `discord_respond_handler`
-/// already flags)
-/// Exactly like `crate::discord::bot::discord_respond_handler`, the only
-/// roster this handler can build in production today is
-/// `ExperienceSettings::discord_bot.trusted_friends`, and that roster is
-/// ALLOWLIST membership only — it can never itself grant `taste_opt_in`
-/// (see `crate::settings::DiscordBotSettings`'s own doc). So in production
-/// today every identity this handler resolves is, at best, not opted in —
-/// [`run_conversational`]'s consent gate is real, reachable, and correctly
-/// forces auto-tier submission off end-to-end, but no live caller can yet
-/// reach the opted-in branch. [`run_conversational`]'s own tests exercise
-/// the opted-in path directly against a constructed identity, proving the
-/// gate is correct even though production can't yet drive a real friend
-/// into that state — a real opt-in persistence layer is the same
-/// separately-reviewable follow-up `discord_respond_handler`'s doc already
-/// calls out.
+/// ## Consent — persisted opt-in, wired (MUSEX-WIRE-06)
+/// MUSEX-WIRE-06 (Plane TERM #398, slice 6) is the mechanical follow-up to
+/// WIRE-05's keystone: this handler now builds its roster via
+/// `crate::discord::roster::resolve_trusted_friends`, exactly like
+/// `crate::discord::bot::discord_respond_handler` — not the allowlist-only
+/// `TrustedFriends::from_friends(settings.discord_bot.trusted_friends...)`
+/// construction this doc used to describe here. The allowlist (from
+/// `ExperienceSettings::discord_bot.trusted_friends`) still scopes who is
+/// served at all, but each allowlisted friend's `taste_opt_in` now reflects
+/// the PERSISTED `repo::friend_opt_in` row (written by `POST
+/// /friends/opt-in`), not a permanent "never opted in" default. So a live
+/// Discord friend who has actually opted in now reaches
+/// [`conversational_auto_tier_allowed`]'s `true` branch for real, through
+/// this exact production route.
+///
+/// **Still an honest, documented limitation:** that consent state currently
+/// has NO observable effect on this handler's JSON response. `effective_auto_tier_enabled`
+/// only ever changes [`crate::arr::request::classify_tier`]'s outcome
+/// between an `AutoApprovable` request (needs a confirmed
+/// [`crate::models::availability::Availability`] with `release_count > 0`)
+/// and `NeedsReview` — but every draft this handler builds passes
+/// `availability: None` (see the module doc's "Missing titles" section: no
+/// availability row exists yet for a not-yet-owned title), so
+/// `classify_tier` always lands on `NeedsReview` regardless of
+/// `auto_tier_enabled`. The consent WIRING is real and now DB-backed (see
+/// the `db_gated` test that drives `resolve_trusted_friends` +
+/// [`conversational_auto_tier_allowed`] end-to-end against a persisted opt-in
+/// row), it's simply that this particular flow's downstream effect of
+/// "opted in" remains structurally unreachable until a real-time
+/// availability check is wired into the conversational path — the same
+/// follow-up `crate::arr::request::NoopMediaRequestSink`'s doc already calls
+/// out.
 pub async fn conversational_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ConversationalHttpRequest>,
@@ -472,13 +488,11 @@ pub async fn conversational_handler(
         return Ok(Json(to_http_response(None)));
     }
 
-    let friends = TrustedFriends::from_friends(
-        settings
-            .discord_bot
-            .trusted_friends
-            .iter()
-            .map(|f| FriendIdentity::new(f.discord_user_id.clone(), f.display_name.clone())),
-    );
+    // MUSEX-WIRE-06 (Plane TERM #398, slice 6): the roster now reflects
+    // PERSISTED opt-in state (see the module-level doc above and
+    // `crate::discord::roster::resolve_trusted_friends`'s own doc), not
+    // allowlist membership alone.
+    let friends = crate::discord::roster::resolve_trusted_friends(&state.pool, &settings).await?;
 
     let sink = NoopMediaRequestSink;
     let limit = req.limit.unwrap_or(DEFAULT_CONVERSATIONAL_LIMIT);
@@ -1457,6 +1471,134 @@ mod db_gated {
             response.missing.is_empty(),
             "an owned title must never be reported as missing: {:?}",
             response.missing
+        );
+    }
+
+    // --- MUSEX-WIRE-06 (Plane TERM #398, slice 6): the roster now reflects
+    // PERSISTED opt-in state -------------------------------------------------
+
+    /// Creates a real `accounts` row so `friend_opt_in.muse_account_id`'s FK
+    /// insert is valid — mirrors `crate::discord::roster::db_gated::seed_account`
+    /// / `crate::discord::bot::db_gated::seed_on_deck_account`'s own helper.
+    async fn seed_account(pool: &sqlx::PgPool) -> i64 {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
+             VALUES ($1, $2, false, false) RETURNING id",
+        )
+        .bind(format!(
+            "wire06-conversational-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .bind("WIRE-06 Conversational Test Account")
+        .fetch_one(pool)
+        .await
+        .expect("seed account");
+        row.0
+    }
+
+    /// THE keystone proof for this slice: `conversational_handler` no
+    /// longer builds its roster from the allowlist alone — it now calls
+    /// `crate::discord::roster::resolve_trusted_friends`, the SAME resolver
+    /// `crate::discord::bot::discord_respond_handler` was rewired to in
+    /// WIRE-05. A friend who differs from a generic/default caller ONLY by
+    /// a `repo::friend_opt_in::set_opt_in` write must now resolve to
+    /// `is_opted_in() == true` (and so `conversational_auto_tier_allowed`
+    /// returns `true`) when reached through the real,
+    /// unmodified `conversational_handler` route — not just when a roster
+    /// is constructed by hand in a unit test.
+    ///
+    /// This composes the exact production call chain the handler runs
+    /// (`resolve_trusted_friends` -> `conversational_auto_tier_allowed`)
+    /// rather than asserting on the handler's JSON response, because — per
+    /// the module doc's "Still an honest, documented limitation" section —
+    /// `effective_auto_tier_enabled` has no observable effect on
+    /// `ConversationalHttpResponse` today (every draft this flow builds
+    /// passes `availability: None`, so `classify_tier` always lands on
+    /// `NeedsReview` regardless of consent). Faking a `submitted: true`
+    /// assertion here would misrepresent a route that structurally cannot
+    /// reach `AutoApprovable` yet; this test instead proves the actual
+    /// thing WIRE-06 changed: the PERSISTED-opt-in-aware roster reaches this
+    /// handler's consent decision, end-to-end, through a real DB round-trip.
+    #[tokio::test]
+    async fn conversational_handler_roster_resolves_persisted_opt_in_to_auto_tier_allowed() {
+        let Some(pool) = test_pool_or_skip(
+            "conversational_handler_roster_resolves_persisted_opt_in_to_auto_tier_allowed",
+        )
+        .await
+        else {
+            return;
+        };
+
+        let account_id = seed_account(&pool).await;
+        let opted_in_id = format!(
+            "discord-wire06-conv-opted-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let never_opted_id = format!(
+            "discord-wire06-conv-never-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+
+        // The ONE thing that differs from the generic/default case: a real
+        // persisted opt-in write via the sanctioned repo function (the same
+        // one `POST /friends/opt-in` performs).
+        repo::friend_opt_in::set_opt_in(&pool, &opted_in_id, account_id)
+            .await
+            .expect("set_opt_in should succeed");
+
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot.enabled = true;
+        settings.discord_bot.trusted_friends = vec![
+            TrustedFriendEntry {
+                discord_user_id: opted_in_id.clone(),
+                display_name: "Alex".to_string(),
+            },
+            TrustedFriendEntry {
+                discord_user_id: never_opted_id.clone(),
+                display_name: "Sam".to_string(),
+            },
+        ];
+        crate::repo::settings::save(&pool, &settings)
+            .await
+            .expect("save enabled settings");
+
+        // Exactly what `conversational_handler` now does internally after
+        // its settings-gate check (see the roster-build line just above the
+        // module's inert-first gate).
+        let friends = crate::discord::roster::resolve_trusted_friends(&pool, &settings)
+            .await
+            .expect("resolve_trusted_friends");
+
+        assert!(
+            conversational_auto_tier_allowed(true, &friends, Some(&opted_in_id)),
+            "a persisted-opted-in friend resolved through the real roster resolver must reach \
+             the auto-tier-allowed (personalized) branch"
+        );
+        assert!(
+            !conversational_auto_tier_allowed(true, &friends, Some(&never_opted_id)),
+            "an allowlisted-but-never-opted-in friend must NOT reach the auto-tier-allowed \
+             branch — no consent regression"
+        );
+        assert!(
+            !conversational_auto_tier_allowed(true, &friends, None),
+            "an unauthenticated caller must NOT reach the auto-tier-allowed branch"
+        );
+
+        // Sanity: the real route still runs end-to-end (no error) with this
+        // exact settings/roster state, proving the swap didn't break wiring.
+        let state = test_app_state(pool);
+        let req = ConversationalHttpRequest {
+            query: "a query with no library match".to_string(),
+            discord_user_id: Some(opted_in_id),
+            limit: None,
+        };
+        let Json(response) = conversational_handler(State(state), Json(req))
+            .await
+            .expect("the enabled, persisted-opted-in path must not error");
+        assert!(
+            response.tier.is_some(),
+            "an enabled subsystem must still run the ladder"
         );
     }
 }

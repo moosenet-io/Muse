@@ -174,7 +174,25 @@ pub async fn gather_taste_candidates(
 /// MUSE-11 on-deck / continue-watching candidates: thin wrapper over
 /// `repo::watch_stats::list_on_deck`, translated into [`Candidate`]s with a
 /// fact grounded in the actual `avg_percent`.
-pub async fn gather_on_deck_candidates(
+///
+/// ## Consent at the source (MUSEX-WIRE-01, Plane TERM #398)
+/// This is a taste-source PRIMITIVE, not a consent gate — it takes a bare
+/// `account_id` and does no opt-in check of its own, same as every other
+/// `gather_*` function in this module. It is deliberately `pub(crate)`, not
+/// `pub`: the MUSEX-CAP-SEC capstone finding (finding 1) was that this
+/// function's old `pub` visibility let a caller wire straight to it and
+/// bypass opt-in-by-construction with no compile error. `pub(crate)` makes
+/// that impossible for any caller outside this crate, while the two real
+/// in-crate callers stay exactly as they were: `crate::curation::recommend`'s
+/// `/recommend` HTTP handlers (the account-owner's own dashboard — no
+/// Discord-friend consent domain applies there, this crate's
+/// `taste_opt_in` model is specifically about a *friend* accessing
+/// *someone else's* taste) and `crate::discord::bot::respond`, which is the
+/// SANCTIONED, opted-in-identity-gated door for the Discord-friend
+/// consent domain — see that function's module doc for how
+/// `decide_response_mode`'s `TasteAware` arm is the only path that can ever
+/// reach this function with a friend-resolved `account_id`.
+pub(crate) async fn gather_on_deck_candidates(
     pool: &PgPool,
     account_id: i64,
     limit: i64,

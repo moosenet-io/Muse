@@ -34,12 +34,22 @@
 //! the invariant" posture `crate::discord::identity::FriendIdentity`'s
 //! private consent fields and `crate::promotion::targeting`'s
 //! `opted_in_friends`-only fan-out already use. The raw [`compute_tier`] /
-//! [`budget_for_tier`] / [`gather_engagement_counts`] primitives stay public
-//! (they're pure/mechanical building blocks the gate composes), but none of
-//! them can reach the request sink without first being wrapped in a
-//! consent-gated [`RequestBudget`]. All consent checks read only the
-//! accessors (`opted_in_friends`/`is_opted_in`/`linked_account`), never a
-//! private field.
+//! [`budget_for_tier`] / [`gather_engagement_counts`] primitives are
+//! pure/mechanical building blocks the gate composes; none of them can
+//! reach the request sink without first being wrapped in a consent-gated
+//! [`RequestBudget`]. All consent checks read only the accessors
+//! (`opted_in_friends`/`is_opted_in`/`linked_account`), never a private
+//! field.
+//!
+//! **MUSEX-WIRE-01 (Plane TERM #398) update:** the three primitives above
+//! used to be `pub`, which was exactly the MUSEX-CAP-SEC capstone's finding
+//! 1 — a caller outside this module could wire straight to them and skip
+//! [`resolve_friend_budget`] / [`resolve_friend_budget_from_counts`]
+//! entirely, with no compile error. They are now `pub(crate)`: still usable
+//! as the pure building blocks the two consent-gated resolvers above
+//! compose (and by this module's own tests), but no longer reachable from
+//! outside the crate to bypass the gate. The resolvers remain the ONLY
+//! sanctioned door onto a [`RequestBudget`].
 //!
 //! ## Budgets modulate, never bypass, `arr::request`
 //! [`submit_with_engagement_budget`] calls
@@ -142,7 +152,10 @@ impl EngagementCounts {
 /// `config`'s thresholds. Total, exhaustive, no I/O — exactly the same
 /// "caller already computed every input" posture `arr::request::classify_tier`
 /// documents for itself.
-pub fn compute_tier(counts: &EngagementCounts, config: &EngagementTierConfig) -> EngagementTier {
+pub(crate) fn compute_tier(
+    counts: &EngagementCounts,
+    config: &EngagementTierConfig,
+) -> EngagementTier {
     let composite = counts.watch_through_rate() * config.watch_through_weight
         + counts.household_love_rate() * config.household_love_weight;
 
@@ -156,7 +169,7 @@ pub fn compute_tier(counts: &EngagementCounts, config: &EngagementTierConfig) ->
 }
 
 /// The request budget a tier earns — pure lookup into `config`.
-pub fn budget_for_tier(tier: EngagementTier, config: &EngagementTierConfig) -> u32 {
+pub(crate) fn budget_for_tier(tier: EngagementTier, config: &EngagementTierConfig) -> u32 {
     match tier {
         EngagementTier::Starter => config.starter_budget,
         EngagementTier::Trusted => config.trusted_budget,
@@ -275,7 +288,7 @@ pub async fn resolve_friend_budget(
 /// against `household_account_ids`' ratings. See the module doc's honest
 /// limitation for exactly what this approximates. Never errors on "no
 /// signal yet" — a cold-start account simply yields all-zero counts.
-pub async fn gather_engagement_counts(
+pub(crate) async fn gather_engagement_counts(
     pool: &PgPool,
     account_id: i64,
     household_account_ids: &[i64],

@@ -41,9 +41,13 @@ pub mod discussion;
 pub mod engagement;
 pub mod schedule;
 
+// MUSEX-WIRE-01 (Plane TERM #398): `compute_tier`/`budget_for_tier`/
+// `gather_engagement_counts` are no longer re-exported here — they became
+// `pub(crate)` in `engagement` (consent-at-source, see that module's doc).
+// The sanctioned doors onto their output are `resolve_friend_budget` /
+// `resolve_friend_budget_from_counts` below, unchanged.
 pub use engagement::{
-    budget_for_tier, compute_tier, gather_engagement_counts, resolve_friend_budget,
-    resolve_friend_budget_from_counts, submit_with_engagement_budget, EngagementCounts,
-    EngagementTier, EngagementTierConfig, RequestBudget,
+    resolve_friend_budget, resolve_friend_budget_from_counts, submit_with_engagement_budget,
+    EngagementCounts, EngagementTier, EngagementTierConfig, RequestBudget,
 };
 pub use schedule::{build_announce_embed, schedule_premiere, PremiereEvent, RsvpStatus};

@@ -878,14 +878,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_conversational_touches_the_pool_when_enabled() {
-        // Mirror-image sanity check (same idiom as
-        // `run_discord_respond_touches_the_pool_when_enabled_and_opted_in`):
-        // WITH the gate enabled, this must actually reach the (unreachable)
-        // pool and fail with a database error — proving the two disabled-
-        // path tests above assert something real. This holds regardless of
-        // consent, since the library-first lookup itself is not gated on
-        // opt-in — only request auto-submission is.
+    async fn run_conversational_runs_the_flow_when_enabled() {
+        // Mirror-image sanity check for the two disabled-path tests above:
+        // they return `Ok(None)` (the gate short-circuits inert); this one
+        // proves that WITH the gate enabled, the flow does NOT short-circuit
+        // — it enters `handle_conversational_request` and runs the real
+        // MUSEX-14 ladder, which reaches the pool at the trigram tier
+        // (`repo::media_metadata::search_by_title`).
+        //
+        // NOTE (why this asserts `Ok(Some(_))`, not `Err`): unlike
+        // `crate::discord::bot::respond` — whose `TasteAware` arm
+        // propagates a pool error via `?`, so its equivalent "touches the
+        // pool" test can assert `is_err()` — the conversational ladder
+        // DELIBERATELY SWALLOWS and DEGRADES DB errors (`vector_tier` /
+        // `trigram_tier` log-and-return-empty on `Err`; see their bodies).
+        // So against an unreachable pool the enabled flow can NEVER surface
+        // an `Err`; it degrades every tier to empty and returns
+        // `Ok(Some(ConversationalOutcome { tier: None, .. }))`. The
+        // load-bearing distinction is therefore `Some` (gate passed, flow
+        // ran, pool reached) vs the disabled tests' `None` (gate blocked,
+        // nothing ran) — deterministic under any test order, and it still
+        // proves a real pool touch: a non-empty query on the enabled path
+        // ALWAYS calls `search_by_title(pool, ..)`.
+        //
+        // This holds regardless of consent, since the library-first lookup
+        // itself is not gated on opt-in — only request auto-submission is.
         let pool = unreachable_pool();
         let mut settings = ExperienceSettings::default();
         settings.master_enabled = true;
@@ -901,11 +918,25 @@ mod tests {
         )
         .await;
 
-        assert!(
-            result.is_err(),
-            "expected a database connection error proving the enabled path really reaches the \
-             pool, got Ok({:?})",
-            result.ok()
+        let outcome = result
+            .expect(
+                "the enabled path must run the flow, not error: the conversational ladder \
+                 swallows DB errors and degrades, so an unreachable pool yields Ok, never Err",
+            )
+            .expect(
+                "an ENABLED subsystem must run the flow and return Some — proving the gate did \
+                 NOT short-circuit to the inert None the disabled-path tests assert",
+            );
+        // With no embed (vector tier skipped) and no tmdb, the only tier
+        // that can run is trigram — which reached the (unreachable) pool and
+        // degraded to empty. `ResolveTier::None` here is the proof the
+        // ladder actually ran and touched the pool rather than the gate
+        // blocking before any work.
+        assert_eq!(
+            outcome.tier,
+            ResolveTier::None,
+            "an unreachable pool degrades the trigram tier to empty -> ResolveTier::None, which \
+             only happens if the enabled flow reached the pool at all: {outcome:?}"
         );
     }
 

@@ -43,9 +43,15 @@
 //!   ([`serendipity::is_exploration_eligible`]) that upgrades `director`'s
 //!   plain `CandidateSource::AvailableNow` split. See that module's doc for
 //!   the full refinement.
+//! - [`director_route`] (MUSEX-WIRE-04, Plane TERM #398) — the production
+//!   HTTP door onto `director`: `POST /channels/director/refresh`,
+//!   settings-gated (`ExperienceSettings::is_channel_director_enabled`) and
+//!   consent-enforced (Phase-F accessors) exactly like the WIRE-01/02/03
+//!   entry points wire the Discord/conversational/premiere flows.
 
 pub mod compose;
 pub mod director;
+pub mod director_route;
 pub mod presets;
 pub mod routes;
 pub mod serendipity;
@@ -59,6 +65,7 @@ pub use director::{
     DirectorCandidate, DirectorConstraints, DirectorPreset, DirectorPresetName, Slot, SlotIntent,
     TimeOfDay,
 };
+pub use director_route::{channel_director_refresh_handler, run_channel_director_refresh};
 pub use presets::{list_presets, resolve_preset, Preset, PresetName};
 pub use routes::compose_handler;
 pub use serendipity::{SerendipityRange, NOVELTY_HIGH, NOVELTY_LOW};

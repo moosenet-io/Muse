@@ -149,6 +149,13 @@ async fn build_director_pool(
 /// [`ChannelSchedule`] plus whether it was personalized — so a caller/test
 /// can distinguish "enabled but anonymous" from "enabled and opted-in"
 /// without inspecting the schedule's contents.
+///
+/// `Debug` so the `run_channel_director_refresh` tests can format the whole
+/// `Result<Option<DirectorRefreshOutcome>, _>` (via `{result:?}`) in their
+/// assert messages — `ChannelSchedule` (and everything it owns) already
+/// derives `Debug`, so this is a plain data holder derive with no logic
+/// change.
+#[derive(Debug)]
 pub struct DirectorRefreshOutcome {
     pub schedule: ChannelSchedule,
     pub personalized: bool,

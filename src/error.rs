@@ -55,6 +55,14 @@ pub enum MuseError {
     /// than treating either as a crash.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// MUSEX-CAP-SEC-01 (Plane TERM #399): a protected route was called
+    /// without a valid `Authorization: Bearer <token>` — see
+    /// `crate::http::auth`. Distinct from [`MuseError::ServiceUnavailable`]
+    /// (used when auth is required but not *configured* at all, a server
+    /// misconfiguration): this is a genuine caller-auth failure, 401.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 impl MuseError {
@@ -84,6 +92,7 @@ impl IntoResponse for MuseError {
             MuseError::Http(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
             MuseError::Upstream { message, .. } => (StatusCode::BAD_GATEWAY, message.clone()),
             MuseError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
+            MuseError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
         };
 
         let body = Json(json!({

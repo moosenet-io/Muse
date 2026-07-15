@@ -119,9 +119,22 @@ fn lazy_test_pool() -> sqlx::PgPool {
 
 /// Build app state with every optional upstream left unconfigured (`None`)
 /// — this module never talks to Plex/Prowlarr/TMDb/Tautulli/arr/Ollama/
-/// Chord, by construction, no matter which endpoint is exercised.
+/// Chord, by construction, no matter which endpoint is exercised. Also the
+/// MUSEX-CAP-SEC-01 (Plane TERM #399) posture under test everywhere except
+/// `auth` below: `Config::default()` leaves `api_token`/`auth_disabled`
+/// unset, i.e. the fail-closed "auth not configured" state.
 fn no_upstream_state(pool: sqlx::PgPool) -> Arc<AppState> {
-    let config = Config::default();
+    no_upstream_state_with_config(pool, Config::default())
+}
+
+/// Same as [`no_upstream_state`] but with a caller-supplied [`Config`] —
+/// used by the `auth` module below to exercise the configured-token and
+/// `MUSE_AUTH_DISABLED` states without touching process env vars (env vars
+/// are process-global and would need `#[serial]`-style coordination across
+/// every test in this file; passing `Config` directly is both simpler and
+/// exactly what `Config`'s own "test/scaffold convenience" `Default` impl
+/// exists for).
+fn no_upstream_state_with_config(pool: sqlx::PgPool, config: Config) -> Arc<AppState> {
     Arc::new(AppState {
         pool,
         enrichment: crate::enrichment::EnrichmentService::from_config(&config),
@@ -136,6 +149,10 @@ fn no_upstream_state(pool: sqlx::PgPool) -> Arc<AppState> {
 
 fn app_no_db() -> axum::Router {
     router(no_upstream_state(lazy_test_pool()))
+}
+
+fn app_no_db_with_config(config: Config) -> axum::Router {
+    router(no_upstream_state_with_config(lazy_test_pool(), config))
 }
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -185,6 +202,19 @@ fn post_empty(path: &str) -> Request<Body> {
         .uri(path)
         .body(Body::empty())
         .unwrap()
+}
+
+/// MUSEX-CAP-SEC-01 (Plane TERM #399): attach `Authorization: Bearer
+/// <token>` to an already-built request — layered on top of `get`/
+/// `post_json`/`post_empty` rather than duplicating them, so every existing
+/// request-builder gets an authed variant for free.
+fn with_bearer(mut req: Request<Body>, token: &str) -> Request<Body> {
+    req.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .expect("token must be a valid header value"),
+    );
+    req
 }
 
 // ---------------------------------------------------------------------
@@ -401,17 +431,34 @@ async fn art_proxy_contract_always_serves_an_image_never_errors_even_with_db_dow
 // /ops/* — router-level contract (the handler-level unit tests already
 // live in `http::ops`'s own `#[cfg(test)] mod tests`; these confirm the
 // *routing* — method + path wiring through the real router — as well).
+//
+// MUSEX-CAP-SEC-01 (Plane TERM #399): `/ops/*` is now behind
+// `auth::require_api_token` (see `auth` module below for the auth
+// contract itself), so these two router-level tests use
+// `auth::with_token_config()` + a valid `Authorization` header to get
+// *past* the auth layer — the
+// `503` they assert is still the ORIGINAL handler-level "arr/tautulli not
+// configured" degrade, now proven to be reachable by an authenticated
+// caller, not a side effect of auth rejecting the request.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
 async fn ops_ingest_arr_contract_503_when_unconfigured() {
-    let (status, _) = send(app_no_db(), post_empty("/ops/ingest/arr")).await;
+    let (status, _) = send(
+        app_no_db_with_config(auth::with_token_config()),
+        with_bearer(post_empty("/ops/ingest/arr"), auth::TEST_API_TOKEN),
+    )
+    .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
 async fn ops_ingest_tautulli_contract_503_when_unconfigured() {
-    let (status, _) = send(app_no_db(), post_empty("/ops/ingest/tautulli")).await;
+    let (status, _) = send(
+        app_no_db_with_config(auth::with_token_config()),
+        with_bearer(post_empty("/ops/ingest/tautulli"), auth::TEST_API_TOKEN),
+    )
+    .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -1812,5 +1859,246 @@ mod golden {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// MUSEX-CAP-SEC-01 (Plane TERM #399): router-level auth contract tests
+/// for `crate::http::auth::require_api_token`, exercised through the real
+/// `Router` (same `send`/`app_no_db_with_config` harness as the rest of
+/// this file) rather than calling the middleware function directly — the
+/// point is to prove the *wiring* (which routes are actually gated)
+/// matches the documented contract in `crate::http::router`, not just that
+/// the middleware function is individually correct (see `crate::http::auth`'s
+/// own `#[cfg(test)]` for the header-parsing/constant-time-compare unit
+/// tests that don't need a router at all).
+mod auth {
+    use super::*;
+
+    /// A dummy, in-memory-only fixture token — never a real credential,
+    /// never read from/written to <secret-manager> or any env var. Same posture
+    /// as the `"test-panel-key"`-style literals `config.rs`'s own tests
+    /// already use for other `*_api_key` fields (S1 governs infra
+    /// literals — hostnames/IPs/org secrets — not disposable test
+    /// fixture strings that only ever exist inside this test process).
+    pub(super) const TEST_API_TOKEN: &str = "endpoint-tests-fixture-token";
+
+    pub(super) fn with_token_config() -> Config {
+        Config {
+            api_token: Some(TEST_API_TOKEN.to_string()),
+            ..Config::default()
+        }
+    }
+
+    fn with_auth_disabled_config() -> Config {
+        Config {
+            api_token: None,
+            auth_disabled: true,
+            ..Config::default()
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // AC: /health (liveness) stays open regardless of auth config.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn health_stays_open_with_no_token_configured() {
+        let (status, _) = send(app_no_db_with_config(Config::default()), get("/health")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_stays_open_even_when_a_token_is_configured_and_not_presented() {
+        // /health must never require a credential, even once the fleet
+        // starts configuring MUSE_API_TOKEN for everything else.
+        let (status, _) = send(app_no_db_with_config(with_token_config()), get("/health")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------
+    // AC: protected route, no token presented, token IS configured -> 401,
+    // BEFORE the handler runs (proven via a route whose handler would
+    // otherwise touch the DB pool and fail differently — 401 here, not the
+    // 500 a reached-but-DB-less handler would produce).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn protected_route_without_token_is_401_and_never_reaches_the_handler() {
+        // `/friends/opt-in`'s handler calls `repo::settings::load` as its
+        // very first statement — against `app_no_db`'s unroutable lazy
+        // pool that would surface as a `500` (MuseError::Database), NOT a
+        // `401`. Observing `401` here is direct proof the middleware
+        // rejected the request before the handler (and therefore the
+        // pool) was ever touched.
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            post_json(
+                "/friends/opt-in",
+                json!({"discord_user_id": "u1", "muse_account_id": 12345}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_route_with_wrong_token_is_401() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            with_bearer(post_empty("/ops/ingest/arr"), "not-the-configured-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_route_with_malformed_auth_header_is_401() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            with_bearer_scheme(post_empty("/ops/ingest/arr"), "Basic", TEST_API_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    fn with_bearer_scheme(mut req: Request<Body>, scheme: &str, token: &str) -> Request<Body> {
+        req.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("{scheme} {token}")).unwrap(),
+        );
+        req
+    }
+
+    // -----------------------------------------------------------------
+    // AC: protected route, valid token presented -> reaches the handler.
+    //
+    // Deliberately does NOT route this through a DB-touching handler like
+    // `friend_opt_in_handler` against the lazy/unroutable test pool: unlike
+    // the no-token case above (which never calls `Next::run` at all, so the
+    // pool is provably never touched — no network I/O happens, no hang
+    // risk), a valid-token request that actually reaches a DB-touching
+    // handler in this sandbox risks a slow/hanging TCP connect attempt to
+    // an unroutable address rather than a fast rejection. `/ops/ingest/arr`
+    // gives the same proof (its *own* 503 is only reachable past the auth
+    // gate) with no pool I/O in its short-circuit path.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn protected_route_with_valid_token_reaches_the_handler() {
+        let (status, body) = send(
+            app_no_db_with_config(with_token_config()),
+            with_bearer(post_empty("/ops/ingest/arr"), TEST_API_TOKEN),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a valid token must not be rejected by the auth layer"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("arr"),
+            "expected the handler's own 'no arr instances configured' message, proving the \
+             request reached `ops::ingest_arr`, not an auth-layer 503: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_route_with_valid_token_and_no_db_dependent_ops_handler_runs() {
+        // `/ops/ingest/arr` degrades to a clean `503` *inside the handler*
+        // when unconfigured, with no DB touch at all — a valid token must
+        // reach that handler and get its real (non-auth) 503, covered
+        // together with the router-contract tests above
+        // (`ops_ingest_arr_contract_503_when_unconfigured`); this test
+        // exists purely to double-check `/ops/ingest/tautulli` too and
+        // give both cases direct auth-focused assertions here.
+        let (status, body) = send(
+            app_no_db_with_config(with_token_config()),
+            with_bearer(post_empty("/ops/ingest/tautulli"), TEST_API_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tautulli"),
+            "expected the handler's own 'tautulli not configured' message, not an auth 503: {body:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // AC: token not configured at all -> fail-closed 503 on protected
+    // routes, distinct from the 401 (bad/missing credential) case above.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn protected_route_fails_closed_503_when_token_unconfigured() {
+        let (status, body) = send(
+            app_no_db_with_config(Config::default()),
+            post_empty("/ops/ingest/arr"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("auth not configured"),
+            "expected the AUTH layer's 503 (unconfigured token), not a coincidental \
+             handler-level 503: {body:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // AC: MUSE_AUTH_DISABLED escape hatch — only takes effect when NO
+    // token is configured; a protected route then reaches its handler
+    // with no Authorization header at all.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn auth_disabled_flag_opens_protected_routes_when_no_token_configured() {
+        let (status, _) = send(
+            app_no_db_with_config(with_auth_disabled_config()),
+            post_empty("/ops/ingest/arr"),
+        )
+        .await;
+        // No auth header at all, yet NOT a 401/503-from-auth — the
+        // handler's own "arr not configured" 503 is reached directly.
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_flag_is_ignored_once_a_token_is_configured() {
+        // MUSE_AUTH_DISABLED must NOT weaken auth once a real token is
+        // configured — it only changes the *unconfigured* default.
+        let config = Config {
+            api_token: Some(TEST_API_TOKEN.to_string()),
+            auth_disabled: true,
+            ..Config::default()
+        };
+        let (status, _) = send(app_no_db_with_config(config), post_empty("/ops/ingest/arr")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a configured token must still be enforced even with MUSE_AUTH_DISABLED set"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Non-mutation-adjacent sanity: routes deliberately left OPEN (per
+    // `crate::http::router`'s doc comment) must stay reachable with no
+    // token configured at all, same as `/health` above.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn open_read_only_surface_stays_reachable_with_no_token_configured() {
+        let app = app_no_db_with_config(Config::default());
+        let (status, _) = send(app, get("/api/channels")).await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the public channel-guide JSON API must stay open, not gated by auth"
+        );
     }
 }

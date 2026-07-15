@@ -383,6 +383,22 @@ pub struct Config {
     /// corpus has tuned this yet, same caveat `kg_taste_neighbor_threshold`'s
     /// own doc makes for its default).
     pub kg_viz_watch_history_limit: u64,
+
+    // --- MUSEX-CAP-SEC-01 (Plane TERM #399): endpoint auth ---
+    /// Bearer token required on the sensitive/mutating HTTP surface (see
+    /// `crate::http::auth`) — `MUSE_API_TOKEN`, <secret-manager>-materialized at
+    /// runtime, never a literal (S1/S7). `None` means auth is NOT
+    /// configured: per the fail-closed posture, every protected route then
+    /// answers `503` rather than either accepting all callers or silently
+    /// opening up, unless [`Config::auth_disabled`] is explicitly set.
+    pub api_token: Option<String>,
+    /// Explicit escape hatch (`MUSE_AUTH_DISABLED=1`/`true`) for a dev box
+    /// with no token configured, so the protected surface degrades to open
+    /// only when an operator deliberately opts in — never as a silent
+    /// default. Ignored (protected routes stay enforced) once
+    /// [`Config::api_token`] IS configured; only changes behavior for the
+    /// unconfigured-token case.
+    pub auth_disabled: bool,
 }
 
 impl Config {
@@ -498,6 +514,11 @@ impl Config {
 
             kg_taste_neighbor_threshold: env_f32("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD", 0.5),
             kg_viz_watch_history_limit: env_u64("MUSE_KG_VIZ_WATCH_HISTORY_LIMIT", 200),
+
+            api_token: env_opt("MUSE_API_TOKEN"),
+            auth_disabled: env_opt("MUSE_AUTH_DISABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
@@ -586,6 +607,8 @@ impl Default for Config {
             premiere_curator_budget: 6,
             kg_taste_neighbor_threshold: 0.5,
             kg_viz_watch_history_limit: 200,
+            api_token: None,
+            auth_disabled: false,
         }
     }
 }
@@ -702,6 +725,8 @@ mod tests {
             "MUSE_PREMIERE_TRUSTED_BUDGET",
             "MUSE_PREMIERE_CURATOR_BUDGET",
             "MUSE_KG_TASTE_NEIGHBOR_THRESHOLD",
+            "MUSE_API_TOKEN",
+            "MUSE_AUTH_DISABLED",
         ] {
             std::env::remove_var(key);
         }
@@ -757,6 +782,23 @@ mod tests {
         assert_eq!(cfg.premiere_curator_budget, 6);
         assert!((cfg.kg_taste_neighbor_threshold - 0.5).abs() < f32::EPSILON);
         assert_eq!(cfg.kg_viz_watch_history_limit, 200);
+        assert!(cfg.api_token.is_none());
+        assert!(!cfg.auth_disabled);
+    }
+
+    #[test]
+    #[serial]
+    fn musexcapsec01_auth_config_reads_token_and_disabled_flag_from_env() {
+        std::env::set_var("MUSE_API_TOKEN", "test-token-value");
+        std::env::set_var("MUSE_AUTH_DISABLED", "true");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.api_token.as_deref(), Some("test-token-value"));
+        assert!(cfg.auth_disabled);
+
+        std::env::remove_var("MUSE_API_TOKEN");
+        std::env::remove_var("MUSE_AUTH_DISABLED");
     }
 
     #[test]

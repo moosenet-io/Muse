@@ -5,6 +5,7 @@
 //! rest of `/ingest` and `/query` are mounted as stub route groups that
 //! answer `501 Not Implemented` until their respective spec items land.
 
+pub mod auth;
 pub mod ops;
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use axum::{
     extract::State,
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -68,15 +70,47 @@ pub struct AppState {
 const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the top-level router for the service.
+///
+/// ## MUSEX-CAP-SEC-01 (Plane TERM #399): endpoint auth
+/// The S118 Epic capstone flagged that the wired experience-layer routes,
+/// the Constellation-GUI control surface, and the manual ops triggers had
+/// **no auth** — `0.0.0.0` bind plus only a `TraceLayer`. Those routes are
+/// now built as their own sub-router (the `protected` `Router` local to
+/// this function) and mounted with
+/// `Router::route_layer(middleware::from_fn_with_state(...,
+/// auth::require_api_token))`, so `crate::http::auth::require_api_token`
+/// runs BEFORE any of their handlers — a rejected request never touches the
+/// database. `route_layer` (not `layer`) is deliberate: it applies only to
+/// routes registered on `protected_routes()` itself, not to whatever this
+/// function `.merge`s in afterward, so it can never accidentally leak onto
+/// `/health` or the rest of the open surface.
+///
+/// **Left open** (unauthenticated), and why:
+/// - `GET /health` — liveness/readiness; must never require a credential.
+/// - `/ingest/*`, `/query/*`, `/proactive/*`, `/recommend*`,
+///   `/channels/:id/compose` — the pre-WIRE, Phase-0/MUSE-xx surface the
+///   capstone finding did NOT flag; each already has its own consumer
+///   (Plex's webhook poster for `/ingest/plex-webhook`, the HDHomeRun/M3U/
+///   XMLTV tuner protocol, the reminders/engagement engine for
+///   `/proactive/*`) that cannot be confirmed to send a bearer header
+///   without touching code outside this repo — bringing them into the auth
+///   perimeter is left to a follow-up item rather than guessed at here.
+/// - The HDHomeRun-emulation tuner routes (`tuner_routes`) and the
+///   browser-facing guide/channel-JSON/artwork surface
+///   (`crate::web::public_routes`) — these are consumed by Plex/HDHomeRun
+///   clients and plain `<img>`/`fetch` calls from the guide page itself,
+///   neither of which can be made to send a custom `Authorization` header.
+///
+/// **Protected**: `/discord/respond`, `/conversational`, `/premiere` +
+/// `/premiere/rsvp`, `/channels/director/refresh`, `/friends/opt-in` +
+/// `/friends/opt-out` (the WIRE-01..06 experience layer the capstone named
+/// directly), `crate::web::protected_routes` (`/api/graph/*` — per-friend
+/// taste/watch data — and `/api/settings` GET+PUT — the control panel), and
+/// `/ops/*` (manual maintenance/ingest triggers).
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .nest("/ingest", ingest_routes())
-        .nest("/query", query_routes())
-        .nest("/proactive", proactive_routes())
-        // MUSE-11: the curation/recommend engine — `POST /recommend`,
-        // `GET /recommend/on_deck`, `GET /recommend/gaps`.
-        .nest("/recommend", recommend_routes())
+    let auth_layer = middleware::from_fn_with_state(state.clone(), auth::require_api_token);
+
+    let protected = Router::new()
         // MUSEX-WIRE-01 (Plane TERM #398): the wired, settings-gated Discord
         // response flow — `POST /discord/respond`. See
         // `crate::discord::bot::discord_respond_handler`.
@@ -94,15 +128,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         // /premiere/rsvp`. See `crate::premiere::http`.
         .route("/premiere", post(crate::premiere::http::premiere_schedule_handler))
         .route("/premiere/rsvp", post(crate::premiere::http::premiere_rsvp_handler))
-        // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
-        // `/api/channels*`, `/art/{kind}/{id}`).
-        .merge(crate::web::routes())
-        // MUSE-28: HDHomeRun-emulation linear tuner (`/discover.json`,
-        // `/lineup.json`, `/muse.m3u`, `/xmltv.xml`, ...).
-        .merge(tuner_routes())
-        // MUSE-31: the on-demand channel composer trigger (MUSE-24's
-        // `compose_channel_run` had no HTTP surface until now).
-        .route("/channels/:id/compose", post(crate::channels::compose_handler))
         // MUSEX-WIRE-04 (Plane TERM #398): the wired, settings-gated,
         // consent-enforced channel DIRECTOR entry point — `POST
         // /channels/director/refresh`. See
@@ -125,11 +150,38 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/friends/opt-out",
             post(crate::discord::friend_opt_out_handler),
         )
+        // MUSEX-17/18: graph-visualization + Constellation GUI
+        // control/settings surface — see `crate::web::protected_routes`.
+        .merge(crate::web::protected_routes())
         // MUSE-31: on-demand ops routes -- manual triggers for the same
         // routines the background maintenance/trending workers run on a
         // schedule (see `crate::maintenance`). Mainly for priming a fresh
         // deploy and operator debugging.
         .nest("/ops", ops_routes())
+        .route_layer(auth_layer);
+
+    Router::new()
+        .route("/health", get(health))
+        .nest("/ingest", ingest_routes())
+        .nest("/query", query_routes())
+        .nest("/proactive", proactive_routes())
+        // MUSE-11: the curation/recommend engine — `POST /recommend`,
+        // `GET /recommend/on_deck`, `GET /recommend/gaps`.
+        .nest("/recommend", recommend_routes())
+        // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
+        // `/api/channels*`, `/art/{kind}/{id}`). Deliberately UNAUTHENTICATED
+        // — see the doc comment on this function.
+        .merge(crate::web::public_routes())
+        // MUSE-28: HDHomeRun-emulation linear tuner (`/discover.json`,
+        // `/lineup.json`, `/muse.m3u`, `/xmltv.xml`, ...).
+        .merge(tuner_routes())
+        // MUSE-31: the on-demand channel composer trigger (MUSE-24's
+        // `compose_channel_run` had no HTTP surface until now).
+        .route("/channels/:id/compose", post(crate::channels::compose_handler))
+        // MUSEX-CAP-SEC-01 (Plane TERM #399): every route registered on
+        // `protected` is gated by `auth::require_api_token` — see this
+        // function's doc comment for the full authed/open breakdown.
+        .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

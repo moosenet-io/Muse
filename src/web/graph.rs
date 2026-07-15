@@ -262,6 +262,13 @@ pub async fn taste_map_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TasteMapRequest>,
 ) -> MuseResult<Json<TasteMapViz>> {
+    // MUSEX-CAP-SEC-04 (epic-capstone finding): inert-first — the KG-viz
+    // subsystem must not run when its toggle (or the master switch) is off.
+    // Read settings first and return an empty viz before any graph assembly
+    // touches the pool, exactly as the WIRE-01..06 handlers gate their work.
+    if !repo::settings::load(&state.pool).await?.is_kg_viz_enabled() {
+        return Ok(Json(TasteMapViz::default()));
+    }
     let graph = req
         .source
         .assemble(&state.pool, state.config.kg_taste_neighbor_threshold)
@@ -283,6 +290,10 @@ pub async fn group_dynamics_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GroupDynamicsRequest>,
 ) -> MuseResult<Json<GroupDynamicsViz>> {
+    // MUSEX-CAP-SEC-04: inert-first KG-viz toggle gate (see `taste_map_handler`).
+    if !repo::settings::load(&state.pool).await?.is_kg_viz_enabled() {
+        return Ok(Json(GroupDynamicsViz::default()));
+    }
     let graph = req
         .source
         .assemble(&state.pool, state.config.kg_taste_neighbor_threshold)
@@ -313,6 +324,10 @@ pub async fn watch_history_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<WatchHistoryRequest>,
 ) -> MuseResult<Json<WatchHistoryViz>> {
+    // MUSEX-CAP-SEC-04: inert-first KG-viz toggle gate (see `taste_map_handler`).
+    if !repo::settings::load(&state.pool).await?.is_kg_viz_enabled() {
+        return Ok(Json(WatchHistoryViz::default()));
+    }
     let graph = req
         .source
         .assemble(&state.pool, state.config.kg_taste_neighbor_threshold)
@@ -339,6 +354,10 @@ pub async fn taste_clusters_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TasteClustersRequest>,
 ) -> MuseResult<Json<TasteClusterViz>> {
+    // MUSEX-CAP-SEC-04: inert-first KG-viz toggle gate (see `taste_map_handler`).
+    if !repo::settings::load(&state.pool).await?.is_kg_viz_enabled() {
+        return Ok(Json(TasteClusterViz::default()));
+    }
     let graph = req
         .source
         .assemble(&state.pool, state.config.kg_taste_neighbor_threshold)
@@ -535,6 +554,20 @@ mod tests {
                 .as_nanos()
         }
 
+        /// MUSEX-CAP-SEC-04: `kg_viz.enabled` defaults `false` (opt-in,
+        /// default-private), so the graph handlers' new inert-first toggle
+        /// gate would return an empty viz on a fresh DB. Persist an ENABLED
+        /// settings document so these consent tests exercise the real
+        /// assembly/filter path; the gate itself (disabled → inert) is proven
+        /// separately by `kg_viz_disabled_returns_inert_empty_viz`.
+        async fn enable_kg_viz(pool: &PgPool) {
+            let mut settings = crate::settings::ExperienceSettings::default();
+            settings.kg_viz.enabled = true; // master_enabled already true by default
+            repo::settings::save(pool, &settings)
+                .await
+                .expect("persist kg-viz-enabled settings");
+        }
+
         fn state_with_pool(pool: PgPool) -> Arc<AppState> {
             let config = crate::config::Config::default();
             Arc::new(AppState {
@@ -615,6 +648,7 @@ mod tests {
             let alex_id = person_node_id(&alex_discord);
             let sam_id = person_node_id(&sam_discord);
             let jamie_title_id = title_node_id(200);
+            enable_kg_viz(&pool).await; // MUSEX-CAP-SEC-04: gate is on by default-off
             let state = state_with_pool(pool);
 
             // 1. taste-map AS ALEX.
@@ -733,6 +767,7 @@ mod tests {
             });
 
             let solo_id = person_node_id(&solo_discord);
+            enable_kg_viz(&pool).await; // MUSEX-CAP-SEC-04: gate is on by default-off
             let state = state_with_pool(pool);
             let req: WatchHistoryRequest = serde_json::from_value(body).unwrap();
             let Json(wh) = watch_history_handler(State(state), Json(req))
@@ -745,6 +780,89 @@ mod tests {
                 "a persisted-opted-in friend must be included with no client-side claim: {:?}",
                 wh.entries
             );
+        }
+
+        /// MUSEX-CAP-SEC-04 (epic-capstone finding): inert-first — the KG-viz
+        /// handlers must return an EMPTY viz when the `kg_viz` toggle (or the
+        /// master switch) is off, before any graph assembly runs. This is the
+        /// proof: identical persisted-opted-in data to
+        /// `persisted_opt_in_grants_inclusion_even_with_no_client_side_claim`
+        /// (Alex opted in, a real watch), but WITHOUT `enable_kg_viz`, so the
+        /// default-off toggle governs. Where the enabled tests above return a
+        /// populated viz, here every handler must return its `Default`
+        /// (empty) — so the assertion cannot pass vacuously (the data is
+        /// present; only the gate suppresses it).
+        #[tokio::test]
+        async fn kg_viz_disabled_returns_inert_empty_viz() {
+            let Some(pool) = test_pool_or_skip("kg_viz_disabled_returns_inert_empty_viz").await
+            else {
+                return;
+            };
+
+            let suffix = uuid_ish();
+            let alex_discord = format!("discord-capsec04-alex-{suffix}");
+            let alex_account = seed_account(&pool, "alex").await;
+            repo::friend_opt_in::set_opt_in(&pool, &alex_discord, alex_account)
+                .await
+                .expect("persist Alex's opt-in");
+
+            let body = json!({
+                "friends": [
+                    {"discord_user_id": alex_discord, "display_name": "Alex", "opted_in_account_id": alex_account},
+                ],
+                "watches": [
+                    {"discord_user_id": alex_discord, "media_item_id": 100, "title": "Severance", "watched_at": "2026-07-14T10:00:00Z"}
+                ],
+                "co_views": [],
+                "personas": [
+                    {"discord_user_id": alex_discord, "persona_id": 1, "persona_name": "alex-primary", "centroid": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+                ]
+            });
+
+            // NOTE: no `enable_kg_viz(&pool)` — `kg_viz.enabled` stays at its
+            // default `false`, so `is_kg_viz_enabled()` is false and the gate
+            // fires.
+            let state = state_with_pool(pool);
+
+            // taste-map AS ALEX — populated in the enabled tests; inert here.
+            let req_body = with_selector(body.clone(), "discord_user_id", &alex_discord);
+            let req: TasteMapRequest =
+                serde_json::from_value(req_body).expect("taste-map body deserializes");
+            let Json(alex_map) = taste_map_handler(State(state.clone()), Json(req))
+                .await
+                .expect("handler succeeds");
+            assert_eq!(
+                alex_map,
+                TasteMapViz::default(),
+                "kg_viz disabled must yield an empty taste-map even for opted-in Alex"
+            );
+
+            // watch-history — likewise inert.
+            let req: WatchHistoryRequest =
+                serde_json::from_value(body.clone()).expect("watch-history body deserializes");
+            let Json(wh) = watch_history_handler(State(state.clone()), Json(req))
+                .await
+                .expect("handler succeeds");
+            assert_eq!(
+                wh,
+                WatchHistoryViz::default(),
+                "kg_viz disabled must yield an empty watch-history"
+            );
+
+            // group-dynamics + taste-clusters — likewise inert.
+            let req: GroupDynamicsRequest =
+                serde_json::from_value(body.clone()).expect("group-dynamics body deserializes");
+            let Json(gd) = group_dynamics_handler(State(state.clone()), Json(req))
+                .await
+                .expect("handler succeeds");
+            assert_eq!(gd, GroupDynamicsViz::default(), "kg_viz disabled → empty");
+
+            let req: TasteClustersRequest =
+                serde_json::from_value(body).expect("taste-clusters body deserializes");
+            let Json(tc) = taste_clusters_handler(State(state), Json(req))
+                .await
+                .expect("handler succeeds");
+            assert_eq!(tc, TasteClusterViz::default(), "kg_viz disabled → empty");
         }
     }
 }

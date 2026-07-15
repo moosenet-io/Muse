@@ -305,15 +305,36 @@ fn to_response(reply: Option<BotReply>) -> DiscordRespondResponse {
 /// exercise the `TasteAware` arm directly against a constructed opted-in
 /// identity, proving the gate + pipeline are correct even though
 /// production can't yet drive a real friend into that state.
+///
+/// ## Inert-first ordering (MUSEX-WIRE-01, codex REQUEST_CHANGES fix)
+/// Loading the settings document is the ONE unavoidable pool read — the
+/// toggle IS the source of truth for whether this flow runs at all, so it
+/// has to be read before the gate can be evaluated. Immediately after that
+/// load, the master + `discord_bot` gate is checked and the inert response
+/// returned BEFORE any roster is built, any friends/taste work is done, or
+/// the pipeline is entered. So when the subsystem is off, the ROUTE (not
+/// just the [`run_discord_respond`] helper) does no work beyond reading the
+/// toggle — the roster construction and pipeline call below are on the
+/// enabled path only. The `db_gated` handler tests below drive this real
+/// `async fn` end-to-end to prove it (a fully DB-free handler test isn't
+/// possible precisely because the settings load needs the pool).
 pub async fn discord_respond_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DiscordRespondRequest>,
 ) -> MuseResult<Json<DiscordRespondResponse>> {
+    // The one unavoidable pool read: the toggle is the source of truth.
     let settings = crate::repo::settings::load(&state.pool).await?;
 
-    // See the module-level "Honest seam" note above: the roster this
-    // handler can build today carries allowlist membership only, never
-    // opt-in.
+    // GATE FIRST — before building any roster or doing any friends/taste
+    // work. A disabled subsystem returns the inert response here; nothing
+    // below runs. This makes the ROUTE inert-first, not just the helper.
+    if !settings.is_discord_bot_enabled() {
+        return Ok(Json(to_response(None)));
+    }
+
+    // Enabled path only. See the module-level "Honest seam" note above: the
+    // roster this handler can build today carries allowlist membership only,
+    // never opt-in.
     let friends = TrustedFriends::from_friends(
         settings
             .discord_bot
@@ -914,5 +935,121 @@ mod db_gated {
             reply.is_none(),
             "a non-allowlisted user must get no reply at all"
         );
+    }
+
+    // --- MUSEX-WIRE-01: HANDLER-level full-flow coverage (codex fix) --------
+    //
+    // These drive the REAL `discord_respond_handler` async fn end-to-end
+    // (build a `State<AppState>` + a `Json` request → call the handler →
+    // inspect the JSON response), the same DB-backed handler-unit-test shape
+    // `crate::web::graph`/`crate::web::settings` use — proving the ROUTE (not
+    // just the `run_discord_respond` helper) is inert-first when disabled.
+    // `db_gated` because the handler's settings load genuinely needs a live
+    // pool (the toggle is the DB-persisted source of truth), so a fully
+    // DB-free handler test isn't possible; see the handler's own doc.
+
+    use crate::settings::{ExperienceSettings, TrustedFriendEntry};
+
+    fn test_app_state(pool: sqlx::PgPool) -> Arc<AppState> {
+        let config = crate::config::Config::default();
+        Arc::new(AppState {
+            pool,
+            enrichment: crate::enrichment::EnrichmentService::from_config(&config),
+            config,
+            plex: None,
+            prowlarr: None,
+            arr_instances: Vec::new(),
+            tmdb: None,
+            embed: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn discord_respond_handler_route_is_inert_when_subsystem_disabled() {
+        let Some(pool) =
+            test_pool_or_skip("discord_respond_handler_route_is_inert_when_subsystem_disabled")
+                .await
+        else {
+            return;
+        };
+
+        // Persist a DISABLED settings doc that STILL carries a non-empty
+        // roster: if the gate did not precede the roster build, the handler
+        // would resolve "discord-1" and proceed — the inert response below
+        // proves the route returns BEFORE any roster/taste work.
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot.enabled = false;
+        settings.discord_bot.trusted_friends = vec![TrustedFriendEntry {
+            discord_user_id: "discord-1".to_string(),
+            display_name: "Alex".to_string(),
+        }];
+        crate::repo::settings::save(&pool, &settings)
+            .await
+            .expect("save disabled settings");
+
+        let state = test_app_state(pool);
+        let req = DiscordRespondRequest {
+            discord_user_id: "discord-1".to_string(),
+        };
+
+        let Json(response) = discord_respond_handler(State(state), Json(req))
+            .await
+            .expect("a disabled route must return an inert Ok, never an error");
+
+        assert!(
+            response.content.is_none(),
+            "a disabled route must return a fully inert response — no content"
+        );
+        assert!(response.embed_title.is_none());
+        assert!(response.embed_poster_url.is_none());
+        assert!(response.embed_synopsis.is_none());
+    }
+
+    #[tokio::test]
+    async fn discord_respond_handler_route_returns_generic_for_enabled_non_opted_in() {
+        let Some(pool) = test_pool_or_skip(
+            "discord_respond_handler_route_returns_generic_for_enabled_non_opted_in",
+        )
+        .await
+        else {
+            return;
+        };
+
+        // ENABLED subsystem with an allowlisted-only roster entry. The
+        // production roster can never grant opt-in (see the handler's Honest
+        // seam note), so the wired flow reaches `ResponseMode::Generic`:
+        // served, but no taste/embed data.
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot.enabled = true;
+        settings.discord_bot.trusted_friends = vec![TrustedFriendEntry {
+            discord_user_id: "discord-1".to_string(),
+            display_name: "Alex".to_string(),
+        }];
+        crate::repo::settings::save(&pool, &settings)
+            .await
+            .expect("save enabled settings");
+
+        let state = test_app_state(pool);
+        let req = DiscordRespondRequest {
+            discord_user_id: "discord-1".to_string(),
+        };
+
+        let Json(response) = discord_respond_handler(State(state), Json(req))
+            .await
+            .expect("the enabled generic path must not error");
+
+        assert_eq!(
+            response.content.as_deref(),
+            Some(GENERIC_REPLY_CONTENT),
+            "an enabled, allowlisted-but-not-opted-in friend gets the fixed generic reply"
+        );
+        assert!(
+            response.embed_title.is_none(),
+            "a generic reply carries no taste/embed data"
+        );
+        assert!(response.embed_poster_url.is_none());
+        assert!(response.embed_synopsis.is_none());
     }
 }

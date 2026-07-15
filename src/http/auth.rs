@@ -64,6 +64,7 @@ use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::Response;
+use sha2::{Digest, Sha256};
 
 use crate::error::MuseError;
 use crate::http::AppState;
@@ -110,18 +111,29 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
-/// Constant-time byte comparison for the token check — deliberately not
-/// `==`, which short-circuits on the first mismatched byte and can leak
-/// timing information about how much of a secret prefix an attacker has
-/// guessed correctly. Length is compared first (an inherent, unavoidable
-/// signal even in constant-time-comparison libraries; not itself sensitive
-/// here since both sides are opaque tokens, not derived from user input).
+/// Length-blind, constant-time token comparison.
+///
+/// Deliberately NOT `==` (which short-circuits on the first mismatched
+/// byte, leaking how much of a secret prefix an attacker has guessed) and
+/// deliberately NOT a raw `a.len() != b.len()` early return either — that
+/// still leaks the configured token's *length* via timing (an attacker
+/// could distinguish "wrong length" from "right length, wrong content").
+///
+/// The fix is the canonical one (the same trick Django's
+/// `constant_time_compare` and others use): hash BOTH inputs to a
+/// fixed-size SHA-256 digest first, then XOR-compare the two 32-byte
+/// digests. The digests are ALWAYS exactly 32 bytes, so there is no
+/// length branch and no length leak — inputs of any length take the same
+/// comparison path. There is no `return` before the full digest
+/// comparison completes, and the work done never reveals which side is the
+/// real token. (SHA-256 is preimage/collision-resistant, so equal digests
+/// imply equal tokens for any realistic token; `sha2` is already a crate
+/// dependency — see `snapshot::provenance` — so this adds no new dep.)
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let digest_a = Sha256::digest(a);
+    let digest_b = Sha256::digest(b);
     let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in digest_a.iter().zip(digest_b.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -171,8 +183,25 @@ mod tests {
     }
 
     #[test]
+    fn constant_time_eq_matches_equal_slices_of_unusual_lengths() {
+        // Equality must hold at any length (empty and long), since the
+        // comparison now runs over fixed-size digests, not the raw bytes.
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(
+            b"a-considerably-longer-token-value-0123456789",
+            b"a-considerably-longer-token-value-0123456789",
+        ));
+    }
+
+    #[test]
     fn constant_time_eq_rejects_different_length() {
+        // A wrong-length token still rejects — but note the rejection comes
+        // from the digest comparison, NOT an early length branch: the
+        // function is length-BLIND (both inputs are hashed to a fixed
+        // 32-byte digest first), so it does not leak the real token's
+        // length via timing. See `constant_time_eq`'s doc comment.
         assert!(!constant_time_eq(b"short", b"much-longer-value"));
+        assert!(!constant_time_eq(b"", b"nonempty"));
     }
 
     #[test]

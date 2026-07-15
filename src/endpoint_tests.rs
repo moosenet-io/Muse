@@ -305,21 +305,42 @@ async fn query_similar_error_path_missing_required_field_is_client_error() {
 // + error-path. Happy paths (needing a real account row) are in db_gated.
 // ---------------------------------------------------------------------
 
+// MUSEX-CAP-SEC-03: `/recommend*` is now behind `auth::require_api_token`
+// (it serves per-account taste data). These error-path tests must therefore
+// present a valid bearer token to reach the handler and exercise the
+// missing-`account_id` client-error behavior; the auth GATE itself (a
+// tokenless request is rejected before the handler) is proven separately in
+// `mod auth`'s `recommend_without_token_is_401_*` test.
 #[tokio::test]
 async fn recommend_error_path_missing_account_id_is_client_error() {
-    let (status, _) = send(app_no_db(), post_json("/recommend", json!({"limit": 5}))).await;
+    let (status, _) = send(
+        app_no_db_with_config(auth::with_token_config()),
+        with_bearer(
+            post_json("/recommend", json!({"limit": 5})),
+            auth::TEST_API_TOKEN,
+        ),
+    )
+    .await;
     assert!(status.is_client_error());
 }
 
 #[tokio::test]
 async fn recommend_on_deck_error_path_missing_account_id_query_param_is_client_error() {
-    let (status, _) = send(app_no_db(), get("/recommend/on_deck")).await;
+    let (status, _) = send(
+        app_no_db_with_config(auth::with_token_config()),
+        with_bearer(get("/recommend/on_deck"), auth::TEST_API_TOKEN),
+    )
+    .await;
     assert!(status.is_client_error());
 }
 
 #[tokio::test]
 async fn recommend_gaps_error_path_missing_account_id_query_param_is_client_error() {
-    let (status, _) = send(app_no_db(), get("/recommend/gaps")).await;
+    let (status, _) = send(
+        app_no_db_with_config(auth::with_token_config()),
+        with_bearer(get("/recommend/gaps"), auth::TEST_API_TOKEN),
+    )
+    .await;
     assert!(status.is_client_error());
 }
 
@@ -1956,6 +1977,23 @@ mod auth {
                 "/friends/opt-in",
                 json!({"discord_user_id": "u1", "muse_account_id": 12345}),
             ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // MUSEX-CAP-SEC-03 (epic-capstone finding): `/recommend` serves per-account
+    // taste/on-deck/gap candidates for a caller-supplied `account_id`. Proven
+    // here to be behind the auth gate: a tokenless POST with an OTHERWISE VALID
+    // body (a well-formed `account_id`, so the ONLY thing that can reject it is
+    // the auth layer — a reached handler would touch `app_no_db`'s unroutable
+    // pool and surface a `500`, not a `401`) is rejected `401` before the
+    // recommend handler (and therefore the taste data) is ever reached.
+    #[tokio::test]
+    async fn recommend_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            post_json("/recommend", json!({"account_id": 12345, "limit": 5})),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);

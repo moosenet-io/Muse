@@ -87,14 +87,14 @@ const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// **Left open** (unauthenticated), and why:
 /// - `GET /health` — liveness/readiness; must never require a credential.
-/// - `/ingest/*`, `/query/*`, `/proactive/*`, `/recommend*`,
-///   `/channels/:id/compose` — the pre-WIRE, Phase-0/MUSE-xx surface the
-///   capstone finding did NOT flag; each already has its own consumer
-///   (Plex's webhook poster for `/ingest/plex-webhook`, the HDHomeRun/M3U/
-///   XMLTV tuner protocol, the reminders/engagement engine for
-///   `/proactive/*`) that cannot be confirmed to send a bearer header
-///   without touching code outside this repo — bringing them into the auth
-///   perimeter is left to a follow-up item rather than guessed at here.
+/// - `/ingest/*`, `/query/*`, `/proactive/*`, `/channels/:id/compose` — the
+///   pre-WIRE, Phase-0/MUSE-xx surface the capstone finding did NOT flag; each
+///   already has its own consumer (Plex's webhook poster for
+///   `/ingest/plex-webhook`, the HDHomeRun/M3U/ XMLTV tuner protocol, the
+///   reminders/engagement engine for `/proactive/*`) that cannot be confirmed
+///   to send a bearer header without touching code outside this repo —
+///   bringing them into the auth perimeter is left to a follow-up item rather
+///   than guessed at here.
 /// - The HDHomeRun-emulation tuner routes (`tuner_routes`) and the
 ///   browser-facing guide/channel-JSON/artwork surface
 ///   (`crate::web::public_routes`) — these are consumed by Plex/HDHomeRun
@@ -105,8 +105,11 @@ const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
 /// `/premiere/rsvp`, `/channels/director/refresh`, `/friends/opt-in` +
 /// `/friends/opt-out` (the WIRE-01..06 experience layer the capstone named
 /// directly), `crate::web::protected_routes` (`/api/graph/*` — per-friend
-/// taste/watch data — and `/api/settings` GET+PUT — the control panel), and
-/// `/ops/*` (manual maintenance/ingest triggers).
+/// taste/watch data — and `/api/settings` GET+PUT — the control panel),
+/// `/recommend*` (MUSEX-CAP-SEC-03: per-account taste/on-deck/gap candidates —
+/// authenticated so an unauthenticated caller cannot enumerate any account's
+/// taste data by numeric `account_id`), and `/ops/*` (manual
+/// maintenance/ingest triggers).
 pub fn router(state: Arc<AppState>) -> Router {
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth::require_api_token);
 
@@ -158,6 +161,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         // schedule (see `crate::maintenance`). Mainly for priming a fresh
         // deploy and operator debugging.
         .nest("/ops", ops_routes())
+        // MUSEX-CAP-SEC-03 (Plane TERM #399, epic-capstone finding): the
+        // MUSE-11 curation/recommend engine — `POST /recommend`, `GET
+        // /recommend/on_deck`, `GET /recommend/gaps`. These serve per-account
+        // taste/on-deck/gap candidates for a caller-supplied `account_id`, so
+        // they are SENSITIVE (an unauthenticated caller could otherwise
+        // enumerate any account's taste data by numeric id). Moved from the
+        // open router into `protected` so `auth::require_api_token` gates them.
+        .nest("/recommend", recommend_routes())
         .route_layer(auth_layer);
 
     Router::new()
@@ -165,9 +176,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/ingest", ingest_routes())
         .nest("/query", query_routes())
         .nest("/proactive", proactive_routes())
-        // MUSE-11: the curation/recommend engine — `POST /recommend`,
-        // `GET /recommend/on_deck`, `GET /recommend/gaps`.
-        .nest("/recommend", recommend_routes())
+        // MUSEX-CAP-SEC-03: `/recommend*` moved to the `protected` router
+        // above (it serves per-account taste data and must be authenticated).
         // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
         // `/api/channels*`, `/art/{kind}/{id}`). Deliberately UNAUTHENTICATED
         // — see the doc comment on this function.

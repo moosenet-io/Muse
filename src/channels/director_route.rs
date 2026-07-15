@@ -30,16 +30,26 @@
 //! one MUSE-11 source that takes no `account_id` and carries no
 //! account-taste-derived signal — never touching a personalized source.
 //!
-//! ## Honest seam (same posture as WIRE-01/03)
-//! The only roster this handler can build in production today is
-//! `ExperienceSettings::discord_bot.trusted_friends`, which is ALLOWLIST
-//! membership only, never opt-in (see `crate::settings::DiscordBotSettings`'s
-//! own doc). So a live caller in production always resolves to the default
-//! (non-personalized) lineup until a real per-friend opt-in persistence
-//! layer lands — a natural WIRE follow-up, not done here. This route's own
-//! tests exercise the personalized arm directly against a constructed
-//! opted-in identity, proving the gate + pipeline are correct even though
-//! production can't yet drive a real friend into that state.
+//! ## Consent — persisted opt-in, wired (MUSEX-WIRE-06)
+//! MUSEX-WIRE-06 (Plane TERM #398, slice 6) is the mechanical follow-up to
+//! WIRE-05's keystone: this handler now builds its roster via
+//! `crate::discord::roster::resolve_trusted_friends`, exactly like
+//! `crate::discord::bot::discord_respond_handler` — not the allowlist-only
+//! `TrustedFriends::from_friends(settings.discord_bot.trusted_friends...)`
+//! construction this doc used to describe here. The allowlist (from
+//! `ExperienceSettings::discord_bot.trusted_friends`) still scopes who is
+//! served at all, but each allowlisted friend's `taste_opt_in` now reflects
+//! the PERSISTED `repo::friend_opt_in` store (written by `POST
+//! /friends/opt-in`), not a permanent "never opted in" default. So a live
+//! caller who has actually opted in now reaches [`resolve_account_id`]'s
+//! `Some(account_id)` branch for real, end-to-end, through this exact
+//! production route — `response.personalized` (directly observable in the
+//! JSON response) is the concrete, unblocked proof this slice's ACs ask
+//! for. This route's own tests still exercise the personalized arm directly
+//! against a constructed opted-in identity (cheaper than a DB round-trip for
+//! pure-logic coverage); the `db_gated` handler tests below additionally
+//! prove the real route, backed by a real persisted opt-in row, reaches
+//! that same arm.
 //!
 //! ## Not persisted (unlike `channels::compose`)
 //! There is no `director_runs`/`director_slots` table — this route returns
@@ -318,15 +328,11 @@ pub async fn channel_director_refresh_handler(
         return Ok(Json(to_response(None)));
     }
 
-    // Enabled path only. See the module doc's "Honest seam" — this roster
-    // carries allowlist membership only, never opt-in, in production today.
-    let friends = TrustedFriends::from_friends(
-        settings
-            .discord_bot
-            .trusted_friends
-            .iter()
-            .map(|f| FriendIdentity::new(f.discord_user_id.clone(), f.display_name.clone())),
-    );
+    // Enabled path only. MUSEX-WIRE-06: the roster now reflects PERSISTED
+    // opt-in state (see the module-level doc above and
+    // `crate::discord::roster::resolve_trusted_friends`'s own doc) instead
+    // of allowlist membership alone.
+    let friends = crate::discord::roster::resolve_trusted_friends(&state.pool, &settings).await?;
     let account_id = resolve_account_id(&friends, req.discord_user_id.as_deref());
 
     let now = Utc::now();
@@ -734,5 +740,145 @@ mod db_gated {
             "an anonymous request must never be personalized"
         );
         assert!(response.schedule.is_some());
+    }
+
+    /// MUSEX-WIRE-06 (Plane TERM #398, slice 6): THE keystone proof for
+    /// this handler. Same setup as
+    /// `_route_runs_when_enabled_and_anonymous` above, plus exactly one
+    /// extra write — `repo::friend_opt_in::set_opt_in`, the same
+    /// persistence `POST /friends/opt-in` performs — and the REAL
+    /// production route now reaches `response.personalized == true` instead
+    /// of `false`, through the unmodified `channel_director_refresh_handler`
+    /// route. This is the end-to-end unblock WIRE-06 exists for: a live
+    /// caller who has actually opted in can now get a personalized channel
+    /// lineup through the real route, not just a unit test constructing a
+    /// roster by hand.
+    #[tokio::test]
+    async fn channel_director_refresh_handler_route_is_personalized_for_a_persisted_opted_in_friend(
+    ) {
+        let Some(pool) = test_pool_or_skip(
+            "channel_director_refresh_handler_route_is_personalized_for_a_persisted_opted_in_friend",
+        )
+        .await
+        else {
+            return;
+        };
+
+        let account_id: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
+             VALUES ($1, $2, false, false) RETURNING id",
+        )
+        .bind(format!(
+            "wire06-director-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .bind("WIRE-06 Director Test Account")
+        .fetch_one(&pool)
+        .await
+        .expect("seed account");
+
+        let discord_user_id = format!("discord-wire06-director-{}", uuid::Uuid::new_v4().simple());
+
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.channel_director = ChannelDirectorSettings {
+            enabled: true,
+            serendipity_percent: 20.0,
+        };
+        settings.discord_bot.trusted_friends = vec![crate::settings::TrustedFriendEntry {
+            discord_user_id: discord_user_id.clone(),
+            display_name: "Alex".to_string(),
+        }];
+        crate::repo::settings::save(&pool, &settings)
+            .await
+            .expect("save enabled settings");
+
+        // The ONE extra step this slice adds: persist real consent via the
+        // sanctioned repo write (the same one `POST /friends/opt-in`
+        // performs) — never a raw `FriendIdentity` field write.
+        repo::friend_opt_in::set_opt_in(&pool, &discord_user_id, account_id)
+            .await
+            .expect("set_opt_in should succeed");
+
+        let state = test_app_state(pool);
+        let req = ChannelDirectorRefreshRequest {
+            discord_user_id: Some(discord_user_id),
+            session_hours: Some(2),
+            time_of_day: Some(TimeOfDayDto::Evening),
+            serendipity_percent: None,
+            seed: 1,
+            max_slots: 0,
+        };
+
+        let Json(response) = channel_director_refresh_handler(State(state), Json(req))
+            .await
+            .expect("the enabled, persisted-opted-in path must not error");
+
+        assert!(
+            response.generated,
+            "an enabled route must generate a schedule"
+        );
+        assert!(
+            response.personalized,
+            "a persisted-opted-in friend's REAL route request must be personalized, through the \
+             unmodified production route"
+        );
+        assert!(response.schedule.is_some());
+    }
+
+    /// No-regression companion: an allowlisted friend who was NEVER opted
+    /// in (no `friend_opt_in` row at all) must still resolve to a
+    /// non-personalized lineup through the same real route — proving
+    /// `resolve_trusted_friends` still enforces the allowlist+opt-in
+    /// two-gate posture, not just "on the allowlist -> personalized".
+    #[tokio::test]
+    async fn channel_director_refresh_handler_route_is_not_personalized_for_an_allowlisted_but_never_opted_in_friend(
+    ) {
+        let Some(pool) = test_pool_or_skip(
+            "channel_director_refresh_handler_route_is_not_personalized_for_an_allowlisted_but_never_opted_in_friend",
+        )
+        .await
+        else {
+            return;
+        };
+
+        let discord_user_id = format!(
+            "discord-wire06-director-never-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.channel_director = ChannelDirectorSettings {
+            enabled: true,
+            serendipity_percent: 20.0,
+        };
+        settings.discord_bot.trusted_friends = vec![crate::settings::TrustedFriendEntry {
+            discord_user_id: discord_user_id.clone(),
+            display_name: "Sam".to_string(),
+        }];
+        crate::repo::settings::save(&pool, &settings)
+            .await
+            .expect("save enabled settings");
+
+        let state = test_app_state(pool);
+        let req = ChannelDirectorRefreshRequest {
+            discord_user_id: Some(discord_user_id),
+            session_hours: Some(2),
+            time_of_day: Some(TimeOfDayDto::Evening),
+            serendipity_percent: None,
+            seed: 1,
+            max_slots: 0,
+        };
+
+        let Json(response) = channel_director_refresh_handler(State(state), Json(req))
+            .await
+            .expect("the enabled path must not error");
+
+        assert!(response.generated);
+        assert!(
+            !response.personalized,
+            "allowlist membership with no persisted opt-in must never personalize"
+        );
     }
 }

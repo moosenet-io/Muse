@@ -585,7 +585,14 @@ mod db_gated {
     }
 
     fn state_for(pool: sqlx::PgPool) -> Arc<AppState> {
-        super::no_upstream_state(pool)
+        // MUSEX-CAP-SEC-03: `/recommend*` is now behind `require_api_token`, so
+        // the db-gated handler/golden tests below present a bearer token (via
+        // `with_bearer(.., super::auth::TEST_API_TOKEN)`) on their `/recommend`
+        // requests. Configure a token here so those authenticated requests
+        // reach the handler; the open routes these tests also exercise
+        // (`/health`, `/query/*`, `/proactive/*`, `/api/channels`, `/art`) are
+        // unaffected (they carry no `route_layer` and never consult the token).
+        super::no_upstream_state_with_config(pool, super::auth::with_token_config())
     }
 
     /// The core MUSET-01 negative test: every Phase-0 READ endpoint, run
@@ -609,9 +616,21 @@ mod db_gated {
                 json!({"query": "totally nonexistent title muset01 xyz"}),
             ),
             post_json("/query/similar", json!({"media_item_id": -1})),
-            post_json("/recommend", json!({"account_id": -1})),
-            get("/recommend/on_deck?account_id=-1"),
-            get("/recommend/gaps?account_id=-1"),
+            // MUSEX-CAP-SEC-03: `/recommend*` is authenticated — present the
+            // fixture token so these reads still reach the handlers (and this
+            // "no writes" invariant keeps covering the recommend read paths).
+            with_bearer(
+                post_json("/recommend", json!({"account_id": -1})),
+                super::auth::TEST_API_TOKEN,
+            ),
+            with_bearer(
+                get("/recommend/on_deck?account_id=-1"),
+                super::auth::TEST_API_TOKEN,
+            ),
+            with_bearer(
+                get("/recommend/gaps?account_id=-1"),
+                super::auth::TEST_API_TOKEN,
+            ),
             get("/proactive/pending?account_id=-1"),
             get("/api/channels"),
             get("/api/channels/-1/lineup"),
@@ -870,7 +889,10 @@ mod db_gated {
 
         let (status, body) = send(
             app.clone(),
-            post_json("/recommend", json!({"account_id": account.id})),
+            with_bearer(
+                post_json("/recommend", json!({"account_id": account.id})),
+                super::auth::TEST_API_TOKEN,
+            ),
         )
         .await;
         assert_eq!(
@@ -882,7 +904,10 @@ mod db_gated {
 
         let (status, body) = send(
             app.clone(),
-            get(&format!("/recommend/on_deck?account_id={}", account.id)),
+            with_bearer(
+                get(&format!("/recommend/on_deck?account_id={}", account.id)),
+                super::auth::TEST_API_TOKEN,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -890,7 +915,10 @@ mod db_gated {
 
         let (status, body) = send(
             app.clone(),
-            get(&format!("/recommend/gaps?account_id={}", account.id)),
+            with_bearer(
+                get(&format!("/recommend/gaps?account_id={}", account.id)),
+                super::auth::TEST_API_TOKEN,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1341,21 +1369,30 @@ mod db_gated {
 
             let (status, recommend) = send(
                 app.clone(),
-                post_json("/recommend", json!({"account_id": account.id})),
+                with_bearer(
+                    post_json("/recommend", json!({"account_id": account.id})),
+                    super::auth::TEST_API_TOKEN,
+                ),
             )
             .await;
             assert_eq!(status, StatusCode::OK);
 
             let (status, on_deck) = send(
                 app.clone(),
-                get(&format!("/recommend/on_deck?account_id={}", account.id)),
+                with_bearer(
+                    get(&format!("/recommend/on_deck?account_id={}", account.id)),
+                    super::auth::TEST_API_TOKEN,
+                ),
             )
             .await;
             assert_eq!(status, StatusCode::OK);
 
             let (status, gaps) = send(
                 app.clone(),
-                get(&format!("/recommend/gaps?account_id={}", account.id)),
+                with_bearer(
+                    get(&format!("/recommend/gaps?account_id={}", account.id)),
+                    super::auth::TEST_API_TOKEN,
+                ),
             )
             .await;
             assert_eq!(status, StatusCode::OK);
@@ -1994,6 +2031,30 @@ mod auth {
         let (status, _) = send(
             app_no_db_with_config(with_token_config()),
             post_json("/recommend", json!({"account_id": 12345, "limit": 5})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // MUSEX-CAP-SEC-03: the two GET siblings of `/recommend` are equally
+    // sensitive (they return an account's on-deck / gap candidates by
+    // `account_id`) and must be gated identically — a well-formed but
+    // tokenless request is rejected `401` before the handler touches the pool.
+    #[tokio::test]
+    async fn recommend_on_deck_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            get("/recommend/on_deck?account_id=12345"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn recommend_gaps_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            get("/recommend/gaps?account_id=12345"),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);

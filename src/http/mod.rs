@@ -98,6 +98,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         // MUSE-31: the on-demand channel composer trigger (MUSE-24's
         // `compose_channel_run` had no HTTP surface until now).
         .route("/channels/:id/compose", post(crate::channels::compose_handler))
+        // MUSEX-WIRE-04 (Plane TERM #398): the wired, settings-gated,
+        // consent-enforced channel DIRECTOR entry point — `POST
+        // /channels/director/refresh`. See
+        // `crate::channels::director_route::channel_director_refresh_handler`.
+        .route(
+            "/channels/director/refresh",
+            post(crate::channels::channel_director_refresh_handler),
+        )
         // MUSE-31: on-demand ops routes -- manual triggers for the same
         // routines the background maintenance/trending workers run on a
         // schedule (see `crate::maintenance`). Mainly for priming a fresh

@@ -292,19 +292,23 @@ fn to_response(reply: Option<BotReply>) -> DiscordRespondResponse {
 /// `crate::discord::identity`'s own module doc says as much ("this module
 /// doesn't prescribe the source, only the shape"). The only roster this
 /// handler can build in production today is
-/// `ExperienceSettings::discord_bot.trusted_friends`, and that settings
-/// document is explicit (see `crate::settings::DiscordBotSettings`'s own
-/// doc) that its roster entries are ALLOWLIST membership only — they can
-/// never themselves grant `taste_opt_in`, which stays gated behind
-/// `FriendIdentity::opt_in`'s private fields. So every identity this
-/// handler resolves is, in production today, at best
-/// `ResponseMode::Generic` — the route is real, reachable, and enforces
-/// both gates correctly end-to-end, but the `TasteAware` arm needs a real
-/// opt-in persistence layer (a separate, natural follow-up item) before a
-/// live Discord friend can reach it. [`run_discord_respond`]'s own tests
-/// exercise the `TasteAware` arm directly against a constructed opted-in
-/// identity, proving the gate + pipeline are correct even though
-/// production can't yet drive a real friend into that state.
+/// `crate::discord::roster::resolve_trusted_friends` (MUSEX-WIRE-05,
+/// Plane TERM #398 slice 5) — the KEYSTONE that closes the honest seam this
+/// doc used to describe here: `ExperienceSettings::discord_bot.trusted_friends`
+/// is still ALLOWLIST membership only (see `crate::settings::DiscordBotSettings`'s
+/// own doc; it can never itself grant `taste_opt_in`), but the roster is no
+/// longer built from that allowlist alone — `resolve_trusted_friends` also
+/// reads the PERSISTED `repo::friend_opt_in` store (written by
+/// `POST /friends/opt-in`) and, for each allowlisted friend who has
+/// genuinely consented, calls the SAME sanctioned `FriendIdentity::opt_in`
+/// this module always required. So a live Discord friend who has actually
+/// opted in via `POST /friends/opt-in` now reaches `ResponseMode::TasteAware`
+/// for real, end-to-end — not just in this module's own tests.
+/// [`run_discord_respond`]'s tests still exercise the `TasteAware` arm
+/// directly against a constructed opted-in identity (cheaper than a DB
+/// round-trip for pure-logic coverage); the `db_gated` handler tests below
+/// additionally prove the real route, backed by a real persisted opt-in
+/// row, reaches that same arm.
 ///
 /// ## Inert-first ordering (MUSEX-WIRE-01, codex REQUEST_CHANGES fix)
 /// Loading the settings document is the ONE unavoidable pool read — the
@@ -332,16 +336,12 @@ pub async fn discord_respond_handler(
         return Ok(Json(to_response(None)));
     }
 
-    // Enabled path only. See the module-level "Honest seam" note above: the
-    // roster this handler can build today carries allowlist membership only,
-    // never opt-in.
-    let friends = TrustedFriends::from_friends(
-        settings
-            .discord_bot
-            .trusted_friends
-            .iter()
-            .map(|f| FriendIdentity::new(f.discord_user_id.clone(), f.display_name.clone())),
-    );
+    // Enabled path only. MUSEX-WIRE-05: the roster now reflects PERSISTED
+    // opt-in state (see the module-level doc above and
+    // `crate::discord::roster::resolve_trusted_friends`'s own doc) instead
+    // of allowlist membership alone — this is the concrete unblock this
+    // slice's AC asks for.
+    let friends = crate::discord::roster::resolve_trusted_friends(&state.pool, &settings).await?;
 
     let chord = ChordClient::from_config(&state.config);
     let reply = run_discord_respond(
@@ -1016,10 +1016,15 @@ mod db_gated {
             return;
         };
 
-        // ENABLED subsystem with an allowlisted-only roster entry. The
-        // production roster can never grant opt-in (see the handler's Honest
-        // seam note), so the wired flow reaches `ResponseMode::Generic`:
-        // served, but no taste/embed data.
+        // ENABLED subsystem with an allowlisted roster entry that has NO
+        // persisted `friend_opt_in` row (MUSEX-WIRE-05): allowlist
+        // membership alone still never grants opt-in — see
+        // `crate::discord::roster::resolve_trusted_friends`'s doc — so the
+        // wired flow reaches `ResponseMode::Generic`: served, but no
+        // taste/embed data. Contrast with the
+        // `_reaches_taste_aware_for_a_persisted_opted_in_friend` test below,
+        // which is identical except for one `POST /friends/opt-in`-shaped
+        // write and reaches `TasteAware` instead.
         let mut settings = ExperienceSettings::default();
         settings.master_enabled = true;
         settings.discord_bot.enabled = true;
@@ -1051,5 +1056,69 @@ mod db_gated {
         );
         assert!(response.embed_poster_url.is_none());
         assert!(response.embed_synopsis.is_none());
+    }
+
+    /// MUSEX-WIRE-05 (Plane TERM #398, slice 5): THE keystone proof. Same
+    /// setup as `_route_returns_generic_for_enabled_non_opted_in` above,
+    /// plus exactly one extra write — `repo::friend_opt_in::set_opt_in`,
+    /// the same persistence `POST /friends/opt-in` performs — and the REAL
+    /// production route now reaches `ResponseMode::TasteAware` instead of
+    /// `Generic`, grounded in the account's real seeded on-deck data. This
+    /// is the end-to-end unblock every WIRE-01..04 slice's "Honest seam"
+    /// note promised was a natural follow-up: a live Discord friend who
+    /// actually opts in can now receive a personalized reply through the
+    /// unmodified `discord_respond_handler` route.
+    #[tokio::test]
+    async fn discord_respond_handler_route_reaches_taste_aware_for_a_persisted_opted_in_friend() {
+        let Some(pool) = test_pool_or_skip(
+            "discord_respond_handler_route_reaches_taste_aware_for_a_persisted_opted_in_friend",
+        )
+        .await
+        else {
+            return;
+        };
+        let (account_id, expected_title) = seed_on_deck_account(&pool).await;
+
+        let mut settings = ExperienceSettings::default();
+        settings.master_enabled = true;
+        settings.discord_bot.enabled = true;
+        settings.discord_bot.trusted_friends = vec![TrustedFriendEntry {
+            discord_user_id: "discord-wire05-opted-in".to_string(),
+            display_name: "Alex".to_string(),
+        }];
+        crate::repo::settings::save(&pool, &settings)
+            .await
+            .expect("save enabled settings");
+
+        // The ONE extra step this slice adds: persist real consent via the
+        // sanctioned repo write (the same one `POST /friends/opt-in`
+        // performs) — never a raw `FriendIdentity` field write.
+        repo::friend_opt_in::set_opt_in(&pool, "discord-wire05-opted-in", account_id)
+            .await
+            .expect("set_opt_in should succeed");
+
+        let state = test_app_state(pool);
+        let req = DiscordRespondRequest {
+            discord_user_id: "discord-wire05-opted-in".to_string(),
+        };
+
+        let Json(response) = discord_respond_handler(State(state), Json(req))
+            .await
+            .expect("the enabled, persisted-opted-in path must not error");
+
+        assert!(
+            response
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains(&expected_title)),
+            "a persisted-opted-in friend's REAL route reply must be grounded in \
+             their real seeded title, got: {:?}",
+            response.content
+        );
+        assert!(
+            response.embed_title.is_some(),
+            "a persisted-opted-in friend's reply must carry a taste-aware embed \
+             through the real production route"
+        );
     }
 }

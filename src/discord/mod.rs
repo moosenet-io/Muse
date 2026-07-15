@@ -36,7 +36,11 @@
 pub mod bot;
 pub mod client;
 pub mod identity;
+pub mod opt_in_route;
+pub mod roster;
 
 pub use bot::{decide_response_mode, ResponseMode};
 pub use client::{DiscordClient, MockDiscordClient, RealDiscordClient, RichEmbed};
 pub use identity::{FriendIdentity, TrustedFriends};
+pub use opt_in_route::{friend_opt_in_handler, friend_opt_out_handler};
+pub use roster::resolve_trusted_friends;

@@ -141,6 +141,34 @@ impl MediaRequestSink for MockMediaRequestSink {
     }
 }
 
+/// MUSEX-WIRE-02 (Plane TERM #398, slice 2): the production placeholder
+/// [`MediaRequestSink`] wired to `POST /conversational`
+/// (`crate::conversational::conversational_handler`). This is deliberately
+/// NOT a live Radarr/Sonarr-writing sink — per this module's own doc, no
+/// such sink has shipped yet, and inventing an acknowledgment for a
+/// request that never actually reaches *arr would be dishonest. It is safe
+/// to wire as a real production dependency today because
+/// [`classify_tier`]'s current callers ([`crate::conversational`],
+/// `crate::premiere::engagement`) never pass a confirmed
+/// [`crate::models::availability::Availability`] into
+/// [`submit_if_appropriate`] — so `submit` is structurally UNREACHABLE from
+/// production right now (see [`classify_tier`]'s doc: "never
+/// `AutoApprovable` in practice"). If that ever changes (a real
+/// availability check gets wired in), `submit` returning `Ok(())` with no
+/// side effect would start silently lying about a request having been
+/// filed — so this type's own doc is the trip wire: a future PR that wires
+/// live availability into the conversational/premiere paths MUST replace
+/// this with (or gate it behind) a real write-capable sink first.
+#[derive(Debug, Default)]
+pub struct NoopMediaRequestSink;
+
+#[async_trait::async_trait]
+impl MediaRequestSink for NoopMediaRequestSink {
+    async fn submit(&self, _draft: &MediaRequestDraft) -> MuseResult<()> {
+        Ok(())
+    }
+}
+
 /// Classify `draft`, and — ONLY when [`classify_tier`] returns
 /// [`RequestTier::AutoApprovable`] — hand it to `sink`. `NeedsReview` and
 /// `Blocked` never touch `sink` at all (not "the sink chooses not to

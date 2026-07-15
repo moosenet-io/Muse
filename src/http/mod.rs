@@ -81,6 +81,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         // response flow — `POST /discord/respond`. See
         // `crate::discord::bot::discord_respond_handler`.
         .route("/discord/respond", post(crate::discord::bot::discord_respond_handler))
+        // MUSEX-WIRE-02 (Plane TERM #398, slice 2): the wired,
+        // settings-gated + consent-enforced conversational-request flow —
+        // `POST /conversational`. See
+        // `crate::conversational::conversational_handler`.
+        .route(
+            "/conversational",
+            post(crate::conversational::conversational_handler),
+        )
         // MUSE-27: the channel-guide page/API + artwork proxy (`/`, `/guide`,
         // `/api/channels*`, `/art/{kind}/{id}`).
         .merge(crate::web::routes())

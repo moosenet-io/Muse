@@ -1708,14 +1708,34 @@ mod golden {
 
     #[tokio::test]
     async fn ops_ingest_arr_unconfigured_matches_golden_baseline() {
-        let (status, body) = send(app_no_db(), post_empty("/ops/ingest/arr")).await;
+        // MUSEX-CAP-SEC-01 (Plane TERM #399): /ops/* is now behind
+        // `auth::require_api_token`, so this golden test must authenticate
+        // (token via Config, valid Bearer header) to get PAST the auth gate
+        // and reach the handler's unchanged 503-unconfigured behavior — the
+        // golden BASELINE itself is untouched, only the request now carries
+        // the credential the new outer layer requires.
+        let (status, body) = send(
+            app_no_db_with_config(super::auth::with_token_config()),
+            with_bearer(post_empty("/ops/ingest/arr"), super::auth::TEST_API_TOKEN),
+        )
+        .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_json_golden("ops_ingest_arr_unconfigured.json", &body);
     }
 
     #[tokio::test]
     async fn ops_ingest_tautulli_unconfigured_matches_golden_baseline() {
-        let (status, body) = send(app_no_db(), post_empty("/ops/ingest/tautulli")).await;
+        // MUSEX-CAP-SEC-01 (Plane TERM #399): authenticate first (see the
+        // sibling arr golden test above) so the request reaches the
+        // handler's unchanged 503-unconfigured golden baseline.
+        let (status, body) = send(
+            app_no_db_with_config(super::auth::with_token_config()),
+            with_bearer(
+                post_empty("/ops/ingest/tautulli"),
+                super::auth::TEST_API_TOKEN,
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_json_golden("ops_ingest_tautulli_unconfigured.json", &body);
     }

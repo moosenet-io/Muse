@@ -11,6 +11,7 @@ pub mod channel;
 pub mod embedding;
 pub mod episode;
 pub mod external_enrichment;
+pub mod friend_opt_in;
 pub mod indexer;
 pub mod interstitial;
 pub mod library;

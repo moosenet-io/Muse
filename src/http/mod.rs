@@ -106,6 +106,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/channels/director/refresh",
             post(crate::channels::channel_director_refresh_handler),
         )
+        // MUSEX-WIRE-05 (Plane TERM #398, slice 5): the persisted opt-in
+        // store's write doors — `POST /friends/opt-in` / `POST
+        // /friends/opt-out`. These are the ONLY production entry points
+        // that write `repo::friend_opt_in` rows; see
+        // `crate::discord::opt_in_route` and `crate::discord::roster`
+        // (the resolver every WIRE handler should read from).
+        .route(
+            "/friends/opt-in",
+            post(crate::discord::friend_opt_in_handler),
+        )
+        .route(
+            "/friends/opt-out",
+            post(crate::discord::friend_opt_out_handler),
+        )
         // MUSE-31: on-demand ops routes -- manual triggers for the same
         // routines the background maintenance/trending workers run on a
         // schedule (see `crate::maintenance`). Mainly for priming a fresh

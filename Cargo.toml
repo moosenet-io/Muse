@@ -42,6 +42,10 @@ async-stream = "0.3"
 # (src/snapshot/provenance.rs) -- a well-established, pure-Rust hashing
 # crate, no new runtime surface (no network, no FFI).
 sha2 = "0.10"
+# PROMEX-03: application-level Prometheus metrics exporter (see
+# src/metrics.rs). Same version pin as the reference pattern merged in
+# Terminus (PROMEX-01) and Chord (PROMEX-02).
+prometheus = "0.13"
 
 [dev-dependencies]
 httpmock = "0.7"

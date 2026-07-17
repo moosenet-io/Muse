@@ -27,6 +27,7 @@ mod http;
 mod integration_tests;
 pub mod kg;
 pub mod maintenance;
+mod metrics;
 pub mod models;
 mod parity;
 pub mod persona;

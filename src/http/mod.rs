@@ -173,6 +173,13 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        // PROMEX-03: `GET /metrics` — encodes the process-global
+        // `crate::metrics` registry (recommendation-engine request counts +
+        // latency histogram) in the standard Prometheus text exposition
+        // format. Mounted unauthenticated alongside `/health` — see
+        // `crate::metrics`'s module doc for why (aggregate counts/timings
+        // only, no per-account recommendation content).
+        .route("/metrics", get(handle_metrics))
         .nest("/ingest", ingest_routes())
         .nest("/query", query_routes())
         .nest("/proactive", proactive_routes())
@@ -274,4 +281,14 @@ fn recommend_routes() -> Router<Arc<AppState>> {
 
 async fn not_implemented() -> MuseError {
     MuseError::NotImplemented
+}
+
+/// PROMEX-03: `GET /metrics` — see this module's `router` doc comment and
+/// `crate::metrics`'s module doc.
+async fn handle_metrics() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        crate::metrics::gather_text(),
+    )
 }

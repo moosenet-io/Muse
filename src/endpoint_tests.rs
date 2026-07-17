@@ -241,6 +241,36 @@ async fn health_db_down_reports_db_down_not_500() {
 }
 
 // ---------------------------------------------------------------------
+// GET /metrics — contract (PROMEX-03)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn metrics_contract_returns_200_with_prometheus_text_body() {
+    // Unauthenticated (no bearer), unlike `/recommend*` — see
+    // `crate::metrics`'s module doc for why /metrics stays open.
+    let (status, body) = send(app_no_db(), get("/metrics")).await;
+    assert_eq!(status, StatusCode::OK);
+    // The process-global metrics registry (`crate::metrics`) is shared
+    // across every test in this binary, so whether any samples have been
+    // recorded yet by the time this test runs is order-dependent: an empty
+    // registry encodes to an empty body (`send` maps that to `Value::Null`),
+    // otherwise it's a Prometheus-exposition-shaped plain-text body (`send`
+    // falls back to `Value::String` since it isn't valid JSON). Either is a
+    // correct `/metrics` response — this test only asserts the contract
+    // (200, never JSON, never a panic), not a specific sample.
+    match body {
+        Value::Null => {}
+        Value::String(text) => {
+            assert!(
+                text.contains('#') || text.contains("muse_"),
+                "expected a Prometheus-exposition-shaped body, got: {text}"
+            );
+        }
+        other => panic!("expected /metrics body to be empty or plain text, got JSON: {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------
 // POST /query/resolve — contract + happy-path (no-DB) + error-path
 // ---------------------------------------------------------------------
 

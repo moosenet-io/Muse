@@ -28,6 +28,7 @@
 //! `include_trace`, so a caller that doesn't ask for it sees no change.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::curation::candidates::{self, Candidate, CandidateSource};
 use crate::error::MuseResult;
 use crate::http::AppState;
+use crate::metrics::{self, ENDPOINT_GAPS, ENDPOINT_ON_DECK, ENDPOINT_RECOMMEND};
 use crate::models::availability::Availability;
 use crate::models::media_metadata::MediaKind;
 use crate::taste_model::chord_client::{ChordClient, DEFAULT_MODEL};
@@ -291,6 +293,18 @@ pub async fn recommend_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecommendRequest>,
 ) -> MuseResult<Json<RecommendResponse>> {
+    let started = Instant::now();
+    let result = recommend_handler_inner(state, req).await;
+    // PROMEX-03: `endpoint` is the fixed literal `ENDPOINT_RECOMMEND`, never
+    // derived from `req` — see `crate::metrics`'s module doc.
+    metrics::record_recommend(ENDPOINT_RECOMMEND, result.is_ok(), started.elapsed());
+    result
+}
+
+async fn recommend_handler_inner(
+    state: Arc<AppState>,
+    req: RecommendRequest,
+) -> MuseResult<Json<RecommendResponse>> {
     let limit = clamp_limit(req.limit);
 
     let mut pool_candidates = Vec::new();
@@ -349,6 +363,18 @@ pub async fn on_deck_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AccountLimitQuery>,
 ) -> MuseResult<Json<RecommendResponse>> {
+    let started = Instant::now();
+    let result = on_deck_handler_inner(state, q).await;
+    // PROMEX-03: `endpoint` is the fixed literal `ENDPOINT_ON_DECK`, never
+    // derived from `q` — see `crate::metrics`'s module doc.
+    metrics::record_recommend(ENDPOINT_ON_DECK, result.is_ok(), started.elapsed());
+    result
+}
+
+async fn on_deck_handler_inner(
+    state: Arc<AppState>,
+    q: AccountLimitQuery,
+) -> MuseResult<Json<RecommendResponse>> {
     let limit = clamp_limit(q.limit);
     let candidates =
         candidates::gather_on_deck_candidates(&state.pool, q.account_id, limit).await?;
@@ -369,6 +395,18 @@ pub async fn on_deck_handler(
 pub async fn gaps_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AccountLimitQuery>,
+) -> MuseResult<Json<RecommendResponse>> {
+    let started = Instant::now();
+    let result = gaps_handler_inner(state, q).await;
+    // PROMEX-03: `endpoint` is the fixed literal `ENDPOINT_GAPS`, never
+    // derived from `q` — see `crate::metrics`'s module doc.
+    metrics::record_recommend(ENDPOINT_GAPS, result.is_ok(), started.elapsed());
+    result
+}
+
+async fn gaps_handler_inner(
+    state: Arc<AppState>,
+    q: AccountLimitQuery,
 ) -> MuseResult<Json<RecommendResponse>> {
     let limit = clamp_limit(q.limit);
     let candidates = candidates::gather_gap_candidates(&state.pool, q.account_id, limit).await?;

@@ -114,7 +114,11 @@ impl TvdbClient {
     pub fn from_config(config: &Config) -> Option<Self> {
         let tvdb = config.tvdb()?;
 
-        match Self::new(tvdb.base_url, tvdb.api_key, tvdb.pin) {
+        match Self::new(
+            tvdb.base_url,
+            tvdb.api_key.expose().to_string(),
+            tvdb.pin.map(|p| p.expose().to_string()),
+        ) {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to construct TheTVDB client; TVDB metadata will degrade");
@@ -943,7 +947,7 @@ mod tests {
     #[test]
     fn from_config_builds_client_when_configured() {
         let config = Config {
-            tvdb_api_key: Some("abc123".to_string()),
+            tvdb_api_key: Some(crate::download::config::QbitPassword::from("abc123".to_string())),
             ..Default::default()
         };
         assert!(TvdbClient::from_config(&config).is_some());

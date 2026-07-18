@@ -71,11 +71,18 @@ pub struct Config {
     /// runtime, never a literal (S1/S7). `None` means the TVDB metadata
     /// provider is unconfigured/inert — `TvdbClient::from_config` returns
     /// `None`, same graceful-degrade posture as `Config::tmdb_api_key`.
-    pub tvdb_api_key: Option<String>,
+    /// Wrapped in `QbitPassword` (S7 review finding) so a stray
+    /// `{:?}`/`tracing::debug!(config = ?cfg, ..)` on this `Config` can't
+    /// print the real key — same posture `qbit_pass` below already has.
+    /// (`tmdb_api_key`/`plex_token` above remain plain `Option<String>` —
+    /// a pre-existing gap this fix does not touch; see the MUSEL-A1
+    /// worktree report.)
+    pub tvdb_api_key: Option<QbitPassword>,
     /// Optional TheTVDB v4 subscriber PIN (`MUSE_TVDB_PIN`), paired with
     /// `tvdb_api_key` for subscription-model keys. Independently optional —
-    /// most standard API keys don't need one.
-    pub tvdb_pin: Option<String>,
+    /// most standard API keys don't need one. Also secret-shaped, also
+    /// wrapped.
+    pub tvdb_pin: Option<QbitPassword>,
     /// TheTVDB v4 API base URL override (`MUSE_TVDB_BASE_URL`). `None` (the
     /// default) means `metadata::tvdb::TvdbClient::from_config` uses
     /// TheTVDB's real host. Not secret-shaped — a host, not a credential;
@@ -503,8 +510,8 @@ impl Config {
             tmdb_api_key: env_opt("TMDB_API_KEY"),
             ollama_url: env_opt("MUSE_OLLAMA_URL"),
             chord_url: env_opt("CHORD_URL"),
-            tvdb_api_key: env_opt("MUSE_TVDB_API_KEY"),
-            tvdb_pin: env_opt("MUSE_TVDB_PIN"),
+            tvdb_api_key: env_opt("MUSE_TVDB_API_KEY").map(QbitPassword::from),
+            tvdb_pin: env_opt("MUSE_TVDB_PIN").map(QbitPassword::from),
             tvdb_base_url: env_opt("MUSE_TVDB_BASE_URL"),
             searxng_url: env_opt("MUSE_SEARXNG_URL"),
             news_url: env_opt("MUSE_NEWS_URL"),
@@ -971,8 +978,8 @@ mod tests {
         let cfg = Config::from_env();
         let tvdb = cfg.tvdb().expect("tvdb config should be Some");
 
-        assert_eq!(tvdb.api_key, "tvdb-key");
-        assert_eq!(tvdb.pin.as_deref(), Some("4242"));
+        assert_eq!(tvdb.api_key.expose(), "tvdb-key");
+        assert_eq!(tvdb.pin.as_ref().map(|p| p.expose()), Some("4242"));
         assert_eq!(tvdb.base_url, "http://tvdb.test.invalid/v4");
 
         std::env::remove_var("MUSE_TVDB_API_KEY");

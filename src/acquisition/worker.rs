@@ -262,6 +262,15 @@ async fn process_wanted_item(
             return (ItemOutcome::CooldownActive, false);
         }
     }
+    // Review finding (codex, follow-up to finding 3): the FIRST time this
+    // monitored item is ever processed (`last_search_at` was still `NULL`)
+    // is the only time the no-capability path below should persist a
+    // `Requested` request -- every later encounter (within or past the
+    // cooldown) must touch `last_search_at` like the searched path does
+    // (so the cooldown guard above actually applies to it next pass) but
+    // must NOT create a second request row. Captured here, before
+    // `last_search_at` gets updated below.
+    let is_first_encounter = monitored.last_search_at.is_none();
 
     // Metadata row deleted out from under this wanted row (a race between
     // list_wanted's snapshot and now) — skip cleanly, not a crash. Also
@@ -286,27 +295,27 @@ async fn process_wanted_item(
     // already applies to `classify_tier`'s `has_matching_arr_instance` param
     // for this Prowlarr-native (not *arr-fleet) grab path: a configured
     // Prowlarr client and a resolvable quality profile for this item. Without
-    // either, this item can never even be searched -- skip without touching
-    // `last_search_at` (nothing was attempted), but it still must NOT
-    // silently vanish: review finding 3 (codex, MUSEM-06 REQUEST_CHANGES) --
-    // persist a `Requested` `media_request` for the operator, same
-    // "persist but never act" posture as every other non-`AutoApprovable`
-    // outcome below.
+    // either, this item can never even be searched, so there's no on-demand
+    // search to run here -- but review finding 3 (codex, MUSEM-06
+    // REQUEST_CHANGES) still applies: this must NOT silently vanish, it must
+    // persist a `Requested` `media_request` for the operator, same "persist
+    // but never act" posture as every other non-`AutoApprovable` outcome
+    // below. A FOLLOW-UP finding (codex): that persist must be create-ONCE,
+    // not repeated every pass -- `last_search_at` doubles as the "have we
+    // already surfaced this" guard (`is_first_encounter`, captured above),
+    // exactly like a real search would leave it, so this item's cooldown is
+    // honored on subsequent passes too and no duplicate request is created.
     let Some(prowlarr) = deps.prowlarr else {
-        persist_pending_request(
-            deps,
-            item,
-            media_kind,
-            "no Prowlarr client configured",
-        )
-        .await;
+        persist_pending_request_once(deps, item, media_kind, is_first_encounter, "no Prowlarr client configured")
+            .await;
         return (ItemOutcome::NoCapability, false);
     };
     if item.quality_profile_id.is_none() {
-        persist_pending_request(
+        persist_pending_request_once(
             deps,
             item,
             media_kind,
+            is_first_encounter,
             "no quality_profile_id set on this monitored item",
         )
         .await;
@@ -429,10 +438,49 @@ async fn process_wanted_item(
 /// `quality_profile_id` on the monitored row) must still not silently
 /// vanish -- persists a `Requested` `media_request` so the operator can see
 /// and manually act on it, same "persist but never act" posture as every
-/// other non-`AutoApprovable` outcome. Best-effort: a failure to even
-/// persist this fallback request is logged, never escalated (the item was
-/// already going to be counted `NoCapability` either way).
-async fn persist_pending_request(deps: &WantedPassDeps<'_>, item: &WantedItem, media_kind: &str, reason: &str) {
+/// other non-`AutoApprovable` outcome.
+///
+/// ## Follow-up finding (codex): create-once, not every pass
+/// The FIRST version of this persisted a new request on EVERY pass a
+/// no-capability item was considered (nothing here ever touched
+/// `last_search_at`, so the cooldown guard never applied to it either) --
+/// a deployment with no Prowlarr, or one monitored item missing a quality
+/// profile, would spam a fresh `Requested` row every maintenance tick
+/// forever. Fixed by treating `last_search_at` as durable "have I already
+/// surfaced this" state, exactly the way a real search leaves it:
+/// - ALWAYS touches `last_search_at` (best-effort, same as the searched
+///   path) -- so the cooldown guard at the top of `process_wanted_item`
+///   skips this item on subsequent passes within the cooldown window,
+///   same as any other processed item.
+/// - Creates the `media_request` row ONLY when `is_first_encounter` is
+///   `true` (the caller passes `monitored.last_search_at.is_none()`,
+///   captured BEFORE this call touches it) -- i.e. only the very first
+///   time this monitored item is ever processed. Every later encounter
+///   still marks the item processed (cooldown-gated) but never creates a
+///   second request.
+///
+/// Best-effort throughout: a failure to touch `last_search_at` or persist
+/// the request is logged, never escalated (the item was already going to
+/// be counted `NoCapability` either way).
+async fn persist_pending_request_once(
+    deps: &WantedPassDeps<'_>,
+    item: &WantedItem,
+    media_kind: &str,
+    is_first_encounter: bool,
+    reason: &str,
+) {
+    touch_last_search_best_effort(deps.pool, item.monitored_item_id).await;
+
+    if !is_first_encounter {
+        tracing::debug!(
+            monitored_item_id = item.monitored_item_id,
+            reason,
+            "MUSEM-06: wanted pass — no-capability item already has a request from a prior pass; \
+             not creating a second one"
+        );
+        return;
+    }
+
     if let Err(e) = create_wanted_request(deps, item, media_kind, "Blocked").await {
         tracing::warn!(
             error = %e,
@@ -966,6 +1014,18 @@ mod db_gated {
             .await
             .expect("a media_request row must have been persisted even with no capability");
         assert_eq!(request.status, RequestStatus::Requested.as_str());
+
+        // Follow-up finding (codex): the no-capability path must also mark
+        // the item processed (same as the searched path), so the
+        // create-once guard and the cooldown guard both actually apply on
+        // a later pass.
+        let monitored = repo::acquisition::get_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("reload monitored_item");
+        assert!(
+            monitored.last_search_at.is_some(),
+            "a no-capability item must still have last_search_at set after being processed"
+        );
     }
 
     #[tokio::test]
@@ -1006,6 +1066,98 @@ mod db_gated {
             .await
             .expect("a media_request row must have been persisted even with no Prowlarr configured");
         assert_eq!(request.status, RequestStatus::Requested.as_str());
+
+        let monitored = repo::acquisition::get_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("reload monitored_item");
+        assert!(
+            monitored.last_search_at.is_some(),
+            "a no-capability item must still have last_search_at set after being processed"
+        );
+    }
+
+    /// Follow-up finding (codex): the no-capability persist must be
+    /// create-ONCE, not repeated every pass -- otherwise a deployment with
+    /// no Prowlarr (or one monitored item missing a quality profile) spams
+    /// a fresh `Requested` row every maintenance tick forever. Runs
+    /// `run_wanted_pass` TWICE against a no-quality-profile item and
+    /// asserts exactly one request exists after both passes, plus
+    /// `last_search_at` got set (proving the second pass was skipped via
+    /// the ordinary cooldown guard, not by re-hitting the no-capability
+    /// branch a second time).
+    #[tokio::test]
+    async fn no_capability_persists_a_requested_request_only_once_across_two_passes() {
+        let Some(pool) = test_pool_or_skip(
+            "no_capability_persists_a_requested_request_only_once_across_two_passes",
+        )
+        .await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let library = seed_library(&pool).await;
+        // No quality profile -- a no-capability item on every pass.
+        let item = seed_wanted_item(&pool, &library, None).await;
+
+        let config = test_config();
+        let download = MockDownloadClient::new();
+        let server = MockServer::start(); // deliberately no mock registered -- never reached
+        let prowlarr = ProwlarrClient::new(server.base_url(), "test-key").expect("client");
+        let deps = WantedPassDeps {
+            pool: &pool,
+            config: &config,
+            prowlarr: Some(&prowlarr),
+            download: Some(&download),
+        };
+
+        run_wanted_pass(&deps).await;
+
+        let request_count_after_pass1: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM media_requests WHERE note = $1")
+                .bind(format!(
+                    "MUSEM-06 wanted worker: monitored_item_id={}",
+                    item.monitored_item_id
+                ))
+                .fetch_one(&pool)
+                .await
+                .expect("count media_requests rows after pass 1");
+        assert_eq!(request_count_after_pass1, 1, "the first pass must create exactly one request");
+
+        let monitored_after_pass1 = repo::acquisition::get_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("reload monitored_item after pass 1");
+        assert!(
+            monitored_after_pass1.last_search_at.is_some(),
+            "the no-capability path must mark the item processed after pass 1"
+        );
+
+        // Pass 2: within the (default) cooldown window -- the ordinary
+        // cooldown guard should skip this item entirely now that
+        // last_search_at is set, so no second request gets created.
+        run_wanted_pass(&deps).await;
+
+        let request_count_after_pass2: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM media_requests WHERE note = $1")
+                .bind(format!(
+                    "MUSEM-06 wanted worker: monitored_item_id={}",
+                    item.monitored_item_id
+                ))
+                .fetch_one(&pool)
+                .await
+                .expect("count media_requests rows after pass 2");
+        assert_eq!(
+            request_count_after_pass2, 1,
+            "a second pass must never create a second request for the same no-capability item"
+        );
+
+        let monitored_after_pass2 = repo::acquisition::get_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("reload monitored_item after pass 2");
+        assert_eq!(
+            monitored_after_pass2.last_search_at, monitored_after_pass1.last_search_at,
+            "pass 2 must be skipped by the ordinary cooldown guard before reaching the \
+             no-capability branch again"
+        );
     }
 
     #[tokio::test]

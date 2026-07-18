@@ -370,6 +370,50 @@ async fn process_wanted_item(
         settings.is_acquisition_enabled() && deps.config.arr_request_auto_tier_enabled && deps.download.is_some();
     let tier = classify_tier(auto_tier_enabled, Some(&availability), true);
 
+    // Never silently grab: only `AutoApprovable` (operator opted in AND
+    // this real search confirmed it's grabbable now) reaches
+    // `fulfill_request` at all -- `NeedsReview`/`Blocked` leave a
+    // `RequestStatus::Requested` request for the operator, the exact
+    // "persist but never act" posture `crate::arr::request::
+    // submit_if_appropriate` and `create_request_handler` already
+    // establish.
+    //
+    // Follow-up finding (opus, MUSEM-06 REQUEST_CHANGES): this persist must
+    // be create-ONCE too, same `is_first_encounter` guard as the
+    // no-capability branches above -- otherwise a monitored item that keeps
+    // classifying `NeedsReview` (auto-tier off, or never confirmed
+    // grabbable) gets a brand-new `Requested` request every ~cooldown-
+    // interval forever. Net invariant: at most one worker-created
+    // `Requested` request is ever persisted per monitored item across
+    // EVERY non-grabbed outcome (no-capability, NeedsReview, Blocked).
+    if tier != RequestTier::AutoApprovable {
+        if is_first_encounter {
+            if let Err(e) = create_wanted_request(deps, item, media_kind, &format!("{tier:?}")).await {
+                tracing::warn!(
+                    error = %e,
+                    monitored_item_id = item.monitored_item_id,
+                    "MUSEM-06: wanted pass — could not persist media_request; continuing"
+                );
+                return (ItemOutcome::Error, true);
+            }
+        } else {
+            tracing::debug!(
+                monitored_item_id = item.monitored_item_id,
+                ?tier,
+                "MUSEM-06: wanted pass — item already has a request from a prior pass; not \
+                 creating a second one"
+            );
+        }
+        return (ItemOutcome::NeedsReview, true);
+    }
+
+    // `AutoApprovable` always needs a request row to hand `fulfill_request`
+    // (the actual grab attempt), regardless of `is_first_encounter` -- the
+    // create-once guard above is about not spamming PENDING requests for an
+    // outcome that never acts; a real grab attempt is a distinct event, and
+    // this branch's own idempotency comes from the `download_queue`
+    // `monitored_item_id` check at the top of this function (a second pass
+    // never even reaches here for an item that's already queued).
     let request = match create_wanted_request(deps, item, media_kind, &format!("{tier:?}")).await {
         Ok(request) => request,
         Err(e) => {
@@ -381,17 +425,6 @@ async fn process_wanted_item(
             return (ItemOutcome::Error, true);
         }
     };
-
-    // Never silently grab: only `AutoApprovable` (operator opted in AND
-    // this real search confirmed it's grabbable now) reaches
-    // `fulfill_request` at all -- `NeedsReview`/`Blocked` leave the just-
-    // persisted request at `RequestStatus::Requested` for the operator, the
-    // exact "persist but never act" posture `crate::arr::request::
-    // submit_if_appropriate` and `create_request_handler` already
-    // establish.
-    if tier != RequestTier::AutoApprovable {
-        return (ItemOutcome::NeedsReview, true);
-    }
 
     // Review finding 1 (opus) + finding 2 (codex, MUSEM-06 REQUEST_CHANGES):
     // thread `monitored_item_id` through so the resulting `download_queue`
@@ -838,6 +871,89 @@ mod db_gated {
             .await
             .expect("a media_request row must still have been persisted");
         assert_eq!(request.status, RequestStatus::Requested.as_str());
+    }
+
+    /// Follow-up finding (opus, MUSEM-06 REQUEST_CHANGES): the create-once
+    /// guard on the no-capability path wasn't enough -- a capability-present
+    /// item that keeps classifying `NeedsReview` (auto-tier disabled here)
+    /// must ALSO only ever get ONE persisted `Requested` request, not a new
+    /// one every time it's re-processed. Calls `process_wanted_item` TWICE
+    /// directly with a near-zero cooldown (rather than `run_wanted_pass`
+    /// twice back to back, which the ordinary cooldown guard would just
+    /// short-circuit on its own -- see the no-capability twice-test for
+    /// that version) so the second call genuinely re-reaches the
+    /// `classify_tier` branch, proving THIS specific create-once guard does
+    /// the work, not the cooldown.
+    #[tokio::test]
+    async fn needs_review_persists_a_requested_request_only_once_across_two_encounters() {
+        let Some(pool) = test_pool_or_skip(
+            "needs_review_persists_a_requested_request_only_once_across_two_encounters",
+        )
+        .await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let library = seed_library(&pool).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+        let item = seed_wanted_item(&pool, &library, Some(profile_id)).await;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/search");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(search_response_body(
+                    "musem06-needsreview-twice-guid",
+                    &format!("{}.2020.1080p.WEB-DL", item.title),
+                ));
+        });
+        let prowlarr = ProwlarrClient::new(server.base_url(), "test-key").expect("client");
+        // arr_request_auto_tier_enabled stays false (Config::default()) --
+        // every encounter classifies NeedsReview regardless of availability.
+        let config = test_config();
+        assert!(!config.arr_request_auto_tier_enabled);
+        let download = MockDownloadClient::new();
+        let mut settings = ExperienceSettings::default();
+        settings.acquisition.enabled = true;
+        let deps = WantedPassDeps {
+            pool: &pool,
+            config: &config,
+            prowlarr: Some(&prowlarr),
+            download: Some(&download),
+        };
+
+        // A cooldown of zero never blocks -- the second call below
+        // genuinely reaches classify_tier again rather than being skipped
+        // by the ordinary cooldown guard.
+        let no_cooldown = chrono::Duration::zero();
+
+        let (outcome1, searched1) = process_wanted_item(&deps, &settings, &item, no_cooldown).await;
+        assert_eq!(outcome1, ItemOutcome::NeedsReview);
+        assert!(searched1);
+
+        let (outcome2, searched2) = process_wanted_item(&deps, &settings, &item, no_cooldown).await;
+        assert_eq!(outcome2, ItemOutcome::NeedsReview);
+        assert!(
+            searched2,
+            "the second encounter must still genuinely search (cooldown was bypassed on purpose, \
+             so this proves the create-once guard -- not the cooldown -- prevents the duplicate)"
+        );
+
+        assert_eq!(download.added_count(), 0, "NeedsReview must never grab");
+
+        let request_count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_requests WHERE note = $1")
+            .bind(format!(
+                "MUSEM-06 wanted worker: monitored_item_id={}",
+                item.monitored_item_id
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("count media_requests rows");
+        assert_eq!(
+            request_count, 1,
+            "a second NeedsReview encounter must never create a second media_request"
+        );
     }
 
     #[tokio::test]

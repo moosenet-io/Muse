@@ -92,6 +92,17 @@ pub fn detect(media_file: &Path) -> SidecarArt {
         .map(|s| format!("{}.nfo", s.to_string_lossy().to_lowercase()));
 
     let mut art = SidecarArt::default();
+    // Review finding (codex, determinism): every poster/fanart candidate
+    // filename actually present in the directory, keyed by its lowercased
+    // name -- collected in one pass over `read_dir` (whose iteration order
+    // is NOT guaranteed), then selected below by the DECLARED priority
+    // order (`POSTER_NAMES`/`FANART_NAMES`'s own array order), never by
+    // whichever one `read_dir` happened to yield first. Without this, a
+    // directory carrying both `poster.jpg` and `folder.jpg` (or
+    // `fanart.jpg` and `backdrop.jpg`) could select a different file
+    // across scans of the SAME, unchanged directory, causing
+    // `cache_if_changed` to needlessly churn `artwork_cache`.
+    let mut present_art_names: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -120,18 +131,17 @@ pub fn detect(media_file: &Path) -> SidecarArt {
             art.nfo_path = Some(path.clone());
         }
 
-        if art.poster_path.is_none() && POSTER_NAMES.contains(&name.as_str()) {
-            art.poster_path = Some(path.clone());
-        }
-
-        if art.fanart_path.is_none() && FANART_NAMES.contains(&name.as_str()) {
-            art.fanart_path = Some(path.clone());
+        if POSTER_NAMES.contains(&name.as_str()) || FANART_NAMES.contains(&name.as_str()) {
+            present_art_names.insert(name.clone(), path.clone());
         }
 
         if name.starts_with("season") && name.contains("poster") {
             art.season_poster_paths.push(path.clone());
         }
     }
+
+    art.poster_path = POSTER_NAMES.iter().find_map(|name| present_art_names.get(*name).cloned());
+    art.fanart_path = FANART_NAMES.iter().find_map(|name| present_art_names.get(*name).cloned());
 
     art.season_poster_paths.sort();
     art
@@ -369,6 +379,43 @@ mod tests {
         assert_eq!(art.poster_path, Some(dir.join("folder.jpg")));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review finding (codex, determinism): when BOTH `poster.jpg` and
+    /// `folder.jpg` are present, `poster.jpg` (the higher-priority entry in
+    /// `POSTER_NAMES`) must always be selected — deterministically,
+    /// regardless of `read_dir`'s (unspecified) iteration order. Run
+    /// several times to make an order-dependent bug more likely to surface
+    /// if the priority logic regresses back to "whichever `read_dir`
+    /// happened to yield first."
+    #[test]
+    fn poster_selection_is_deterministic_by_priority_not_read_dir_order() {
+        for _ in 0..20 {
+            let dir = unique_dir("poster-priority");
+            let media = dir.join("Movie.Name.2020.mkv");
+            fs::write(&media, b"x").unwrap();
+            // Written in an order that would pick folder.jpg if selection
+            // just took "first entry found in the directory listing" --
+            // must still select poster.jpg every time.
+            fs::write(dir.join("folder.jpg"), b"folder-bytes").unwrap();
+            fs::write(dir.join("poster.jpg"), b"poster-bytes").unwrap();
+            fs::write(dir.join("backdrop.jpg"), b"backdrop-bytes").unwrap();
+            fs::write(dir.join("fanart.jpg"), b"fanart-bytes").unwrap();
+
+            let art = detect(&media);
+            assert_eq!(
+                art.poster_path,
+                Some(dir.join("poster.jpg")),
+                "poster.jpg must always win over folder.jpg regardless of read_dir order"
+            );
+            assert_eq!(
+                art.fanart_path,
+                Some(dir.join("fanart.jpg")),
+                "fanart.jpg must always win over backdrop.jpg regardless of read_dir order"
+            );
+
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

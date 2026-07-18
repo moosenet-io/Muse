@@ -317,9 +317,22 @@ impl<'a> LibraryResolver for DbLibraryResolver<'a> {
             return Ok(ScanMatch::Unmatched);
         }
 
-        if let Some(title) = &file.parsed.title {
+        // Review finding (codex, correctness): the confident title+year
+        // match requires a REAL year, not just a title. `find_by_title_year`
+        // (a shared helper other callers rely on for its own, different
+        // posture) runs a TITLE-ONLY query when `year` is `None` and still
+        // returns a confident id -- which here would let a file whose
+        // filename simply didn't carry a parseable year attach confidently
+        // to ANY same-title catalog row (a remake vs the original, a
+        // different edition, ...). Deliberately NOT changing
+        // `find_by_title_year`'s own behavior (other callers may want the
+        // title-only fallback); this scanner call site just refuses to use
+        // it. A title with no year skips straight past this branch to the
+        // resolve_and_merge tentative path below (never persisted as
+        // confident) / unmatched.
+        if let (Some(title), Some(year)) = (&file.parsed.title, file.parsed.year) {
             if let Some(media_metadata_id) =
-                repo::media_metadata::find_by_title_year(self.pool, file.kind_guess, title, file.parsed.year).await?
+                repo::media_metadata::find_by_title_year(self.pool, file.kind_guess, title, Some(year)).await?
             {
                 return Ok(ScanMatch::Matched { media_metadata_id });
             }
@@ -1531,6 +1544,113 @@ mod tests {
 
         let items = repo::media_item::list_by_library(&pool, library.id).await.expect("list media_items");
         assert!(items.is_empty(), "no media_items row should be created for the unresolved nfo-id file");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review finding (codex, correctness): a file whose filename parses a
+    /// title but NO year (`ParsedRelease.year == None`) must NOT confidently
+    /// attach via a title-ONLY match, even when a catalog row with that
+    /// exact title exists (any year) — `repo::media_metadata::
+    /// find_by_title_year` runs a title-only query and returns a confident
+    /// id when `year` is `None`, which this scanner call site must refuse
+    /// to use (a remake vs. the original, a different edition, etc. would
+    /// otherwise attach wrong-confidently). No id tag, no providers
+    /// configured -> the file should end up unmatched, never `Matched`,
+    /// and no `media_items` row created.
+    #[tokio::test]
+    async fn title_with_no_year_does_not_confidently_attach_via_title_only_match() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!(
+                "MUSE_TEST_DATABASE_URL not set -- skipping \
+                 title_with_no_year_does_not_confidently_attach_via_title_only_match \
+                 (expected in the default test run; the crate does not require a live DB)"
+            );
+            return;
+        };
+
+        use uuid::Uuid;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect to MUSE_TEST_DATABASE_URL");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply cleanly");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let title = format!("MUSEL-B1 No Year Title Only Test {suffix}");
+
+        let dir = unique_dir(&format!("no-year-title-only-{suffix}"));
+        let movie_dir = dir.join(&title);
+        fs::create_dir_all(&movie_dir).unwrap();
+        // Deliberately no 4-digit year token anywhere in this filename --
+        // `parse_release_name` will parse a title but leave `year: None`.
+        let media_path = movie_dir.join(format!("{title}.1080p.BluRay.x264-GRP.mkv"));
+        fs::write(&media_path, b"fixture bytes").unwrap();
+
+        let library = repo::library::create(
+            &pool,
+            &crate::models::library::NewLibrary {
+                name: format!("MUSEL-B1 No Year Title Only Library {suffix}"),
+                kind: crate::models::library::LibraryKind::Movie,
+                root_folder: dir.to_string_lossy().to_string(),
+                source_arr_name: None,
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("seed library row");
+
+        repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &crate::models::media_metadata::NewMediaMetadata {
+                kind: crate::models::media_metadata::MediaKind::Movie,
+                tmdb_id: Some(format!("no-year-title-only-tmdb-{suffix}")),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: title.clone(),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: None,
+                // Any year on the catalog row -- the fixture file's own
+                // parse has NO year at all, so this must never be treated
+                // as a match regardless of what this row's year is.
+                year: Some(1999),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("seed a media_metadata row with the exact same title (but the fixture file has no parsed year)");
+
+        // Sanity precondition: confirm the fixture filename really did
+        // parse with no year, so this test is actually exercising the
+        // no-year path and not accidentally matching some other way.
+        let files = walk_media_files(&dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].parsed.title.as_deref(), Some(title.as_str()));
+        assert_eq!(files[0].parsed.year, None, "precondition: this fixture filename must parse with no year");
+
+        let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
+        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(
+            report.matched, 0,
+            "a title-only match (no parsed year) must never confidently attach, even with an exact-title catalog row"
+        );
+
+        let items = repo::media_item::list_by_library(&pool, library.id).await.expect("list media_items");
+        assert!(items.is_empty(), "no media_items row should be created for a title-only (no-year) match");
 
         fs::remove_dir_all(&dir).ok();
     }

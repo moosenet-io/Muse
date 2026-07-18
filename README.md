@@ -329,10 +329,17 @@ MUSEL-A2's `apply_enrichment` (additive-onto-an-existing-row only). Matching, in
    guess after one fails could confidently attach the file to a *different* title's row that
    happens to share a title+year. This mirrors MUSEL-A2's `resolve_and_merge` rule that
    known-but-unresolvable ids never fall back to a title guess.
-2. An exact, case-insensitive title+year match via `repo::media_metadata::find_by_title_year`
+2. An exact, case-insensitive title+**year** match via `repo::media_metadata::find_by_title_year`
    (already existed, from the Prowlarr report-pull worker) — deterministic, not a fuzzy guess, so
    treated as a confident match. **Reached only when the file carried no explicit id candidate at
-   all** (see the refusal rule above).
+   all** (see the refusal rule above), **and only when the filename's parse actually produced a
+   year** (codex review): `find_by_title_year` runs a TITLE-ONLY query (no year filter at all) and
+   still returns a confident id when its `year` argument is `None` — a behavior other callers of
+   that shared helper may legitimately want, so it isn't changed there — but this scanner call site
+   deliberately never invokes it that way. A file whose filename carries a title with no parseable
+   year (`ParsedRelease.year == None`) skips this branch entirely rather than confidently attaching
+   to any same-title catalog row (a remake vs. the original, a different edition, …); it falls
+   through to the tentative path below / ends up unmatched.
 3. If neither found a local row and metadata providers are configured, a
    `metadata::resolve::resolve_and_merge` title search runs purely to leave a discoverable log
    trail ("resolvable externally, not yet in the local catalog") — its result is always recorded
@@ -365,6 +372,13 @@ schema change needed, since that column already exists for exactly this kind of 
 (`backdrop.jpg`/`.png`), and per-season `season##-poster.*` beside the media file —
 `sidecar::detect` (a directory listing only, no content read) runs once per file during the walk
 and is cached on `ScannedFile::sidecar_art` so both matching and recording reuse the same pass.
+**Poster/fanart selection is deterministic by declared priority order, not `read_dir` order**
+(codex review): when a directory carries more than one candidate for the same slot (e.g. both
+`poster.jpg` and `folder.jpg`), `detect` collects every present candidate first, then selects by
+walking `POSTER_NAMES`/`FANART_NAMES` in their own declared array order — never by whichever one
+`std::fs::read_dir` (an unspecified iteration order) happened to yield first. Without this, the
+same, unchanged directory could select a different file across scans, and `cache_if_changed`
+below would then needlessly churn `artwork_cache` even though nothing on disk actually changed.
 **Every candidate is symlink-checked via `std::fs::symlink_metadata` (never `Path::is_file()`,
 which follows symlinks) and rejected unless it's a genuine regular file** (codex review) — the
 same read-only-root-boundary posture `walk_dir` already enforces for media files, now applied to

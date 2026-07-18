@@ -26,10 +26,19 @@
 //! - `POST /login` body `{"apikey": "...", "pin": "..."}` (pin omitted when
 //!   unset) -> `{"status": "success", "data": {"token": "..."}}`.
 //! - Authenticated calls send `Authorization: Bearer <token>`.
-//! - `GET /series/{id}` / `GET /movies/{id}` -> `{"status": "...", "data": {..a
-//!   base record..}}`.
+//! - [`MetadataProvider::resolve_by_id`] calls the EXTENDED record
+//!   endpoints — `GET /series/{id}/extended` / `GET /movies/{id}/extended`
+//!   — not the base `/series/{id}` / `/movies/{id}` ones. TheTVDB v4's base
+//!   record omits `overview`, `genres`, `originalNetwork`, and (critically)
+//!   `remoteIds` — the imdb/tmdb id bridge MUSEL-A2's resolver depends on;
+//!   only the extended record carries them. `name`/`image`/`score`/
+//!   `firstAired`/`year` are present on both, so one `/extended` call per
+//!   resolve is sufficient — no separate base-record call is made.
 //! - `GET /search?query=..&type=series|movie` -> `{"status": "...", "data":
-//!   [..search hits..]}`.
+//!   [..search hits..]}`. Search hits are deliberately thin (discovery
+//!   only) — a caller that needs the full record calls `search` to find a
+//!   candidate id, then `resolve_by_id` (which hits `/extended`) for the
+//!   complete `ProviderMetadata`.
 
 use std::time::Duration;
 
@@ -221,14 +230,20 @@ impl TvdbClient {
         Ok(Some(envelope.data))
     }
 
-    /// `GET /series/{id}`.
+    /// `GET /series/{id}/extended` — the EXTENDED record, not the base
+    /// `/series/{id}` one: the base record omits `overview`, `genres`,
+    /// `originalNetwork`, and (critically) `remoteIds` — the imdb/tmdb id
+    /// bridge `resolve_by_id` callers (MUSEL-A2's resolver) depend on.
+    /// Resolving via the base endpoint would silently return those fields
+    /// NULL. See the module doc.
     async fn get_series(&self, id: &str) -> MuseResult<Option<TvdbRecord>> {
-        self.get_data(&format!("/series/{id}"), &[]).await
+        self.get_data(&format!("/series/{id}/extended"), &[]).await
     }
 
-    /// `GET /movies/{id}`.
+    /// `GET /movies/{id}/extended` — see [`Self::get_series`]'s doc; the
+    /// same base-vs-extended distinction applies to movies.
     async fn get_movie(&self, id: &str) -> MuseResult<Option<TvdbRecord>> {
-        self.get_data(&format!("/movies/{id}"), &[]).await
+        self.get_data(&format!("/movies/{id}/extended"), &[]).await
     }
 }
 
@@ -579,7 +594,7 @@ mod tests {
         login_mock(&server, "tok");
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/series/121361")
+                .path("/series/121361/extended")
                 .header("authorization", "Bearer tok");
             then.status(200)
                 .header("content-type", "application/json")
@@ -630,7 +645,7 @@ mod tests {
         login_mock(&server, "tok");
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/series/121361")
+                .path("/series/121361/extended")
                 .header("authorization", "Bearer tok");
             then.status(200)
                 .header("content-type", "application/json")
@@ -679,7 +694,7 @@ mod tests {
         let server = MockServer::start();
         login_mock(&server, "tok");
         server.mock(|when, then| {
-            when.method(GET).path("/movies/999");
+            when.method(GET).path("/movies/999/extended");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
@@ -711,7 +726,7 @@ mod tests {
         login_mock(&server, "tok");
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/movies/12345")
+                .path("/movies/12345/extended")
                 .header("authorization", "Bearer tok");
             then.status(200)
                 .header("content-type", "application/json")
@@ -720,7 +735,12 @@ mod tests {
                     "data": {
                         "name": "Arrival",
                         "overview": "A linguist deciphers an alien language.",
-                        "firstAired": "2016-11-10"
+                        "firstAired": "2016-11-10",
+                        "genres": [{"name": "Sci-Fi"}],
+                        "remoteIds": [
+                            {"id": "tt2543164", "sourceName": "IMDB"},
+                            {"id": "329865", "sourceName": "TheMovieDB.com"}
+                        ]
                     }
                 }));
         });
@@ -734,7 +754,21 @@ mod tests {
 
         mock.assert();
         assert_eq!(metadata.title.as_deref(), Some("Arrival"));
+        assert_eq!(metadata.overview.as_deref(), Some("A linguist deciphers an alien language."));
+        assert_eq!(metadata.genres, vec!["Sci-Fi".to_string()]);
         assert_eq!(metadata.year, Some(2016));
+        // The critical remoteIds -> provider_ids bridge (codex review
+        // finding): resolving via /extended is what makes this data
+        // available at all — the base /movies/{id} endpoint has no
+        // remoteIds field.
+        assert_eq!(
+            metadata.provider_ids.get("imdb").map(String::as_str),
+            Some("tt2543164")
+        );
+        assert_eq!(
+            metadata.provider_ids.get("tmdb").map(String::as_str),
+            Some("329865")
+        );
     }
 
     #[tokio::test]
@@ -742,7 +776,7 @@ mod tests {
         let server = MockServer::start();
         login_mock(&server, "tok");
         server.mock(|when, then| {
-            when.method(GET).path("/series/999999");
+            when.method(GET).path("/series/999999/extended");
             then.status(404).body("not found");
         });
 
@@ -760,7 +794,7 @@ mod tests {
         let server = MockServer::start();
         login_mock(&server, "tok");
         server.mock(|when, then| {
-            when.method(GET).path("/series/121361");
+            when.method(GET).path("/series/121361/extended");
             then.status(500).body("internal server error");
         });
 
@@ -865,7 +899,7 @@ mod tests {
         let server = MockServer::start();
         let unauthorized_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/series/121361")
+                .path("/series/121361/extended")
                 .header("authorization", "Bearer stale-token");
             then.status(401).body("Unauthorized");
         });
@@ -877,7 +911,7 @@ mod tests {
         });
         let retry_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/series/121361")
+                .path("/series/121361/extended")
                 .header("authorization", "Bearer fresh-token");
             then.status(200)
                 .header("content-type", "application/json")

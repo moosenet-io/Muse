@@ -97,8 +97,19 @@ pub fn decide_release(
                 .cutoff_quality_id
                 .and_then(|id| scoring::tier_position(&profile.items, id))
                 .map(|(rank, _)| rank);
-            let at_cutoff_tier = cutoff_rank.map(|c| existing_rank >= c).unwrap_or(true);
-            let at_cutoff_score = existing.total_format_score >= profile.cutoff_format_score;
+            // No configured cutoff (quality or score) means there is no
+            // "good enough" bar the existing file could have already met —
+            // it can't be "at cutoff" by default, so upgrades must proceed
+            // toward the best available candidate rather than stopping
+            // up front (review: codex, MUSEM-04 re-review finding; matches
+            // *arr: no cutoff ⇒ keep upgrading). `unwrap_or(false)` for
+            // both, not `true`.
+            let at_cutoff_tier = cutoff_rank.map(|c| existing_rank >= c).unwrap_or(false);
+            let at_cutoff_score = if profile.cutoff_format_score > 0 {
+                existing.total_format_score >= profile.cutoff_format_score
+            } else {
+                false
+            };
             if at_cutoff_tier && at_cutoff_score {
                 return Decision::Reject {
                     reasons: vec![
@@ -508,13 +519,18 @@ mod tests {
         ];
         let items = profile_items(&[1, 2]);
         let mut p = profile(items, Some(1)); // cutoff at tier 1 (rank 0)
-        p.cutoff_format_score = 0;
+        // A positive cutoff_format_score, explicitly met by `existing`, so
+        // this genuinely exercises "cutoff configured and reached" rather
+        // than the "no cutoff configured" default (that default now means
+        // "keep upgrading", not "already satisfied" — see
+        // `no_cutoff_configured_keeps_upgrading`).
+        p.cutoff_format_score = 1;
         let policy = ScoringPolicy {
             definitions: &definitions,
             custom_formats: &no_formats(),
             existing: Some(scoring::ExistingRelease {
                 quality_definition_id: 1,
-                total_format_score: 0,
+                total_format_score: 1,
             }),
         };
         // A better candidate exists, but the existing file already meets
@@ -524,6 +540,38 @@ mod tests {
         match decision {
             Decision::Reject { reasons } => assert!(reasons[0].contains("cutoff")),
             other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    // --- no cutoff configured means "keep upgrading", not "already satisfied" ---
+
+    #[test]
+    fn no_cutoff_configured_keeps_upgrading() {
+        // Review finding (codex, re-review): with no `cutoff_quality_id`
+        // AND no positive `cutoff_format_score` configured on the profile,
+        // there is no "good enough" bar the existing file could have
+        // already met, so `decide_release` must proceed to evaluate
+        // candidates (and grab a genuinely better one) instead of
+        // short-circuiting to Reject before candidates are even looked at.
+        let definitions = vec![
+            definition(1, "web-720p", "WEB", Some("720p")),
+            definition(2, "web-1080p", "WEB", Some("1080p")),
+        ];
+        let items = profile_items(&[1, 2]); // 2 (1080p) ranks higher
+        let p = profile(items, None); // no cutoff_quality_id; cutoff_format_score defaults to 0
+        let policy = ScoringPolicy {
+            definitions: &definitions,
+            custom_formats: &no_formats(),
+            existing: Some(scoring::ExistingRelease {
+                quality_definition_id: 1, // existing file is the lower tier
+                total_format_score: 0,
+            }),
+        };
+        let candidates = vec![candidate(release("better", "WEB", Some("1080p")))];
+        let decision = decide_release(&candidates, &p, &no_scores(), &policy);
+        match decision {
+            Decision::Grab(choice) => assert_eq!(choice.release.guid, "better"),
+            other => panic!("expected Grab (no cutoff configured -> keep upgrading), got {other:?}"),
         }
     }
 

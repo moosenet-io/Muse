@@ -55,6 +55,48 @@ pub fn build_args(file_path: &str, seek_ms: i64) -> Vec<String> {
     args
 }
 
+/// Build the ffmpeg CLI arguments (everything after the binary name) to
+/// extract exactly **one** still frame from `file_path` at `seek_ms`
+/// milliseconds in, as an in-memory MJPEG written to stdout (MUSEL-C1, the
+/// still-extraction primitive backing `crate::matching`).
+///
+/// Reuses the same fast input-seek as [`build_args`] — `-ss` placed *before*
+/// `-i` — for the same reason: an input seek is a keyframe-nearest demuxer
+/// seek with no decode of skipped data, which matters here because
+/// `extract_sample_stills` spawns one of these per sample timestamp and a
+/// slow output-seek per still would make a multi-still scan expensive.
+/// `-frames:v 1` decodes exactly one frame (never a run of frames), matching
+/// the one-invocation-per-unit discipline `build_args`' doc comment
+/// describes for MUSE-29 (a still per invocation here, a program per
+/// invocation there) rather than trying to batch multiple stills out of a
+/// single ffmpeg process.
+pub fn build_still_args(file_path: &str, seek_ms: i64) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+    ];
+
+    if seek_ms > 0 {
+        args.push("-ss".to_string());
+        args.push(format!("{:.3}", seek_ms as f64 / 1000.0));
+    }
+
+    args.push("-i".to_string());
+    args.push(file_path.to_string());
+
+    args.push("-frames:v".to_string());
+    args.push("1".to_string());
+    args.push("-f".to_string());
+    args.push("image2pipe".to_string());
+    args.push("-vcodec".to_string());
+    args.push("mjpeg".to_string());
+    args.push("pipe:1".to_string());
+
+    args
+}
+
 /// Join a configured media root onto a stored `relative_path`/`file_path`.
 /// An empty `media_root` (the default — see [`crate::config::Config`])
 /// means "use the stored value exactly as-is," which is correct both for
@@ -181,6 +223,52 @@ mod tests {
         assert_eq!(join_media_path("/srv/media", "TV/Show/ep.mkv"), "/srv/media/TV/Show/ep.mkv");
         assert_eq!(join_media_path("/srv/media/", "/TV/Show/ep.mkv"), "/srv/media/TV/Show/ep.mkv");
         assert_eq!(join_media_path("/srv/media", "/TV/Show/ep.mkv"), "/srv/media/TV/Show/ep.mkv");
+    }
+
+    #[test]
+    fn build_still_args_places_ss_before_i_when_seeking() {
+        let args = build_still_args("/media/Movies/Foo/Foo.mkv", 45_000);
+        let ss_idx = args.iter().position(|a| a == "-ss").unwrap();
+        let i_idx = args.iter().position(|a| a == "-i").unwrap();
+        assert!(ss_idx < i_idx);
+        assert_eq!(args[ss_idx + 1], "45.000");
+    }
+
+    #[test]
+    fn build_still_args_omits_seek_at_zero() {
+        let args = build_still_args("/media/Movies/Foo/Foo.mkv", 0);
+        assert!(!args.contains(&"-ss".to_string()));
+    }
+
+    #[test]
+    fn build_still_args_requests_exactly_one_mjpeg_frame_to_pipe() {
+        let args = build_still_args("/media/Movies/Foo/Foo.mkv", 1_000);
+        assert_eq!(
+            args,
+            vec![
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                "1.000",
+                "-i",
+                "/media/Movies/Foo/Foo.mkv",
+                "-frames:v",
+                "1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "pipe:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_still_args_never_seeks_negative() {
+        let args = build_still_args("/media/Movies/Foo/Foo.mkv", -5);
+        assert!(!args.contains(&"-ss".to_string()));
     }
 
     #[test]

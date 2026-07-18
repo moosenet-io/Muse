@@ -29,6 +29,7 @@ mod http;
 #[cfg(test)]
 mod integration_tests;
 pub mod kg;
+pub mod library;
 pub mod maintenance;
 pub mod matching;
 pub mod metadata;

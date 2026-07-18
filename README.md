@@ -144,6 +144,7 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_TVDB_API_KEY` | *(none)* | TheTVDB v4 API key (MUSEL-A1 metadata provider — the primary TV-metadata source the `*arr` suite uses). `None` keeps `metadata::tvdb::TvdbClient::from_config` uninstantiable; TVDB metadata degrades to unavailable. |
 | `MUSE_TVDB_PIN` | *(none)* | Optional TheTVDB v4 subscriber PIN, paired with `MUSE_TVDB_API_KEY` for subscription-model keys. Most standard keys don't need one. |
 | `MUSE_TVDB_BASE_URL` | *(none → real API)* | TheTVDB v4 API base URL override. Exists for tests/an on-prem proxy, same seam `MUSE_TRAKT_BASE_URL` provides for Trakt. |
+| `MUSE_LIBRARY_ROOT` | *(none)* | MUSEL-B1: filesystem root of the READ-ONLY library scan (a read-only-mounted share, e.g. the QNAP NAS — see MUSEL-B0). `None`/unset (also treated as unset if blank) makes `library::scan::run_scan` a clean no-op — the scanner code + its fixture-dir tests never need this set. |
 | `MUSE_OLLAMA_URL` | *(none)* | Ollama base URL serving `nomic-embed-text` for local embeddings. |
 | `CHORD_URL` | *(none)* | Chord OpenAI-compatible base URL for routed local-model reasoning (rationale, taste notes, channel composition). |
 | `MUSE_SEARXNG_URL` | *(none)* | Fleet SearXNG base URL for forum/critic sentiment + "does it get good" enrichment. |
@@ -282,6 +283,171 @@ many movie rows and that many show rows per pass — via
 pass continues, same error-isolation posture as every other maintenance step; zero providers
 configured is a harmless, cheap skip; a `MatchConfidence::TitleSearch` result is logged and skipped
 (not persisted), per the persistence rule above.
+
+### Read-only library scan + sidecar art (`src/library/`, MUSEL-B1)
+
+Walks `MUSE_LIBRARY_ROOT` (a read-only-mounted media library — the QNAP NAS share, per the
+MUSEL-B0 ops prerequisite), finds media files, matches each to an *already-cataloged*
+`media_metadata` row, records the on-disk file, and pulls sidecar art beside it.
+
+**READ-ONLY is a hard, structurally-enforced constraint.** Every filesystem call the scanner
+makes into the library is one of `read_dir` / `symlink_metadata` / `metadata` / `File::open`
+with `OpenOptions::new().read(true)` — never `.write(true)`/`.create(true)`/`.append(true)`,
+and never `fs::remove_*`/`fs::rename`/`fs::write`. This is proven two ways in
+`src/library/scan.rs`'s test suite:
+- **Structural**: `no_write_create_remove_calls_in_the_scan_and_sidecar_source` `read_dir`s the
+  whole `src/library/` production source directory (`mod.rs`/`scan.rs`/`sidecar.rs`, everything
+  above each file's own `#[cfg(test)]` block) and greps every `.rs` file for a comprehensive
+  banned-pattern set: `File::create`, `.write(true)`, `.create(true)`, `.create_new(true)`,
+  `.append(true)`, `.truncate(true)`, `fs::write(`/`std::fs::write`, `fs::remove_file`,
+  `fs::remove_dir`/`fs::remove_dir_all`, `fs::rename`, `fs::copy(`, `fs::hard_link`,
+  `fs::soft_link`, `fs::symlink(` (kept paren-suffixed so it doesn't false-positive against this
+  module's own legitimate, read-only `symlink_metadata` calls), `fs::set_permissions`,
+  `fs::create_dir`/`fs::create_dir_all` — failing the build if a future edit (anywhere in the
+  module) introduces any write-shaped filesystem call into the library.
+- **Behavioral**: `fixture_scan_leaves_the_library_byte_for_byte_unchanged` checksums (relative
+  path + size + full bytes) an entire fixture library tree, runs a full walk + sidecar-detect +
+  sidecar-read pass over it, checksums again, and asserts the two checksums are identical.
+
+**It never creates a new `media_metadata` row.** The scanner only ever links a file it finds on
+disk to a title *already* in Muse's catalog (from `arr::ingest` or a curator) — same posture as
+MUSEL-A2's `apply_enrichment` (additive-onto-an-existing-row only). Matching, in order
+(`library::scan::DbLibraryResolver`):
+1. **Explicit id candidates**, checked in priority order, each resolved against the catalog via
+   `repo::media_metadata::find_by_tmdb_id`/`find_by_tvdb_id` (the latter added by this item,
+   symmetric with the former):
+   - An `{tmdb-NNNN}`/`{tvdb-NNNN}`/`{imdb-ttNNN}` id tag in the path (the Radarr/Sonarr
+     folder-naming convention, `library::scan::extract_id_tag`).
+   - The `.nfo` sidecar's own embedded id (`sidecar::extract_provider_id_from_nfo` — see "Sidecar
+     art + `.nfo`" below), read READ-ONLY during the walk itself so it's available as a matching
+     signal, not just something discovered after the fact for caching. This is the *arr suite's
+     own identification, arguably the single strongest signal available to the scanner.
+   
+   **If ANY explicit id candidate is present but NONE of them resolve to a local catalog row, the
+   file is `Unmatched` — it never falls through to the title/year match below.** A path tag or a
+   `.nfo` id is a specific, caller/tooling-asserted identity claim; falling back to a title/year
+   guess after one fails could confidently attach the file to a *different* title's row that
+   happens to share a title+year. This mirrors MUSEL-A2's `resolve_and_merge` rule that
+   known-but-unresolvable ids never fall back to a title guess.
+2. An exact, case-insensitive title+**year** match via `repo::media_metadata::find_by_title_year`
+   (already existed, from the Prowlarr report-pull worker) — deterministic, not a fuzzy guess, so
+   treated as a confident match. **Reached only when the file carried no explicit id candidate at
+   all** (see the refusal rule above), **and only when the filename's parse actually produced a
+   year** (codex review): `find_by_title_year` runs a TITLE-ONLY query (no year filter at all) and
+   still returns a confident id when its `year` argument is `None` — a behavior other callers of
+   that shared helper may legitimately want, so it isn't changed there — but this scanner call site
+   deliberately never invokes it that way. A file whose filename carries a title with no parseable
+   year (`ParsedRelease.year == None`) skips this branch entirely rather than confidently attaching
+   to any same-title catalog row (a remake vs. the original, a different edition, …); it falls
+   through to the tentative path below / ends up unmatched.
+3. If neither found a local row and metadata providers are configured, a
+   `metadata::resolve::resolve_and_merge` title search runs purely to leave a discoverable log
+   trail ("resolvable externally, not yet in the local catalog") — its result is always recorded
+   as **tentative**, never matched, mirroring `maintenance::run_metadata_resolve_pass`'s own rule
+   that a `MatchConfidence::TitleSearch` hit is never auto-persisted as authoritative. There is no
+   local row to attach it to regardless of the provider's own confidence.
+
+A file that resolves none of the above is **unmatched**. Because `media_files.media_item_id` and
+`media_items.media_metadata_id` are both `NOT NULL` (`migrations/0009_media_files.sql`,
+`migrations/0006_media_items.sql`), there is no schema-level "unmatched file" row to attach an
+unmatched/tentative file to — extending that schema is out of this item's scope. Unmatched and
+tentative files are instead surfaced via `ScanReport::unmatched_paths` and a `tracing` log line,
+satisfying the spec's "recorded as unmatched (visible), never a wrong-confident match" — just via
+the scan report rather than a `media_files` row specifically. A matched file's release-name parse
+(title/year/season/episode) reuses `prowlarr::parse::parse_release_name` — the same deterministic,
+no-network parser the Prowlarr report-pull worker already uses; a season marker in the parse picks
+`MediaKind::Show`, its absence picks `MediaKind::Movie`.
+
+**Recording**: a confidently-matched file gets a `media_items` row (`repo::media_item::upsert`,
+keyed `(library_id, media_metadata_id)`, already idempotent) and a `media_files` row via the new
+`repo::media_file::upsert_scanned` — idempotent on `(media_item_id, relative_path)`: an unchanged
+`size_bytes` is a clean no-op, a changed one updates the existing row in place, never inserting a
+duplicate. (The spec asks for an "mtime/size guard"; `media_files` has no mtime column, so size is
+the change signal actually available — documented on `upsert_scanned`.) The file's container
+extension is recorded into the existing `media_info` jsonb column as `{"container": "mkv"}` — no
+schema change needed, since that column already exists for exactly this kind of file-probing data.
+
+**Sidecar art + `.nfo`** (`src/library/sidecar.rs`): detects `movie.nfo`/`tvshow.nfo`/
+`<basename>.nfo`, `poster.jpg`/`.png` (falling back to `folder.jpg`/`.png`), `fanart.jpg`/`.png`
+(`backdrop.jpg`/`.png`), and per-season `season##-poster.*` beside the media file —
+`sidecar::detect` (a directory listing only, no content read) runs once per file during the walk
+and is cached on `ScannedFile::sidecar_art` so both matching and recording reuse the same pass.
+**Poster/fanart selection is deterministic by declared priority order, not `read_dir` order**
+(codex review): when a directory carries more than one candidate for the same slot (e.g. both
+`poster.jpg` and `folder.jpg`), `detect` collects every present candidate first, then selects by
+walking `POSTER_NAMES`/`FANART_NAMES` in their own declared array order — never by whichever one
+`std::fs::read_dir` (an unspecified iteration order) happened to yield first. Without this, the
+same, unchanged directory could select a different file across scans, and `cache_if_changed`
+below would then needlessly churn `artwork_cache` even though nothing on disk actually changed.
+**Every candidate is symlink-checked via `std::fs::symlink_metadata` (never `Path::is_file()`,
+which follows symlinks) and rejected unless it's a genuine regular file** (codex review) — the
+same read-only-root-boundary posture `walk_dir` already enforces for media files, now applied to
+sidecars too: a `poster.jpg`/`.nfo` symlinked to somewhere outside `MUSE_LIBRARY_ROOT` is never
+detected, read, or attached. `sidecar::read_bytes` re-checks this itself as defense-in-depth for a
+caller that invokes it directly.
+
+- **`.nfo` — used for matching, not just cached.** `sidecar::extract_provider_id_from_nfo` reads a
+  detected `.nfo`'s bytes READ-ONLY and extracts an embedded provider id: `<uniqueid
+  type="tmdb"/"imdb"/"tvdb">…</uniqueid>` (current Kodi/`*arr` schema, any attribute order/quoting)
+  or the legacy flat `<tmdbid>`/`<imdbid>`/`<tvdbid>`/bare `<id>` tags (older Kodi `movie.nfo`,
+  `<id>` conventionally the TMDb id). Deliberately a plain substring scan, not a real XML parser —
+  matches the crate's no-new-heavy-dependency posture for a handful of well-known tags — but
+  **tag-scoped, not a whole-document search** (codex review): the `type` attribute is only ever
+  read from within a genuine `<uniqueid ...>` element's own opening-tag bounds, and the element
+  text only from that same element's own `</uniqueid>` close. A naive whole-document search for
+  `type="tmdb"` would also match an unrelated element like `<rating type="tmdb">603</rating>` and
+  mis-read it as a confident provider id — which, since an explicit id suppresses the title/year
+  fallback, would produce a WRONG confident match against an unrelated catalog row. Feeds straight
+  into `DbLibraryResolver` as an explicit id candidate (see "Matching" above) — subject to the same
+  "fails to resolve -> unmatched, never a title/year guess" rule as a path id tag.
+- **`.nfo` — attached, not just detected.** A matched file's `.nfo` bytes are also read READ-ONLY
+  and cached into `artwork_cache` under `entity_kind = "media_item"`, `variant = "nfo"`,
+  `content_type = "application/xml"` — the same table/key convention poster/fanart use — and
+  counted in `ScanReport::nfo_attached`, so `.nfo` detection→attachment is complete and observable,
+  not silently dropped (a prior revision detected the `.nfo` but never read/used/reported it).
+- **Poster/fanart** bytes are read READ-ONLY (`sidecar::read_bytes`) and cached into
+  `artwork_cache` the same way, `entity_kind = "media_item"` — the same key convention
+  `web::artwork::art_handler` already reads from, so a scanned file's art (and now its `.nfo`) is
+  immediately retrievable with no further wiring (`GET /art/media_item/{id}?variant=nfo` etc.).
+- **Idempotent per-sidecar, decoupled from the media file's own change status.** Sidecar
+  detection/attachment always runs for a matched file — it is deliberately NOT gated on
+  `upsert_scanned`'s media-file size guard (an earlier revision skipped all sidecar work whenever
+  the media file was unchanged, which meant a poster/fanart/`.nfo` added or edited *after* the
+  first scan — a curator drops in a better poster, `*arr` rewrites the `.nfo` — was never picked
+  up on a later rescan of that same, byte-identical file). Instead, `cache_if_changed` (shared by
+  `cache_art`/`cache_nfo`) looks up whatever is already cached for `(media_item_id, variant)` and
+  skips the write only when the bytes are byte-for-byte identical to what's already there;
+  otherwise it (re-)writes. Net effect: a rescan where nothing changed (media file AND every
+  sidecar identical) still does zero writes and reports `art_cached`/`nfo_attached` as `0`, but a
+  rescan that finds a newly-added or edited sidecar attaches it — even when the media file next to
+  it hasn't moved at all.
+- No local sidecar art/`.nfo` found is not an error — the existing artwork-proxy path (Plex fetch,
+  then the built-in placeholder) already covers "fall back to a provider re-fetch."
+
+**Entry point**: `library::scan::run_scan(pool, config, providers)` is a clean no-op when
+`config.library_root` (`MUSE_LIBRARY_ROOT`) is unset — logged at `debug`, no filesystem or DB
+touch at all. When set, it scans every enabled `libraries` row whose `root_folder` falls under
+`MUSE_LIBRARY_ROOT`, using `library::scan::path_is_within_root` for that containment check —
+**path-component-aware** (`Path::starts_with`, canonicalizing when both sides exist on disk and
+falling back to a lexical-but-still-component-aware comparison otherwise), not a raw
+`str::starts_with`: `/mnt/library2` is correctly rejected as "inside" `/mnt/library` even though
+the *string* `"library2"` starts with `"library"`. **Not wired into a worker/route yet** (out of
+this item's scope, matching the "ships the primitive, wiring is a later item" posture MUSEM-02's
+download adapter also documents above) — call it from an operator CLI subcommand or the
+maintenance pass in a follow-up item. Per-file failures (a bad file, a resolver error, a DB write
+failure) increment `ScanReport::errors` and the pass continues; a directory that can't be listed
+mid-walk is logged and that subtree is skipped, not the whole pass. Symlinks under the library root
+are detected via `symlink_metadata` and never followed — a deliberate, documented skip (a symlink
+out of the read-only root would otherwise let the walk escape it; a symlink loop would otherwise
+hang it).
+
+Tests: `cargo test --bin muse library::` — walk/parse/match(mocked resolver)/sidecar-detect all
+run against a fixture directory tree (`std::env::temp_dir()` + a unique per-test subdir, no
+`tempfile` dependency needed), no live QNAP mount or DB required for those. The full record path
+(`scan_library_end_to_end_matches_records_and_caches_art_idempotently`) and
+`repo::media_file`'s `upsert_scanned_is_idempotent_and_updates_only_on_a_size_change` are gated on
+`MUSE_TEST_DATABASE_URL`, same skip-cleanly-when-unset posture as every other live-DB test in this
+crate.
 
 ### Download-client adapter (`src/download/`, MUSEM-02)
 

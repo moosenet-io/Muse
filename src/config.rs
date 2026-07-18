@@ -215,6 +215,19 @@ pub struct Config {
     /// already the library root.
     pub media_root: String,
 
+    /// MUSEL-B1: filesystem root of the read-only library scan
+    /// (`MUSE_LIBRARY_ROOT`) — a READ-ONLY mount of the media library (the
+    /// QNAP share, per the spec's MUSEL-B0 ops prerequisite). `None` (the
+    /// default, unset) makes the scanner an inert clean no-op — see
+    /// `crate::library::scan::run_scan`. Deliberately `Option<String>`
+    /// rather than the empty-string-means-unset convention `media_root`
+    /// uses above: an empty root would be nonsensical to `fs::read_dir`
+    /// (unlike `media_root`, which is a path *prefix* where "" is a valid
+    /// no-op prefix), so "unset" needs to be an unambiguous `None`, not an
+    /// empty string that could also arise from an accidentally-blank env
+    /// var.
+    pub library_root: Option<String>,
+
     /// MUSE-12: how often the proactive-content generator worker wakes up
     /// to run all five generators for every account
     /// (`MUSE_PROACTIVE_TICK_INTERVAL_SECS`). Purely a wake cadence, not a
@@ -547,6 +560,7 @@ impl Config {
             media_root: std::env::var("MUSE_MEDIA_ROOT")
                 .ok()
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_string()),
+            library_root: env_opt("MUSE_LIBRARY_ROOT").filter(|v| !v.trim().is_empty()),
 
             proactive_tick_interval_secs: env_u64("MUSE_PROACTIVE_TICK_INTERVAL_SECS", 3600),
 
@@ -714,6 +728,7 @@ impl Default for Config {
             recall_vector_max_distance: 0.4,
             ffmpeg_path: DEFAULT_FFMPEG_PATH.to_string(),
             media_root: DEFAULT_MEDIA_ROOT.to_string(),
+            library_root: None,
             proactive_tick_interval_secs: 3600,
             maintenance_tick_secs: 1800,
             trending_tick_secs: 86400,
@@ -844,6 +859,7 @@ mod tests {
             "MUSE_RECALL_VECTOR_MAX_DISTANCE",
             "MUSE_FFMPEG_PATH",
             "MUSE_MEDIA_ROOT",
+            "MUSE_LIBRARY_ROOT",
             "MUSE_PROACTIVE_TICK_INTERVAL_SECS",
             "MUSE_MAINTENANCE_TICK_SECS",
             "MUSE_TRENDING_TICK_SECS",
@@ -903,6 +919,7 @@ mod tests {
         assert!((cfg.recall_vector_max_distance - 0.4).abs() < f64::EPSILON);
         assert_eq!(cfg.ffmpeg_path, DEFAULT_FFMPEG_PATH);
         assert_eq!(cfg.media_root, DEFAULT_MEDIA_ROOT);
+        assert!(cfg.library_root.is_none());
         assert_eq!(cfg.proactive_tick_interval_secs, 3600);
         assert_eq!(cfg.maintenance_tick_secs, 1800);
         assert_eq!(cfg.trending_tick_secs, 86400);
@@ -1164,6 +1181,35 @@ mod tests {
 
         std::env::remove_var("MUSE_FFMPEG_PATH");
         std::env::remove_var("MUSE_MEDIA_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn config_library_root_unset_is_none() {
+        std::env::remove_var("MUSE_LIBRARY_ROOT");
+        let cfg = Config::from_env();
+        assert!(cfg.library_root.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn config_library_root_blank_is_treated_as_unset() {
+        // An accidentally-blank env var (set but empty) must not be
+        // mistaken for "yes, scan an empty-string path" — same posture as
+        // the `MUSE_LIBRARY_ROOT` field doc.
+        std::env::set_var("MUSE_LIBRARY_ROOT", "   ");
+        let cfg = Config::from_env();
+        assert!(cfg.library_root.is_none());
+        std::env::remove_var("MUSE_LIBRARY_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_library_root_override_from_env() {
+        std::env::set_var("MUSE_LIBRARY_ROOT", "/mnt/qnap-library-ro");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.library_root.as_deref(), Some("/mnt/qnap-library-ro"));
+        std::env::remove_var("MUSE_LIBRARY_ROOT");
     }
 
     #[test]

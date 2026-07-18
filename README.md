@@ -52,7 +52,7 @@ Subsystem map (source module → concern):
 | `plex/` | Read-only Plex API client (libraries, sessions, ratings, watchlist, artwork) |
 | `tracker/` | **Native Tautulli-replacement**: webhook receiver + session poller + reconstruction |
 | `tautulli/` | One-time Tautulli history backfill importer |
-| `prowlarr/` | Availability report-pull worker (indexer sync, RSS pull, release parse, rollup) |
+| `prowlarr/` | Availability report-pull worker (indexer sync, RSS pull, release parse, rollup) + on-demand targeted search (`search_releases`) |
 | `trending/` | TMDb trending/population feed + streaming-availability |
 | `embed/` | Local embedding pipeline (`nomic-embed-text` → pgvector) + cosine recall primitive |
 | `recall/` | Vector-recall search API (`/query/resolve`, `/query/similar`) |
@@ -116,6 +116,7 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_PROWLARR_TV_CATEGORIES` | `5000` | Comma-separated Newznab parent category ids treated as TV. |
 | `MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE` | `0.5` | Minimum release-name parse confidence before resolving a release to a title. |
 | `MUSE_RELEASE_EXPIRY_DAYS` | `21` | How long a rolling `releases` snapshot row lives before it's pruned. |
+| `MUSE_PROWLARR_SEARCH_MAX_PER_HOUR` | `30` | Rolling hourly cap on on-demand targeted searches (`prowlarr::search_releases`), shared with the report-pull worker's rate limiter. |
 | `MUSE_PUBLIC_URL` | *(none)* | LAN-reachable base URL advertised by the tuner (`/discover.json`, `/muse.m3u` stream URLs). Degrades to `http://{bind_addr}` (only correct when `bind_addr` is a real LAN address). |
 | `MUSE_HDHR_DEVICE_ID` | `MUSE0001` | HDHomeRun-emulation device id advertised in `/discover.json`. |
 | `MUSE_CHANNEL_GUIDE_WINDOW_HOURS` | `48` | Rolling linear-guide window the director keeps `channel_programs` filled to; also the XMLTV render window. |
@@ -201,6 +202,7 @@ some capabilities need a manual invocation or a future worker/route to become li
 - `channels::compose_channel_run` — the on-demand pseudo-TV director. Fully implemented + tested, but no HTTP route mounts it (the *linear* tuner uses its own `tuner::scheduler` grid-filler instead).
 - `enrichment::EnrichmentService::enrich_media_item` — external-enrichment cache population. Wired object on `AppState`, but nothing calls it outside tests.
 - `plex_control::*` — Plex Companion cast/play-queue client. Declared as a module but **not mounted anywhere** and never called — library-only, and never exercised against a real Plex server.
+- `prowlarr::search_releases` — on-demand targeted Prowlarr search (MUSEM-03). No HTTP route or worker calls it yet; it's the input the release-decision/scoring engine (MUSEM-04) is expected to drive, not a standalone entry point in this change.
 
 Consequence: in a fresh deployment with a fully populated library and Ollama/Chord configured,
 `/recommend`'s taste tier, `proactive`'s `friday_evening`, and `zeitgeist` will silently return

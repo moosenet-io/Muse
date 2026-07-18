@@ -104,6 +104,14 @@ pub struct Config {
     /// `repo::release::prune_expired` removes it (spec S3.6: "expired rows
     /// are pruned"). Every re-seen release refreshes this on upsert.
     pub release_expiry_days: i64,
+    /// MUSEM-03: the rolling hourly cap on on-demand targeted searches
+    /// (`prowlarr::search::search_releases`), passed through to
+    /// `ProwlarrClient::targeted_search`'s `max_searches_per_hour`. Shares
+    /// the client's single `RateLimiter` instance with the report-pull
+    /// path, so this budgets on-demand search specifically -- "sparingly,
+    /// never fan a text search across all private indexers on a whim"
+    /// (blueprint §4b-C). `MUSE_PROWLARR_SEARCH_MAX_PER_HOUR`.
+    pub prowlarr_search_max_per_hour: u64,
 
     // --- MUSE-28: linear tuner (HDHomeRun-emulation + M3U + XMLTV) ---
     /// Public LAN base URL Plex/other players use to reach this Muse
@@ -437,6 +445,7 @@ impl Config {
             prowlarr_tv_categories: env_int_list("MUSE_PROWLARR_TV_CATEGORIES", &[5000]),
             prowlarr_resolve_min_confidence: env_f32("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", 0.5),
             release_expiry_days: env_i64("MUSE_RELEASE_EXPIRY_DAYS", 21),
+            prowlarr_search_max_per_hour: env_u64("MUSE_PROWLARR_SEARCH_MAX_PER_HOUR", 30),
 
             public_base_url: env_opt("MUSE_PUBLIC_URL"),
             hdhr_device_id: std::env::var("MUSE_HDHR_DEVICE_ID")
@@ -566,6 +575,7 @@ impl Default for Config {
             prowlarr_tv_categories: vec![5000],
             prowlarr_resolve_min_confidence: 0.5,
             release_expiry_days: 21,
+            prowlarr_search_max_per_hour: 30,
             searxng_url: None,
             news_url: None,
             news_api_key: None,
@@ -693,6 +703,7 @@ mod tests {
             "MUSE_PROWLARR_TV_CATEGORIES",
             "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
             "MUSE_RELEASE_EXPIRY_DAYS",
+            "MUSE_PROWLARR_SEARCH_MAX_PER_HOUR",
             "MUSE_PUBLIC_URL",
             "MUSE_HDHR_DEVICE_ID",
             "MUSE_CHANNEL_GUIDE_WINDOW_HOURS",
@@ -1014,6 +1025,7 @@ mod tests {
         std::env::set_var("MUSE_PROWLARR_TV_CATEGORIES", "5000,5010");
         std::env::set_var("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", "0.75");
         std::env::set_var("MUSE_RELEASE_EXPIRY_DAYS", "7");
+        std::env::set_var("MUSE_PROWLARR_SEARCH_MAX_PER_HOUR", "12");
 
         let cfg = Config::from_env();
 
@@ -1022,6 +1034,7 @@ mod tests {
         assert_eq!(cfg.prowlarr_tv_categories, vec![5000, 5010]);
         assert!((cfg.prowlarr_resolve_min_confidence - 0.75).abs() < f32::EPSILON);
         assert_eq!(cfg.release_expiry_days, 7);
+        assert_eq!(cfg.prowlarr_search_max_per_hour, 12);
 
         for key in [
             "MUSE_PROWLARR_TICK_INTERVAL_SECS",
@@ -1029,6 +1042,7 @@ mod tests {
             "MUSE_PROWLARR_TV_CATEGORIES",
             "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
             "MUSE_RELEASE_EXPIRY_DAYS",
+            "MUSE_PROWLARR_SEARCH_MAX_PER_HOUR",
         ] {
             std::env::remove_var(key);
         }

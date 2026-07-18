@@ -115,14 +115,20 @@ fn opt_eq_ignore_ascii_case(a: Option<&str>, b: Option<&str>) -> bool {
 pub fn tier_position(items: &Json, quality_definition_id: i64) -> Option<(usize, bool)> {
     let array = items.as_array()?;
     for (idx, entry) in array.iter().enumerate() {
+        let entry_allowed = entry.get("allowed").and_then(Json::as_bool).unwrap_or(true);
         if entry_matches_id(entry, quality_definition_id) {
-            let allowed = entry.get("allowed").and_then(Json::as_bool).unwrap_or(true);
-            return Some((idx, allowed));
+            return Some((idx, entry_allowed));
         }
         if let Some(nested) = entry.get("items").and_then(Json::as_array) {
-            if nested.iter().any(|n| entry_matches_id(n, quality_definition_id)) {
-                let allowed = entry.get("allowed").and_then(Json::as_bool).unwrap_or(true);
-                return Some((idx, allowed));
+            if let Some(leaf) = nested.iter().find(|n| entry_matches_id(n, quality_definition_id)) {
+                // Honor the leaf item's OWN `allowed` flag (review: codex —
+                // a quality explicitly disallowed inside an otherwise-
+                // allowed group must still be rejected), falling back to
+                // the group's flag when the leaf doesn't specify its own. A
+                // group disallowed as a whole disallows every member
+                // regardless of a leaf's own flag.
+                let leaf_allowed = leaf.get("allowed").and_then(Json::as_bool).unwrap_or(entry_allowed);
+                return Some((idx, entry_allowed && leaf_allowed));
             }
         }
     }

@@ -97,19 +97,21 @@ pub fn decide_release(
                 .cutoff_quality_id
                 .and_then(|id| scoring::tier_position(&profile.items, id))
                 .map(|(rank, _)| rank);
-            // No configured cutoff (quality or score) means there is no
-            // "good enough" bar the existing file could have already met —
-            // it can't be "at cutoff" by default, so upgrades must proceed
-            // toward the best available candidate rather than stopping
-            // up front (review: codex, MUSEM-04 re-review finding; matches
-            // *arr: no cutoff ⇒ keep upgrading). `unwrap_or(false)` for
-            // both, not `true`.
+            // No configured cutoff *quality* means there is no "good enough"
+            // tier bar the existing file could have already met — it can't
+            // be "at cutoff" by default, so upgrades must proceed toward
+            // the best available candidate rather than stopping up front
+            // (review: codex; matches *arr: no cutoff quality ⇒ keep
+            // upgrading). `cutoff_format_score`, by contrast, is a real
+            // NOT NULL profile column where `0` legitimately means "no
+            // format-score minimum" — trivially satisfied — so it's a plain
+            // comparison with no special-cased default (review: codex,
+            // correcting an over-correction from the prior review cycle:
+            // gating this on `> 0` broke the case where a profile
+            // intentionally has no score floor but does have a tier
+            // cutoff).
             let at_cutoff_tier = cutoff_rank.map(|c| existing_rank >= c).unwrap_or(false);
-            let at_cutoff_score = if profile.cutoff_format_score > 0 {
-                existing.total_format_score >= profile.cutoff_format_score
-            } else {
-                false
-            };
+            let at_cutoff_score = existing.total_format_score >= profile.cutoff_format_score;
             if at_cutoff_tier && at_cutoff_score {
                 return Decision::Reject {
                     reasons: vec![
@@ -384,6 +386,60 @@ mod tests {
         }
     }
 
+    // --- nested quality-group: leaf's own `allowed` flag is honored ---------
+
+    #[test]
+    fn rejects_a_tier_nested_in_a_group_with_allowed_false() {
+        // Review finding (codex): `tier_position` used to return the
+        // parent group's `allowed` flag for a nested quality, ignoring the
+        // leaf's own flag — a quality explicitly disallowed inside an
+        // otherwise-allowed group must still be rejected.
+        let definitions = vec![definition(1, "web-1080p", "WEB", Some("1080p"))];
+        let items = json!([{
+            "quality": { "id": 0, "name": "WEB 1080p Group" },
+            "allowed": true,
+            "items": [
+                { "quality": { "id": 1 }, "allowed": false }
+            ]
+        }]);
+        let p = profile(items, None);
+        let policy = ScoringPolicy {
+            definitions: &definitions,
+            custom_formats: &no_formats(),
+            existing: None,
+        };
+        let candidates = vec![candidate(release("r1", "WEB", Some("1080p")))];
+        let decision = decide_release(&candidates, &p, &no_scores(), &policy);
+        match decision {
+            Decision::Reject { reasons } => assert!(reasons[0].contains("not allowed")),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_a_tier_nested_in_a_group_with_allowed_true() {
+        let definitions = vec![definition(1, "web-1080p", "WEB", Some("1080p"))];
+        let items = json!([{
+            "quality": { "id": 0, "name": "WEB 1080p Group" },
+            "allowed": true,
+            "items": [
+                { "quality": { "id": 1 }, "allowed": true }
+            ]
+        }]);
+        let p = profile(items, None);
+        let policy = ScoringPolicy {
+            definitions: &definitions,
+            custom_formats: &no_formats(),
+            existing: None,
+        };
+        let candidates = vec![candidate(release("r1", "WEB", Some("1080p")))];
+        let decision = decide_release(&candidates, &p, &no_scores(), &policy);
+        match decision {
+            Decision::Grab(choice) => assert_eq!(choice.release.guid, "r1"),
+            other => panic!("expected Grab, got {other:?}"),
+        }
+    }
+
     // --- size-per-minute rejection -----------------------------------------
 
     #[test]
@@ -572,6 +628,41 @@ mod tests {
         match decision {
             Decision::Grab(choice) => assert_eq!(choice.release.guid, "better"),
             other => panic!("expected Grab (no cutoff configured -> keep upgrading), got {other:?}"),
+        }
+    }
+
+    // --- cutoff_format_score = 0 is a legitimate, trivially-satisfied floor -----
+
+    #[test]
+    fn zero_cutoff_format_score_counts_as_satisfied() {
+        // Review finding (codex): `cutoff_format_score` is NOT NULL on the
+        // profile and `0` legitimately means "no format-score minimum" —
+        // trivially met, not "unconfigured". So an existing file already at
+        // a *configured cutoff tier* with `cutoff_format_score = 0` IS at
+        // cutoff, and an equal-or-worse candidate must be rejected as "no
+        // upgrade needed" — this must NOT be confused with the
+        // no-cutoff-quality-configured case (`no_cutoff_configured_keeps_upgrading`),
+        // which is a different (tier-only) default.
+        let definitions = vec![
+            definition(1, "web-720p", "WEB", Some("720p")),
+            definition(2, "web-1080p", "WEB", Some("1080p")),
+        ];
+        let items = profile_items(&[1, 2]); // 2 (1080p) ranks higher
+        let mut p = profile(items, Some(2)); // cutoff quality = tier 2 (1080p)
+        p.cutoff_format_score = 0; // explicit "no score floor" — trivially met
+        let policy = ScoringPolicy {
+            definitions: &definitions,
+            custom_formats: &no_formats(),
+            existing: Some(scoring::ExistingRelease {
+                quality_definition_id: 2, // existing file is already at the cutoff tier
+                total_format_score: 0,
+            }),
+        };
+        let candidates = vec![candidate(release("same_tier", "WEB", Some("1080p")))];
+        let decision = decide_release(&candidates, &p, &no_scores(), &policy);
+        match decision {
+            Decision::Reject { reasons } => assert!(reasons[0].contains("cutoff")),
+            other => panic!("expected Reject (already at cutoff, score floor of 0 trivially met), got {other:?}"),
         }
     }
 

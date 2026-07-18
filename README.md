@@ -365,15 +365,27 @@ schema change needed, since that column already exists for exactly this kind of 
 (`backdrop.jpg`/`.png`), and per-season `season##-poster.*` beside the media file —
 `sidecar::detect` (a directory listing only, no content read) runs once per file during the walk
 and is cached on `ScannedFile::sidecar_art` so both matching and recording reuse the same pass.
+**Every candidate is symlink-checked via `std::fs::symlink_metadata` (never `Path::is_file()`,
+which follows symlinks) and rejected unless it's a genuine regular file** (codex review) — the
+same read-only-root-boundary posture `walk_dir` already enforces for media files, now applied to
+sidecars too: a `poster.jpg`/`.nfo` symlinked to somewhere outside `MUSE_LIBRARY_ROOT` is never
+detected, read, or attached. `sidecar::read_bytes` re-checks this itself as defense-in-depth for a
+caller that invokes it directly.
 
 - **`.nfo` — used for matching, not just cached.** `sidecar::extract_provider_id_from_nfo` reads a
   detected `.nfo`'s bytes READ-ONLY and extracts an embedded provider id: `<uniqueid
   type="tmdb"/"imdb"/"tvdb">…</uniqueid>` (current Kodi/`*arr` schema, any attribute order/quoting)
   or the legacy flat `<tmdbid>`/`<imdbid>`/`<tvdbid>`/bare `<id>` tags (older Kodi `movie.nfo`,
   `<id>` conventionally the TMDb id). Deliberately a plain substring scan, not a real XML parser —
-  matches the crate's no-new-heavy-dependency posture for a handful of well-known tags. Feeds
-  straight into `DbLibraryResolver` as an explicit id candidate (see "Matching" above) — subject to
-  the same "fails to resolve -> unmatched, never a title/year guess" rule as a path id tag.
+  matches the crate's no-new-heavy-dependency posture for a handful of well-known tags — but
+  **tag-scoped, not a whole-document search** (codex review): the `type` attribute is only ever
+  read from within a genuine `<uniqueid ...>` element's own opening-tag bounds, and the element
+  text only from that same element's own `</uniqueid>` close. A naive whole-document search for
+  `type="tmdb"` would also match an unrelated element like `<rating type="tmdb">603</rating>` and
+  mis-read it as a confident provider id — which, since an explicit id suppresses the title/year
+  fallback, would produce a WRONG confident match against an unrelated catalog row. Feeds straight
+  into `DbLibraryResolver` as an explicit id candidate (see "Matching" above) — subject to the same
+  "fails to resolve -> unmatched, never a title/year guess" rule as a path id tag.
 - **`.nfo` — attached, not just detected.** A matched file's `.nfo` bytes are also read READ-ONLY
   and cached into `artwork_cache` under `entity_kind = "media_item"`, `variant = "nfo"`,
   `content_type = "application/xml"` — the same table/key convention poster/fanart use — and

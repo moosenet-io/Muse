@@ -95,7 +95,19 @@ pub fn detect(media_file: &Path) -> SidecarArt {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        // Review finding (codex): reject a symlinked sidecar candidate.
+        // `Path::is_file()` FOLLOWS symlinks, which would let a
+        // `poster.jpg`/`fanart.jpg`/`.nfo` symlink inside the library
+        // point OUTSIDE `MUSE_LIBRARY_ROOT` and get read+persisted --
+        // breaking the same read-only-root boundary `walk_dir` already
+        // protects for media files (`std::fs::symlink_metadata`, which
+        // does NOT follow the link, then require a REGULAR file).
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            // Not a regular file at all (a symlink -- to anything, dir or
+            // file -- a directory, a device node, ...) -- skip.
             continue;
         }
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_lowercase()) else {
@@ -129,7 +141,30 @@ pub fn detect(media_file: &Path) -> SidecarArt {
 /// .read(true)` — never `.write(true)`/`.create(true)`/`.append(true)`).
 /// Used by a caller that intends to cache the art bytes (see
 /// `repo::artwork_cache`); detection alone ([`detect`]) never calls this.
+///
+/// Defense-in-depth (codex review): re-checks via `symlink_metadata` that
+/// `path` is a REGULAR file, not a symlink, before opening it — `detect`
+/// already filters symlinked candidates out, but a caller invoking this
+/// directly (or a TOCTOU race where the entry was swapped for a symlink
+/// between `detect` and this call) must not silently follow one outside
+/// `MUSE_LIBRARY_ROOT`.
 pub fn read_bytes(path: &Path) -> MuseResult<Vec<u8>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(MuseError::upstream(format!(
+                "library sidecar: refusing to read {} — not a regular file (symlink or other special file)",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(MuseError::upstream(format!(
+                "library sidecar: could not stat {}: {e}",
+                path.display()
+            )));
+        }
+    }
+
     let mut file = OpenOptions::new()
         .read(true)
         .open(path)
@@ -201,26 +236,66 @@ pub fn extract_provider_id_from_nfo(bytes: &[u8]) -> Option<(&'static str, Strin
     None
 }
 
-/// Find `<uniqueid type="{provider_attr}" ...>VALUE</uniqueid>` (attribute
-/// order/quoting-tolerant): locates `type="{provider_attr}"` (or
-/// single-quoted), then the `>` that closes that opening tag, then the text
-/// up to the next `<`.
+/// Find a real `<uniqueid ...>VALUE</uniqueid>` ELEMENT whose OWN `type`
+/// attribute is `provider_attr`, and return its element text.
+/// Attribute-order/quoting-tolerant, but — unlike a naive "find `type=
+/// "{provider_attr}"` anywhere in the document" scan — this only ever looks
+/// for the `type` attribute *within a `<uniqueid ...>` opening tag's own
+/// bounds* (from `<uniqueid` up to that tag's closing `>`), then only reads
+/// the element text up to that specific element's own `</uniqueid>`.
+///
+/// This distinction matters (codex review): a naive whole-document search
+/// for `type="tmdb"` would also match e.g. `<rating type="tmdb">603
+/// </rating>` or any other element that happens to carry a `type=`
+/// attribute of its own, mis-reading it as a confident provider id — which,
+/// since an explicit id suppresses the title/year fallback in
+/// `DbLibraryResolver`, would produce a WRONG confident match. Only a
+/// genuine `<uniqueid>` element's own `type` attribute counts.
+///
+/// Iterates every `<uniqueid>` element in the document (there can be
+/// several, one per provider) until one both matches `provider_attr` and
+/// has a non-empty element text, or none do. A self-closing `<uniqueid
+/// .../>` (no element text at all) is never treated as a value source.
 fn extract_uniqueid_value(xml: &str, xml_lower: &str, provider_attr: &str) -> Option<String> {
     let needle_dq = format!("type=\"{provider_attr}\"");
     let needle_sq = format!("type='{provider_attr}'");
-    let attr_pos = xml_lower.find(&needle_dq).or_else(|| xml_lower.find(&needle_sq))?;
 
-    let tail = &xml[attr_pos..];
-    let gt = tail.find('>')?;
-    let value_start = &tail[gt + 1..];
-    let lt = value_start.find('<')?;
-    let value = value_start[..lt].trim();
+    let mut search_from = 0usize;
+    while let Some(rel_open) = xml_lower[search_from..].find("<uniqueid") {
+        let open_pos = search_from + rel_open;
 
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
+        // The end of THIS element's own opening tag -- the '>' that closes
+        // `<uniqueid ...>` (or the self-closing `.../>`). Attributes are
+        // only ever read from within `[open_pos, tag_end]` below, never
+        // past it into the rest of the document.
+        let Some(rel_gt) = xml_lower[open_pos..].find('>') else {
+            break; // malformed: an unclosed <uniqueid — nothing more to parse
+        };
+        let tag_end = open_pos + rel_gt;
+        let opening_tag_lower = &xml_lower[open_pos..tag_end];
+        let self_closing = opening_tag_lower.trim_end().ends_with('/');
+        let type_matches_here = opening_tag_lower.contains(&needle_dq) || opening_tag_lower.contains(&needle_sq);
+
+        if type_matches_here && !self_closing {
+            let value_start = tag_end + 1;
+            if let Some(rel_close) = xml_lower[value_start..].find("</uniqueid>") {
+                let value = xml[value_start..value_start + rel_close].trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+
+        // Advance past this element (to its own closing tag if present,
+        // else just past its opening tag) before looking for another
+        // `<uniqueid>` — guarantees forward progress every iteration.
+        search_from = match xml_lower[tag_end..].find("</uniqueid>") {
+            Some(rel) => tag_end + rel + "</uniqueid>".len(),
+            None => tag_end + 1,
+        };
     }
+
+    None
 }
 
 /// Find `<{tag}>VALUE</{tag}>` (case-insensitive on the tag name).
@@ -322,6 +397,54 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Review finding (codex): a symlinked sidecar candidate must be
+    /// rejected, not followed — same read-only-root-boundary posture
+    /// `library::scan::walk_dir` already enforces for media files. A
+    /// `poster.jpg` symlink pointing OUTSIDE the fixture dir must not be
+    /// detected/attached.
+    #[test]
+    #[cfg(unix)]
+    fn detect_rejects_a_symlinked_sidecar_candidate() {
+        let dir = unique_dir("symlink-sidecar");
+        let outside = unique_dir("symlink-sidecar-outside");
+        fs::write(outside.join("real-poster.jpg"), b"outside-the-library-bytes").unwrap();
+        fs::write(outside.join("real.nfo"), br#"<movie><uniqueid type="tmdb">999</uniqueid></movie>"#).unwrap();
+
+        let media = dir.join("Movie.mkv");
+        fs::write(&media, b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("real-poster.jpg"), dir.join("poster.jpg")).unwrap();
+        std::os::unix::fs::symlink(outside.join("real.nfo"), dir.join("movie.nfo")).unwrap();
+
+        let art = detect(&media);
+        assert!(
+            art.poster_path.is_none(),
+            "a symlinked poster.jpg must not be detected as sidecar art at all"
+        );
+        assert!(art.nfo_path.is_none(), "a symlinked .nfo must not be detected as sidecar art at all");
+        assert!(art.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    /// [`read_bytes`]'s own defense-in-depth symlink rejection (in case a
+    /// caller passes a symlink path directly, bypassing `detect`).
+    #[test]
+    #[cfg(unix)]
+    fn read_bytes_refuses_to_follow_a_symlink() {
+        let dir = unique_dir("read-bytes-symlink");
+        let outside = unique_dir("read-bytes-symlink-outside");
+        fs::write(outside.join("real.jpg"), b"outside-bytes").unwrap();
+        let link = dir.join("poster.jpg");
+        std::os::unix::fs::symlink(outside.join("real.jpg"), &link).unwrap();
+
+        let result = read_bytes(&link);
+        assert!(result.is_err(), "read_bytes must refuse to open a symlink, even directly");
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
     #[test]
     fn unreadable_directory_is_a_clean_empty_result_not_a_panic() {
         let dir = std::env::temp_dir().join("muse-sidecar-test-does-not-exist-at-all");
@@ -382,6 +505,65 @@ mod tests {
             <uniqueid type="tmdb">603</uniqueid>
         </movie>"#;
         assert_eq!(extract_provider_id_from_nfo(nfo), Some((resolve::TMDB, "603".to_string())));
+    }
+
+    /// Review finding (codex, wrong-confident-match round), test (a): a
+    /// `type="tmdb"` attribute on an UNRELATED element (`<rating>`, not
+    /// `<uniqueid>`) must never be mis-read as a provider id — a naive
+    /// whole-document `type="tmdb"` search would wrongly yield `603` here,
+    /// which (since an explicit id suppresses the title/year fallback)
+    /// would produce a wrong-confident match against an unrelated row.
+    #[test]
+    fn extract_provider_id_from_nfo_ignores_type_attribute_on_a_non_uniqueid_element() {
+        let nfo = br#"<movie><rating type="tmdb">603</rating></movie>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(nfo),
+            None,
+            "a `type=\"tmdb\"` attribute on <rating> (not <uniqueid>) must never be read as a provider id"
+        );
+
+        // Same, but with a real <uniqueid> for a DIFFERENT provider present
+        // too -- the <rating type="tmdb"> must still be ignored, and the
+        // real <uniqueid type="imdb"> must still resolve correctly.
+        let nfo2 = br#"<movie><rating type="tmdb">603</rating><uniqueid type="imdb">tt0133093</uniqueid></movie>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(nfo2),
+            Some((resolve::IMDB, "tt0133093".to_string()))
+        );
+    }
+
+    /// Review finding (codex), test (b): a genuine `<uniqueid
+    /// type="tmdb">603</uniqueid>` still parses correctly after the fix
+    /// (regression guard against test (a)'s tightened parsing breaking the
+    /// legitimate case).
+    #[test]
+    fn extract_provider_id_from_nfo_still_reads_a_genuine_uniqueid() {
+        let nfo = br#"<movie><uniqueid type="tmdb">603</uniqueid></movie>"#;
+        assert_eq!(extract_provider_id_from_nfo(nfo), Some((resolve::TMDB, "603".to_string())));
+    }
+
+    /// Review finding (codex), test (c): attribute order/quoting variety on
+    /// a real `<uniqueid>` element still parses — `type` before or after
+    /// other attributes (`default="true"`), single or double quotes.
+    #[test]
+    fn extract_provider_id_from_nfo_uniqueid_attribute_order_and_quoting_variants() {
+        let type_first_dq = br#"<uniqueid type="tmdb" default="true">603</uniqueid>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(type_first_dq),
+            Some((resolve::TMDB, "603".to_string()))
+        );
+
+        let type_last_dq = br#"<uniqueid default="true" type="tmdb">603</uniqueid>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(type_last_dq),
+            Some((resolve::TMDB, "603".to_string()))
+        );
+
+        let type_single_quoted = br#"<uniqueid default='true' type='tmdb'>603</uniqueid>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(type_single_quoted),
+            Some((resolve::TMDB, "603".to_string()))
+        );
     }
 
     #[test]

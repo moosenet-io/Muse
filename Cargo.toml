@@ -46,6 +46,12 @@ sha2 = "0.10"
 # src/metrics.rs). Same version pin as the reference pattern merged in
 # Terminus (PROMEX-01) and Chord (PROMEX-02).
 prometheus = "0.13"
+# MUSEL-C2: base64-encodes still-frame JPEG bytes into the OpenAI-compatible
+# `data:image/jpeg;base64,...` image_url payload Chord's vision endpoint
+# expects (src/taste_model/chord_client.rs `chat_completion_with_image`).
+# Encoding only -- not an image/JPEG decoder (see src/matching/liveness.rs
+# for why a decode dependency was deliberately avoided).
+base64 = "0.22"
 
 [dev-dependencies]
 httpmock = "0.7"

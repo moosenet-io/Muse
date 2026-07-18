@@ -58,6 +58,15 @@ pub struct ProviderMetadata {
     pub first_aired: Option<String>,
     pub year: Option<i32>,
     pub network: Option<String>,
+    /// Runtime in minutes, where the provider states one. `None` both when
+    /// the provider has no runtime for this title and when the concrete
+    /// [`MetadataProvider`] implementation doesn't parse it yet (as of
+    /// MUSEL-C2, TheTVDB v4's base record/search-hit shapes this crate
+    /// deserializes don't carry `averageRuntime`/`runtime` — see
+    /// `metadata::tvdb::TvdbRecord`). Added for MUSEL-C2's `verify_match`
+    /// runtime-consistency signal (`matching::verify`); a future provider
+    /// or a richer TVDB parse can populate it without changing this shape.
+    pub runtime_minutes: Option<i32>,
 }
 
 /// A provider of normalized title metadata. Read-only: no method on this

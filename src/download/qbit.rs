@@ -219,6 +219,18 @@ impl DownloadClient for QbitClient {
                 message: format!("qbit add to {url} failed: {body}"),
             });
         }
+        // qBittorrent answers `torrents/add` with HTTP 200 even when it
+        // REJECTS the torrent — the plain-text body is the actual verdict:
+        // `"Ok."` on success, `"Fails."` when it declines (e.g. a duplicate
+        // or malformed torrent/magnet). A 200 with any body other than
+        // `"Ok."` is therefore a failed add, not a success — treating it as
+        // one would silently drop a grab and report it as submitted.
+        if body.trim() != "Ok." {
+            return Err(MuseError::Upstream {
+                status,
+                message: format!("qbit rejected add to {url}: {body}"),
+            });
+        }
 
         // qBittorrent's add response is a bare "Ok." with no hash (older
         // builds always behave this way) — resolve the infohash from the
@@ -552,6 +564,33 @@ mod tests {
         match result.unwrap_err() {
             MuseError::Upstream { status, .. } => assert_eq!(status, 500),
             other => panic!("expected Upstream error, got {other:?}"),
+        }
+    }
+
+    /// qBittorrent answers a REJECTED `torrents/add` with HTTP 200 and body
+    /// `"Fails."` (not a non-2xx status) — a caller that only checked the
+    /// HTTP status would treat this as a successful grab and silently drop
+    /// it. Proves `add` reads the body and surfaces a typed error instead.
+    #[tokio::test]
+    async fn add_with_200_fails_body_is_a_typed_error_not_a_success() {
+        let server = MockServer::start();
+        login_mock(&server, "testsid123");
+        server.mock(|when, then| {
+            when.method(POST).path(ADD_PATH);
+            then.status(200).body("Fails.");
+        });
+
+        let client =
+            QbitClient::from_config(&config_for(&server)).expect("client should construct");
+        let result = client.add(GrabRequest::new("magnet:?xt=urn:btih:AA")).await;
+
+        match result {
+            Ok(receipt) => panic!("expected a typed error, got a GrabReceipt: {receipt:?}"),
+            Err(MuseError::Upstream { status, message }) => {
+                assert_eq!(status, 200);
+                assert!(message.contains("Fails."));
+            }
+            Err(other) => panic!("expected Upstream error, got {other:?}"),
         }
     }
 

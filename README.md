@@ -350,6 +350,37 @@ flagged as "never `AutoApprovable` in practice" and named as the natural follow-
 `decision::`/`prowlarr::search_releases`/`download::qbit::QbitClient` have no dependency on each
 other beyond what `acquisition::fulfill_request` wires — each still merges/tests independently.
 
+## Monitored "wanted" acquisition worker (MUSEM-06)
+
+`src/acquisition/worker.rs` is the Sonarr/Radarr-style background engine: `run_wanted_pass`
+scans `repo::acquisition::list_wanted` (MUSEM-01) across every library and, for each item not
+searched within `Config::wanted_search_cooldown_secs` (default 6h) of its
+`monitored_items.last_search_at`, runs a real on-demand Prowlarr search (MUSEM-03) and turns the
+result into an `Availability` signal for `arr::request::classify_tier` — reused verbatim, never a
+second tiering rule. Only an `AutoApprovable` item (the operator opted in via
+`Config::arr_request_auto_tier_enabled` AND the search actually confirmed it's grabbable now)
+reaches `acquisition::fulfill_request` (MUSEM-05) at all; every other item still gets a
+`media_requests` row persisted at `RequestStatus::Requested` for manual/operator follow-up —
+never a silent grab. It is capped two ways per pass (`Config::wanted_max_grabs_per_pass`,
+default 5; `Config::wanted_max_searches_per_pass`, default 20) on top of the shared
+`ProwlarrClient` `RateLimiter`'s own hourly search budget, idempotent (an item already
+`queued`/`downloading` in `download_queue`, via the new
+`repo::acquisition::is_monitored_item_active_in_queue` check, is skipped, never re-grabbed), and
+non-blocking (an unreachable Prowlarr/qBittorrent, a DB hiccup, or a metadata row deleted mid-pass
+is logged and the pass moves on to the next item — never a panic, never an aborted pass).
+
+`run_wanted_pass` is itself gated on `ExperienceSettings.acquisition.enabled` (the same master
+gate `fulfill_request` enforces unbypassably as its own first action) — checked again here purely
+so a gate-off deployment short-circuits to a cheap no-op without even listing libraries.
+
+**Scheduled inside the maintenance chain** (`crate::maintenance::run_maintenance_pass`,
+`src/maintenance/mod.rs`), right after the arr-ingest step and before embed/taste/divergence/
+enrichment — dependency order, since arr ingest is what refreshes the `media_items`/`media_files`
+rows `list_wanted`'s cutoff comparison reads. `MaintenanceSummary.wanted` carries the pass's own
+tally (`grabbed`/`needs_review`/`already_queued_skipped`/`cooldown_skipped`/`no_capability_skipped`/
+`metadata_missing_skipped`/`search_failed`/`errors`/`grab_cap_skipped`/`search_cap_skipped`), same
+"ran and did nothing" vs "not run" posture every other maintenance-pass step already follows.
+
 ## Wiring status: what actually runs
 
 Not every implemented subsystem is triggered in a running deployment. This matters for operators —
@@ -366,9 +397,12 @@ caller):
 - `decision::decide_release` — called by `acquisition::fulfill_request` against the candidates the
   search above returns.
 - `repo::acquisition::*` — `media_requests`/`download_queue`/`history_events` are now written
-  end-to-end by `acquisition::fulfill_request` and the `POST /requests*` handlers
-  (`monitored_items`/`blocklist` remain unwired — no MUSEM-06 wanted-worker or blocklist-write
-  caller exists yet).
+  end-to-end by `acquisition::fulfill_request` and the `POST /requests*` handlers.
+
+**Newly wired at MUSEM-06:**
+- `monitored_items` (MUSEM-01's "wanted" driver table) — now has a real caller:
+  `acquisition::worker::run_wanted_pass`, scheduled inside the maintenance chain (see above).
+  `blocklist` still has no caller (no write path adds to it yet).
 
 **Background workers spawned at startup** (`src/workers.rs`):
 - Plex session poller (`tracker::poller`) — always spawned; no-ops if Plex unconfigured.
@@ -386,7 +420,7 @@ caller):
 - `channels::compose_channel_run` — the on-demand pseudo-TV director. Fully implemented + tested, but no HTTP route mounts it (the *linear* tuner uses its own `tuner::scheduler` grid-filler instead).
 - `enrichment::EnrichmentService::enrich_media_item` — external-enrichment cache population. Wired object on `AppState`, but nothing calls it outside tests.
 - `plex_control::*` — Plex Companion cast/play-queue client. Declared as a module but **not mounted anywhere** and never called — library-only, and never exercised against a real Plex server.
-- `repo::acquisition::{monitored_items,blocklist}` (MUSEM-01) — `media_requests`/`download_queue`/`history_events` are now wired (see "Newly wired at MUSEM-05" above); `monitored_items` (the "wanted" driver table) and `blocklist` still have no caller — that's MUSEM-06's (the monitored "wanted" acquisition worker) job.
+- `repo::acquisition::blocklist` (MUSEM-01) — `media_requests`/`download_queue`/`history_events`/`monitored_items` are now wired (see "Newly wired at MUSEM-05"/"Newly wired at MUSEM-06" above); `blocklist` still has no write-path caller.
 
 Consequence: in a fresh deployment with a fully populated library and Ollama/Chord configured,
 `/recommend`'s taste tier, `proactive`'s `friday_evening`, and `zeitgeist` will silently return

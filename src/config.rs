@@ -229,6 +229,31 @@ pub struct Config {
     /// against a self-hosted instance.
     pub maintenance_enrichment_limit: i64,
 
+    // --- MUSEM-06: monitored "wanted" acquisition worker ---
+    /// Minimum time between two on-demand searches for the SAME
+    /// `monitored_items` row (`MUSE_WANTED_SEARCH_COOLDOWN_SECS`) — the
+    /// cooldown [`crate::acquisition::worker::run_wanted_pass`] checks
+    /// against `monitored_items.last_search_at` before re-searching an
+    /// item, so a still-below-cutoff item doesn't get re-searched every
+    /// single maintenance tick. Defaults to 6 hours.
+    pub wanted_search_cooldown_secs: i64,
+    /// Upper bound on how many NEW grabs one `run_wanted_pass` call will
+    /// make (`MUSE_WANTED_MAX_GRABS_PER_PASS`) — bounded for the same
+    /// reason `embed_batch_size`/`maintenance_enrichment_limit` are: a
+    /// freshly-populated wanted list (e.g. right after a big arr ingest)
+    /// must never turn into an unbounded qBittorrent/Prowlarr burst in one
+    /// pass. Subsequent passes make forward progress on the rest.
+    pub wanted_max_grabs_per_pass: usize,
+    /// Upper bound on how many on-demand Prowlarr searches one
+    /// `run_wanted_pass` call will issue (`MUSE_WANTED_MAX_SEARCHES_PER_PASS`)
+    /// — a second, independent cap from `wanted_max_grabs_per_pass`: even a
+    /// pass that never grabs (every candidate rejected) must still stay
+    /// polite to Prowlarr. This is on top of, never a replacement for, the
+    /// shared `ProwlarrClient` `RateLimiter`'s own hourly cap
+    /// (`prowlarr_search_max_per_hour`) that every search — this worker's
+    /// included — already funnels through.
+    pub wanted_max_searches_per_pass: usize,
+
     // --- MUSET-07 (Plane TERM #372): adversarial reasoning review ---
     /// Base URL of a configured adversarial reasoning-critique panel
     /// endpoint (`MUSE_REASONING_PANEL_URL`). `None` (the default) keeps
@@ -502,6 +527,10 @@ impl Config {
             embed_batch_size: env_u64("MUSE_EMBED_BATCH_SIZE", 50) as usize,
             maintenance_enrichment_limit: env_i64("MUSE_MAINTENANCE_ENRICHMENT_LIMIT", 10),
 
+            wanted_search_cooldown_secs: env_i64("MUSE_WANTED_SEARCH_COOLDOWN_SECS", 21_600),
+            wanted_max_grabs_per_pass: env_u64("MUSE_WANTED_MAX_GRABS_PER_PASS", 5) as usize,
+            wanted_max_searches_per_pass: env_u64("MUSE_WANTED_MAX_SEARCHES_PER_PASS", 20) as usize,
+
             reasoning_panel_url: env_opt("MUSE_REASONING_PANEL_URL"),
             reasoning_panel_api_key: env_opt("MUSE_REASONING_PANEL_API_KEY"),
             reasoning_panel_model: env_opt("MUSE_REASONING_PANEL_MODEL"),
@@ -640,6 +669,9 @@ impl Default for Config {
             trending_tick_secs: 86400,
             embed_batch_size: 50,
             maintenance_enrichment_limit: 10,
+            wanted_search_cooldown_secs: 21_600,
+            wanted_max_grabs_per_pass: 5,
+            wanted_max_searches_per_pass: 20,
             reasoning_panel_url: None,
             reasoning_panel_api_key: None,
             reasoning_panel_model: None,

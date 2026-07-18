@@ -33,6 +33,8 @@
 //! *arr-fleet meaning would have produced for "no capability at all,"
 //! which is the property `classify_tier`'s callers actually depend on.
 
+pub mod worker;
+
 use std::sync::Arc;
 
 use serde_json::json;

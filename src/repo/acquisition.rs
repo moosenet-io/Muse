@@ -284,6 +284,27 @@ pub async fn list_download_queue_by_status(
     .map_err(MuseError::Database)
 }
 
+/// MUSEM-06: is `monitored_item_id` already active (`queued`/`downloading`,
+/// i.e. not yet `completed`/`imported`/`failed`/`removed`) in
+/// `download_queue`? The wanted worker's idempotency check — an item
+/// already mid-flight must be skipped, never re-grabbed, by two passes (or
+/// two ticks of the same pass) racing each other.
+pub async fn is_monitored_item_active_in_queue(
+    pool: &PgPool,
+    monitored_item_id: i64,
+) -> MuseResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM download_queue \
+         WHERE monitored_item_id = $1 AND status IN ('queued', 'downloading') \
+         LIMIT 1",
+    )
+    .bind(monitored_item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(row.is_some())
+}
+
 pub async fn update_download_status(
     pool: &PgPool,
     id: i64,

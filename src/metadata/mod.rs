@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::error::MuseResult;
 
 pub mod config;
+pub mod resolve;
 pub mod tvdb;
 
 /// Which kind of title a lookup/search is for. Mirrors
@@ -58,6 +59,17 @@ pub struct ProviderMetadata {
     pub first_aired: Option<String>,
     pub year: Option<i32>,
     pub network: Option<String>,
+    /// TMDb-style free-text keywords (e.g. "time travel", "based on a
+    /// novel"). Added post-A1 (MUSEL-A2) as an additive, `Default`-backed
+    /// field — no existing caller/test constructs a `ProviderMetadata`
+    /// positionally, so this doesn't break `MockMetadataProvider` or the
+    /// A1 tests above. No concrete provider populates it yet (neither
+    /// `TvdbClient` nor the MUSEL-A2 `TmdbClient` adapter fetch a
+    /// keywords endpoint) — it exists so `resolve_and_merge`'s merge and
+    /// `repo::media_metadata::apply_enrichment`'s persistence path are
+    /// already wired for it, ready for a provider to start populating it
+    /// without another schema-shape change.
+    pub keywords: Vec<String>,
 }
 
 /// A provider of normalized title metadata. Read-only: no method on this

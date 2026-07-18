@@ -88,6 +88,61 @@ pub struct ProviderEntry {
     pub provider_name: String,
 }
 
+/// `/movie|tv/{id}` details response (MUSEL-A2), requested with
+/// `append_to_response=external_ids` so the id-bridge fields land in the
+/// same call as the rest of the record — see
+/// `client::TmdbClient::get_details`. Like [`TmdbTitle`], deliberately
+/// permissive: movie vs tv responses share most of this shape but not all
+/// of it (e.g. only tv has `name`/`first_air_date`).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TmdbDetails {
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[serde(default)]
+    pub(crate) overview: Option<String>,
+    #[serde(default)]
+    pub(crate) release_date: Option<String>,
+    #[serde(rename = "first_air_date", default)]
+    pub(crate) first_air_date: Option<String>,
+    #[serde(default)]
+    pub(crate) vote_average: Option<f64>,
+    #[serde(default)]
+    pub(crate) poster_path: Option<String>,
+    #[serde(default)]
+    pub(crate) backdrop_path: Option<String>,
+    #[serde(default)]
+    pub(crate) genres: Vec<TmdbGenre>,
+    #[serde(default)]
+    pub(crate) external_ids: Option<TmdbExternalIds>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TmdbGenre {
+    #[serde(default)]
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct TmdbExternalIds {
+    #[serde(default)]
+    pub(crate) imdb_id: Option<String>,
+}
+
+/// `/find/{external_id}?external_source=imdb_id` — the IMDb-id bridge
+/// MUSEL-A2's TMDb adapter uses when only an `imdb_id` is known for a
+/// title (no native `tmdb_id` yet). TMDb splits hits by media type; a
+/// caller already knows which bucket it wants from the requested
+/// `MediaKind`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TmdbFindResults {
+    #[serde(default)]
+    pub(crate) movie_results: Vec<TmdbTitle>,
+    #[serde(default)]
+    pub(crate) tv_results: Vec<TmdbTitle>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

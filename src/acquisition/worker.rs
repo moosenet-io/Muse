@@ -49,11 +49,12 @@
 //!   never aborts the maintenance chain it's scheduled inside
 //!   (`crate::maintenance::run_maintenance_pass`).
 
-use crate::acquisition::{fulfill_request, media_kind_str, search_candidates, AcquisitionDeps};
+use crate::acquisition::{fulfill_request, media_kind_str, search_candidates, AcquisitionDeps, FulfillOptions};
 use crate::arr::request::{classify_tier, RequestTier};
 use crate::config::Config;
 use crate::download::DownloadClient;
-use crate::models::acquisition::{NewMediaRequest, WantedItem};
+use crate::error::MuseResult;
+use crate::models::acquisition::{MediaRequest, NewMediaRequest, WantedItem};
 use crate::models::availability::Availability;
 use crate::prowlarr::ProwlarrClient;
 use crate::repo;
@@ -279,24 +280,42 @@ async fn process_wanted_item(
         }
     };
 
+    let media_kind = media_kind_str(metadata.kind);
+
     // "Has capability at all" -- same honest re-reading `crate::http::requests`
     // already applies to `classify_tier`'s `has_matching_arr_instance` param
     // for this Prowlarr-native (not *arr-fleet) grab path: a configured
     // Prowlarr client and a resolvable quality profile for this item. Without
     // either, this item can never even be searched -- skip without touching
-    // `last_search_at` (nothing was attempted) or persisting a request (no
-    // quality profile means `fulfill_request` could only ever Skip it anyway).
+    // `last_search_at` (nothing was attempted), but it still must NOT
+    // silently vanish: review finding 3 (codex, MUSEM-06 REQUEST_CHANGES) --
+    // persist a `Requested` `media_request` for the operator, same
+    // "persist but never act" posture as every other non-`AutoApprovable`
+    // outcome below.
     let Some(prowlarr) = deps.prowlarr else {
+        persist_pending_request(
+            deps,
+            item,
+            media_kind,
+            "no Prowlarr client configured",
+        )
+        .await;
         return (ItemOutcome::NoCapability, false);
     };
     if item.quality_profile_id.is_none() {
+        persist_pending_request(
+            deps,
+            item,
+            media_kind,
+            "no quality_profile_id set on this monitored item",
+        )
+        .await;
         return (ItemOutcome::NoCapability, false);
     }
 
     // The real, on-demand search -- never a fabricated availability signal,
     // same posture as `crate::acquisition`'s module doc and
     // `crate::http::requests::create_request_handler`.
-    let media_kind = media_kind_str(metadata.kind);
     let candidates =
         match search_candidates(prowlarr, deps.config, &item.title, media_kind).await {
             Ok(candidates) => candidates,
@@ -342,16 +361,7 @@ async fn process_wanted_item(
         settings.is_acquisition_enabled() && deps.config.arr_request_auto_tier_enabled && deps.download.is_some();
     let tier = classify_tier(auto_tier_enabled, Some(&availability), true);
 
-    let new_request = NewMediaRequest {
-        provider_ids: serde_json::json!({}),
-        media_kind: media_kind.to_string(),
-        title: item.title.clone(),
-        requested_by: Some("wanted-worker".to_string()),
-        tier: Some(format!("{tier:?}")),
-        quality_profile_id: item.quality_profile_id,
-        note: Some(format!("MUSEM-06 wanted worker: monitored_item_id={}", item.monitored_item_id)),
-    };
-    let request = match repo::acquisition::create_request(deps.pool, &new_request).await {
+    let request = match create_wanted_request(deps, item, media_kind, &format!("{tier:?}")).await {
         Ok(request) => request,
         Err(e) => {
             tracing::warn!(
@@ -374,7 +384,18 @@ async fn process_wanted_item(
         return (ItemOutcome::NeedsReview, true);
     }
 
-    match fulfill_request(&deps.acquisition_deps(), &request).await {
+    // Review finding 1 (opus) + finding 2 (codex, MUSEM-06 REQUEST_CHANGES):
+    // thread `monitored_item_id` through so the resulting `download_queue`
+    // row is idempotency-visible (see `FulfillOptions`'s doc), and hand
+    // `fulfill_request` the candidates THIS call already fetched above so it
+    // never runs a second, redundant on-demand search for the same title --
+    // exactly one real Prowlarr search per wanted item, which is what makes
+    // `wanted_max_searches_per_pass` an honest bound on actual search calls.
+    let options = FulfillOptions {
+        monitored_item_id: Some(item.monitored_item_id),
+        prefetched_candidates: Some(candidates),
+    };
+    match fulfill_request(&deps.acquisition_deps(), &request, &options).await {
         Ok(crate::acquisition::FulfillOutcome::Grabbed { .. }) => (ItemOutcome::Grabbed, true),
         Ok(crate::acquisition::FulfillOutcome::Rejected { reasons }) => {
             tracing::debug!(
@@ -401,6 +422,48 @@ async fn process_wanted_item(
             (ItemOutcome::Error, true)
         }
     }
+}
+
+/// Review finding 3 (codex, MUSEM-06 REQUEST_CHANGES): a wanted item this
+/// pass could not even attempt to search (no Prowlarr configured, or no
+/// `quality_profile_id` on the monitored row) must still not silently
+/// vanish -- persists a `Requested` `media_request` so the operator can see
+/// and manually act on it, same "persist but never act" posture as every
+/// other non-`AutoApprovable` outcome. Best-effort: a failure to even
+/// persist this fallback request is logged, never escalated (the item was
+/// already going to be counted `NoCapability` either way).
+async fn persist_pending_request(deps: &WantedPassDeps<'_>, item: &WantedItem, media_kind: &str, reason: &str) {
+    if let Err(e) = create_wanted_request(deps, item, media_kind, "Blocked").await {
+        tracing::warn!(
+            error = %e,
+            monitored_item_id = item.monitored_item_id,
+            reason,
+            "MUSEM-06: wanted pass — could not persist a pending media_request for a no-capability item"
+        );
+    }
+}
+
+/// The one place a wanted-worker-originated `media_requests` row gets built
+/// — shared by the no-capability fallback above and the main tier-
+/// classified path, so every such row carries the exact same `note` shape
+/// (`"MUSEM-06 wanted worker: monitored_item_id={id}"`) callers/tests can
+/// key off of.
+async fn create_wanted_request(
+    deps: &WantedPassDeps<'_>,
+    item: &WantedItem,
+    media_kind: &str,
+    tier_label: &str,
+) -> MuseResult<MediaRequest> {
+    let new_request = NewMediaRequest {
+        provider_ids: serde_json::json!({}),
+        media_kind: media_kind.to_string(),
+        title: item.title.clone(),
+        requested_by: Some("wanted-worker".to_string()),
+        tier: Some(tier_label.to_string()),
+        quality_profile_id: item.quality_profile_id,
+        note: Some(format!("MUSEM-06 wanted worker: monitored_item_id={}", item.monitored_item_id)),
+    };
+    repo::acquisition::create_request(deps.pool, &new_request).await
 }
 
 /// `touch_last_search` is best-effort here: a failure to record it just
@@ -895,6 +958,54 @@ mod db_gated {
         assert_eq!(outcome, ItemOutcome::NoCapability);
         assert!(!searched);
         assert_eq!(download.added_count(), 0);
+
+        // Review finding 3 (codex, MUSEM-06 REQUEST_CHANGES): a no-capability
+        // item must still persist a `Requested` request for the operator,
+        // never silently vanish.
+        let request = request_for_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("a media_request row must have been persisted even with no capability");
+        assert_eq!(request.status, RequestStatus::Requested.as_str());
+    }
+
+    #[tokio::test]
+    async fn no_prowlarr_configured_is_no_capability_and_persists_a_requested_request() {
+        let Some(pool) =
+            test_pool_or_skip("no_prowlarr_configured_is_no_capability_and_persists_a_requested_request").await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let library = seed_library(&pool).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+        let item = seed_wanted_item(&pool, &library, Some(profile_id)).await;
+
+        let config = test_config();
+        let download = MockDownloadClient::new();
+        let mut settings = ExperienceSettings::default();
+        settings.acquisition.enabled = true;
+        let deps = WantedPassDeps {
+            pool: &pool,
+            config: &config,
+            prowlarr: None,
+            download: Some(&download),
+        };
+
+        let (outcome, searched) = process_wanted_item(
+            &deps,
+            &settings,
+            &item,
+            chrono::Duration::seconds(config.wanted_search_cooldown_secs),
+        )
+        .await;
+        assert_eq!(outcome, ItemOutcome::NoCapability);
+        assert!(!searched);
+        assert_eq!(download.added_count(), 0);
+
+        let request = request_for_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("a media_request row must have been persisted even with no Prowlarr configured");
+        assert_eq!(request.status, RequestStatus::Requested.as_str());
     }
 
     #[tokio::test]
@@ -1073,5 +1184,116 @@ mod db_gated {
         // genuine no-op, not skipped entirely).
         let summary = run_wanted_pass(&deps).await;
         assert!(summary.libraries_scanned >= 1);
+    }
+
+    /// Review finding 1 (opus, MUSEM-06 REQUEST_CHANGES) — the serious one:
+    /// a worker-originated grab's `download_queue` row must carry
+    /// `monitored_item_id` (via `FulfillOptions`, threaded through
+    /// `fulfill_request`/`grab_and_persist`), not just `request_id` — proven
+    /// end to end here by running `run_wanted_pass` TWICE against the same
+    /// seeded item and asserting the second pass writes no second queue row,
+    /// no second request, and never even re-searches (touches
+    /// `last_search_at`). Every assertion below is scoped to this test's own
+    /// `monitored_item_id`/exact `note` text, so it stays correct regardless
+    /// of whatever else is wanted in the shared test database concurrently.
+    #[tokio::test]
+    async fn second_pass_skips_an_item_whose_first_pass_grab_is_still_queued() {
+        let Some(pool) =
+            test_pool_or_skip("second_pass_skips_an_item_whose_first_pass_grab_is_still_queued").await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let library = seed_library(&pool).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+        let item = seed_wanted_item(&pool, &library, Some(profile_id)).await;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/search");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(search_response_body(
+                    "musem06-idempotent-guid",
+                    &format!("{}.2020.1080p.WEB-DL", item.title),
+                ));
+        });
+        let prowlarr = ProwlarrClient::new(server.base_url(), "test-key").expect("client");
+        let config = Config {
+            arr_request_auto_tier_enabled: true,
+            ..test_config()
+        };
+        let download = MockDownloadClient::new();
+        let deps = WantedPassDeps {
+            pool: &pool,
+            config: &config,
+            prowlarr: Some(&prowlarr),
+            download: Some(&download),
+        };
+
+        // Pass 1: exercises the full pass (not just process_wanted_item
+        // directly) so the grab really goes through fulfill_request's real
+        // enqueue path.
+        run_wanted_pass(&deps).await;
+
+        let queue_count_after_pass1: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM download_queue WHERE monitored_item_id = $1")
+                .bind(item.monitored_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count download_queue rows after pass 1");
+        assert_eq!(
+            queue_count_after_pass1, 1,
+            "the worker's grab must write a download_queue row with monitored_item_id set -- if \
+             this is 0, the row was written with only request_id set (the original bug) and this \
+             query can never find it"
+        );
+
+        let monitored_after_pass1 = repo::acquisition::get_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("reload monitored_item after pass 1");
+        assert!(
+            monitored_after_pass1.last_search_at.is_some(),
+            "pass 1 must have actually searched (and thus touched last_search_at)"
+        );
+
+        // Pass 2: the already-queued idempotency check must short-circuit
+        // this item before anything else -- no second search, no second
+        // grab, no duplicate rows.
+        run_wanted_pass(&deps).await;
+
+        let queue_count_after_pass2: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM download_queue WHERE monitored_item_id = $1")
+                .bind(item.monitored_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count download_queue rows after pass 2");
+        assert_eq!(
+            queue_count_after_pass2, 1,
+            "a second pass must never write a second download_queue row for an item that's \
+             already active in the queue"
+        );
+
+        let request_count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_requests WHERE note = $1")
+            .bind(format!(
+                "MUSEM-06 wanted worker: monitored_item_id={}",
+                item.monitored_item_id
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("count media_requests rows for this monitored item");
+        assert_eq!(
+            request_count, 1,
+            "a second pass must never persist a second media_request for an already-queued item"
+        );
+
+        let monitored_after_pass2 = repo::acquisition::get_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("reload monitored_item after pass 2");
+        assert_eq!(
+            monitored_after_pass2.last_search_at, monitored_after_pass1.last_search_at,
+            "the already-queued short-circuit happens BEFORE the cooldown/search logic, so a \
+             second pass must never touch last_search_at for an already-queued item"
+        );
     }
 }

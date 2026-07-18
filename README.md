@@ -361,13 +361,27 @@ second tiering rule. Only an `AutoApprovable` item (the operator opted in via
 `Config::arr_request_auto_tier_enabled` AND the search actually confirmed it's grabbable now)
 reaches `acquisition::fulfill_request` (MUSEM-05) at all; every other item still gets a
 `media_requests` row persisted at `RequestStatus::Requested` for manual/operator follow-up —
-never a silent grab. It is capped two ways per pass (`Config::wanted_max_grabs_per_pass`,
-default 5; `Config::wanted_max_searches_per_pass`, default 20) on top of the shared
-`ProwlarrClient` `RateLimiter`'s own hourly search budget, idempotent (an item already
-`queued`/`downloading` in `download_queue`, via the new
-`repo::acquisition::is_monitored_item_active_in_queue` check, is skipped, never re-grabbed), and
-non-blocking (an unreachable Prowlarr/qBittorrent, a DB hiccup, or a metadata row deleted mid-pass
-is logged and the pass moves on to the next item — never a panic, never an aborted pass).
+never a silent grab, including when there's no capability to even search (no Prowlarr configured,
+or no `quality_profile_id` on the monitored row).
+
+**Exactly one real Prowlarr search per wanted item.** `fulfill_request` normally runs its own
+on-demand search; the worker instead hands it the candidates it already fetched via a new
+`FulfillOptions::prefetched_candidates` field, so an `AutoApprovable` item is never searched
+twice. This is what makes `Config::wanted_max_searches_per_pass` (default 20) an honest bound on
+actual Prowlarr calls, not just on how many items get *considered* — on top of the shared
+`ProwlarrClient` `RateLimiter`'s own hourly search budget. `Config::wanted_max_grabs_per_pass`
+(default 5) separately caps grabs.
+
+**Idempotent across passes.** A worker-originated grab's `download_queue` row carries BOTH
+`request_id` and `monitored_item_id` (`FulfillOptions::monitored_item_id` →
+`DownloadSource::Both`, threaded through `fulfill_request`/`grab_and_persist`) — not just
+`request_id` the way `POST /requests`' grabs do — so `repo::acquisition::
+is_monitored_item_active_in_queue`'s `monitored_item_id`-keyed check actually finds it, and an
+item already `queued`/`downloading` is skipped on every subsequent pass, never re-searched or
+re-grabbed.
+
+Non-blocking: an unreachable Prowlarr/qBittorrent, a DB hiccup, or a metadata row deleted mid-pass
+is logged and the pass moves on to the next item — never a panic, never an aborted pass.
 
 `run_wanted_pass` is itself gated on `ExperienceSettings.acquisition.enabled` (the same master
 gate `fulfill_request` enforces unbypassably as its own first action) — checked again here purely

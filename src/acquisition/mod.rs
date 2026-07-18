@@ -179,6 +179,34 @@ pub enum FulfillOutcome {
     },
 }
 
+/// Optional extras a caller of [`fulfill_request`] can thread through —
+/// `FulfillOptions::default()` (both fields `None`) reproduces the original
+/// MUSEM-05 behavior exactly (a fresh on-demand search, a `download_queue`
+/// row sourced from the request alone), which is what `POST /requests`,
+/// `approve`, and [`AcquisitionSink`] all still pass.
+///
+/// Added for MUSEM-06's wanted worker (review findings on the initial
+/// MUSEM-06 push):
+/// - `monitored_item_id` — when set, the `download_queue` row a `Grab`
+///   writes carries BOTH `request_id` and `monitored_item_id`
+///   (`DownloadSource::Both`), not just `request_id`. Without this, a
+///   worker-originated grab's queue row is invisible to
+///   `repo::acquisition::is_monitored_item_active_in_queue`'s
+///   `monitored_item_id`-keyed lookup, and the wanted worker re-searches/
+///   re-grabs the same item every pass.
+/// - `prefetched_candidates` — when set, `fulfill_request` scores these
+///   candidates directly instead of running its own on-demand Prowlarr
+///   search. The wanted worker already runs a real search to build the
+///   `Availability` signal `classify_tier` needs before ever calling this
+///   function; without this, `fulfill_request` would search AGAIN for the
+///   same title, silently doubling the worker's real Prowlarr call count
+///   and defeating its own per-pass search cap.
+#[derive(Debug, Clone, Default)]
+pub struct FulfillOptions {
+    pub monitored_item_id: Option<i64>,
+    pub prefetched_candidates: Option<Vec<SearchRelease>>,
+}
+
 /// THE orchestrator: search (MUSEM-03) → decide (MUSEM-04) → grab
 /// (MUSEM-02) → persist `download_queue` + `history_events` (MUSEM-01), for
 /// one already-created [`MediaRequest`] row. Called both from the
@@ -187,6 +215,7 @@ pub enum FulfillOutcome {
 pub async fn fulfill_request(
     deps: &AcquisitionDeps<'_>,
     request: &MediaRequest,
+    options: &FulfillOptions,
 ) -> MuseResult<FulfillOutcome> {
     // Review finding 1 (codex, MUSEM-05 REQUEST_CHANGES): the master
     // acquisition gate (`ExperienceSettings.acquisition.enabled`) MUST be
@@ -204,11 +233,14 @@ pub async fn fulfill_request(
         });
     }
 
-    let Some(prowlarr) = deps.prowlarr else {
+    // A prefetched candidate list (the wanted worker's own already-run
+    // search) makes a configured `ProwlarrClient` unnecessary here — only
+    // check for one when this call will need to run its own search below.
+    if options.prefetched_candidates.is_none() && deps.prowlarr.is_none() {
         return Ok(FulfillOutcome::Skipped {
             reason: "prowlarr is not configured; cannot search for releases".to_string(),
         });
-    };
+    }
 
     let Some(quality_profile_id) = request.quality_profile_id else {
         return Ok(FulfillOutcome::Skipped {
@@ -234,7 +266,18 @@ pub async fn fulfill_request(
     let format_scores =
         repo::quality::list_profile_format_scores(deps.pool, quality_profile_id).await?;
 
-    let candidates = search_candidates(prowlarr, deps.config, &request.title, &request.media_kind).await?;
+    let candidates = match &options.prefetched_candidates {
+        Some(prefetched) => prefetched.clone(),
+        None => {
+            // Guaranteed `Some` here: the early-return check above already
+            // ensured `deps.prowlarr` is configured whenever
+            // `prefetched_candidates` is `None`.
+            let prowlarr = deps
+                .prowlarr
+                .expect("prowlarr must be configured when prefetched_candidates is None (checked above)");
+            search_candidates(prowlarr, deps.config, &request.title, &request.media_kind).await?
+        }
+    };
 
     let scored: Vec<(SearchRelease, Release)> = candidates
         .iter()
@@ -257,8 +300,15 @@ pub async fn fulfill_request(
     match decision {
         Decision::Grab(choice) => {
             let matched = scored.iter().find(|(_, r)| r.guid == choice.release.guid);
-            match grab_and_persist(deps.pool, download, request.id, &choice, matched.map(|(sr, _)| sr))
-                .await
+            match grab_and_persist(
+                deps.pool,
+                download,
+                request.id,
+                options.monitored_item_id,
+                &choice,
+                matched.map(|(sr, _)| sr),
+            )
+            .await
             {
                 Ok(entry) => {
                     repo::acquisition::update_request_status(
@@ -267,8 +317,14 @@ pub async fn fulfill_request(
                         RequestStatus::Grabbed.as_str(),
                     )
                     .await?;
-                    record_history_grabbed(deps.pool, request, &entry, matched.map(|(sr, _)| sr))
-                        .await?;
+                    record_history_grabbed(
+                        deps.pool,
+                        request,
+                        options.monitored_item_id,
+                        &entry,
+                        matched.map(|(sr, _)| sr),
+                    )
+                    .await?;
                     Ok(FulfillOutcome::Grabbed {
                         queue_id: entry.id,
                         hash: entry.client_hash,
@@ -336,16 +392,32 @@ async fn grab_and_persist(
     pool: &PgPool,
     download: &dyn DownloadClient,
     request_id: i64,
+    monitored_item_id: Option<i64>,
     choice: &ReleaseChoice,
     matched: Option<&SearchRelease>,
 ) -> MuseResult<DownloadQueueEntry> {
     let url = resolve_grab_url(choice)?;
     let receipt = download.add(GrabRequest::new(url)).await?;
 
+    // Review finding 1 (opus, MUSEM-06 REQUEST_CHANGES): a worker-originated
+    // grab must carry `monitored_item_id` on the `download_queue` row (in
+    // addition to `request_id`), not just `request_id` alone — otherwise
+    // `repo::acquisition::is_monitored_item_active_in_queue`'s
+    // `monitored_item_id`-keyed idempotency check can never find it, and
+    // the wanted worker re-searches/re-grabs the same item every pass. See
+    // `FulfillOptions::monitored_item_id`'s doc.
+    let source = match monitored_item_id {
+        Some(monitored_item_id) => DownloadSource::Both {
+            request_id,
+            monitored_item_id,
+        },
+        None => DownloadSource::Request(request_id),
+    };
+
     repo::acquisition::enqueue_download(
         pool,
         &NewDownloadQueueEntry {
-            source: DownloadSource::Request(request_id),
+            source,
             release_guid: choice.release.guid.clone(),
             release_title: choice.release.title.clone(),
             indexer: matched.and_then(|sr| sr.indexer.clone()),
@@ -361,6 +433,7 @@ async fn grab_and_persist(
 async fn record_history_grabbed(
     pool: &PgPool,
     request: &MediaRequest,
+    monitored_item_id: Option<i64>,
     entry: &DownloadQueueEntry,
     matched: Option<&SearchRelease>,
 ) -> MuseResult<()> {
@@ -369,7 +442,7 @@ async fn record_history_grabbed(
         &NewHistoryEvent {
             event_type: HistoryEventType::Grabbed.as_str().to_string(),
             media_metadata_id: None,
-            monitored_item_id: None,
+            monitored_item_id,
             download_id: entry.client_hash.clone(),
             source_title: Some(entry.release_title.clone()),
             quality: None,
@@ -445,7 +518,7 @@ impl MediaRequestSink for AcquisitionSink {
         // a terminal, accurate state either way, so `submit`'s only
         // failure mode here is a genuine infra error (already `?`-
         // propagated by `fulfill_request` for the DB calls it makes).
-        fulfill_request(&deps, &request).await?;
+        fulfill_request(&deps, &request, &FulfillOptions::default()).await?;
         Ok(())
     }
 }
@@ -706,7 +779,7 @@ mod db_gated {
             download: Some(&download),
         };
 
-        let outcome = fulfill_request(&deps, &request).await.expect("fulfill_request");
+        let outcome = fulfill_request(&deps, &request, &FulfillOptions::default()).await.expect("fulfill_request");
         match outcome {
             FulfillOutcome::Grabbed { queue_id, .. } => {
                 let entry = repo::acquisition::get_download_queue_entry(&pool, queue_id)
@@ -781,7 +854,7 @@ mod db_gated {
             download: Some(&download),
         };
 
-        let outcome = fulfill_request(&deps, &request).await.expect("fulfill_request");
+        let outcome = fulfill_request(&deps, &request, &FulfillOptions::default()).await.expect("fulfill_request");
         assert!(matches!(outcome, FulfillOutcome::Rejected { .. }));
         assert_eq!(download.added_count(), 0, "a rejected decision must never grab");
 
@@ -849,7 +922,7 @@ mod db_gated {
             download: Some(&download),
         };
 
-        let outcome = fulfill_request(&deps, &request).await.expect("fulfill_request must not error");
+        let outcome = fulfill_request(&deps, &request, &FulfillOptions::default()).await.expect("fulfill_request must not error");
         assert!(matches!(outcome, FulfillOutcome::Rejected { .. }));
 
         let reloaded = repo::acquisition::get_request(&pool, request.id).await.expect("reload request");
@@ -886,7 +959,7 @@ mod db_gated {
             download: Some(&download),
         };
 
-        let outcome = fulfill_request(&deps, &request).await.expect("fulfill_request");
+        let outcome = fulfill_request(&deps, &request, &FulfillOptions::default()).await.expect("fulfill_request");
         assert!(matches!(outcome, FulfillOutcome::Skipped { .. }));
         assert_eq!(download.added_count(), 0);
 
@@ -932,7 +1005,7 @@ mod db_gated {
             download: Some(&download),
         };
 
-        let outcome = fulfill_request(&deps, &request).await.expect("fulfill_request");
+        let outcome = fulfill_request(&deps, &request, &FulfillOptions::default()).await.expect("fulfill_request");
         assert!(
             matches!(outcome, FulfillOutcome::Skipped { .. }),
             "expected Skipped with the master gate off, got {outcome:?}"

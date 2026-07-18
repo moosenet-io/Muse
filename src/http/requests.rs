@@ -25,7 +25,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::acquisition::{fulfill_request, media_kind_str, AcquisitionDeps, FulfillOutcome};
+use crate::acquisition::{fulfill_request, media_kind_str, AcquisitionDeps, FulfillOptions, FulfillOutcome};
 use crate::arr::request::{classify_tier, RequestTier};
 use crate::download::DownloadClient;
 use crate::error::{MuseError, MuseResult};
@@ -172,7 +172,7 @@ pub async fn create_request_handler(
             prowlarr: state.prowlarr.as_ref(),
             download: download_client_ref(&state),
         };
-        Some(fulfill_request(&deps, &request).await?)
+        Some(fulfill_request(&deps, &request, &FulfillOptions::default()).await?)
     } else {
         None
     };
@@ -266,7 +266,7 @@ pub async fn approve_request_handler(
     // every other precondition) as the single grab chokepoint — see its own
     // doc — so this handler doesn't need (and must not duplicate) a
     // separate settings check here.
-    let outcome = fulfill_request(&deps, &request).await?;
+    let outcome = fulfill_request(&deps, &request, &FulfillOptions::default()).await?;
     let final_request = repo::acquisition::get_request(&state.pool, id).await?;
 
     Ok(Json(RequestResponse {

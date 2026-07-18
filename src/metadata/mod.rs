@@ -61,15 +61,17 @@ pub struct ProviderMetadata {
     pub network: Option<String>,
     /// TMDb-style free-text keywords (e.g. "time travel", "based on a
     /// novel"). Added post-A1 (MUSEL-A2) as an additive, `Default`-backed
-    /// field — no existing caller/test constructs a `ProviderMetadata`
-    /// positionally, so this doesn't break `MockMetadataProvider` or the
-    /// A1 tests above. No concrete provider populates it yet (neither
-    /// `TvdbClient` nor the MUSEL-A2 `TmdbClient` adapter fetch a
-    /// keywords endpoint) — it exists so `resolve_and_merge`'s merge and
-    /// `repo::media_metadata::apply_enrichment`'s persistence path are
-    /// already wired for it, ready for a provider to start populating it
-    /// without another schema-shape change.
+    /// field. No concrete provider populates it yet — it exists so
+    /// `resolve_and_merge`'s merge and `repo::media_metadata::apply_enrichment`'s
+    /// persistence path are already wired for it.
     pub keywords: Vec<String>,
+    /// Runtime in minutes, where the provider states one. `None` both when
+    /// the provider has no runtime for this title and when the concrete
+    /// [`MetadataProvider`] implementation doesn't parse it yet (as of
+    /// MUSEL-C2, TheTVDB v4's shapes this crate deserializes don't carry
+    /// `averageRuntime`/`runtime`). Added for MUSEL-C2's `verify_match`
+    /// runtime-consistency signal (`matching::verify`).
+    pub runtime_minutes: Option<i32>,
 }
 
 /// A provider of normalized title metadata. Read-only: no method on this

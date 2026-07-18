@@ -52,7 +52,7 @@ Subsystem map (source module → concern):
 | `plex/` | Read-only Plex API client (libraries, sessions, ratings, watchlist, artwork) |
 | `tracker/` | **Native Tautulli-replacement**: webhook receiver + session poller + reconstruction |
 | `tautulli/` | One-time Tautulli history backfill importer |
-| `prowlarr/` | Availability report-pull worker (indexer sync, RSS pull, release parse, rollup) |
+| `prowlarr/` | Availability report-pull worker (indexer sync, RSS pull, release parse, rollup) + on-demand targeted search (`search_releases`) |
 | `trending/` | TMDb trending/population feed + streaming-availability |
 | `embed/` | Local embedding pipeline (`nomic-embed-text` → pgvector) + cosine recall primitive |
 | `recall/` | Vector-recall search API (`/query/resolve`, `/query/similar`) |
@@ -66,6 +66,40 @@ Subsystem map (source module → concern):
 | `streaming/` | ffmpeg channel streaming engine (`/auto/v{id}`) |
 | `web/` | Channel-guide web page + JSON API + artwork proxy |
 | `plex_control/` | Plex Companion cast/play-queue client (library-only, unwired — see below) |
+
+## Acquisition domain schema (MUSEM-01)
+
+Muse today is a *read-only* observer of the operator's Radarr/Sonarr/Prowlarr fleet (`arr/`,
+`prowlarr/`). `migrations/0104_acquisition_domain.sql` lays the **schema + repository foundation**
+(`src/models/acquisition.rs`, `src/repo/acquisition.rs`) for a native write-path — monitoring
+("wanted"), requests, the download queue, typed history, and a blocklist — mirroring the
+Radarr/Sonarr data model (`quality` is a compound `{quality, revision}` value, custom formats are a
+named scored-matcher registry, history is typed `jsonb`, provider IDs are a keyed map). **This item
+is schema/repo only: no workers, no HTTP endpoints, nothing wired into a running deployment yet**
+(see "Wiring status" below and the later MUSEM items for the write path itself).
+
+Tables added:
+
+| Table | Purpose |
+|---|---|
+| `monitored_items` | The "wanted" driver — monitoring a title within a `library`, decoupled from whether a `media_items`/file exists yet |
+| `media_requests` | <media-service>-style request lifecycle (`requested → approved/denied → searching → grabbed → available`) |
+| `download_queue` | One row per in-flight/terminal grab; requires at least one of `request_id`/`monitored_item_id` (`download_queue_has_source` CHECK) |
+| `history_events` | Typed history (`event_type`-keyed `jsonb` payload), correlated to a download via `download_id` |
+| `blocklist` | Releases/hashes a future decision engine must never re-grab |
+
+The pre-existing quality-domain tables (`quality_definitions`, `quality_profiles`, `custom_formats`,
+`quality_profile_formats` — added in MUSE-02, `src/models/quality.rs` / `src/repo/quality.rs`) are
+reused by FK, **not redefined** — see the migration's header comment for why. `media_requests.kind`
+and the `status`/`event_type` columns are plain `text` (not a Postgres enum type) so a future
+`'music'` kind or a new status value never needs an `ALTER TYPE`; `src/models/acquisition.rs`
+provides the validated Rust-side enums (`RequestStatus`, `QueueStatus`, `HistoryEventType`) with
+`as_str()`/`FromStr` conversions.
+
+The hot "wanted" scan is `repo::acquisition::list_wanted(pool, library_id)`: everything monitored
+in a library that either has no file yet, or whose best on-disk file quality is strictly below its
+quality profile's cutoff (compared via `quality_definitions.sort_order`, never raw quality-tier
+ids, which are historical/non-contiguous per the blueprint).
 
 ## Running
 
@@ -116,6 +150,7 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_PROWLARR_TV_CATEGORIES` | `5000` | Comma-separated Newznab parent category ids treated as TV. |
 | `MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE` | `0.5` | Minimum release-name parse confidence before resolving a release to a title. |
 | `MUSE_RELEASE_EXPIRY_DAYS` | `21` | How long a rolling `releases` snapshot row lives before it's pruned. |
+| `MUSE_PROWLARR_SEARCH_MAX_PER_HOUR` | `30` | Rolling hourly cap on on-demand targeted searches (`prowlarr::search_releases`), shared with the report-pull worker's rate limiter. |
 | `MUSE_PUBLIC_URL` | *(none)* | LAN-reachable base URL advertised by the tuner (`/discover.json`, `/muse.m3u` stream URLs). Degrades to `http://{bind_addr}` (only correct when `bind_addr` is a real LAN address). |
 | `MUSE_HDHR_DEVICE_ID` | `MUSE0001` | HDHomeRun-emulation device id advertised in `/discover.json`. |
 | `MUSE_CHANNEL_GUIDE_WINDOW_HOURS` | `48` | Rolling linear-guide window the director keeps `channel_programs` filled to; also the XMLTV render window. |
@@ -242,6 +277,8 @@ some capabilities need a manual invocation or a future worker/route to become li
 - `channels::compose_channel_run` — the on-demand pseudo-TV director. Fully implemented + tested, but no HTTP route mounts it (the *linear* tuner uses its own `tuner::scheduler` grid-filler instead).
 - `enrichment::EnrichmentService::enrich_media_item` — external-enrichment cache population. Wired object on `AppState`, but nothing calls it outside tests.
 - `plex_control::*` — Plex Companion cast/play-queue client. Declared as a module but **not mounted anywhere** and never called — library-only, and never exercised against a real Plex server.
+- `repo::acquisition::*` (MUSEM-01) — the acquisition-domain schema + repository layer (monitoring/requests/download-queue/history/blocklist). No worker, decision engine, download-client adapter, or HTTP route calls any of it yet — this item is the write-path *foundation* only; see later MUSEM items in `specs/S119-muse-media-management.md`.
+- `prowlarr::search_releases` — on-demand targeted Prowlarr search (MUSEM-03). No HTTP route or worker calls it yet; it's the input the release-decision/scoring engine (MUSEM-04) is expected to drive, not a standalone entry point in this change.
 
 Consequence: in a fresh deployment with a fully populated library and Ollama/Chord configured,
 `/recommend`'s taste tier, `proactive`'s `friday_evening`, and `zeitgeist` will silently return

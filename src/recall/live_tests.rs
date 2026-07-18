@@ -45,6 +45,7 @@ fn degraded_state(pool: sqlx::PgPool) -> Arc<AppState> {
         arr_instances: Vec::new(),
         tmdb: None,
         embed: None,
+        download: None,
     })
 }
 

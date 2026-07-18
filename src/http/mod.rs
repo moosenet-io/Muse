@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod ops;
+pub mod requests;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +64,15 @@ pub struct AppState {
     /// `None` when `MUSE_OLLAMA_URL` isn't configured — the vector tier
     /// degrades to skipped, falling through to pg_trgm.
     pub embed: Option<OllamaEmbedClient>,
+    /// MUSEM-05: the qBittorrent download client the request-lifecycle
+    /// endpoints (`crate::http::requests`) grab through. `None` when
+    /// `MUSE_QBIT_URL`/`MUSE_QBIT_USER`/`MUSE_QBIT_PASS` aren't fully
+    /// configured — same graceful-degrade posture as every other optional
+    /// integration on this struct: the request endpoints still persist
+    /// requests, they just can never fulfill one (see
+    /// `crate::acquisition::fulfill_request`'s "download client
+    /// unavailable" path).
+    pub download: Option<crate::download::qbit::QbitClient>,
 }
 
 /// Timeout for the `/health` DB probe — health must never hang/500 just
@@ -169,6 +179,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // enumerate any account's taste data by numeric id). Moved from the
         // open router into `protected` so `auth::require_api_token` gates them.
         .nest("/recommend", recommend_routes())
+        // MUSEM-05: the request lifecycle (`POST /requests`, `GET /requests`,
+        // `POST /requests/:id/approve`, `POST /requests/:id/deny`) — can
+        // trigger a real download-client grab and serves request/lifecycle
+        // data, so it is gated the same as `/recommend*` above.
+        .nest("/requests", request_routes())
         .route_layer(auth_layer);
 
     Router::new()
@@ -277,6 +292,19 @@ fn recommend_routes() -> Router<Arc<AppState>> {
         .route("/", post(crate::curation::recommend_handler))
         .route("/on_deck", get(crate::curation::on_deck_handler))
         .route("/gaps", get(crate::curation::gaps_handler))
+}
+
+/// MUSEM-05: `POST /requests` (mounted at nest root), `GET /requests`,
+/// `POST /requests/:id/approve`, `POST /requests/:id/deny` — see
+/// `crate::http::requests`.
+fn request_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/",
+            post(requests::create_request_handler).get(requests::list_requests_handler),
+        )
+        .route("/:id/approve", post(requests::approve_request_handler))
+        .route("/:id/deny", post(requests::deny_request_handler))
 }
 
 async fn not_implemented() -> MuseError {

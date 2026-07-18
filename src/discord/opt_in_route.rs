@@ -220,6 +220,7 @@ mod db_gated {
             arr_instances: Vec::new(),
             tmdb: None,
             embed: None,
+            download: None,
         })
     }
 

@@ -657,6 +657,7 @@ mod tests {
             ),
             tmdb: None,
             embed: None,
+            download: None,
         };
 
         let summary = run_tick(&state).await.expect("run_tick should succeed");

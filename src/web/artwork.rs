@@ -218,6 +218,7 @@ mod tests {
             enrichment: crate::enrichment::EnrichmentService::from_config(&config),
             tmdb: None,
             embed: None,
+            download: None,
         });
 
         // First request: cache miss, fetches from (mocked) Plex.
@@ -319,6 +320,7 @@ mod tests {
             enrichment: crate::enrichment::EnrichmentService::from_config(&config),
             tmdb: None,
             embed: None,
+            download: None,
         });
 
         let resp = art_handler(

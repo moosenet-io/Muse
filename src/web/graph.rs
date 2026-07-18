@@ -445,6 +445,7 @@ mod tests {
             arr_instances: Vec::new(),
             tmdb: None,
             embed: None,
+            download: None,
         })
     }
 
@@ -579,6 +580,7 @@ mod tests {
                 arr_instances: Vec::new(),
                 tmdb: None,
                 embed: None,
+                download: None,
             })
         }
 

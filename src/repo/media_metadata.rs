@@ -145,6 +145,20 @@ pub async fn find_by_tmdb_id(
         .map_err(MuseError::Database)
 }
 
+/// MUSEL-B1: resolve a provider `tvdb_id` (+ kind) to an existing
+/// `media_metadata.id`, the TVDB-equivalent of [`find_by_tmdb_id`] above —
+/// used by the library scanner to match a file whose path carries a
+/// `{tvdb-NNNN}` id tag (the Sonarr/Radarr folder-naming convention) against
+/// an already-cataloged row, without ever creating a new one.
+pub async fn find_by_tvdb_id(pool: &PgPool, kind: MediaKind, tvdb_id: &str) -> MuseResult<Option<i64>> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM media_metadata WHERE kind = $1 AND tvdb_id = $2")
+        .bind(kind)
+        .bind(tvdb_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}
+
 /// Best-effort resolve a parsed release (title + optional year) to an
 /// existing `media_metadata` row via an exact, case-insensitive title match
 /// (+ year equality when a year was parsed). Used by the Prowlarr

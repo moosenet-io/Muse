@@ -77,8 +77,15 @@ CREATE INDEX ON media_requests (status);
 -- monitor).
 CREATE TABLE download_queue (
     id                  bigserial PRIMARY KEY,
-    request_id          bigint REFERENCES media_requests(id) ON DELETE SET NULL,
-    monitored_item_id   bigint REFERENCES monitored_items(id) ON DELETE SET NULL,
+    -- CASCADE (not SET NULL): a download_queue row is transient (an in-flight
+    -- grab) and MUST keep at least one source (the download_queue_has_source
+    -- CHECK below). SET NULL on the sole-source case would null the only source
+    -- column and violate that CHECK, blocking the parent delete (MUSEM-01
+    -- review, codex). CASCADE instead cancels/removes the transient queue row
+    -- when its driver is deleted; the permanent audit trail is history_events
+    -- (nullable refs, no such CHECK), which survives the delete.
+    request_id          bigint REFERENCES media_requests(id) ON DELETE CASCADE,
+    monitored_item_id   bigint REFERENCES monitored_items(id) ON DELETE CASCADE,
     release_guid        text NOT NULL,
     release_title       text NOT NULL,
     indexer             text,

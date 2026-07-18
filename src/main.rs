@@ -31,6 +31,7 @@ mod integration_tests;
 pub mod kg;
 pub mod maintenance;
 pub mod matching;
+pub mod metadata;
 mod metrics;
 pub mod models;
 mod parity;

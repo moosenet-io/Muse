@@ -65,6 +65,31 @@ pub struct Config {
     pub ollama_url: Option<String>,
     pub chord_url: Option<String>,
 
+    // --- MUSEL-A1: TheTVDB v4 metadata provider (`metadata::tvdb::TvdbClient`).
+    // All three read together; see `Config::tvdb`. ---
+    /// TheTVDB v4 API key (`MUSE_TVDB_API_KEY`), <secret-manager>-materialized at
+    /// runtime, never a literal (S1/S7). `None` means the TVDB metadata
+    /// provider is unconfigured/inert — `TvdbClient::from_config` returns
+    /// `None`, same graceful-degrade posture as `Config::tmdb_api_key`.
+    /// Wrapped in `QbitPassword` (S7 review finding) so a stray
+    /// `{:?}`/`tracing::debug!(config = ?cfg, ..)` on this `Config` can't
+    /// print the real key — same posture `qbit_pass` below already has.
+    /// (`tmdb_api_key`/`plex_token` above remain plain `Option<String>` —
+    /// a pre-existing gap this fix does not touch; see the MUSEL-A1
+    /// worktree report.)
+    pub tvdb_api_key: Option<QbitPassword>,
+    /// Optional TheTVDB v4 subscriber PIN (`MUSE_TVDB_PIN`), paired with
+    /// `tvdb_api_key` for subscription-model keys. Independently optional —
+    /// most standard API keys don't need one. Also secret-shaped, also
+    /// wrapped.
+    pub tvdb_pin: Option<QbitPassword>,
+    /// TheTVDB v4 API base URL override (`MUSE_TVDB_BASE_URL`). `None` (the
+    /// default) means `metadata::tvdb::TvdbClient::from_config` uses
+    /// TheTVDB's real host. Not secret-shaped — a host, not a credential;
+    /// exists so a test/on-prem proxy can point the client elsewhere, same
+    /// seam `Config::trakt_base_url` provides for Trakt.
+    pub tvdb_base_url: Option<String>,
+
     /// MUSE-14: fleet SearXNG instance base URL, used for forum/critic
     /// sentiment + "does it get good" enrichment queries. `None` disables
     /// that enrichment source (graceful degrade, same posture as every
@@ -485,6 +510,9 @@ impl Config {
             tmdb_api_key: env_opt("TMDB_API_KEY"),
             ollama_url: env_opt("MUSE_OLLAMA_URL"),
             chord_url: env_opt("CHORD_URL"),
+            tvdb_api_key: env_opt("MUSE_TVDB_API_KEY").map(QbitPassword::from),
+            tvdb_pin: env_opt("MUSE_TVDB_PIN").map(QbitPassword::from),
+            tvdb_base_url: env_opt("MUSE_TVDB_BASE_URL"),
             searxng_url: env_opt("MUSE_SEARXNG_URL"),
             news_url: env_opt("MUSE_NEWS_URL"),
             news_api_key: env_opt("MUSE_NEWS_API_KEY"),
@@ -616,6 +644,25 @@ impl Config {
             pass: self.qbit_pass.clone()?,
         })
     }
+
+    /// Assembles [`crate::metadata::config::TvdbConfig`] from the
+    /// already-loaded `MUSE_TVDB_*` fields. Returns `None` (not an error)
+    /// when `tvdb_api_key` is unset — same posture as [`Self::qbit`]: TVDB
+    /// metadata is an optional, gracefully degrading dependency. This is
+    /// the only place `tvdb_base_url`'s "empty means the real API host"
+    /// default is applied; callers (`metadata::tvdb::TvdbClient::from_config`)
+    /// never read the env themselves.
+    pub fn tvdb(&self) -> Option<crate::metadata::config::TvdbConfig> {
+        let api_key = self.tvdb_api_key.clone()?;
+        Some(crate::metadata::config::TvdbConfig {
+            base_url: self
+                .tvdb_base_url
+                .clone()
+                .unwrap_or_else(|| crate::metadata::tvdb::DEFAULT_BASE_URL.to_string()),
+            api_key,
+            pin: self.tvdb_pin.clone(),
+        })
+    }
 }
 
 /// Test/scaffold convenience -- NOT used by `from_env`, which always reads
@@ -643,6 +690,9 @@ impl Default for Config {
             tmdb_api_key: None,
             ollama_url: None,
             chord_url: None,
+            tvdb_api_key: None,
+            tvdb_pin: None,
+            tvdb_base_url: None,
             arr_instances_json: None,
             qbit_url: None,
             qbit_user: None,
@@ -774,6 +824,9 @@ mod tests {
             "TMDB_API_KEY",
             "MUSE_OLLAMA_URL",
             "CHORD_URL",
+            "MUSE_TVDB_API_KEY",
+            "MUSE_TVDB_PIN",
+            "MUSE_TVDB_BASE_URL",
             "MUSE_SEARXNG_URL",
             "MUSE_NEWS_URL",
             "MUSE_NEWS_API_KEY",
@@ -830,6 +883,9 @@ mod tests {
         assert!(cfg.plex_url.is_none());
         assert!(cfg.plex_poll_secs.is_none());
         assert!(cfg.tmdb_api_key.is_none());
+        assert!(cfg.tvdb_api_key.is_none());
+        assert!(cfg.tvdb_pin.is_none());
+        assert!(cfg.tvdb_base_url.is_none());
         assert!(cfg.arr_instances_json.is_none());
         assert!(cfg
             .arr_instances()
@@ -902,6 +958,47 @@ mod tests {
         assert!((cfg.kg_taste_neighbor_threshold - 0.72).abs() < f32::EPSILON);
 
         std::env::remove_var("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD");
+    }
+
+    #[test]
+    #[serial]
+    fn musela1_tvdb_config_none_when_api_key_unset() {
+        std::env::remove_var("MUSE_TVDB_API_KEY");
+        let cfg = Config::from_env();
+        assert!(cfg.tvdb().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn musela1_tvdb_config_reads_key_pin_and_base_url_override() {
+        std::env::set_var("MUSE_TVDB_API_KEY", "tvdb-key");
+        std::env::set_var("MUSE_TVDB_PIN", "4242");
+        std::env::set_var("MUSE_TVDB_BASE_URL", "http://tvdb.test.invalid/v4");
+
+        let cfg = Config::from_env();
+        let tvdb = cfg.tvdb().expect("tvdb config should be Some");
+
+        assert_eq!(tvdb.api_key.expose(), "tvdb-key");
+        assert_eq!(tvdb.pin.as_ref().map(|p| p.expose()), Some("4242"));
+        assert_eq!(tvdb.base_url, "http://tvdb.test.invalid/v4");
+
+        std::env::remove_var("MUSE_TVDB_API_KEY");
+        std::env::remove_var("MUSE_TVDB_PIN");
+        std::env::remove_var("MUSE_TVDB_BASE_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn musela1_tvdb_config_defaults_base_url_when_unset() {
+        std::env::set_var("MUSE_TVDB_API_KEY", "tvdb-key");
+        std::env::remove_var("MUSE_TVDB_BASE_URL");
+
+        let cfg = Config::from_env();
+        let tvdb = cfg.tvdb().expect("tvdb config should be Some");
+
+        assert_eq!(tvdb.base_url, crate::metadata::tvdb::DEFAULT_BASE_URL);
+
+        std::env::remove_var("MUSE_TVDB_API_KEY");
     }
 
     #[test]

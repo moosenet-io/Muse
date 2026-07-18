@@ -14,6 +14,7 @@
 //! migrations and summarized in each module here.
 
 pub mod account;
+pub mod acquisition;
 pub mod artwork_cache;
 pub mod availability;
 pub mod channel;
@@ -41,6 +42,12 @@ pub mod trending;
 pub mod watch_stats;
 
 pub use account::Account;
+pub use acquisition::{
+    BlocklistEntry, DownloadQueueEntry, DownloadSource, HistoryEvent, HistoryEventType,
+    MediaRequest, MonitoredItem, NewBlocklistEntry, NewDownloadQueueEntry, NewHistoryEvent,
+    NewMediaRequest, NewMonitoredItem, QualityRevision, QualityStamp, QueueStatus, RequestStatus,
+    WantedItem,
+};
 pub use artwork_cache::ArtworkCache;
 pub use availability::Availability;
 pub use channel::{

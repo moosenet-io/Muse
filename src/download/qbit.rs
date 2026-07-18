@@ -175,35 +175,41 @@ impl QbitClient {
 
 #[async_trait::async_trait]
 impl DownloadClient for QbitClient {
-    /// `POST /api/v2/torrents/add` (form: `urls=`, optional
+    /// `POST /api/v2/torrents/add` (multipart/form-data: `urls=`, optional
     /// `category=`/`savepath=`, `paused=` — see the body-encoding note
     /// below).
     async fn add(&self, req: GrabRequest) -> MuseResult<GrabReceipt> {
         let url = format!("{}{ADD_PATH}", self.base_url);
 
-        // The MUSEM-02 spec's APPROACH describes this as a multipart form,
-        // matching qBittorrent's own docs (which cover the file-upload
-        // case). This crate's `reqwest` dependency doesn't enable the
-        // `multipart` feature (see `Cargo.toml` — only `rustls-tls`/`json`
-        // are on), and we're not uploading a `.torrent` file here (only
-        // `urls=`, a text field) — the qBittorrent WebUI accepts a plain
-        // `application/x-www-form-urlencoded` body for the text-only add
-        // path just as well, so this uses `.form()` (already available,
-        // same as `login`/`delete` below) rather than pulling in a new
-        // feature for a body reqwest already knows how to send.
-        let mut form: Vec<(&str, String)> = vec![
-            ("urls", req.url.clone()),
-            ("paused", if req.paused { "true" } else { "false" }.to_string()),
-        ];
-        if let Some(category) = &req.category {
-            form.push(("category", category.clone()));
-        }
-        if let Some(save_path) = &req.save_path {
-            form.push(("savepath", save_path.clone()));
-        }
+        // qBittorrent's own WebUI v2 API docs specify `torrents/add` as
+        // `multipart/form-data` (the `urls`/`category`/`savepath`/`paused`
+        // fields are multipart parts) — matched here via `reqwest`'s
+        // `multipart` feature (`Cargo.toml`), not the urlencoded `.form()`
+        // used by `login`/`delete` below. A fresh `Form` is built per call
+        // (an owned `reqwest::multipart::Form` isn't `Clone`), so the
+        // closure passed to `send_with_reauth` — which may run twice, once
+        // per attempt on a 403 re-auth retry — constructs it from scratch
+        // each time rather than sharing one across attempts.
+        let build_form = || {
+            let mut form = reqwest::multipart::Form::new()
+                .text("urls", req.url.clone())
+                .text("paused", if req.paused { "true" } else { "false" });
+            if let Some(category) = &req.category {
+                form = form.text("category", category.clone());
+            }
+            if let Some(save_path) = &req.save_path {
+                form = form.text("savepath", save_path.clone());
+            }
+            form
+        };
 
         let (status, bytes) = self
-            .send_with_reauth(|sid| self.http.post(&url).header(COOKIE, sid).form(&form))
+            .send_with_reauth(|sid| {
+                self.http
+                    .post(&url)
+                    .header(COOKIE, sid)
+                    .multipart(build_form())
+            })
             .await?;
 
         let body = String::from_utf8_lossy(&bytes).to_string();
@@ -434,13 +440,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_parses_receipt_and_resolves_magnet_hash() {
+    async fn add_sends_multipart_form_data_and_resolves_magnet_hash() {
         let server = MockServer::start();
         login_mock(&server, "testsid123");
         let add_mock = server.mock(|when, then| {
             when.method(POST)
                 .path(ADD_PATH)
-                .header("cookie", "SID=testsid123");
+                .header("cookie", "SID=testsid123")
+                // `reqwest::multipart` picks a random boundary per request,
+                // so the content-type value can't be matched exactly — this
+                // still proves the request is genuinely `multipart/form-data`
+                // (an urlencoded body would neither carry this prefix nor
+                // contain the `Content-Disposition` part headers asserted
+                // via `body_contains` below).
+                // The `Content-Type` header value carries a random
+                // per-request boundary and can't be asserted exactly, but
+                // `httpmock` doesn't expose a substring/prefix header
+                // matcher — the `Content-Disposition` part headers
+                // asserted via `body_contains` below are what actually
+                // prove this is a genuine multipart body (an urlencoded
+                // body would never contain them).
+                .header_exists("content-type")
+                .body_contains("Content-Disposition: form-data; name=\"urls\"")
+                .body_contains(
+                    "magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD&dn=Test",
+                )
+                .body_contains("Content-Disposition: form-data; name=\"category\"")
+                .body_contains("movies")
+                .body_contains("Content-Disposition: form-data; name=\"savepath\"")
+                .body_contains("/media/downloads")
+                .body_contains("Content-Disposition: form-data; name=\"paused\"");
             then.status(200).body("Ok.");
         });
 
@@ -462,6 +491,48 @@ mod tests {
             Some("aabbccddeeff00112233445566778899aabbccdd")
         );
         assert_eq!(receipt.raw_response, "Ok.");
+    }
+
+    /// Custom matcher (a plain `fn`, per `httpmock::MockMatcherFunction`) for
+    /// [`add_omits_category_and_savepath_parts_when_unset`]: proves the
+    /// multipart body carries the `urls` part but neither a `category` nor
+    /// `savepath` part when the [`GrabRequest`] left them `None` — the "omit
+    /// entirely, don't send empty" behavior from the MUSEM-02 spec's EDGE
+    /// CASES, which `body_contains` alone can't express (it only asserts
+    /// presence, not absence).
+    fn body_has_urls_but_no_category_or_savepath(
+        req: &httpmock::prelude::HttpMockRequest,
+    ) -> bool {
+        let body = match &req.body {
+            Some(bytes) => String::from_utf8_lossy(bytes),
+            None => return false,
+        };
+        body.contains("Content-Disposition: form-data; name=\"urls\"")
+            && !body.contains("name=\"category\"")
+            && !body.contains("name=\"savepath\"")
+    }
+
+    #[tokio::test]
+    async fn add_omits_category_and_savepath_parts_when_unset() {
+        let server = MockServer::start();
+        login_mock(&server, "testsid123");
+        let add_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(ADD_PATH)
+                .matches(body_has_urls_but_no_category_or_savepath);
+            then.status(200).body("Ok.");
+        });
+
+        let client =
+            QbitClient::from_config(&config_for(&server)).expect("client should construct");
+        client
+            .add(GrabRequest::new(
+                "magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD",
+            ))
+            .await
+            .expect("add should succeed");
+
+        add_mock.assert();
     }
 
     #[tokio::test]

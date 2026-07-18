@@ -157,9 +157,11 @@ records every `add` for later items' tests and performs no network I/O.
   call, since this crate's `reqwest` dependency doesn't enable the `cookie_store` feature. A
   `403` on any data call triggers exactly one transparent re-auth + retry; a second failure (or
   any other status) surfaces as a typed `MuseError::Upstream`, never a panic.
-- **Add**: `POST /api/v2/torrents/add` — `urls=` (magnet URI or `.torrent` URL, both accepted),
-  optional `category=`/`savepath=` (omitted entirely, not sent empty, when the caller has no
-  opinion), `paused=`. qBittorrent's response body is a bare `"Ok."` with no hash, so the
+- **Add**: `POST /api/v2/torrents/add`, sent as `multipart/form-data` (matching qBittorrent's
+  own WebUI v2 API docs) via `reqwest`'s `multipart` feature — `urls=` (magnet URI or
+  `.torrent` URL, both accepted), optional `category=`/`savepath=` parts (omitted entirely, not
+  sent empty, when the caller has no opinion), `paused=`. qBittorrent's response body is a bare
+  `"Ok."` with no hash, so the
   returned `GrabReceipt.hash` is resolved client-side from the magnet's `xt=urn:btih:` when
   present, and left `None` for a `.torrent`-URL add (no client-side way to know the infohash in
   that case).

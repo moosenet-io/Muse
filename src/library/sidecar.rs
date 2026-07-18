@@ -18,6 +18,8 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::metadata::resolve;
+
 use crate::error::{MuseError, MuseResult};
 
 /// Well-known movie/show-level NFO filenames (checked case-insensitively).
@@ -150,6 +152,94 @@ pub fn guess_content_type(path: &Path) -> &'static str {
     }
 }
 
+/// Extract a provider id embedded in a `.nfo`'s XML — the *arr suite (and
+/// Kodi's own scrapers) writes the id it identified the title against right
+/// into the `.nfo` it drops beside the media file, which makes a `.nfo` the
+/// single highest-value sidecar for matching: it's the *arr suite's own
+/// identification, not a filename guess. Recognizes, in priority order:
+/// 1. `<uniqueid type="tmdb">…</uniqueid>` / `type="imdb"` / `type="tvdb"`
+///    (the current Kodi/`*arr` NFO schema — any attribute order, single or
+///    double quotes).
+/// 2. Legacy flat tags: `<tmdbid>…</tmdbid>`, `<imdbid>…</imdbid>`, and a
+///    bare `<id>…</id>` (older Kodi `movie.nfo` scraped via the TMDb
+///    scraper wrote the TMDb id into a plain `<id>` tag with no `uniqueid`
+///    wrapper at all — treated as a TMDb id here, the common-case
+///    convention; a title where that guess is wrong just fails to resolve
+///    locally, which is a safe, visible "unmatched," never a wrong-confident
+///    attach — see `library::scan::DbLibraryResolver`).
+///
+/// Deliberately a plain substring scan, not a real XML parser — the crate's
+/// existing no-new-heavy-dependency posture (see `Cargo.toml`'s comments on
+/// why `image`'s dependency footprint was kept minimal) and a `.nfo`'s
+/// handful of well-known tags don't need one. Returns `None` (never an
+/// error) for anything that doesn't parse as UTF-8-ish text or carries none
+/// of the recognized tags — a `.nfo` that doesn't yield an id simply
+/// contributes nothing to matching, same as no `.nfo` at all.
+pub fn extract_provider_id_from_nfo(bytes: &[u8]) -> Option<(&'static str, String)> {
+    let xml = String::from_utf8_lossy(bytes);
+    let xml_lower = xml.to_lowercase();
+
+    for (attr, provider) in [("tmdb", resolve::TMDB), ("imdb", resolve::IMDB), ("tvdb", resolve::TVDB)] {
+        if let Some(value) = extract_uniqueid_value(&xml, &xml_lower, attr) {
+            return Some((provider, value));
+        }
+    }
+
+    if let Some(value) = extract_simple_tag_value(&xml, &xml_lower, "tmdbid") {
+        return Some((resolve::TMDB, value));
+    }
+    if let Some(value) = extract_simple_tag_value(&xml, &xml_lower, "imdbid") {
+        return Some((resolve::IMDB, value));
+    }
+    if let Some(value) = extract_simple_tag_value(&xml, &xml_lower, "tvdbid") {
+        return Some((resolve::TVDB, value));
+    }
+    if let Some(value) = extract_simple_tag_value(&xml, &xml_lower, "id") {
+        return Some((resolve::TMDB, value));
+    }
+
+    None
+}
+
+/// Find `<uniqueid type="{provider_attr}" ...>VALUE</uniqueid>` (attribute
+/// order/quoting-tolerant): locates `type="{provider_attr}"` (or
+/// single-quoted), then the `>` that closes that opening tag, then the text
+/// up to the next `<`.
+fn extract_uniqueid_value(xml: &str, xml_lower: &str, provider_attr: &str) -> Option<String> {
+    let needle_dq = format!("type=\"{provider_attr}\"");
+    let needle_sq = format!("type='{provider_attr}'");
+    let attr_pos = xml_lower.find(&needle_dq).or_else(|| xml_lower.find(&needle_sq))?;
+
+    let tail = &xml[attr_pos..];
+    let gt = tail.find('>')?;
+    let value_start = &tail[gt + 1..];
+    let lt = value_start.find('<')?;
+    let value = value_start[..lt].trim();
+
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Find `<{tag}>VALUE</{tag}>` (case-insensitive on the tag name).
+fn extract_simple_tag_value(xml: &str, xml_lower: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+
+    let open_pos = xml_lower.find(&open)?;
+    let value_start = open_pos + open.len();
+    let rel_close = xml_lower[value_start..].find(&close)?;
+    let value = xml[value_start..value_start + rel_close].trim();
+
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +354,65 @@ mod tests {
         assert_eq!(guess_content_type(Path::new("poster.jpg")), "image/jpeg");
         assert_eq!(guess_content_type(Path::new("poster.png")), "image/png");
         assert_eq!(guess_content_type(Path::new("poster")), "image/jpeg");
+    }
+
+    #[test]
+    fn extract_provider_id_from_nfo_reads_a_uniqueid_tmdb_tag() {
+        let nfo = br#"<movie><uniqueid type="tmdb" default="true">603</uniqueid></movie>"#;
+        assert_eq!(extract_provider_id_from_nfo(nfo), Some((resolve::TMDB, "603".to_string())));
+    }
+
+    #[test]
+    fn extract_provider_id_from_nfo_reads_uniqueid_imdb_and_tvdb() {
+        let imdb_nfo = br#"<movie><uniqueid type="imdb">tt0133093</uniqueid></movie>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(imdb_nfo),
+            Some((resolve::IMDB, "tt0133093".to_string()))
+        );
+
+        let tvdb_nfo = br#"<tvshow><uniqueid type='tvdb'>81189</uniqueid></tvshow>"#;
+        assert_eq!(extract_provider_id_from_nfo(tvdb_nfo), Some((resolve::TVDB, "81189".to_string())));
+    }
+
+    #[test]
+    fn extract_provider_id_from_nfo_prefers_tmdb_over_imdb_over_tvdb() {
+        let nfo = br#"<movie>
+            <uniqueid type="tvdb">999</uniqueid>
+            <uniqueid type="imdb">tt0133093</uniqueid>
+            <uniqueid type="tmdb">603</uniqueid>
+        </movie>"#;
+        assert_eq!(extract_provider_id_from_nfo(nfo), Some((resolve::TMDB, "603".to_string())));
+    }
+
+    #[test]
+    fn extract_provider_id_from_nfo_falls_back_to_legacy_flat_tags() {
+        let tmdbid_nfo = br#"<movie><tmdbid>603</tmdbid></movie>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(tmdbid_nfo),
+            Some((resolve::TMDB, "603".to_string()))
+        );
+
+        let imdbid_nfo = br#"<movie><imdbid>tt0133093</imdbid></movie>"#;
+        assert_eq!(
+            extract_provider_id_from_nfo(imdbid_nfo),
+            Some((resolve::IMDB, "tt0133093".to_string()))
+        );
+
+        // Oldest legacy shape: a bare <id> with no uniqueid/tmdbid wrapper
+        // at all -- treated as a TMDb id (documented convention).
+        let bare_id_nfo = br#"<movie><id>603</id></movie>"#;
+        assert_eq!(extract_provider_id_from_nfo(bare_id_nfo), Some((resolve::TMDB, "603".to_string())));
+    }
+
+    #[test]
+    fn extract_provider_id_from_nfo_returns_none_for_no_recognized_tag() {
+        let nfo = br#"<movie><title>Some Movie</title></movie>"#;
+        assert_eq!(extract_provider_id_from_nfo(nfo), None);
+    }
+
+    #[test]
+    fn extract_provider_id_from_nfo_returns_none_for_garbage_bytes() {
+        let garbage: &[u8] = &[0xff, 0xfe, 0x00, 0x01, 0x02];
+        assert_eq!(extract_provider_id_from_nfo(garbage), None);
     }
 }

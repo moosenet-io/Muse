@@ -79,6 +79,20 @@ pub struct ScannedFile {
     /// `prowlarr::parse::ParsedRelease` already exposes; the scanner adds no
     /// new classification heuristic of its own.
     pub kind_guess: MediaKind,
+    /// Sidecar art/`.nfo` detected beside this file (`sidecar::detect`),
+    /// computed once during the walk so both matching (the `.nfo`-embedded
+    /// id, see `nfo_provider_id` below) and attachment
+    /// (`record_matched_file`) reuse the same detection pass instead of
+    /// re-listing the directory.
+    pub sidecar_art: crate::library::sidecar::SidecarArt,
+    /// The provider id embedded in the `.nfo` sidecar (READ-ONLY read +
+    /// parse via `sidecar::extract_provider_id_from_nfo`), if one was found
+    /// — `*arr`/Kodi writes its own identification into the `.nfo`, making
+    /// this the highest-value sidecar signal for matching (review finding,
+    /// S119b codex: detecting the `.nfo` without ever reading its embedded
+    /// id left the most valuable sidecar unused). `None` when there's no
+    /// `.nfo`, it has no recognized id tag, or it couldn't be read.
+    pub nfo_provider_id: Option<(&'static str, String)>,
 }
 
 /// Recursively walk `root` (READ-ONLY: `read_dir` + `symlink_metadata` +
@@ -159,12 +173,25 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<ScannedFile>) {
             MediaKind::Movie
         };
 
+        // Detect + (READ-ONLY) read the `.nfo` here, during the walk, so
+        // its embedded provider id (when present) is available to the
+        // resolver as a matching signal, not just discovered after the
+        // fact for caching.
+        let sidecar_art = crate::library::sidecar::detect(&path);
+        let nfo_provider_id = sidecar_art
+            .nfo_path
+            .as_ref()
+            .and_then(|nfo_path| crate::library::sidecar::read_bytes(nfo_path).ok())
+            .and_then(|bytes| crate::library::sidecar::extract_provider_id_from_nfo(&bytes));
+
         out.push(ScannedFile {
             absolute_path: path,
             relative_path,
             size_bytes,
             parsed,
             kind_guess,
+            sidecar_art,
+            nfo_provider_id,
         });
     }
 }
@@ -242,36 +269,52 @@ pub struct DbLibraryResolver<'a> {
 #[async_trait]
 impl<'a> LibraryResolver for DbLibraryResolver<'a> {
     async fn resolve(&self, file: &ScannedFile) -> MuseResult<ScanMatch> {
-        if let Some((provider, id)) = extract_id_tag(&file.relative_path) {
-            let local = match provider {
-                resolve::TMDB => repo::media_metadata::find_by_tmdb_id(self.pool, file.kind_guess, &id).await?,
-                resolve::TVDB => repo::media_metadata::find_by_tvdb_id(self.pool, file.kind_guess, &id).await?,
-                _ => None,
-            };
-            // Review finding 1 (codex): an explicit id tag in the path is a
-            // caller-asserted, specific identity claim. If it doesn't
-            // resolve to a local catalog row, that must NOT fall through
-            // to the title/year match below -- doing so risks confidently
-            // attaching this file to a DIFFERENT title's row (the one that
-            // happens to share a title+year) even though the path itself
-            // named a specific id that isn't cataloged. This mirrors
-            // MUSEL-A2's `resolve_and_merge` rule: known-but-unresolvable
-            // ids never fall back to a title guess. The title/year and
-            // resolve_and_merge paths below are reachable ONLY when the
-            // path carried no explicit id tag at all.
-            return Ok(match local {
-                Some(media_metadata_id) => ScanMatch::Matched { media_metadata_id },
-                None => {
-                    tracing::info!(
-                        path = %file.relative_path,
-                        provider,
-                        id,
-                        "library scan: explicit id tag did not resolve to a local catalog row; \
-                         recording as unmatched rather than falling back to a title/year guess"
-                    );
-                    ScanMatch::Unmatched
+        // Explicit id candidates, in priority order: the path's
+        // `{tmdb-...}`/`{tvdb-...}`/`{imdb-...}` tag first (the
+        // Radarr/Sonarr folder-naming convention), then the `.nfo`'s own
+        // embedded id (the `*arr` suite's own identification -- the
+        // strongest signal available, per the S119b codex review). Either
+        // one is a caller/tooling-asserted, SPECIFIC identity claim -- see
+        // the loop below for why a failure here must never fall through to
+        // a title/year guess.
+        let mut explicit_ids: Vec<(&'static str, String)> = Vec::new();
+        if let Some(tag) = extract_id_tag(&file.relative_path) {
+            explicit_ids.push(tag);
+        }
+        if let Some(nfo_id) = &file.nfo_provider_id {
+            explicit_ids.push(nfo_id.clone());
+        }
+
+        if !explicit_ids.is_empty() {
+            for (provider, id) in &explicit_ids {
+                let local = match *provider {
+                    resolve::TMDB => repo::media_metadata::find_by_tmdb_id(self.pool, file.kind_guess, id).await?,
+                    resolve::TVDB => repo::media_metadata::find_by_tvdb_id(self.pool, file.kind_guess, id).await?,
+                    _ => None,
+                };
+                if let Some(media_metadata_id) = local {
+                    return Ok(ScanMatch::Matched { media_metadata_id });
                 }
-            });
+            }
+
+            // Review finding 1 (codex): an explicit id (path tag OR .nfo)
+            // is a caller-asserted, specific identity claim. If NONE of
+            // the explicit candidates resolve to a local catalog row, that
+            // must NOT fall through to the title/year match below --
+            // doing so risks confidently attaching this file to a
+            // DIFFERENT title's row (the one that happens to share a
+            // title+year) even though an explicit id said otherwise. This
+            // mirrors MUSEL-A2's `resolve_and_merge` rule: known-but-
+            // unresolvable ids never fall back to a title guess. The
+            // title/year and resolve_and_merge paths below are reachable
+            // ONLY when the file carried no explicit id at all.
+            tracing::info!(
+                path = %file.relative_path,
+                candidates = ?explicit_ids,
+                "library scan: explicit id(s) (path tag and/or .nfo) did not resolve to a local catalog row; \
+                 recording as unmatched rather than falling back to a title/year guess"
+            );
+            return Ok(ScanMatch::Unmatched);
         }
 
         if let Some(title) = &file.parsed.title {
@@ -330,6 +373,12 @@ pub struct ScanReport {
     /// the module doc).
     pub unmatched_paths: Vec<String>,
     pub art_cached: usize,
+    /// How many `.nfo` sidecars were (re-)read and cached/attached onto a
+    /// matched item this pass — the counter that makes `.nfo`
+    /// detection→attachment observable in the report, not silently
+    /// dropped (S119b codex review). Skips the same idempotency guard
+    /// `art_cached` does: an unchanged rescan doesn't re-attach.
+    pub nfo_attached: usize,
 }
 
 /// Walk `library.root_folder` and record what's found. Non-blocking per
@@ -366,9 +415,10 @@ pub async fn scan_library(pool: &PgPool, library: &Library, resolver: &dyn Libra
         match scan_match {
             ScanMatch::Matched { media_metadata_id } => {
                 match record_matched_file(pool, library.id, media_metadata_id, &file).await {
-                    Ok(art_cached) => {
+                    Ok(outcome) => {
                         report.matched += 1;
-                        report.art_cached += art_cached;
+                        report.art_cached += outcome.art_cached;
+                        report.nfo_attached += outcome.nfo_attached;
                     }
                     Err(e) => {
                         report.errors += 1;
@@ -392,15 +442,28 @@ pub async fn scan_library(pool: &PgPool, library: &Library, resolver: &dyn Libra
     Ok(report)
 }
 
+/// What [`record_matched_file`] actually did this pass — separate counters
+/// so [`ScanReport`] can report `.nfo` attachment independently of
+/// poster/fanart caching (S119b codex review: `.nfo` detection with no
+/// attachment/counter left it silently dropped).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RecordOutcome {
+    /// 0-2: poster/backdrop.
+    art_cached: usize,
+    /// 0-1: whether the `.nfo` sidecar (if any) was (re-)attached this pass.
+    nfo_attached: usize,
+}
+
 /// Upsert the `media_items` + `media_files` rows for a confidently-matched
-/// file, then detect + cache any sidecar art beside it. Returns how many
-/// art variants were cached (0-2: poster/backdrop).
+/// file, then cache/attach any sidecar art + `.nfo` beside it
+/// (`file.sidecar_art`, already detected during the walk — see
+/// [`ScannedFile`]).
 async fn record_matched_file(
     pool: &PgPool,
     library_id: i64,
     media_metadata_id: i64,
     file: &ScannedFile,
-) -> MuseResult<usize> {
+) -> MuseResult<RecordOutcome> {
     let media_item = repo::media_item::upsert(
         pool,
         &NewMediaItem {
@@ -430,29 +493,66 @@ async fn record_matched_file(
     // Review finding 3 (codex): an idempotent rescan of an unchanged file
     // (the size guard says nothing changed) must be a full no-op, not just
     // "no duplicate media_files row" -- re-reading + re-writing the same
-    // sidecar art bytes into `artwork_cache` on every pass is unnecessary
-    // I/O and DB churn for a file that hasn't moved. Only (re-)cache art
-    // when `upsert_scanned` actually recorded a change (first sighting, or
-    // a genuine size change).
+    // sidecar art/`.nfo` bytes into `artwork_cache` on every pass is
+    // unnecessary I/O and DB churn for a file that hasn't moved. Only
+    // (re-)cache/attach sidecar content when `upsert_scanned` actually
+    // recorded a change (first sighting, or a genuine size change).
     if !file_changed {
-        return Ok(0);
+        return Ok(RecordOutcome::default());
     }
 
-    let art = crate::library::sidecar::detect(&file.absolute_path);
-    let mut cached = 0usize;
+    let mut outcome = RecordOutcome::default();
 
-    if let Some(poster_path) = &art.poster_path {
+    if let Some(poster_path) = &file.sidecar_art.poster_path {
         if cache_art(pool, media_item.id, "poster", poster_path).await {
-            cached += 1;
+            outcome.art_cached += 1;
         }
     }
-    if let Some(fanart_path) = &art.fanart_path {
+    if let Some(fanart_path) = &file.sidecar_art.fanart_path {
         if cache_art(pool, media_item.id, "backdrop", fanart_path).await {
-            cached += 1;
+            outcome.art_cached += 1;
+        }
+    }
+    // Review finding (S119b codex): the `.nfo` was detected but never
+    // attached/reported -- cache it the same way poster/fanart are, under
+    // its own `artwork_cache` variant, so detection -> attachment is
+    // complete and observable (`ScanReport::nfo_attached`), not silently
+    // dropped. Its embedded id was already consumed for MATCHING up in
+    // `DbLibraryResolver::resolve`; this is the separate "attach the file
+    // itself" step the review asked for.
+    if let Some(nfo_path) = &file.sidecar_art.nfo_path {
+        if cache_nfo(pool, media_item.id, nfo_path).await {
+            outcome.nfo_attached += 1;
         }
     }
 
-    Ok(cached)
+    Ok(outcome)
+}
+
+/// Read (READ-ONLY) + cache the `.nfo` sidecar into `artwork_cache` under
+/// variant `"nfo"` — same table/`entity_kind` convention [`cache_art`] uses
+/// for poster/fanart, so a matched item's `.nfo` is attached and later
+/// retrievable the same way. Best-effort, same posture as [`cache_art`]: a
+/// read or DB failure is logged and treated as "not attached this pass,"
+/// never a scan-aborting error.
+async fn cache_nfo(pool: &PgPool, media_item_id: i64, nfo_path: &Path) -> bool {
+    let bytes = match crate::library::sidecar::read_bytes(nfo_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(path = %nfo_path.display(), error = %e, "library scan: could not read .nfo sidecar; skipping attachment");
+            return false;
+        }
+    };
+
+    match repo::artwork_cache::store_bytes(pool, "media_item", media_item_id, "nfo", None, "application/xml", &bytes, None)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(media_item_id, error = %e, "library scan: could not attach .nfo sidecar; skipping");
+            false
+        }
+    }
 }
 
 /// Read (READ-ONLY) + cache one sidecar art file into `artwork_cache`,
@@ -555,6 +655,7 @@ pub async fn run_scan(
                     unmatched = report.unmatched,
                     errors = report.errors,
                     art_cached = report.art_cached,
+                    nfo_attached = report.nfo_attached,
                     "library scan: pass complete"
                 );
                 reports.push(report);
@@ -1131,6 +1232,215 @@ mod tests {
 
         let items = repo::media_item::list_by_library(&pool, library.id).await.expect("list media_items");
         assert!(items.is_empty(), "no media_items row should be created for the unresolved id-tagged file");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// S119b codex review, test (a): a `.nfo` with an embedded
+    /// `<uniqueid type="tmdb">` id, beside a file with NO path id tag and a
+    /// filename that does NOT title/year-match the seeded row, still
+    /// matches via the `.nfo`'s id — proving the `.nfo`'s embedded id is
+    /// actually consumed for matching, not just detected/cached.
+    #[tokio::test]
+    async fn nfo_embedded_tmdb_id_matches_a_file_with_no_path_id_tag() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!(
+                "MUSE_TEST_DATABASE_URL not set -- skipping \
+                 nfo_embedded_tmdb_id_matches_a_file_with_no_path_id_tag \
+                 (expected in the default test run; the crate does not require a live DB)"
+            );
+            return;
+        };
+
+        use uuid::Uuid;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect to MUSE_TEST_DATABASE_URL");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply cleanly");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        // Deliberately does NOT match the seeded row's title -- the only
+        // way this can match is via the .nfo's embedded id.
+        let filename_title = format!("Totally Different Filename Title {suffix}");
+        let catalog_title = format!("MUSEL-B1 Nfo Id Match Test {suffix}");
+        let tmdb_id = format!("nfo-id-match-tmdb-{suffix}");
+
+        let dir = unique_dir(&format!("nfo-id-match-{suffix}"));
+        // No {tmdb-...}/{tvdb-...}/{imdb-...} tag anywhere in this path.
+        let movie_dir = dir.join(format!("{filename_title} (2019)"));
+        fs::create_dir_all(&movie_dir).unwrap();
+        let media_path = movie_dir.join(format!("{filename_title}.2019.1080p.WEB-DL.x264-GRP.mkv"));
+        fs::write(&media_path, b"fixture bytes").unwrap();
+        fs::write(
+            movie_dir.join("movie.nfo"),
+            format!(r#"<movie><uniqueid type="tmdb">{tmdb_id}</uniqueid></movie>"#),
+        )
+        .unwrap();
+
+        let library = repo::library::create(
+            &pool,
+            &crate::models::library::NewLibrary {
+                name: format!("MUSEL-B1 Nfo Id Match Library {suffix}"),
+                kind: crate::models::library::LibraryKind::Movie,
+                root_folder: dir.to_string_lossy().to_string(),
+                source_arr_name: None,
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("seed library row");
+
+        let metadata = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &crate::models::media_metadata::NewMediaMetadata {
+                kind: crate::models::media_metadata::MediaKind::Movie,
+                tmdb_id: Some(tmdb_id),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: catalog_title,
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: None,
+                year: Some(2019),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("seed the media_metadata row the .nfo's tmdb id points at");
+
+        let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
+        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(
+            report.matched, 1,
+            "the .nfo's embedded tmdb id must match even though the filename's own title doesn't"
+        );
+        // Test (b): the .nfo present + attached is reflected in the report.
+        assert_eq!(report.nfo_attached, 1, ".nfo attachment must be observable in the ScanReport counter");
+
+        let items = repo::media_item::list_by_library(&pool, library.id).await.expect("list media_items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].media_metadata_id, metadata.id);
+
+        let nfo_art = repo::artwork_cache::get(&pool, "media_item", items[0].id, "nfo")
+            .await
+            .expect("query artwork_cache for the nfo variant")
+            .expect(".nfo should have been cached/attached under the 'nfo' variant");
+        assert!(nfo_art.bytes.is_some(), "the cached .nfo row should carry the actual .nfo bytes");
+        assert_eq!(nfo_art.content_type.as_deref(), Some("application/xml"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// S119b codex review, test (c): a `.nfo` embeds an id that does NOT
+    /// resolve locally, and the file's own filename WOULD otherwise exactly
+    /// title/year-match a different, already-cataloged row — the resolver
+    /// must still refuse the confident title/year attach (same "an
+    /// explicit id that fails must not fall through" rule as the path-tag
+    /// case, now via the .nfo).
+    #[tokio::test]
+    async fn nfo_embedded_id_that_fails_to_resolve_does_not_fall_back_to_a_title_year_match() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!(
+                "MUSE_TEST_DATABASE_URL not set -- skipping \
+                 nfo_embedded_id_that_fails_to_resolve_does_not_fall_back_to_a_title_year_match \
+                 (expected in the default test run; the crate does not require a live DB)"
+            );
+            return;
+        };
+
+        use uuid::Uuid;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect to MUSE_TEST_DATABASE_URL");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply cleanly");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let title = format!("MUSEL-B1 Nfo Id Failure Precedence Test {suffix}");
+
+        let dir = unique_dir(&format!("nfo-id-failure-precedence-{suffix}"));
+        // No id tag in the path itself -- but the .nfo carries one that
+        // won't resolve. The filename's title+year DOES exactly match the
+        // seeded row below; the resolver must still not attach it.
+        let movie_dir = dir.join(format!("{title} (2022)"));
+        fs::create_dir_all(&movie_dir).unwrap();
+        let media_path = movie_dir.join(format!("{title}.2022.1080p.BluRay.x264-GRP.mkv"));
+        fs::write(&media_path, b"fixture bytes").unwrap();
+        fs::write(
+            movie_dir.join("movie.nfo"),
+            br#"<movie><uniqueid type="tmdb">99999999-does-not-exist</uniqueid></movie>"#,
+        )
+        .unwrap();
+
+        let library = repo::library::create(
+            &pool,
+            &crate::models::library::NewLibrary {
+                name: format!("MUSEL-B1 Nfo Id Failure Precedence Library {suffix}"),
+                kind: crate::models::library::LibraryKind::Movie,
+                root_folder: dir.to_string_lossy().to_string(),
+                source_arr_name: None,
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("seed library row");
+
+        repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &crate::models::media_metadata::NewMediaMetadata {
+                kind: crate::models::media_metadata::MediaKind::Movie,
+                tmdb_id: Some(format!("nfo-id-failure-precedence-tmdb-{suffix}")),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: title.clone(),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: None,
+                year: Some(2022),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("seed a media_metadata row whose title+year exactly matches the fixture file");
+
+        let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
+        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(
+            report.matched, 0,
+            "an unresolvable .nfo-embedded id must never fall back to a confident title/year attach"
+        );
+        assert_eq!(report.unmatched, 1);
+        assert_eq!(report.nfo_attached, 0, "an unmatched file's .nfo is never attached (no media_item to attach it to)");
+
+        let items = repo::media_item::list_by_library(&pool, library.id).await.expect("list media_items");
+        assert!(items.is_empty(), "no media_items row should be created for the unresolved nfo-id file");
 
         fs::remove_dir_all(&dir).ok();
     }

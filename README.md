@@ -295,11 +295,12 @@ makes into the library is one of `read_dir` / `symlink_metadata` / `metadata` / 
 with `OpenOptions::new().read(true)` — never `.write(true)`/`.create(true)`/`.append(true)`,
 and never `fs::remove_*`/`fs::rename`/`fs::write`. This is proven two ways in
 `src/library/scan.rs`'s test suite:
-- **Structural**: `no_write_create_remove_calls_in_the_scan_and_sidecar_source` greps both
-  `scan.rs`'s and `sidecar.rs`'s own production source (everything above their `#[cfg(test)]`
-  block) for any write-shaped call — `File::create`, `.write(true)`, `.create(true)`,
-  `.append(true)`, `fs::remove_file`/`_dir`, `fs::rename`, `fs::write(`, `fs::copy(`,
-  `fs::set_permissions` — and fails the build if a future edit introduces one.
+- **Structural**: `no_write_create_remove_calls_in_the_scan_and_sidecar_source` `read_dir`s the
+  whole `src/library/` production source directory (`mod.rs`/`scan.rs`/`sidecar.rs`, everything
+  above each file's own `#[cfg(test)]` block) and greps every `.rs` file for any write-shaped
+  call — `File::create`, `.write(true)`, `.create(true)`, `.append(true)`, `fs::remove_file`/`_dir`,
+  `fs::rename`, `fs::write(`, `fs::copy(`, `fs::set_permissions` — failing the build if a future
+  edit (anywhere in the module, not just the two files it originally covered) introduces one.
 - **Behavioral**: `fixture_scan_leaves_the_library_byte_for_byte_unchanged` checksums (relative
   path + size + full bytes) an entire fixture library tree, runs a full walk + sidecar-detect +
   sidecar-read pass over it, checksums again, and asserts the two checksums are identical.
@@ -308,13 +309,26 @@ and never `fs::remove_*`/`fs::rename`/`fs::write`. This is proven two ways in
 disk to a title *already* in Muse's catalog (from `arr::ingest` or a curator) — same posture as
 MUSEL-A2's `apply_enrichment` (additive-onto-an-existing-row only). Matching, in order
 (`library::scan::DbLibraryResolver`):
-1. An `{tmdb-NNNN}`/`{tvdb-NNNN}`/`{imdb-ttNNN}` id tag in the path (the Radarr/Sonarr
-   folder-naming convention, `library::scan::extract_id_tag`) resolved against the catalog via
+1. **Explicit id candidates**, checked in priority order, each resolved against the catalog via
    `repo::media_metadata::find_by_tmdb_id`/`find_by_tvdb_id` (the latter added by this item,
-   symmetric with the former).
+   symmetric with the former):
+   - An `{tmdb-NNNN}`/`{tvdb-NNNN}`/`{imdb-ttNNN}` id tag in the path (the Radarr/Sonarr
+     folder-naming convention, `library::scan::extract_id_tag`).
+   - The `.nfo` sidecar's own embedded id (`sidecar::extract_provider_id_from_nfo` — see "Sidecar
+     art + `.nfo`" below), read READ-ONLY during the walk itself so it's available as a matching
+     signal, not just something discovered after the fact for caching. This is the *arr suite's
+     own identification, arguably the single strongest signal available to the scanner.
+   
+   **If ANY explicit id candidate is present but NONE of them resolve to a local catalog row, the
+   file is `Unmatched` — it never falls through to the title/year match below.** A path tag or a
+   `.nfo` id is a specific, caller/tooling-asserted identity claim; falling back to a title/year
+   guess after one fails could confidently attach the file to a *different* title's row that
+   happens to share a title+year. This mirrors MUSEL-A2's `resolve_and_merge` rule that
+   known-but-unresolvable ids never fall back to a title guess.
 2. An exact, case-insensitive title+year match via `repo::media_metadata::find_by_title_year`
-   (already existed, from the Prowlarr report-pull worker) — deterministic, not a fuzzy guess,
-   so treated as a confident match.
+   (already existed, from the Prowlarr report-pull worker) — deterministic, not a fuzzy guess, so
+   treated as a confident match. **Reached only when the file carried no explicit id candidate at
+   all** (see the refusal rule above).
 3. If neither found a local row and metadata providers are configured, a
    `metadata::resolve::resolve_and_merge` title search runs purely to leave a discoverable log
    trail ("resolvable externally, not yet in the local catalog") — its result is always recorded
@@ -342,27 +356,52 @@ the change signal actually available — documented on `upsert_scanned`.) The fi
 extension is recorded into the existing `media_info` jsonb column as `{"container": "mkv"}` — no
 schema change needed, since that column already exists for exactly this kind of file-probing data.
 
-**Sidecar art** (`src/library/sidecar.rs`): detects `movie.nfo`/`tvshow.nfo`/`<basename>.nfo`,
-`poster.jpg`/`.png` (falling back to `folder.jpg`/`.png`), `fanart.jpg`/`.png`
-(`backdrop.jpg`/`.png`), and per-season `season##-poster.*` beside the media file — detection is a
-directory listing only (no content read). For a matched file, `poster`/`fanart` bytes are read
-READ-ONLY (`sidecar::read_bytes`) and cached into `artwork_cache` — same table and the same
-`entity_kind = "media_item"` key convention `web::artwork::art_handler` already reads from, so a
-scanned file's art is immediately servable from `GET /art/media_item/{id}` with no further wiring.
-No local sidecar art found is not an error — the existing artwork-proxy path (Plex fetch, then the
-built-in placeholder) already covers "fall back to a provider re-fetch."
+**Sidecar art + `.nfo`** (`src/library/sidecar.rs`): detects `movie.nfo`/`tvshow.nfo`/
+`<basename>.nfo`, `poster.jpg`/`.png` (falling back to `folder.jpg`/`.png`), `fanart.jpg`/`.png`
+(`backdrop.jpg`/`.png`), and per-season `season##-poster.*` beside the media file —
+`sidecar::detect` (a directory listing only, no content read) runs once per file during the walk
+and is cached on `ScannedFile::sidecar_art` so both matching and recording reuse the same pass.
+
+- **`.nfo` — used for matching, not just cached.** `sidecar::extract_provider_id_from_nfo` reads a
+  detected `.nfo`'s bytes READ-ONLY and extracts an embedded provider id: `<uniqueid
+  type="tmdb"/"imdb"/"tvdb">…</uniqueid>` (current Kodi/`*arr` schema, any attribute order/quoting)
+  or the legacy flat `<tmdbid>`/`<imdbid>`/`<tvdbid>`/bare `<id>` tags (older Kodi `movie.nfo`,
+  `<id>` conventionally the TMDb id). Deliberately a plain substring scan, not a real XML parser —
+  matches the crate's no-new-heavy-dependency posture for a handful of well-known tags. Feeds
+  straight into `DbLibraryResolver` as an explicit id candidate (see "Matching" above) — subject to
+  the same "fails to resolve -> unmatched, never a title/year guess" rule as a path id tag.
+- **`.nfo` — attached, not just detected.** A matched file's `.nfo` bytes are also read READ-ONLY
+  and cached into `artwork_cache` under `entity_kind = "media_item"`, `variant = "nfo"`,
+  `content_type = "application/xml"` — the same table/key convention poster/fanart use — and
+  counted in `ScanReport::nfo_attached`, so `.nfo` detection→attachment is complete and observable,
+  not silently dropped (a prior revision detected the `.nfo` but never read/used/reported it).
+- **Poster/fanart** bytes are read READ-ONLY (`sidecar::read_bytes`) and cached into
+  `artwork_cache` the same way, `entity_kind = "media_item"` — the same key convention
+  `web::artwork::art_handler` already reads from, so a scanned file's art (and now its `.nfo`) is
+  immediately retrievable with no further wiring (`GET /art/media_item/{id}?variant=nfo` etc.).
+- **Idempotent, like the file record itself**: `record_matched_file` only (re-)caches/attaches
+  poster/fanart/`.nfo` when `upsert_scanned` reports the file actually changed this pass (the size
+  guard) — an unchanged rescan does zero sidecar I/O and reports `art_cached`/`nfo_attached` as `0`
+  for that file, not just "no duplicate row."
+- No local sidecar art/`.nfo` found is not an error — the existing artwork-proxy path (Plex fetch,
+  then the built-in placeholder) already covers "fall back to a provider re-fetch."
 
 **Entry point**: `library::scan::run_scan(pool, config, providers)` is a clean no-op when
 `config.library_root` (`MUSE_LIBRARY_ROOT`) is unset — logged at `debug`, no filesystem or DB
 touch at all. When set, it scans every enabled `libraries` row whose `root_folder` falls under
-`MUSE_LIBRARY_ROOT`. **Not wired into a worker/route yet** (out of this item's scope, matching the
-"ships the primitive, wiring is a later item" posture MUSEM-02's download adapter also documents
-above) — call it from an operator CLI subcommand or the maintenance pass in a follow-up item.
-Per-file failures (a bad file, a resolver error, a DB write failure) increment
-`ScanReport::errors` and the pass continues; a directory that can't be listed mid-walk is logged
-and that subtree is skipped, not the whole pass. Symlinks under the library root are detected via
-`symlink_metadata` and never followed — a deliberate, documented skip (a symlink out of the
-read-only root would otherwise let the walk escape it; a symlink loop would otherwise hang it).
+`MUSE_LIBRARY_ROOT`, using `library::scan::path_is_within_root` for that containment check —
+**path-component-aware** (`Path::starts_with`, canonicalizing when both sides exist on disk and
+falling back to a lexical-but-still-component-aware comparison otherwise), not a raw
+`str::starts_with`: `/mnt/library2` is correctly rejected as "inside" `/mnt/library` even though
+the *string* `"library2"` starts with `"library"`. **Not wired into a worker/route yet** (out of
+this item's scope, matching the "ships the primitive, wiring is a later item" posture MUSEM-02's
+download adapter also documents above) — call it from an operator CLI subcommand or the
+maintenance pass in a follow-up item. Per-file failures (a bad file, a resolver error, a DB write
+failure) increment `ScanReport::errors` and the pass continues; a directory that can't be listed
+mid-walk is logged and that subtree is skipped, not the whole pass. Symlinks under the library root
+are detected via `symlink_metadata` and never followed — a deliberate, documented skip (a symlink
+out of the read-only root would otherwise let the walk escape it; a symlink loop would otherwise
+hang it).
 
 Tests: `cargo test --bin muse library::` — walk/parse/match(mocked resolver)/sidecar-detect all
 run against a fixture directory tree (`std::env::temp_dir()` + a unique per-test subdir, no

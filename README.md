@@ -297,10 +297,14 @@ and never `fs::remove_*`/`fs::rename`/`fs::write`. This is proven two ways in
 `src/library/scan.rs`'s test suite:
 - **Structural**: `no_write_create_remove_calls_in_the_scan_and_sidecar_source` `read_dir`s the
   whole `src/library/` production source directory (`mod.rs`/`scan.rs`/`sidecar.rs`, everything
-  above each file's own `#[cfg(test)]` block) and greps every `.rs` file for any write-shaped
-  call — `File::create`, `.write(true)`, `.create(true)`, `.append(true)`, `fs::remove_file`/`_dir`,
-  `fs::rename`, `fs::write(`, `fs::copy(`, `fs::set_permissions` — failing the build if a future
-  edit (anywhere in the module, not just the two files it originally covered) introduces one.
+  above each file's own `#[cfg(test)]` block) and greps every `.rs` file for a comprehensive
+  banned-pattern set: `File::create`, `.write(true)`, `.create(true)`, `.create_new(true)`,
+  `.append(true)`, `.truncate(true)`, `fs::write(`/`std::fs::write`, `fs::remove_file`,
+  `fs::remove_dir`/`fs::remove_dir_all`, `fs::rename`, `fs::copy(`, `fs::hard_link`,
+  `fs::soft_link`, `fs::symlink(` (kept paren-suffixed so it doesn't false-positive against this
+  module's own legitimate, read-only `symlink_metadata` calls), `fs::set_permissions`,
+  `fs::create_dir`/`fs::create_dir_all` — failing the build if a future edit (anywhere in the
+  module) introduces any write-shaped filesystem call into the library.
 - **Behavioral**: `fixture_scan_leaves_the_library_byte_for_byte_unchanged` checksums (relative
   path + size + full bytes) an entire fixture library tree, runs a full walk + sidecar-detect +
   sidecar-read pass over it, checksums again, and asserts the two checksums are identical.
@@ -379,10 +383,18 @@ and is cached on `ScannedFile::sidecar_art` so both matching and recording reuse
   `artwork_cache` the same way, `entity_kind = "media_item"` — the same key convention
   `web::artwork::art_handler` already reads from, so a scanned file's art (and now its `.nfo`) is
   immediately retrievable with no further wiring (`GET /art/media_item/{id}?variant=nfo` etc.).
-- **Idempotent, like the file record itself**: `record_matched_file` only (re-)caches/attaches
-  poster/fanart/`.nfo` when `upsert_scanned` reports the file actually changed this pass (the size
-  guard) — an unchanged rescan does zero sidecar I/O and reports `art_cached`/`nfo_attached` as `0`
-  for that file, not just "no duplicate row."
+- **Idempotent per-sidecar, decoupled from the media file's own change status.** Sidecar
+  detection/attachment always runs for a matched file — it is deliberately NOT gated on
+  `upsert_scanned`'s media-file size guard (an earlier revision skipped all sidecar work whenever
+  the media file was unchanged, which meant a poster/fanart/`.nfo` added or edited *after* the
+  first scan — a curator drops in a better poster, `*arr` rewrites the `.nfo` — was never picked
+  up on a later rescan of that same, byte-identical file). Instead, `cache_if_changed` (shared by
+  `cache_art`/`cache_nfo`) looks up whatever is already cached for `(media_item_id, variant)` and
+  skips the write only when the bytes are byte-for-byte identical to what's already there;
+  otherwise it (re-)writes. Net effect: a rescan where nothing changed (media file AND every
+  sidecar identical) still does zero writes and reports `art_cached`/`nfo_attached` as `0`, but a
+  rescan that finds a newly-added or edited sidecar attaches it — even when the media file next to
+  it hasn't moved at all.
 - No local sidecar art/`.nfo` found is not an error — the existing artwork-proxy path (Plex fetch,
   then the built-in placeholder) already covers "fall back to a provider re-fetch."
 

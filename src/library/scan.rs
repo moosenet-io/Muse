@@ -486,21 +486,23 @@ async fn record_matched_file(
         .map(|e| e.to_lowercase());
     let media_info = container.map(|c| serde_json::json!({ "container": c }));
 
-    let (_media_file, file_changed) =
+    let (_media_file, _file_changed) =
         repo::media_file::upsert_scanned(pool, media_item.id, &file.relative_path, file.size_bytes, media_info)
             .await?;
 
-    // Review finding 3 (codex): an idempotent rescan of an unchanged file
-    // (the size guard says nothing changed) must be a full no-op, not just
-    // "no duplicate media_files row" -- re-reading + re-writing the same
-    // sidecar art/`.nfo` bytes into `artwork_cache` on every pass is
-    // unnecessary I/O and DB churn for a file that hasn't moved. Only
-    // (re-)cache/attach sidecar content when `upsert_scanned` actually
-    // recorded a change (first sighting, or a genuine size change).
-    if !file_changed {
-        return Ok(RecordOutcome::default());
-    }
-
+    // Review finding (codex, this round): sidecar attachment must NOT be
+    // gated on the MEDIA FILE's own change status. A prior revision
+    // skipped ALL sidecar work whenever `upsert_scanned` reported the
+    // media file unchanged -- but a poster/fanart/`.nfo` can be added or
+    // edited beside an already-scanned, byte-identical media file (a
+    // curator drops in a better poster after the fact, `*arr` rewrites the
+    // `.nfo`, etc.), and that rescan would then never pick it up. Sidecar
+    // detection + attachment now ALWAYS runs for a matched file; the
+    // idempotency guarantee moves down into `cache_if_changed` below,
+    // which compares against what's already cached and skips only a
+    // byte-identical re-write -- so an unchanged file with unchanged
+    // sidecars still does zero writes, but a changed/new sidecar is
+    // attached regardless of whether the media file itself moved.
     let mut outcome = RecordOutcome::default();
 
     if let Some(poster_path) = &file.sidecar_art.poster_path {
@@ -544,15 +546,7 @@ async fn cache_nfo(pool: &PgPool, media_item_id: i64, nfo_path: &Path) -> bool {
         }
     };
 
-    match repo::artwork_cache::store_bytes(pool, "media_item", media_item_id, "nfo", None, "application/xml", &bytes, None)
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!(media_item_id, error = %e, "library scan: could not attach .nfo sidecar; skipping");
-            false
-        }
-    }
+    cache_if_changed(pool, media_item_id, "nfo", "application/xml", &bytes).await
 }
 
 /// Read (READ-ONLY) + cache one sidecar art file into `artwork_cache`,
@@ -570,12 +564,47 @@ async fn cache_art(pool: &PgPool, media_item_id: i64, variant: &str, art_path: &
     };
     let content_type = crate::library::sidecar::guess_content_type(art_path);
 
-    match repo::artwork_cache::store_bytes(pool, "media_item", media_item_id, variant, None, content_type, &bytes, None)
+    cache_if_changed(pool, media_item_id, variant, content_type, &bytes).await
+}
+
+/// The per-sidecar idempotency guard (codex review, this round): looks up
+/// whatever is already cached for `(media_item_id, variant)` and, if its
+/// bytes are byte-for-byte identical to `bytes`, skips the write entirely
+/// (returns `false` — "not (re-)attached this pass," the sidecar was
+/// already current). Otherwise (no existing row, a lookup failure, or
+/// genuinely different bytes) writes via `artwork_cache::store_bytes` and
+/// returns whether that write succeeded. This is what makes sidecar
+/// attachment idempotent WITHOUT tying it to the media file's own
+/// size-guard: a newly-added or edited sidecar is written even when the
+/// media file next to it hasn't changed at all, while re-scanning an
+/// unchanged sidecar is still a true no-op (no DB write).
+async fn cache_if_changed(pool: &PgPool, media_item_id: i64, variant: &str, content_type: &str, bytes: &[u8]) -> bool {
+    match repo::artwork_cache::get(pool, "media_item", media_item_id, variant).await {
+        Ok(Some(existing)) if existing.bytes.as_deref() == Some(bytes) => {
+            tracing::debug!(
+                media_item_id,
+                variant,
+                "library scan: sidecar unchanged since the last cache; skipping the write"
+            );
+            return false;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                media_item_id,
+                variant,
+                error = %e,
+                "library scan: could not check the existing cached sidecar; attempting to (re-)write it anyway"
+            );
+        }
+    }
+
+    match repo::artwork_cache::store_bytes(pool, "media_item", media_item_id, variant, None, content_type, bytes, None)
         .await
     {
         Ok(_) => true,
         Err(e) => {
-            tracing::warn!(media_item_id, variant, error = %e, "library scan: could not cache sidecar art; skipping");
+            tracing::warn!(media_item_id, variant, error = %e, "library scan: could not cache/attach sidecar; skipping");
             false
         }
     }
@@ -927,17 +956,38 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
 
+            // Review finding (codex, "airtight" round): the banned-pattern
+            // set was too short-listed. Broadened to comprehensively cover
+            // every std/library write-shaped filesystem entry point, not
+            // just the handful this module happened to need to avoid so
+            // far. `fs::` (unqualified) patterns already match the
+            // `std::fs::`-qualified spelling too since this is a plain
+            // substring search (`"fs::write("` is a substring of
+            // `"std::fs::write("`), but a few fully-qualified forms are
+            // listed explicitly anyway for defense-in-depth/readability.
+            // `"fs::symlink("` (not bare `"symlink"`) deliberately keeps
+            // its trailing `(` so it doesn't false-positive against this
+            // module's own legitimate, read-only `symlink_metadata` calls.
             for banned in [
                 "File::create",
                 ".write(true)",
                 ".create(true)",
+                ".create_new(true)",
                 ".append(true)",
+                ".truncate(true)",
+                "fs::write(",
+                "std::fs::write",
                 "fs::remove_file",
                 "fs::remove_dir",
+                "fs::remove_dir_all",
                 "fs::rename",
-                "fs::write(",
                 "fs::copy(",
+                "fs::hard_link",
+                "fs::soft_link",
+                "fs::symlink(",
                 "fs::set_permissions",
+                "fs::create_dir",
+                "fs::create_dir_all",
             ] {
                 assert!(
                     !code_only.contains(banned),
@@ -1137,6 +1187,46 @@ mod tests {
             .await
             .expect("list media_files again");
         assert_eq!(files_again.len(), 1, "re-scanning an unchanged file must not create a duplicate media_files row");
+
+        // Review finding (codex, "sidecar must not depend on the media file
+        // changing" round): a NEW poster + `.nfo` dropped in beside an
+        // already-scanned, byte-identical media file must still be
+        // attached on the next rescan -- sidecar attachment must not hinge
+        // on `media_files`' own size-guard. Neither sidecar existed on the
+        // first two scans above, so a fresh scan finding them now proves
+        // detection isn't gated on the media file having changed.
+        fs::write(movie_dir.join("fanart.jpg"), b"newly-added-fanart-bytes").unwrap();
+        fs::write(movie_dir.join("movie.nfo"), b"<movie><title>added later</title></movie>").unwrap();
+
+        let report3 = scan_library(&pool, &library, &resolver).await.expect("third scan_library pass");
+        assert_eq!(report3.matched, 1);
+        assert_eq!(
+            report3.art_cached, 1,
+            "a newly-added fanart beside an unchanged media file must still be attached on rescan"
+        );
+        assert_eq!(
+            report3.nfo_attached, 1,
+            "a newly-added .nfo beside an unchanged media file must still be attached on rescan"
+        );
+
+        let fanart = repo::artwork_cache::get(&pool, "media_item", items[0].id, "backdrop")
+            .await
+            .expect("query artwork_cache for the newly-added fanart")
+            .expect("fanart should now be cached");
+        assert_eq!(fanart.bytes.as_deref(), Some(&b"newly-added-fanart-bytes"[..]));
+
+        let nfo = repo::artwork_cache::get(&pool, "media_item", items[0].id, "nfo")
+            .await
+            .expect("query artwork_cache for the newly-added nfo")
+            .expect("nfo should now be cached");
+        assert_eq!(nfo.bytes.as_deref(), Some(&b"<movie><title>added later</title></movie>"[..]));
+
+        // And re-scanning again with nothing further changed is back to a
+        // full no-op, including for the sidecars just attached above.
+        let report4 = scan_library(&pool, &library, &resolver).await.expect("fourth scan_library pass");
+        assert_eq!(report4.matched, 1);
+        assert_eq!(report4.art_cached, 0, "unchanged sidecars (poster+fanart) must not be re-cached again");
+        assert_eq!(report4.nfo_attached, 0, "an unchanged .nfo must not be re-attached again");
 
         fs::remove_dir_all(&dir).ok();
     }

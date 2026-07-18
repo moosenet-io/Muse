@@ -384,6 +384,7 @@ mod tests {
             title: "Some.Movie.2020.1080p".into(),
             indexer_id: 1,
             indexer: None,
+            protocol: None,
             size: None,
             publish_date: None,
             info_url: None,
@@ -397,6 +398,9 @@ mod tests {
                 name: None,
             }],
             indexer_flags: vec![],
+            imdb_id_raw: None,
+            tmdb_id_raw: None,
+            tvdb_id_raw: None,
         };
         // No season parsed, but category says TV -> Show wins.
         let parsed = parse_release_name(&release.title);
@@ -411,6 +415,7 @@ mod tests {
             title: "Show.Name.S01E02.720p.WEB-DL".into(),
             indexer_id: 1,
             indexer: None,
+            protocol: None,
             size: None,
             publish_date: None,
             info_url: None,
@@ -421,6 +426,9 @@ mod tests {
             grabs: None,
             categories: vec![],
             indexer_flags: vec![],
+            imdb_id_raw: None,
+            tmdb_id_raw: None,
+            tvdb_id_raw: None,
         };
         let parsed = parse_release_name(&release.title);
         assert_eq!(infer_media_kind(&release, &parsed, &config), MediaKind::Show);
@@ -434,6 +442,7 @@ mod tests {
             title: "Ambiguous.Release.Name".into(),
             indexer_id: 1,
             indexer: None,
+            protocol: None,
             size: None,
             publish_date: None,
             info_url: None,
@@ -444,6 +453,9 @@ mod tests {
             grabs: None,
             categories: vec![],
             indexer_flags: vec![],
+            imdb_id_raw: None,
+            tmdb_id_raw: None,
+            tvdb_id_raw: None,
         };
         let parsed = parse_release_name(&release.title);
         assert_eq!(infer_media_kind(&release, &parsed, &config), MediaKind::Movie);

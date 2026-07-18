@@ -518,6 +518,7 @@ mod tests {
             year: Some(2021),
             network: None,
             keywords: vec![format!("musela2-keyword-{suffix}")],
+            runtime_minutes: None,
         };
 
         let updated = apply_enrichment(&pool, seeded.id, &enrichment)

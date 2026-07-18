@@ -288,6 +288,8 @@ fn details_to_provider_metadata(details: TmdbDetails, tmdb_id: &str) -> Provider
         // movies have no network at all).
         network: None,
         keywords: Vec::new(),
+        // MUSEL-C2 field: TMDb runtime isn't fetched in this v1 mapping.
+        runtime_minutes: None,
     }
 }
 

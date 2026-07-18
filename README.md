@@ -65,6 +65,7 @@ Subsystem map (source module → concern):
 | `channels/` | On-demand pseudo-TV lineup composer + presets |
 | `tuner/` | HDHomeRun-emulation linear tuner (discover/lineup/M3U/XMLTV) + rolling-grid scheduler |
 | `streaming/` | ffmpeg channel streaming engine (`/auto/v{id}`) |
+| `matching/` | Matching-verification support: MUSEL-C1's ffmpeg sample-still extraction primitive (MUSEL-C2's verdict logic lands later) |
 | `web/` | Channel-guide web page + JSON API + artwork proxy |
 | `plex_control/` | Plex Companion cast/play-queue client (library-only, unwired — see below) |
 
@@ -304,6 +305,31 @@ either off, `POST /requests` still persists the request — it just never reache
 - `GET /muse.m3u` — M3U playlist alternative.
 - `GET /xmltv.xml` — XMLTV EPG generated from `channel_programs`.
 - `GET /auto/v{channel_id}` — continuous MPEG-TS stream (join-mid-stream). `501` if ffmpeg is missing, `503` if nothing is scheduled "now".
+
+## Matching-verification: sample-still extraction (`src/matching/`, MUSEL-C1)
+
+MUSEL-C1 is the raw-material primitive for a matching-verification pipeline: rather than
+trusting a provider-ID match blindly, Muse can pull a handful of still frames from a media
+file and (in a later item, MUSEL-C2) judge whether the file's actual content is consistent
+with what it's labeled as.
+
+- `streaming::ffmpeg::build_still_args(file_path, seek_ms)` — pure arg builder, extending the
+  existing channel-streaming `ffmpeg` module. Reuses the same fast input-seek (`-ss` *before*
+  `-i`) as `build_args`, and decodes exactly one frame (`-frames:v 1 -f image2pipe -vcodec
+  mjpeg pipe:1`) per invocation — one still per ffmpeg process, mirroring MUSE-29's
+  one-invocation-per-unit discipline.
+- `matching::stills::extract_sample_stills(ffmpeg_path, file_path, runtime_ms, n)` — spreads
+  `n` sample timestamps across `runtime_ms` (roughly 10%..90%, so a still never lands on a
+  black leader/credits frame or seeks past EOF), spawns ffmpeg once per timestamp, and
+  captures each resulting JPEG's bytes + timestamp into a `Still { bytes, timestamp_ms }`.
+  Read-only on the input; every still lives in memory only (never written to disk beside the
+  media). A decode failure on one timestamp is skipped, not fatal to the rest. `ffmpeg_path`
+  is threaded through explicitly (matching `Config::ffmpeg_path`, `MUSE_FFMPEG_PATH`) rather
+  than assumed — no hardcoded infra. If the ffmpeg binary itself is missing, the whole call
+  degrades gracefully to `MuseError::NotImplemented` (the same posture `streaming` uses for a
+  missing binary), instead of panicking or repeating the same failure per timestamp.
+- MUSEL-C2 (a separate spec item) builds the actual `verify_match` verdict — VLM-via-Chord,
+  still-liveness, metadata-consistency — on top of these stills. Not implemented yet.
 
 ## Release-decision engine
 

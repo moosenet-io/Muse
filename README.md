@@ -207,13 +207,16 @@ This is what lets Muse identify/enrich titles without depending on `*arr` for me
 
 ### Provider-resolution + enrichment aggregator (`src/metadata/resolve.rs`, MUSEL-A2)
 
-`metadata::resolve::resolve_and_merge(ids, kind, providers) -> MuseResult<ProviderMetadata>` is the
-fan-out-then-merge step on top of the MUSEL-A1 seam above: given a title's already-known provider
-ids (`metadata::resolve::ResolveIds` — a `provider_ids: HashMap<String, String>` keyed by provider
-name, e.g. `"tmdb"`/`"tvdb"`/`"imdb"`, plus a fallback `title`) and a set of *named*, already-
-configured providers (`metadata::resolve::NamedProvider { name, provider: &dyn MetadataProvider }`),
-it calls each provider's own `resolve_by_id`, merges the results into one `ProviderMetadata`, and
-never fails just because a provider is absent, down, or has nothing for this id.
+`metadata::resolve::resolve_and_merge(ids, kind, providers) -> MuseResult<Option<ResolvedMetadata>>`
+is the fan-out-then-merge step on top of the MUSEL-A1 seam above: given a title's already-known
+provider ids (`metadata::resolve::ResolveIds` — a `provider_ids: HashMap<String, String>` keyed by
+provider name, e.g. `"tmdb"`/`"tvdb"`/`"imdb"`, plus a fallback `title`) and a set of *named*,
+already-configured providers (`metadata::resolve::NamedProvider { name, provider: &dyn
+MetadataProvider }`), it calls each provider's own `resolve_by_id`, merges the results into one
+`ProviderMetadata`, and never fails just because a provider is absent, down, or has nothing for this
+id. `ResolvedMetadata { metadata, confidence }` wraps the merge with a
+`metadata::resolve::MatchConfidence` marker (`Id` vs `TitleSearch`, see below) — `resolve_and_merge`
+returns `Ok(None)` when nothing resolved at all.
 
 **Precedence (ARR-BLUEPRINT §7.7)**: movies are **TMDb-primary**, TV/anime are **TVDB-primary** —
 the primary provider's fields win on a conflict (logged at `debug`, never silently swallowed); a
@@ -229,29 +232,41 @@ full record. `ResolveIds::id_for` falls back to the `imdb` id for any provider t
 own name recorded — TheTVDB has no analogous by-imdb-id lookup, so passing it there is still
 graceful (TheTVDB just returns "not found" for an id it doesn't recognize, never an error).
 
-**Graceful degrade**: `providers` empty -> `Ok(ProviderMetadata::default())` (clean no-op, not an
-error). A provider present but with no id known for it is skipped for the id-based pass. A provider
-that errors or returns `Ok(None)` mid-fan-out is skipped; the rest still merge. **No known ids for a
-title** falls back to each configured provider's `search(title, kind)`, first hit only, at the
-lowest confidence — logged at `warn` so it's visible in logs, and never promoted to a normal,
-confident id-based match.
+**Graceful degrade + the title-search fallback's NARROW scope** (tightened in review, S119b):
+`providers` empty -> `Ok(None)` (clean no-op, not an error). A provider present but with no id known
+for it is skipped for the id-based pass. A provider that errors or returns `Ok(None)` mid-fan-out is
+skipped; the rest still merge. The lowest-confidence title-search fallback (each configured
+provider's `search(title, kind)`, first hit only) is attempted **only when `ids` carries no known
+provider id at all** — if one or more ids WERE supplied and every one of them failed to resolve,
+`resolve_and_merge` returns `Ok(None)` rather than guessing by title, since a title guess could
+silently attach an unrelated title's data to a row that carries a specific (if currently
+unresolvable) id. When the fallback IS taken (no ids known, title present), the result is wrapped
+with `MatchConfidence::TitleSearch` and logged at `warn` — never `MatchConfidence::Id`, and never
+silently treated as a confident match by a persistence caller.
 
 **Persistence** (`repo::media_metadata::apply_enrichment`, Muse's DB only — never a provider, never
-the library) writes the merged result onto an *existing* `media_metadata` row (never creates one;
-row creation stays `arr::ingest`'s job): `overview`/`year` fill in only when the merge produced a
-value (never clears a previously-enriched field); `tmdb_id`/`tvdb_id`/`imdb_id` fill in only when
-the row doesn't already carry that id; `provider_ids` and `images` (by `coverType`) are merged with
-what's already on the row, not replaced wholesale; `genres` are additively linked via
-`genres`/`media_metadata_genres` (find-or-create by name, link if not already linked) — never
-unlinked, so a single provider's genre call never silently removes a curator's or another
-provider's tag. `ratings` gets a coarse v1 shape, `{"resolved": {"value": <merged rating>}}` —
-`ProviderMetadata::rating` is already a single merged scalar by the time it reaches persistence (the
-per-provider breakdown was collapsed during the precedence merge), so there's no richer per-provider
-key to write yet; a future item could thread that through `ProviderMetadata` if the UI ends up
-wanting per-provider rating badges. `keywords` is wired end-to-end (merge + an additive DB write
-path exists) but no concrete provider populates `ProviderMetadata::keywords` yet — added as an
-empty-by-default, `Default`-backed field so a provider can start populating it later without another
-shape change.
+the library) writes a `ResolvedMetadata.metadata` onto an *existing* `media_metadata` row (never
+creates one; row creation stays `arr::ingest`'s job) — but callers MUST check `confidence` first:
+`maintenance::run_metadata_resolve_pass` (the only wired caller) skips persisting a
+`MatchConfidence::TitleSearch` result entirely rather than writing it as if it were authoritative.
+`apply_enrichment` itself is strictly **fill-only / add-only**, never a refresh-and-replace:
+- `overview`/`year`/`tmdb_id`/`tvdb_id`/`imdb_id` only fill in when the row's own value is currently
+  NULL — an existing (possibly curated) value always wins over whatever this pass resolved, even on
+  a re-run that resolved something different.
+- `provider_ids` is a union with what the row already has (existing keys win on overlap).
+- `images` and `keywords` are **add-only**: a new `coverType`/keyword not already present is
+  appended; an existing `coverType` entry's URL is left untouched even when the merge produced a
+  different URL for the same `coverType` (this is intentionally not a "refresh art from the
+  provider" operation — that would be a separate, explicit item). `keywords` persists into the
+  `media_metadata.keywords` jsonb array, deduplicated.
+- `genres` are additively linked via `genres`/`media_metadata_genres` (find-or-create by name, link
+  if not already linked) — never unlinked, so a single provider's genre call never silently removes
+  a curator's or another provider's tag.
+- `ratings` gets a coarse v1 shape, fill-only: `{"resolved": {"value": <merged rating>}}` is only
+  set if the row has no `"resolved"` key yet. `ProviderMetadata::rating` is already a single merged
+  scalar by the time it reaches persistence (the per-provider breakdown was collapsed during the
+  precedence merge), so there's no richer per-provider key to write yet; a future item could thread
+  that through `ProviderMetadata` if the UI ends up wanting per-provider rating badges.
 
 **Wired into the maintenance pass** (`maintenance::run_maintenance_pass`, step (a3)) as an optional,
 bounded step: runs only when at least one metadata provider is configured (`state.tmdb` and/or a
@@ -262,7 +277,8 @@ many movie rows and that many show rows per pass — via
 `repo::media_metadata::find_needing_enrichment` (rows with a known provider id but
 `overview IS NULL`, oldest-unsynced-first). Every row's resolve/persist failure is logged and the
 pass continues, same error-isolation posture as every other maintenance step; zero providers
-configured is a harmless, cheap skip.
+configured is a harmless, cheap skip; a `MatchConfidence::TitleSearch` result is logged and skipped
+(not persisted), per the persistence rule above.
 
 ### Download-client adapter (`src/download/`, MUSEM-02)
 

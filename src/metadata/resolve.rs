@@ -34,18 +34,62 @@
 //! - A provider that returns `Ok(None)` (well-formed "not found") or
 //!   `Err(_)` (mid-fan-out failure) is skipped; the others still merge.
 //!   An error is logged at `warn`, a `None` at `debug`.
-//! - `providers` empty -> `Ok(ProviderMetadata::default())`, not an error.
-//! - No id-based hit from any provider: if a `title` was supplied, each
-//!   provider's [`MetadataProvider::search`] is tried as a **lowest-
-//!   confidence fallback** (first hit only, logged at `warn` so a caller
-//!   scanning logs can see a title resolved this way) — never silently
-//!   promoted to a normal, confident match. No title either -> clean no-op.
+//! - `providers` empty -> `Ok(None)`, not an error.
+//!
+//! ## The title-search fallback is NARROWLY scoped (review finding, S119b)
+//! The lowest-confidence title-search fallback is **only** attempted when
+//! `ids` carries **no known provider id at all**
+//! (`ResolveIds::provider_ids.is_empty()`). If the caller *did* supply one
+//! or more known ids and every one of them failed to resolve (each
+//! provider returned `Ok(None)` or errored), [`resolve_and_merge`] returns
+//! `Ok(None)` — it does **not** fall back to a title search in that case.
+//! Guessing by title when a specific id was supplied but came up empty
+//! would risk silently attaching an unrelated title's data to a real,
+//! specific id (e.g. a stale/wrong `tmdb_id` on the row) — exactly the
+//! "wrong-confident match" the spec's edge cases forbid. Only the true
+//! "we have nothing to go on but a title" case gets the fallback.
+//!
+//! When the fallback IS taken, the result is wrapped in
+//! [`ResolvedMetadata`] with [`MatchConfidence::TitleSearch`] rather than
+//! [`MatchConfidence::Id`] — see that type's doc. Callers that persist a
+//! [`ResolvedMetadata`] (see `repo::media_metadata::apply_enrichment`'s
+//! caller in `maintenance::run_metadata_resolve_pass`) MUST check
+//! `confidence` and treat `TitleSearch` as tentative, never as an
+//! authoritative overwrite.
 
 use std::collections::HashMap;
 
 use crate::error::MuseResult;
 
 use super::{MediaKind, MetadataProvider, ProviderMetadata};
+
+/// How [`resolve_and_merge`] arrived at a [`ResolvedMetadata`] result.
+/// Exists specifically so a persistence caller can tell an authoritative
+/// id-based match apart from a lowest-confidence title-search guess —
+/// `ProviderMetadata` itself carries no such marker (it's the same
+/// normalized shape either way), so this lives on the wrapper instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchConfidence {
+    /// At least one configured provider resolved this title via its own
+    /// id lookup (`MetadataProvider::resolve_by_id`). Safe to persist as
+    /// an authoritative enrichment.
+    Id,
+    /// No known id resolved anything (or none was supplied); this is a
+    /// first-hit, free-text title search result. NEVER an authoritative
+    /// match — a caller persisting this should treat it as tentative at
+    /// best, or skip persisting it entirely (see
+    /// `maintenance::run_metadata_resolve_pass`, which skips it).
+    TitleSearch,
+}
+
+/// [`resolve_and_merge`]'s output: the merged metadata plus how confident
+/// the match is. `None` from `resolve_and_merge` itself (not a variant
+/// here) covers "nothing resolved at all" — see that function's doc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMetadata {
+    pub metadata: ProviderMetadata,
+    pub confidence: MatchConfidence,
+}
 
 /// Provider name for TMDb entries in [`ProviderMetadata::provider_ids`] /
 /// the `providers` slice passed to [`resolve_and_merge`]. Matches the keys
@@ -127,76 +171,114 @@ fn primary_provider_name(kind: MediaKind) -> &'static str {
 }
 
 /// Fan out to every provider in `providers`, resolve/merge into one
-/// [`ProviderMetadata`]. See the module doc for the full precedence and
-/// graceful-degrade rules. Never returns `Err` for a provider-side
-/// failure — only a truly unexpected internal error would surface as
-/// `Err` here, and no such path currently exists (kept `MuseResult` for
-/// forward compatibility with a future provider whose `resolve_by_id`
-/// contract might need to short-circuit the whole resolve).
+/// [`ResolvedMetadata`]. See the module doc for the full precedence,
+/// graceful-degrade, and title-search-scoping rules. Never returns `Err`
+/// for a provider-side failure — only a truly unexpected internal error
+/// would surface as `Err` here, and no such path currently exists (kept
+/// `MuseResult` for forward compatibility with a future provider whose
+/// `resolve_by_id` contract might need to short-circuit the whole
+/// resolve).
+///
+/// Returns `Ok(None)` when nothing resolved: no providers configured, no
+/// known ids AND no title, or — critically — known ids WERE supplied but
+/// every one of them came back empty/erroring (see the module doc's
+/// "title-search fallback is NARROWLY scoped" section for why that case
+/// does NOT fall back to a title guess).
 pub async fn resolve_and_merge(
     ids: &ResolveIds,
     kind: MediaKind,
     providers: &[NamedProvider<'_>],
-) -> MuseResult<ProviderMetadata> {
+) -> MuseResult<Option<ResolvedMetadata>> {
     if providers.is_empty() {
         tracing::debug!("resolve_and_merge: no providers configured; clean no-op");
-        return Ok(ProviderMetadata::default());
+        return Ok(None);
     }
 
+    let have_known_ids = !ids.provider_ids.is_empty();
+
+    if have_known_ids {
+        let mut hits: Vec<(&str, ProviderMetadata)> = Vec::new();
+
+        for np in providers {
+            let Some(id) = ids.id_for(np.name) else {
+                tracing::debug!(provider = np.name, "resolve_and_merge: no known id for this provider; skipping");
+                continue;
+            };
+
+            match np.provider.resolve_by_id(kind, id).await {
+                Ok(Some(meta)) => hits.push((np.name, meta)),
+                Ok(None) => {
+                    tracing::debug!(provider = np.name, id, "resolve_and_merge: provider has no record for this id");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = np.name,
+                        id,
+                        error = %e,
+                        "resolve_and_merge: provider errored mid-fan-out; skipping (graceful degrade)"
+                    );
+                }
+            }
+        }
+
+        if hits.is_empty() {
+            // Known ids were supplied but NONE of them resolved — do NOT
+            // fall back to a title search here (see module doc): that
+            // would risk attaching an unrelated title's data to a row
+            // that carries a specific (if currently unresolvable) id.
+            // Unresolved, not an error, not a guess.
+            tracing::debug!(
+                "resolve_and_merge: known ids were supplied but none resolved; returning unresolved \
+                 (not falling back to a title guess against a specific-id row)"
+            );
+            return Ok(None);
+        }
+
+        return Ok(Some(ResolvedMetadata {
+            metadata: merge_metadata(kind, hits),
+            confidence: MatchConfidence::Id,
+        }));
+    }
+
+    // No known ids at all — the only case the title-search fallback is
+    // allowed to run in.
+    let Some(title) = ids.title.as_deref().filter(|t| !t.trim().is_empty()) else {
+        tracing::debug!("resolve_and_merge: no known ids and no title to fall back to; clean no-op");
+        return Ok(None);
+    };
+
     let mut hits: Vec<(&str, ProviderMetadata)> = Vec::new();
-
     for np in providers {
-        let Some(id) = ids.id_for(np.name) else {
-            tracing::debug!(provider = np.name, "resolve_and_merge: no known id for this provider; skipping");
-            continue;
-        };
-
-        match np.provider.resolve_by_id(kind, id).await {
-            Ok(Some(meta)) => hits.push((np.name, meta)),
-            Ok(None) => {
-                tracing::debug!(provider = np.name, id, "resolve_and_merge: provider has no record for this id");
+        match np.provider.search(title, kind).await {
+            Ok(results) => {
+                if let Some(first) = results.into_iter().next() {
+                    tracing::warn!(
+                        provider = np.name,
+                        title,
+                        "resolve_and_merge: no known id for any provider; falling back to lowest-confidence \
+                         title search — flagged MatchConfidence::TitleSearch, never treated as a confident \
+                         id-based match by a persistence caller"
+                    );
+                    hits.push((np.name, first));
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    provider = np.name,
-                    id,
-                    error = %e,
-                    "resolve_and_merge: provider errored mid-fan-out; skipping (graceful degrade)"
-                );
-            }
+            Err(e) => tracing::warn!(
+                provider = np.name,
+                title,
+                error = %e,
+                "resolve_and_merge: fallback title search failed; skipping"
+            ),
         }
     }
 
     if hits.is_empty() {
-        let Some(title) = ids.title.as_deref().filter(|t| !t.trim().is_empty()) else {
-            tracing::debug!("resolve_and_merge: no known ids and no title to fall back to; clean no-op");
-            return Ok(ProviderMetadata::default());
-        };
-
-        for np in providers {
-            match np.provider.search(title, kind).await {
-                Ok(results) => {
-                    if let Some(first) = results.into_iter().next() {
-                        tracing::warn!(
-                            provider = np.name,
-                            title,
-                            "resolve_and_merge: no known id for any provider; falling back to lowest-confidence \
-                             title search — flagged, never treated as a confident id-based match"
-                        );
-                        hits.push((np.name, first));
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    provider = np.name,
-                    title,
-                    error = %e,
-                    "resolve_and_merge: fallback title search failed; skipping"
-                ),
-            }
-        }
+        return Ok(None);
     }
 
-    Ok(merge_metadata(kind, hits))
+    Ok(Some(ResolvedMetadata {
+        metadata: merge_metadata(kind, hits),
+        confidence: MatchConfidence::TitleSearch,
+    }))
 }
 
 /// The pure merge step: primary-provider-wins-ties, gap-fill from the
@@ -289,7 +371,7 @@ mod tests {
     async fn no_providers_is_a_clean_no_op() {
         let ids = ResolveIds::new().with_id(TMDB, "603");
         let result = resolve_and_merge(&ids, MediaKind::Movie, &[]).await.unwrap();
-        assert_eq!(result, ProviderMetadata::default());
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
@@ -299,7 +381,7 @@ mod tests {
         let result = resolve_and_merge(&ResolveIds::new(), MediaKind::Movie, &providers)
             .await
             .unwrap();
-        assert_eq!(result, ProviderMetadata::default());
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
@@ -308,8 +390,9 @@ mod tests {
         let providers = [NamedProvider::new(TMDB, &tmdb)];
         let ids = ResolveIds::new().with_id(TMDB, "603");
 
-        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap();
-        assert_eq!(result.title, Some("The Matrix".to_string()));
+        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap().unwrap();
+        assert_eq!(result.metadata.title, Some("The Matrix".to_string()));
+        assert_eq!(result.confidence, MatchConfidence::Id);
     }
 
     #[tokio::test]
@@ -321,8 +404,8 @@ mod tests {
         let providers = [NamedProvider::new(TVDB, &tvdb), NamedProvider::new(TMDB, &tmdb)];
         let ids = ResolveIds::new().with_id(TMDB, "603").with_id(TVDB, "81");
 
-        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap();
-        assert_eq!(result.title, Some("The Matrix (TMDb)".to_string()));
+        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap().unwrap();
+        assert_eq!(result.metadata.title, Some("The Matrix (TMDb)".to_string()));
     }
 
     #[tokio::test]
@@ -332,8 +415,8 @@ mod tests {
         let providers = [NamedProvider::new(TMDB, &tmdb), NamedProvider::new(TVDB, &tvdb)];
         let ids = ResolveIds::new().with_id(TMDB, "1399").with_id(TVDB, "121361");
 
-        let result = resolve_and_merge(&ids, MediaKind::Series, &providers).await.unwrap();
-        assert_eq!(result.title, Some("GoT (TVDB)".to_string()));
+        let result = resolve_and_merge(&ids, MediaKind::Series, &providers).await.unwrap().unwrap();
+        assert_eq!(result.metadata.title, Some("GoT (TVDB)".to_string()));
     }
 
     #[tokio::test]
@@ -353,12 +436,12 @@ mod tests {
         let providers = [NamedProvider::new(TMDB, &tmdb), NamedProvider::new(TVDB, &tvdb)];
         let ids = ResolveIds::new().with_id(TMDB, "603").with_id(TVDB, "81");
 
-        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap();
+        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap().unwrap();
         // primary (tmdb) wins the title...
-        assert_eq!(result.title, Some("The Matrix".to_string()));
+        assert_eq!(result.metadata.title, Some("The Matrix".to_string()));
         // ...but overview gap-fills from tvdb since tmdb didn't have one.
         assert_eq!(
-            result.overview,
+            result.metadata.overview,
             Some("A hacker discovers reality is a simulation.".to_string())
         );
     }
@@ -376,10 +459,10 @@ mod tests {
         let providers = [NamedProvider::new(TMDB, &tmdb), NamedProvider::new(TVDB, &tvdb)];
         let ids = ResolveIds::new().with_id(TMDB, "603").with_id(TVDB, "81");
 
-        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap();
-        assert_eq!(result.provider_ids.get(TMDB), Some(&"603".to_string()));
-        assert_eq!(result.provider_ids.get(TVDB), Some(&"81".to_string()));
-        assert_eq!(result.provider_ids.get(IMDB), Some(&"tt0133093".to_string()));
+        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap().unwrap();
+        assert_eq!(result.metadata.provider_ids.get(TMDB), Some(&"603".to_string()));
+        assert_eq!(result.metadata.provider_ids.get(TVDB), Some(&"81".to_string()));
+        assert_eq!(result.metadata.provider_ids.get(IMDB), Some(&"tt0133093".to_string()));
     }
 
     #[tokio::test]
@@ -407,18 +490,38 @@ mod tests {
         let providers = [NamedProvider::new(TVDB, &down_tvdb), NamedProvider::new(TMDB, &tmdb)];
         let ids = ResolveIds::new().with_id(TMDB, "603").with_id(TVDB, "81");
 
-        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap();
-        assert_eq!(result.title, Some("The Matrix".to_string()));
+        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap().unwrap();
+        assert_eq!(result.metadata.title, Some("The Matrix".to_string()));
+        assert_eq!(result.confidence, MatchConfidence::Id);
     }
 
     #[tokio::test]
-    async fn no_known_id_falls_back_to_title_search() {
+    async fn no_known_id_falls_back_to_title_search_and_is_flagged_low_confidence() {
         let tmdb = MockMetadataProvider::new().with_search_results(vec![meta("Arrival")]);
         let providers = [NamedProvider::new(TMDB, &tmdb)];
         let ids = ResolveIds::new().with_title("arrival");
 
+        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap().unwrap();
+        assert_eq!(result.metadata.title, Some("Arrival".to_string()));
+        assert_eq!(result.confidence, MatchConfidence::TitleSearch);
+    }
+
+    /// The review-finding regression test (S119b codex REQUEST_CHANGES,
+    /// finding 1): known ids were supplied, but every provider failed to
+    /// resolve any of them — this must NOT fall back to a title search,
+    /// even though a `title` is also present on `ids` and would otherwise
+    /// have plenty to search with. A wrong-confident match against the
+    /// wrong title is worse than an honest "unresolved".
+    #[tokio::test]
+    async fn known_ids_all_failing_does_not_fall_back_to_title_search() {
+        let tmdb = MockMetadataProvider::new().with_search_results(vec![meta("Some Unrelated Movie")]);
+        let providers = [NamedProvider::new(TMDB, &tmdb)];
+        // "603" is NOT registered in the mock's `by_id` map -> resolve_by_id
+        // returns Ok(None). A title IS also present, but must be ignored.
+        let ids = ResolveIds::new().with_id(TMDB, "603").with_title("The Matrix");
+
         let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap();
-        assert_eq!(result.title, Some("Arrival".to_string()));
+        assert_eq!(result, None, "known-but-unresolvable ids must return None, never a title-search guess");
     }
 
     #[tokio::test]
@@ -429,9 +532,9 @@ mod tests {
         let providers = [NamedProvider::new(TMDB, &tmdb)];
         let ids = ResolveIds::new().with_id(TMDB, "603").with_id(TVDB, "81");
 
-        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap();
-        assert_eq!(result.title, Some("The Matrix".to_string()));
-        assert!(!result.provider_ids.contains_key(TVDB));
+        let result = resolve_and_merge(&ids, MediaKind::Movie, &providers).await.unwrap().unwrap();
+        assert_eq!(result.metadata.title, Some("The Matrix".to_string()));
+        assert!(!result.metadata.provider_ids.contains_key(TVDB));
     }
 
     #[test]

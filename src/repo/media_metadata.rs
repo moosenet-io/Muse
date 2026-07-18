@@ -255,16 +255,21 @@ pub async fn find_needing_enrichment(
 /// nothing here calls out to a provider or writes to the library, matching
 /// `MetadataProvider`'s read-only contract.
 ///
-/// Additive by design, not a blind overwrite:
-/// - `overview`/`year` only replace the existing value when the merge
-///   actually produced one (`enrichment.overview.is_some()`); a title with
-///   sparse provider coverage never *clears* a previously-enriched field.
-/// - `tmdb_id`/`tvdb_id`/`imdb_id` only fill in when the row doesn't
-///   already have that id (`COALESCE`-style precedence keeps whatever the
-///   row already carries — e.g. arr ingest already set `tmdb_id` — over
-///   a resolver run that happened not to find a fresh one this pass).
-/// - `provider_ids`/`images` are merged (union / by-`coverType` upsert)
-///   with what the row already has, never replaced wholesale.
+/// Truly additive/fill-only, never a blind overwrite (review finding 3,
+/// S119b codex REQUEST_CHANGES) — an existing Muse DB value may be
+/// curated or a previous, deliberately-chosen enrichment, and a fresh
+/// resolver pass must never clobber it:
+/// - `overview`/`year`/`tmdb_id`/`tvdb_id`/`imdb_id` only fill in when the
+///   row's own value is currently NULL — the row's existing value always
+///   wins over whatever this pass resolved, even if the merge produced a
+///   different one.
+/// - `provider_ids` is a union with what the row already has (existing
+///   keys win on overlap), never replaced wholesale.
+/// - `images`/`keywords` are ADD-ONLY: a new `coverType`/keyword not
+///   already present is appended; an existing `coverType` entry's
+///   URL is left untouched even if the merge produced a different URL for
+///   the same `coverType` — this is intentionally NOT a "refresh art from
+///   the provider" operation (that would be a different, explicit item).
 /// - `genres` are additively linked (`ensure_genres_linked`) — never
 ///   unlinked, so a possibly-wrong single-provider genre never silently
 ///   removes a curator's or another provider's tag.
@@ -284,10 +289,21 @@ pub async fn apply_enrichment(
 
     let mut images: Vec<serde_json::Value> = current.images.as_array().cloned().unwrap_or_default();
     if let Some(poster) = &enrichment.images.poster_url {
-        upsert_image_entry(&mut images, "poster", poster);
+        add_image_entry_if_absent(&mut images, "poster", poster);
     }
     if let Some(backdrop) = &enrichment.images.backdrop_url {
-        upsert_image_entry(&mut images, "fanart", backdrop);
+        add_image_entry_if_absent(&mut images, "fanart", backdrop);
+    }
+
+    let mut keywords: Vec<serde_json::Value> = current.keywords.as_array().cloned().unwrap_or_default();
+    for keyword in &enrichment.keywords {
+        if keyword.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::Value::String(keyword.clone());
+        if !keywords.contains(&value) {
+            keywords.push(value);
+        }
     }
 
     let mut ratings = current.ratings.as_object().cloned().unwrap_or_default();
@@ -298,17 +314,20 @@ pub async fn apply_enrichment(
         // per-provider breakdown left to key this by. Documented in
         // README.md; a future item could thread per-provider ratings
         // through `ProviderMetadata` if that granularity turns out to
-        // matter for the UI.
-        ratings.insert(
-            "resolved".to_string(),
-            serde_json::json!({ "value": rating }),
-        );
+        // matter for the UI. Fill-only, same as every other scalar below:
+        // an already-recorded "resolved" rating is left alone.
+        ratings
+            .entry("resolved".to_string())
+            .or_insert_with(|| serde_json::json!({ "value": rating }));
     }
 
     let tmdb_id = current.tmdb_id.clone().or_else(|| enrichment.provider_ids.get("tmdb").cloned());
     let tvdb_id = current.tvdb_id.clone().or_else(|| enrichment.provider_ids.get("tvdb").cloned());
     let imdb_id = current.imdb_id.clone().or_else(|| enrichment.provider_ids.get("imdb").cloned());
-    let overview = enrichment.overview.clone().or_else(|| current.overview.clone());
+    // Fill-only: the row's existing overview/year always win (review
+    // finding 3) — a resolver re-run must never clobber a previously
+    // recorded (possibly curated) value.
+    let overview = current.overview.clone().or_else(|| enrichment.overview.clone());
     let year = current.year.or(enrichment.year);
 
     let updated = sqlx::query_as::<_, MediaMetadata>(
@@ -322,6 +341,7 @@ pub async fn apply_enrichment(
             images = $7,
             ratings = $8,
             year = $9,
+            keywords = $10,
             last_info_sync = now(),
             updated_at = now()
         WHERE id = $1
@@ -337,6 +357,7 @@ pub async fn apply_enrichment(
     .bind(serde_json::Value::Array(images))
     .bind(serde_json::Value::Object(ratings))
     .bind(year)
+    .bind(serde_json::Value::Array(keywords))
     .fetch_optional(pool)
     .await
     .map_err(MuseError::Database)?
@@ -349,21 +370,18 @@ pub async fn apply_enrichment(
     Ok(updated)
 }
 
-/// Upserts one `images` array entry by `coverType` (replacing the existing
-/// entry's `url`/`remoteUrl` if one is already present for that
-/// `coverType`, else appending a new one) — matches the shape documented
-/// on `media_metadata.images` in migration 0005
+/// Appends one `images` array entry for `cover_type` ONLY if no entry for
+/// that `coverType` already exists — add-only, never replaces an existing
+/// entry's URL (review finding 3: an existing poster/backdrop may be a
+/// deliberately-chosen or previously-fetched one; a resolver re-run must
+/// not silently swap it for a different provider's URL). Matches the
+/// shape documented on `media_metadata.images` in migration 0005
 /// (`[{coverType,url,remoteUrl}]`).
-fn upsert_image_entry(images: &mut Vec<serde_json::Value>, cover_type: &str, url: &str) {
-    if let Some(entry) = images
-        .iter_mut()
-        .find(|e| e.get("coverType").and_then(|c| c.as_str()) == Some(cover_type))
-    {
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("url".to_string(), serde_json::Value::String(url.to_string()));
-            obj.insert("remoteUrl".to_string(), serde_json::Value::String(url.to_string()));
-        }
-    } else {
+fn add_image_entry_if_absent(images: &mut Vec<serde_json::Value>, cover_type: &str, url: &str) {
+    let already_present = images
+        .iter()
+        .any(|e| e.get("coverType").and_then(|c| c.as_str()) == Some(cover_type));
+    if !already_present {
         images.push(serde_json::json!({ "coverType": cover_type, "url": url, "remoteUrl": url }));
     }
 }
@@ -499,7 +517,7 @@ mod tests {
             first_aired: Some("2021-01-01".to_string()),
             year: Some(2021),
             network: None,
-            keywords: Vec::new(),
+            keywords: vec![format!("musela2-keyword-{suffix}")],
         };
 
         let updated = apply_enrichment(&pool, seeded.id, &enrichment)
@@ -524,6 +542,11 @@ mod tests {
             Some(8.4)
         );
 
+        let keywords = updated.keywords.as_array().expect("keywords should be an array");
+        assert!(keywords
+            .iter()
+            .any(|k| k.as_str() == Some(format!("musela2-keyword-{suffix}").as_str())));
+
         let genre_linked: i64 = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM media_metadata_genres mmg \
              JOIN genres g ON g.id = mmg.genre_id \
@@ -537,8 +560,9 @@ mod tests {
         assert_eq!(genre_linked, 1);
 
         // A second apply_enrichment call (re-running the resolver) with the
-        // same genre is idempotent -- still exactly one link row.
-        apply_enrichment(&pool, seeded.id, &enrichment)
+        // same genre/keyword is idempotent -- still exactly one link row
+        // and no duplicate keyword entry.
+        let updated_again = apply_enrichment(&pool, seeded.id, &enrichment)
             .await
             .expect("second apply_enrichment should succeed");
         let genre_linked_again: i64 = sqlx::query_scalar::<_, i64>(
@@ -552,5 +576,106 @@ mod tests {
         .await
         .expect("genre-link count query");
         assert_eq!(genre_linked_again, 1);
+
+        let keywords_again = updated_again.keywords.as_array().expect("keywords should be an array");
+        let keyword_count = keywords_again
+            .iter()
+            .filter(|k| k.as_str() == Some(format!("musela2-keyword-{suffix}").as_str()))
+            .count();
+        assert_eq!(keyword_count, 1, "re-running enrichment must not duplicate an already-recorded keyword");
+    }
+
+    /// Review finding 3 (S119b codex REQUEST_CHANGES): `apply_enrichment`
+    /// must be fill-only for `overview`/images, never clobbering a value
+    /// the row already carries (curated, or from an earlier enrichment
+    /// pass) with whatever a fresh resolve happened to produce. Seeds a
+    /// row that ALREADY has an overview and a poster image, then applies
+    /// an enrichment carrying DIFFERENT values for both, and asserts
+    /// neither changed.
+    #[tokio::test]
+    async fn apply_enrichment_never_clobbers_a_preexisting_overview_or_image() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!(
+                "MUSE_TEST_DATABASE_URL not set — skipping \
+                 apply_enrichment_never_clobbers_a_preexisting_overview_or_image \
+                 (expected in the default test run; the crate does not require a live DB)"
+            );
+            return;
+        };
+
+        use sqlx::postgres::PgPoolOptions;
+        use uuid::Uuid;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect to MUSE_TEST_DATABASE_URL");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply cleanly");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let curated_overview = format!("Curated overview {suffix} — do not overwrite");
+        let curated_poster = format!("https://curated.example/{suffix}/poster.jpg");
+
+        let seeded = upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(format!("musela2-clobber-tmdb-{suffix}")),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: format!("MUSEL-A2 Clobber Test Movie {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: Some(curated_overview.clone()),
+                studio: None,
+                network: None,
+                runtime_minutes: None,
+                year: Some(1999),
+                images: serde_json::json!([{"coverType": "poster", "url": curated_poster, "remoteUrl": curated_poster}]),
+            },
+        )
+        .await
+        .expect("seed media_metadata row with a pre-existing overview + poster");
+
+        let enrichment = ProviderMetadata {
+            title: Some("A Different Title Entirely".to_string()),
+            overview: Some("A DIFFERENT overview from a fresh resolve.".to_string()),
+            images: crate::metadata::ProviderImages {
+                poster_url: Some("https://fresh-provider.example/different-poster.jpg".to_string()),
+                backdrop_url: None,
+            },
+            year: Some(2005),
+            ..Default::default()
+        };
+
+        let updated = apply_enrichment(&pool, seeded.id, &enrichment)
+            .await
+            .expect("apply_enrichment should succeed");
+
+        assert_eq!(
+            updated.overview,
+            Some(curated_overview),
+            "a pre-existing overview must never be replaced by a fresh resolve"
+        );
+        assert_eq!(updated.year, Some(1999), "a pre-existing year must never be replaced");
+
+        let images = updated.images.as_array().expect("images should be an array");
+        let poster_entries: Vec<_> = images
+            .iter()
+            .filter(|img| img.get("coverType").and_then(|c| c.as_str()) == Some("poster"))
+            .collect();
+        assert_eq!(poster_entries.len(), 1, "must not duplicate the poster coverType entry");
+        assert_eq!(
+            poster_entries[0].get("url").and_then(|u| u.as_str()),
+            Some(curated_poster.as_str()),
+            "the pre-existing poster URL must be left untouched, not replaced by the fresh provider's URL"
+        );
     }
 }

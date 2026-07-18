@@ -362,8 +362,13 @@ async fn run_metadata_resolve_pass(
                 ids = ids.with_id(crate::metadata::resolve::IMDB, imdb_id.clone());
             }
 
-            let merged = match crate::metadata::resolve::resolve_and_merge(&ids, resolve_kind, providers).await {
-                Ok(merged) => merged,
+            let resolved_match = match crate::metadata::resolve::resolve_and_merge(&ids, resolve_kind, providers).await
+            {
+                Ok(Some(resolved_match)) => resolved_match,
+                Ok(None) => {
+                    tracing::debug!(media_metadata_id = row.id, "MUSEL-A2: maintenance pass — nothing resolved this pass; continuing");
+                    continue;
+                }
                 Err(e) => {
                     failed += 1;
                     tracing::warn!(error = %e, media_metadata_id = row.id, "MUSEL-A2: maintenance pass — resolve_and_merge failed; continuing");
@@ -371,7 +376,26 @@ async fn run_metadata_resolve_pass(
                 }
             };
 
-            match crate::repo::media_metadata::apply_enrichment(pool, row.id, &merged).await {
+            // Review finding 1 (S119b codex REQUEST_CHANGES): an automated
+            // background pass must never persist a `TitleSearch` (lowest-
+            // confidence, free-text) match as if it were authoritative.
+            // Only `MatchConfidence::Id` (resolved via a provider's own id
+            // lookup) is written to `media_metadata` here. A
+            // `TitleSearch` hit is discoverable in logs (see
+            // `resolve_and_merge`'s own `tracing::warn!` when it takes
+            // that path) for a future manual-review surface, but this
+            // unattended pass skips persisting it rather than risking a
+            // wrong-confident enrichment landing on the row unattended.
+            if resolved_match.confidence != crate::metadata::resolve::MatchConfidence::Id {
+                tracing::info!(
+                    media_metadata_id = row.id,
+                    "MUSEL-A2: maintenance pass — resolved via low-confidence title search; \
+                     skipping persistence (never auto-persisted as authoritative)"
+                );
+                continue;
+            }
+
+            match crate::repo::media_metadata::apply_enrichment(pool, row.id, &resolved_match.metadata).await {
                 Ok(_) => resolved += 1,
                 Err(e) => {
                     failed += 1;

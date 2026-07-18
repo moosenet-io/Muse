@@ -186,6 +186,22 @@ pub async fn fulfill_request(
     deps: &AcquisitionDeps<'_>,
     request: &MediaRequest,
 ) -> MuseResult<FulfillOutcome> {
+    // Review finding 1 (codex, MUSEM-05 REQUEST_CHANGES): the master
+    // acquisition gate (`ExperienceSettings.acquisition.enabled`) MUST be
+    // enforced HERE — the single chokepoint every grab path (`POST
+    // /requests`, `approve`, `AcquisitionSink`, and any future MUSEM-06
+    // worker) funnels through — rather than merely being a caller-side
+    // convention that a new call site could forget to check. Fail closed:
+    // with the gate off, this is a no-op that leaves the request row
+    // exactly as it was (`Requested`, for manual/operator follow-up), never
+    // a grab, regardless of who called `fulfill_request`.
+    let settings = repo::settings::load(deps.pool).await?;
+    if !settings.is_acquisition_enabled() {
+        return Ok(FulfillOutcome::Skipped {
+            reason: "acquisition is disabled (master gate off)".to_string(),
+        });
+    }
+
     let Some(prowlarr) = deps.prowlarr else {
         return Ok(FulfillOutcome::Skipped {
             reason: "prowlarr is not configured; cannot search for releases".to_string(),
@@ -195,6 +211,18 @@ pub async fn fulfill_request(
     let Some(quality_profile_id) = request.quality_profile_id else {
         return Ok(FulfillOutcome::Skipped {
             reason: "no quality profile set on this request".to_string(),
+        });
+    };
+
+    // Review finding 2 (codex): a request is not genuinely fulfillable
+    // without a configured download client — checked as a precondition
+    // (Skipped, request stays `Requested`) rather than discovering it only
+    // after a `Decision::Grab`, which would wrongly mark the request
+    // `Failed` for a system-capability gap rather than a genuine
+    // release-decision rejection.
+    let Some(download) = deps.download else {
+        return Ok(FulfillOutcome::Skipped {
+            reason: "no download client is configured".to_string(),
         });
     };
 
@@ -226,20 +254,6 @@ pub async fn fulfill_request(
 
     match decision {
         Decision::Grab(choice) => {
-            let Some(download) = deps.download else {
-                let reason = "no download client is configured".to_string();
-                repo::acquisition::update_request_status(
-                    deps.pool,
-                    request.id,
-                    RequestStatus::Failed.as_str(),
-                )
-                .await?;
-                record_failed_history(deps.pool, request, &reason).await?;
-                return Ok(FulfillOutcome::Rejected {
-                    reasons: vec![reason],
-                });
-            };
-
             let matched = scored.iter().find(|(_, r)| r.guid == choice.release.guid);
             match grab_and_persist(deps.pool, download, request.id, &choice, matched.map(|(sr, _)| sr))
                 .await
@@ -638,12 +652,33 @@ mod db_gated {
         )
     }
 
+    /// Review finding 1 (codex): `fulfill_request` now enforces the master
+    /// acquisition gate itself, loading `ExperienceSettings` from `pool` on
+    /// every call — so every DB-gated scenario below that expects a grab to
+    /// actually happen must explicitly turn the gate ON first (it defaults
+    /// OFF, see `crate::settings::AcquisitionSettings`). Scenarios that
+    /// expect NO grab regardless (missing quality profile, decision-reject,
+    /// download-client error) still turn it on too, so those tests keep
+    /// isolating the ORIGINAL reason they're testing rather than silently
+    /// becoming "skipped because the gate is off" — see the dedicated
+    /// `gate_off_*` tests below for the gate itself.
+    async fn save_settings(pool: &PgPool, acquisition_enabled: bool) {
+        let mut settings = crate::settings::ExperienceSettings::default();
+        settings.acquisition = crate::settings::AcquisitionSettings {
+            enabled: acquisition_enabled,
+        };
+        repo::settings::save(pool, &settings)
+            .await
+            .expect("save settings");
+    }
+
     #[tokio::test]
     async fn autoapprovable_grab_writes_queue_and_history_rows() {
         let Some(pool) = test_pool_or_skip("autoapprovable_grab_writes_queue_and_history_rows").await
         else {
             return;
         };
+        save_settings(&pool, true).await;
         let profile_id = seed_profile_allowing_web_1080p(&pool).await;
         let title = format!("Musem05 Grab Movie {}", unique_suffix());
         let request = seed_request(&pool, &title, Some(profile_id)).await;
@@ -705,6 +740,7 @@ mod db_gated {
         else {
             return;
         };
+        save_settings(&pool, true).await;
         // A profile with zero allowed tiers -- every candidate is rejected.
         let profile_id = crate::repo::quality::create_profile(
             &pool,
@@ -765,6 +801,7 @@ mod db_gated {
         else {
             return;
         };
+        save_settings(&pool, true).await;
         let profile_id = seed_profile_allowing_web_1080p(&pool).await;
         let title = format!("Musem05 Qbit Error Movie {}", unique_suffix());
         let request = seed_request(&pool, &title, Some(profile_id)).await;
@@ -831,6 +868,7 @@ mod db_gated {
         else {
             return;
         };
+        save_settings(&pool, true).await;
         let title = format!("Musem05 No Profile Movie {}", unique_suffix());
         let request = seed_request(&pool, &title, None).await;
 
@@ -855,12 +893,70 @@ mod db_gated {
         assert_eq!(reloaded.status, RequestStatus::Requested.as_str());
     }
 
+    /// Review finding 1 (codex): with the master gate OFF, `fulfill_request`
+    /// must never reach `DownloadClient::add` even for an otherwise
+    /// perfectly grabbable candidate (configured Prowlarr + download client
+    /// + quality profile, and a search result that would decide `Grab`).
+    #[tokio::test]
+    async fn gate_off_prevents_a_grab_even_for_an_otherwise_grabbable_request() {
+        let Some(pool) =
+            test_pool_or_skip("gate_off_prevents_a_grab_even_for_an_otherwise_grabbable_request").await
+        else {
+            return;
+        };
+        save_settings(&pool, false).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+        let title = format!("Musem05 Gate Off Movie {}", unique_suffix());
+        let request = seed_request(&pool, &title, Some(profile_id)).await;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/search");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(search_response_body(
+                    "gate-off-fulfill-guid",
+                    &format!("{title}.2020.1080p.WEB-DL"),
+                ));
+        });
+        let prowlarr = ProwlarrClient::new(server.base_url(), "test-key").expect("client");
+        let config = Config::default();
+        let download = MockDownloadClient::new();
+
+        let deps = AcquisitionDeps {
+            pool: &pool,
+            config: &config,
+            prowlarr: Some(&prowlarr),
+            download: Some(&download),
+        };
+
+        let outcome = fulfill_request(&deps, &request).await.expect("fulfill_request");
+        assert!(
+            matches!(outcome, FulfillOutcome::Skipped { .. }),
+            "expected Skipped with the master gate off, got {outcome:?}"
+        );
+        assert_eq!(download.added_count(), 0, "the master gate being off must prevent any grab");
+
+        let reloaded = repo::acquisition::get_request(&pool, request.id).await.expect("reload request");
+        assert_eq!(
+            reloaded.status,
+            RequestStatus::Requested.as_str(),
+            "a gate-off skip must leave the request Requested, not Failed or Grabbed"
+        );
+
+        let queue = repo::acquisition::list_download_queue_by_status(&pool, QueueStatus::Queued.as_str())
+            .await
+            .expect("list queue");
+        assert!(!queue.iter().any(|q| q.request_id == Some(request.id)));
+    }
+
     #[tokio::test]
     async fn acquisition_sink_creates_and_fulfills_a_request() {
         let Some(pool) = test_pool_or_skip("acquisition_sink_creates_and_fulfills_a_request").await
         else {
             return;
         };
+        save_settings(&pool, true).await;
         let profile_id = seed_profile_allowing_web_1080p(&pool).await;
 
         let title = format!("Musem05 Sink Movie {}", unique_suffix());
@@ -899,5 +995,72 @@ mod db_gated {
             requests.iter().any(|r| r.title == title),
             "the sink must have created and grabbed a request for the draft's title"
         );
+    }
+
+    /// Review finding 1 (codex): the master gate is enforced INSIDE
+    /// `fulfill_request`, so `AcquisitionSink::submit` — the sink
+    /// `submit_if_appropriate` calls ONLY for `RequestTier::AutoApprovable`
+    /// — must still perform NO grab when the gate is off, even though it's
+    /// the one path that's structurally already past the tiered-safety
+    /// check. Proves the gate is a real, unbypassable property of the grab
+    /// chokepoint, not just a `POST /requests`-side convention.
+    #[tokio::test]
+    async fn acquisition_sink_performs_no_grab_when_the_master_gate_is_off() {
+        let Some(pool) =
+            test_pool_or_skip("acquisition_sink_performs_no_grab_when_the_master_gate_is_off").await
+        else {
+            return;
+        };
+        save_settings(&pool, false).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+
+        let title = format!("Musem05 Sink Gate Off Movie {}", unique_suffix());
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/search");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(search_response_body(
+                    "musem05-sink-gate-off-guid",
+                    &format!("{title}.2020.1080p.WEB-DL"),
+                ));
+        });
+        let prowlarr = Arc::new(ProwlarrClient::new(server.base_url(), "test-key").expect("client"));
+        let mock_download = Arc::new(MockDownloadClient::new());
+        let download: Arc<dyn DownloadClient> = mock_download.clone();
+
+        let sink = AcquisitionSink {
+            pool: pool.clone(),
+            config: Arc::new(Config::default()),
+            prowlarr: Some(prowlarr),
+            download: Some(download),
+            quality_profile_id: Some(profile_id),
+        };
+
+        let draft = MediaRequestDraft {
+            tmdb_id: "tmdb-musem05-gate-off".to_string(),
+            title: title.clone(),
+            kind: MediaKind::Movie,
+        };
+        sink.submit(&draft).await.expect("sink submit should succeed even when gated off");
+
+        assert_eq!(
+            mock_download.added_count(),
+            0,
+            "the master gate being off must prevent the sink from ever grabbing"
+        );
+
+        let requests = repo::acquisition::list_requests_by_status(&pool, RequestStatus::Requested.as_str())
+            .await
+            .expect("list requested requests");
+        assert!(
+            requests.iter().any(|r| r.title == title),
+            "the sink must still have created the request row (persist-but-never-act)"
+        );
+
+        let queue = repo::acquisition::list_download_queue_by_status(&pool, QueueStatus::Queued.as_str())
+            .await
+            .expect("list queue");
+        assert!(!queue.iter().any(|q| q.release_title.contains(title.as_str())));
     }
 }

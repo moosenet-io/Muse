@@ -95,12 +95,25 @@ pub async fn create_request_handler(
 
     let settings = repo::settings::load(&state.pool).await?;
     let acquisition_enabled = settings.is_acquisition_enabled();
-    let auto_tier_enabled = acquisition_enabled && state.config.arr_request_auto_tier_enabled;
+    // Review finding 2 (codex, MUSEM-05 REQUEST_CHANGES): a download client
+    // is as much a hard precondition for a live grab as Prowlarr or a
+    // quality profile — without one, `Decision::Grab` can never actually be
+    // executed. Folded into `auto_tier_enabled` (rather than into the
+    // hard-block `has_matching_capability` gate below) so the request is
+    // still PERSISTED as `Requested` for manual/operator follow-up, never
+    // classified `AutoApprovable`, and never surfaced as a spurious `Failed`
+    // — a missing download client is a system-capability gap, not a reason
+    // to refuse filing the request at all (that's what `has_matching_capability`
+    // below is for: genuinely can't ever search/decide).
+    let auto_tier_enabled =
+        acquisition_enabled && state.config.arr_request_auto_tier_enabled && state.download.is_some();
 
     // "Has capability at all": a configured Prowlarr client and a resolvable
     // quality profile for this kind — see the module doc on why this is the
     // honest re-reading of `has_matching_arr_instance` for a Prowlarr-native
-    // (not *arr-fleet) grab path.
+    // (not *arr-fleet) grab path. Deliberately does NOT include the download
+    // client (see above) — a request is still worth filing/searching without
+    // one, it just can never auto-approve.
     let has_matching_capability = state.prowlarr.is_some() && body.quality_profile_id.is_some();
     if !has_matching_capability {
         return Err(MuseError::BadRequest(
@@ -212,10 +225,23 @@ pub async fn list_requests_handler(
     Ok(Json(all))
 }
 
-/// `POST /requests/:id/approve` — fulfills a `Requested` request now.
-/// Idempotent: approving a request that has already moved past `Requested`
-/// (already `Grabbed`/`Failed`/`Denied`/etc.) is a no-op that returns the
-/// current row rather than a second grab.
+/// `POST /requests/:id/approve` — attempts to fulfill a `Requested` request
+/// now. Idempotent: approving a request that has already moved past
+/// `Requested` (already `Grabbed`/`Failed`/`Denied`/etc.) is a no-op that
+/// returns the current row rather than a second grab.
+///
+/// ## Review finding 3 (codex, MUSEM-05 REQUEST_CHANGES): outcome-based status
+/// The final status is derived from what `fulfill_request` actually did,
+/// never set speculatively beforehand. The previous version flipped the row
+/// to `Approved` BEFORE calling `fulfill_request`; when fulfillment turned
+/// out to be a no-op (missing Prowlarr/quality-profile/download-client, or
+/// the master gate off — `FulfillOutcome::Skipped`, which leaves the row
+/// untouched), the request was stranded at `Approved` forever — looking
+/// "handled" while never having been grabbed. Calling `fulfill_request`
+/// directly on the still-`Requested` row means: a `Grabbed`/`Rejected`
+/// outcome already updates the row's status itself (see that function), and
+/// a `Skipped` outcome correctly leaves it exactly as it was — `Requested`,
+/// so it can be retried once whatever precondition was missing is fixed.
 pub async fn approve_request_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -230,29 +256,17 @@ pub async fn approve_request_handler(
         }));
     }
 
-    let settings = repo::settings::load(&state.pool).await?;
-    if !settings.is_acquisition_enabled() {
-        return Ok(Json(RequestResponse {
-            request,
-            tier: None,
-            outcome: Some("skipped: acquisition is disabled (master gate off)".to_string()),
-        }));
-    }
-
-    let approved = repo::acquisition::update_request_status(
-        &state.pool,
-        id,
-        RequestStatus::Approved.as_str(),
-    )
-    .await?;
-
     let deps = AcquisitionDeps {
         pool: &state.pool,
         config: &state.config,
         prowlarr: state.prowlarr.as_ref(),
         download: download_client_ref(&state),
     };
-    let outcome = fulfill_request(&deps, &approved).await?;
+    // `fulfill_request` itself enforces the master acquisition gate (and
+    // every other precondition) as the single grab chokepoint — see its own
+    // doc — so this handler doesn't need (and must not duplicate) a
+    // separate settings check here.
+    let outcome = fulfill_request(&deps, &request).await?;
     let final_request = repo::acquisition::get_request(&state.pool, id).await?;
 
     Ok(Json(RequestResponse {
@@ -567,6 +581,68 @@ mod db_gated {
         assert_eq!(response.request.status, RequestStatus::Grabbed.as_str());
     }
 
+    /// Review finding 2 (codex): without a configured download client, a
+    /// request must never classify `AutoApprovable` (it can search+decide
+    /// but can never actually grab) — it's persisted `Requested` for manual
+    /// follow-up, never `Failed` (a missing download client is a
+    /// system-capability gap discovered up front, not a decision-time
+    /// rejection).
+    #[tokio::test]
+    async fn create_request_without_download_client_persists_requested_never_autoapprovable() {
+        let Some(pool) = test_pool_or_skip(
+            "create_request_without_download_client_persists_requested_never_autoapprovable",
+        )
+        .await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+        let title = format!("Musem05 Http No Download Client Movie {}", unique_suffix());
+
+        let prowlarr_server = MockServer::start();
+        prowlarr_server.mock(|when, then| {
+            when.method(GET).path("/api/v1/search");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(search_response_body(
+                    "no-download-client-guid",
+                    &format!("{title}.2020.1080p.WEB-DL"),
+                ));
+        });
+        let prowlarr = crate::prowlarr::ProwlarrClient::new(prowlarr_server.base_url(), "test-key")
+            .expect("prowlarr client");
+
+        let config = Config {
+            arr_request_auto_tier_enabled: true,
+            ..Config::default()
+        };
+        // No download client configured (`None`) — the whole point of this test.
+        let state = state_for(pool.clone(), config, Some(prowlarr), None).await;
+
+        let body = CreateRequestBody {
+            provider_ids: json!({"tmdb": "603"}),
+            kind: MediaKind::Movie,
+            title: title.clone(),
+            quality_profile_id: Some(profile_id),
+        };
+        let response = create_request_handler(State(state), Json(body))
+            .await
+            .expect("create_request_handler should succeed");
+
+        assert_eq!(
+            response.tier.as_deref(),
+            Some("NeedsReview"),
+            "no download client configured must never classify AutoApprovable"
+        );
+        assert_eq!(response.request.status, RequestStatus::Requested.as_str());
+        assert_ne!(
+            response.request.status,
+            RequestStatus::Failed.as_str(),
+            "a missing download client must never surface as Failed"
+        );
+    }
+
     /// Approve is idempotent: approving an already-`Grabbed` request never
     /// grabs a second time.
     #[tokio::test]
@@ -602,6 +678,52 @@ mod db_gated {
 
         assert_eq!(response.request.status, RequestStatus::Grabbed.as_str());
         assert_eq!(response.outcome.as_deref(), Some("no-op: request is not in Requested state"));
+    }
+
+    /// Review finding 3 (codex): approving a request that turns out to be
+    /// unfulfillable (here: no `quality_profile_id`, so `fulfill_request`
+    /// returns `Skipped`) must NOT strand the row at `Approved` — it must be
+    /// left exactly as it was, `Requested`, so it can be retried once the
+    /// missing precondition is fixed.
+    #[tokio::test]
+    async fn approve_leaves_requested_when_fulfillment_is_skipped() {
+        let Some(pool) = test_pool_or_skip("approve_leaves_requested_when_fulfillment_is_skipped").await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let request = crate::repo::acquisition::create_request(
+            &pool,
+            &crate::models::acquisition::NewMediaRequest {
+                provider_ids: json!({}),
+                media_kind: "movie".to_string(),
+                title: format!("Musem05 Approve Skip {}", unique_suffix()),
+                requested_by: None,
+                tier: None,
+                // No quality profile -- fulfill_request can only Skip.
+                quality_profile_id: None,
+                note: None,
+            },
+        )
+        .await
+        .expect("seed request");
+
+        let prowlarr_server = MockServer::start();
+        let prowlarr = crate::prowlarr::ProwlarrClient::new(prowlarr_server.base_url(), "test-key")
+            .expect("prowlarr client");
+        let config = Config::default();
+        let state = state_for(pool.clone(), config, Some(prowlarr), None).await;
+
+        let response = approve_request_handler(State(state), Path(request.id))
+            .await
+            .expect("approve_request_handler should succeed");
+
+        assert_eq!(
+            response.request.status,
+            RequestStatus::Requested.as_str(),
+            "a skipped fulfillment must never strand the request at Approved"
+        );
+        assert!(response.outcome.as_deref().unwrap_or_default().contains("quality profile"));
     }
 
     /// Deny persists `Denied` and writes a `history_events` row.

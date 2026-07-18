@@ -132,10 +132,16 @@ pub fn decide_release(
     if let Some(existing) = policy.existing {
         let (existing_rank, _) =
             scoring::tier_position(&profile.items, existing.quality_definition_id).unwrap_or((0, true));
+        // Tier order is the primary quality dimension — an "upgrade" must
+        // never regress it, even if format score alone would otherwise
+        // clear `min_upgrade_format_score` (review: codex, MUSEM-04
+        // REQUEST_CHANGES finding 2). A same-tier candidate is fine (score
+        // alone can justify it); a *lower*-tier candidate never is.
+        let tier_regressed = best_eval.tier_rank < existing_rank;
         let tier_improved = best_eval.tier_rank > existing_rank;
         let score_improved =
             best_eval.total_format_score - existing.total_format_score >= profile.min_upgrade_format_score;
-        if !(tier_improved || score_improved) {
+        if tier_regressed || !(tier_improved || score_improved) {
             return Decision::Reject {
                 reasons: vec![format!(
                     "best candidate ({}) does not improve enough on the existing file to justify an upgrade \
@@ -169,19 +175,27 @@ fn rank_candidates(
     b_eval: &CandidateEvaluation,
 ) -> Ordering {
     // Higher tier_rank is better -> reverse for ascending sort.
+    //
+    // `proper_repack` is deliberately the LAST comparison before the guid
+    // tiebreak (review: codex, MUSEM-04 REQUEST_CHANGES finding 1) — it must
+    // only decide between otherwise-fully-equal candidates ("REPACK beats an
+    // *equal* non-repack"). Placing it earlier would let a repack with worse
+    // seeders/freeleech/size beat a strictly-better non-repack release,
+    // which is exactly the "never a strictly-inferior re-release" case the
+    // item spec forbids.
     b_eval
         .tier_rank
         .cmp(&a_eval.tier_rank)
         .then_with(|| b_eval.total_format_score.cmp(&a_eval.total_format_score))
+        .then_with(|| cmp_seeders(a_cand.release.seeders, b_cand.release.seeders))
+        .then_with(|| b_cand.release.freeleech.cmp(&a_cand.release.freeleech))
+        .then_with(|| cmp_smaller_size_wins(a_cand.release.size_bytes, b_cand.release.size_bytes))
         .then_with(|| {
             b_cand
                 .release
                 .proper_repack
                 .cmp(&a_cand.release.proper_repack)
         })
-        .then_with(|| cmp_seeders(a_cand.release.seeders, b_cand.release.seeders))
-        .then_with(|| b_cand.release.freeleech.cmp(&a_cand.release.freeleech))
-        .then_with(|| cmp_smaller_size_wins(a_cand.release.size_bytes, b_cand.release.size_bytes))
         .then_with(|| a_cand.release.guid.cmp(&b_cand.release.guid))
 }
 
@@ -456,6 +470,34 @@ mod tests {
         }
     }
 
+    // --- REPACK does NOT beat a strictly-better non-repack --------------------
+
+    #[test]
+    fn repack_does_not_beat_a_strictly_better_non_repack() {
+        // Review finding (codex): proper_repack must be the FINAL tiebreak,
+        // not an early one — a repack that's worse on seeders/size must
+        // never win over a non-repack that's better on those axes ("never a
+        // strictly-inferior re-release").
+        let definitions = vec![definition(1, "web-1080p", "WEB", Some("1080p"))];
+        let p = profile(profile_items(&[1]), None);
+        let policy = ScoringPolicy {
+            definitions: &definitions,
+            custom_formats: &no_formats(),
+            existing: None,
+        };
+        let mut better_non_repack = release("better", "WEB", Some("1080p"));
+        better_non_repack.seeders = Some(500);
+        let mut worse_repack = release("worse_repack", "WEB", Some("1080p"));
+        worse_repack.proper_repack = true;
+        worse_repack.seeders = Some(1);
+        let candidates = vec![candidate(better_non_repack), candidate(worse_repack)];
+        let decision = decide_release(&candidates, &p, &no_scores(), &policy);
+        match decision {
+            Decision::Grab(choice) => assert_eq!(choice.release.guid, "better"),
+            other => panic!("expected Grab, got {other:?}"),
+        }
+    }
+
     // --- cutoff stops an upgrade ---------------------------------------------
 
     #[test]
@@ -482,6 +524,59 @@ mod tests {
         match decision {
             Decision::Reject { reasons } => assert!(reasons[0].contains("cutoff")),
             other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    // --- upgrade must not regress tier, even with a higher format score --------
+
+    #[test]
+    fn lower_tier_higher_format_score_is_not_an_upgrade() {
+        // Review finding (codex): tier order is the primary quality
+        // dimension for an upgrade decision — a lower-tier candidate must
+        // never be treated as an upgrade purely because it out-scores the
+        // existing file on custom formats.
+        let definitions = vec![
+            definition(1, "web-720p", "WEB", Some("720p")),
+            definition(2, "web-1080p", "WEB", Some("1080p")),
+        ];
+        let items = profile_items(&[1, 2]); // 2 (1080p) ranks higher than 1 (720p)
+        let p = profile(items, None); // no cutoff configured; upgrade_allowed=true
+        let formats = vec![CustomFormat {
+            id: 1,
+            name: "high-value-tag".to_string(),
+            specifications: json!([{
+                "implementation": "ReleaseTitleSpecification",
+                "required": true,
+                "negate": false,
+                "fields": { "value": "tagged" }
+            }]),
+            include_when_renaming: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let scores = vec![QualityProfileFormat {
+            quality_profile_id: 1,
+            custom_format_id: 1,
+            score: 100,
+        }];
+        let policy = ScoringPolicy {
+            definitions: &definitions,
+            custom_formats: &formats,
+            // Existing file is already the higher tier (1080p), no format score.
+            existing: Some(scoring::ExistingRelease {
+                quality_definition_id: 2,
+                total_format_score: 0,
+            }),
+        };
+        // Only candidate is the LOWER tier (720p), but scores heavily on a
+        // custom format — should still not be offered as an upgrade.
+        let mut lower_tier_high_score = release("lower_tier_tagged", "WEB", Some("720p"));
+        lower_tier_high_score.title = "Some.Title.2020.WEB.720p.tagged".to_string();
+        let candidates = vec![candidate(lower_tier_high_score)];
+        let decision = decide_release(&candidates, &p, &scores, &policy);
+        match decision {
+            Decision::Reject { reasons } => assert!(!reasons.is_empty()),
+            other => panic!("expected Reject (tier must not regress on upgrade), got {other:?}"),
         }
     }
 

@@ -503,6 +503,7 @@ mod tests {
             enrichment: crate::enrichment::EnrichmentService::from_config(&crate::config::Config::default()),
             tmdb: None,
             embed: None,
+            download: None,
         };
 
         let summary = run_maintenance_pass(&state).await;

@@ -687,6 +687,7 @@ mod tests {
             enrichment: crate::enrichment::EnrichmentService::from_config(&config),
             tmdb: None,
             embed: None,
+            download: None,
         });
 
         let channels = list_channels_handler(State(state.clone()))

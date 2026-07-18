@@ -133,6 +133,7 @@ mod tests {
             arr_instances: Vec::new(),
             tmdb: None,
             embed: None,
+            download: None,
         });
 
         let req = ComposeChannelRequest {
@@ -302,6 +303,7 @@ mod tests {
             arr_instances: Vec::new(),
             tmdb: None,
             embed: None,
+            download: None,
         });
 
         let req = ComposeChannelRequest {

@@ -5,6 +5,7 @@
 //! harness. No domain logic lives here yet — see the founding spec
 //! `specs/S96-muse-foundation.md`.
 
+pub mod acquisition;
 pub mod adaptation;
 pub mod arr;
 pub mod assistant;
@@ -169,6 +170,25 @@ async fn main() -> anyhow::Result<()> {
     // degrade independently and gracefully — see `EnrichmentService`.
     let enrichment = crate::enrichment::EnrichmentService::from_config(&config);
 
+    // MUSEM-05: the qBittorrent download client the request-lifecycle
+    // endpoints grab through. Degrades to `None` (requests persist but never
+    // fulfill) when `MUSE_QBIT_*` isn't fully configured, same posture as
+    // every other optional integration constructed above.
+    let download_client = match config.qbit() {
+        Some(qbit_config) => match crate::download::qbit::QbitClient::from_config(&qbit_config) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to construct qbittorrent client; acquisition grabs will degrade");
+                None
+            }
+        },
+        None => None,
+    };
+    tracing::info!(
+        qbit_configured = download_client.is_some(),
+        "qbittorrent download client initialized"
+    );
+
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
@@ -178,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         enrichment,
         tmdb: tmdb_client,
         embed: embed_client,
+        download: download_client,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

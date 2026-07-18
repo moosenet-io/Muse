@@ -215,7 +215,7 @@ records every `add` for later items' tests and performs no network I/O.
   isolation, covered by its own httpmock test suite (`cargo test --bin muse download::`).
   Wiring it into a caller is a later MUSEM item.
 
-## HTTP API surface (20 routes)
+## HTTP API surface (24 routes)
 
 Every route below is real. The `/ingest/*`, `/query/*`, and `/proactive/*` nests each also carry a
 `fallback` that answers **`501 Not Implemented`** for any un-mounted sub-path (a documented seam for
@@ -245,6 +245,29 @@ future spec items). Error→status mapping lives in `src/error.rs`.
 - `GET /api/channels` — channel summaries.
 - `GET /api/channels/{id}/lineup` — a channel's program lineup (window `now-2h … now+24h`).
 - `GET /art/{kind}/{id}?variant=poster` — artwork proxy (Postgres-cached; never leaks the Plex token; serves a 1×1 placeholder rather than 404).
+
+**Request lifecycle (MUSEM-05, auth-gated — `Authorization: Bearer <MUSE_API_TOKEN>`)**
+- `POST /requests` — body `{provider_ids, kind, title, quality_profile_id?}`. Classifies the
+  request via `arr::request::classify_tier`, using a REAL on-demand Prowlarr search (MUSEM-03) as
+  the availability signal rather than a fabricated one (see `src/acquisition`'s module doc).
+  `Blocked` (no Prowlarr configured, or no `quality_profile_id`) → `400`, never persisted.
+  `AutoApprovable` → persisted, then fulfilled immediately (search → decide → grab). Anything else
+  → persisted as `Requested` for manual review. `{request, tier, outcome}`.
+- `GET /requests?status=` — list requests, optionally filtered to one `media_requests.status`
+  value; omitted lists across every status. Auth-gated so an unauthenticated caller can never
+  enumerate request data (the same CAP-SEC-03 lesson `/recommend*` already applies).
+- `POST /requests/{id}/approve` — fulfills a `Requested` request now (search → decide → grab).
+  Idempotent: approving anything not currently `Requested` (already `Grabbed`/`Failed`/`Denied`/…)
+  is a no-op, never a second grab.
+- `POST /requests/{id}/deny` — marks `Requested` → `Denied` and records a `history_events` row.
+  Idempotent the same way `approve` is.
+
+Gated by TWO independent switches, both of which must be on for a live grab to ever happen:
+`ExperienceSettings.acquisition.enabled` (the master gate, `crate::settings::AcquisitionSettings`,
+default **off**) AND `Config::arr_request_auto_tier_enabled` (`MUSE_ARR_REQUEST_AUTO_TIER_ENABLED`,
+default **off**, the same tiered-safety flag `arr::request::classify_tier` has always used). With
+either off, `POST /requests` still persists the request — it just never reaches
+`acquisition::fulfill_request`.
 
 **Linear tuner (HDHomeRun-emulation) + streaming**
 - `GET /discover.json` — HDHomeRun device descriptor.
@@ -300,16 +323,52 @@ passed in by the caller, which is what makes it exhaustively unit-testable.
   outright ("good enough, stop") without even reaching ranking; otherwise the best candidate must
   beat the existing file by tier or by at least `min_upgrade_format_score`.
 
-Not yet wired to any route/worker — see [Wiring status](#wiring-status-what-actually-runs) below.
-`decision::` has no dependency on the unmerged MUSEM-01/03 acquisition-domain branches, so it
-merges independently of them.
+As of MUSEM-05, `decision::decide_release` IS wired — see the next section.
+
+## Acquisition orchestrator + request lifecycle (MUSEM-05)
+
+`src/acquisition/` is the first thing in this crate that assembles MUSEM-01..04 into a real,
+callable path: `acquisition::fulfill_request(deps, request) -> FulfillOutcome` runs, for one
+`media_requests` row, a genuine on-demand Prowlarr search (MUSEM-03, narrowed to the request's
+`media_kind`'s configured categories) → `decision::decide_release` (MUSEM-04) against the
+request's `quality_profile_id` → on `Decision::Grab`, `DownloadClient::add` (MUSEM-02) → persists
+a `download_queue` row (MUSEM-01, status `Queued`, `client_hash` from the grab receipt) and a
+`Grabbed` `history_events` row; on `Decision::Reject` (or a download-client error), marks the
+request `Failed` and records a `DownloadFailed` history row — never a phantom queue row, never a
+panic. A request with no `quality_profile_id`, or no Prowlarr configured, degrades to
+`FulfillOutcome::Skipped` and is left `Requested` for manual follow-up, rather than erroring.
+
+`acquisition::AcquisitionSink` is the FIRST real (non-`Noop`) implementation of
+`arr::request::MediaRequestSink` this crate ships: `submit(draft)` creates the `media_requests` row
+for the draft and immediately `fulfill_request`s it. `arr::request::submit_if_appropriate`
+guarantees `submit` is only ever reached for `RequestTier::AutoApprovable` — see
+`src/acquisition/mod.rs`'s module doc for how `POST /requests` (below) computes a REAL
+availability signal (from the on-demand search itself, not a fabrication) so that tier is
+actually reachable now, closing the gap `conversational::handle_conversational_request`'s own doc
+flagged as "never `AutoApprovable` in practice" and named as the natural follow-up.
+
+`decision::`/`prowlarr::search_releases`/`download::qbit::QbitClient` have no dependency on each
+other beyond what `acquisition::fulfill_request` wires — each still merges/tests independently.
 
 ## Wiring status: what actually runs
 
 Not every implemented subsystem is triggered in a running deployment. This matters for operators —
 some capabilities need a manual invocation or a future worker/route to become live.
 
-**Live HTTP routes:** all 20 listed above.
+**Live HTTP routes:** all 24 listed above.
+
+**Newly wired at MUSEM-05** (previously listed below as unwired seams — each now has a real
+caller):
+- `download::qbit::QbitClient` — called by `acquisition::fulfill_request` (via `AppState.download`,
+  constructed in `main.rs` from `Config::qbit()`) whenever a request's search resolves to a `Grab`.
+- `prowlarr::search_releases` — called by `acquisition::search_candidates`, both from
+  `POST /requests`' availability check and from `acquisition::fulfill_request`'s search step.
+- `decision::decide_release` — called by `acquisition::fulfill_request` against the candidates the
+  search above returns.
+- `repo::acquisition::*` — `media_requests`/`download_queue`/`history_events` are now written
+  end-to-end by `acquisition::fulfill_request` and the `POST /requests*` handlers
+  (`monitored_items`/`blocklist` remain unwired — no MUSEM-06 wanted-worker or blocklist-write
+  caller exists yet).
 
 **Background workers spawned at startup** (`src/workers.rs`):
 - Plex session poller (`tracker::poller`) — always spawned; no-ops if Plex unconfigured.
@@ -323,14 +382,11 @@ some capabilities need a manual invocation or a future worker/route to become li
 - `radar::divergence::recompute_divergence` — the you-vs-masses radar. No caller, no HTTP surface at all; `taste_divergence` is never computed automatically.
 - `arr::ingest::run` — library ingest. Parsed `MUSE_ARR_INSTANCES` is held in state, but no worker or route runs the ingest.
 - `tautulli::backfill::run` — one-time history import. No route/CLI/worker; intended to be driven by an orchestrator/ops step.
-- `download::qbit::QbitClient` — the qBittorrent download-client adapter (MUSEM-02). Nothing in `AppState`/any route/worker constructs or calls it yet; it exists as a tested, standalone seam awaiting a caller (grab-decision logic lands in a later MUSEM item).
 - `trending::snapshot_trending` — TMDb trending ingest. `main.rs` notes it as a "follow-on wiring item".
 - `channels::compose_channel_run` — the on-demand pseudo-TV director. Fully implemented + tested, but no HTTP route mounts it (the *linear* tuner uses its own `tuner::scheduler` grid-filler instead).
 - `enrichment::EnrichmentService::enrich_media_item` — external-enrichment cache population. Wired object on `AppState`, but nothing calls it outside tests.
 - `plex_control::*` — Plex Companion cast/play-queue client. Declared as a module but **not mounted anywhere** and never called — library-only, and never exercised against a real Plex server.
-- `repo::acquisition::*` (MUSEM-01) — the acquisition-domain schema + repository layer (monitoring/requests/download-queue/history/blocklist). No worker, decision engine, download-client adapter, or HTTP route calls any of it yet — this item is the write-path *foundation* only; see later MUSEM items in `specs/S119-muse-media-management.md`.
-- `prowlarr::search_releases` — on-demand targeted Prowlarr search (MUSEM-03). No HTTP route or worker calls it yet; it's the input the release-decision/scoring engine (MUSEM-04) is expected to drive, not a standalone entry point in this change.
-- `decision::decide_release` — the release-decision/scoring engine (MUSEM-04). Fully implemented and unit-tested, but nothing calls it yet: it awaits a targeted-search caller (MUSEM-03) upstream and a grab/persist caller (MUSEM-02/05) downstream.
+- `repo::acquisition::{monitored_items,blocklist}` (MUSEM-01) — `media_requests`/`download_queue`/`history_events` are now wired (see "Newly wired at MUSEM-05" above); `monitored_items` (the "wanted" driver table) and `blocklist` still have no caller — that's MUSEM-06's (the monitored "wanted" acquisition worker) job.
 
 Consequence: in a fresh deployment with a fully populated library and Ollama/Chord configured,
 `/recommend`'s taste tier, `proactive`'s `friday_evening`, and `zeitgeist` will silently return

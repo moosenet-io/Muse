@@ -77,6 +77,11 @@ pub struct ExperienceSettings {
     /// future persona-editing surface can bind display copy to.
     pub personas: Vec<PersonaDefinition>,
     pub sharing: SharingSettings,
+    /// MUSEM-05: the master acquisition gate — see
+    /// [`Self::is_acquisition_enabled`] and [`AcquisitionSettings`]'s own
+    /// doc for why this defaults OFF unlike most of this document's other
+    /// per-subsystem toggles.
+    pub acquisition: AcquisitionSettings,
 }
 
 impl Default for ExperienceSettings {
@@ -92,6 +97,7 @@ impl Default for ExperienceSettings {
             question_frequency: QuestionFrequencySettings::default(),
             personas: Vec::new(),
             sharing: SharingSettings::default(),
+            acquisition: AcquisitionSettings::default(),
         }
     }
 }
@@ -127,6 +133,16 @@ impl ExperienceSettings {
     pub fn is_kg_viz_enabled(&self) -> bool {
         self.master_enabled && self.kg_viz.enabled
     }
+
+    /// MUSEM-05's master acquisition gate: `true` only when both the panel
+    /// master switch AND `acquisition.enabled` hold. With this `false`,
+    /// `crate::http::requests`'s endpoints still persist `media_requests`
+    /// rows — they simply never reach `crate::acquisition::fulfill_request`
+    /// (the actual search → decide → grab path), same "persist but never
+    /// act" fail-safe posture as every other AND-gated subsystem here.
+    pub fn is_acquisition_enabled(&self) -> bool {
+        self.master_enabled && self.acquisition.enabled
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -138,6 +154,29 @@ pub struct SubsystemToggle {
 impl Default for SubsystemToggle {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+// --- acquisition (MUSEM-05): the master search->decide->grab gate -----------
+
+/// MUSEM-05's master acquisition gate. Unlike [`SubsystemToggle`] (which
+/// defaults `enabled: true`), this defaults `enabled: false` — the same
+/// deliberate "off until an operator opts in" posture
+/// [`DiscordBotSettings`] and [`KgVizSettings`] already establish for
+/// consent-/write-shaped surfaces, because flipping this on can cause a
+/// REAL qBittorrent download to start. With it off,
+/// `crate::http::requests`'s endpoints still persist `media_requests` rows
+/// (so the request lifecycle itself is always usable) — they just never
+/// reach `crate::acquisition::fulfill_request`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AcquisitionSettings {
+    pub enabled: bool,
+}
+
+impl Default for AcquisitionSettings {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -452,6 +491,22 @@ mod tests {
         assert!(!settings.is_discord_bot_enabled());
         assert!(!settings.kg_viz.enabled);
         assert!(!settings.is_kg_viz_enabled());
+    }
+
+    #[test]
+    fn acquisition_defaults_off_and_requires_both_gates() {
+        let mut settings = ExperienceSettings::default();
+        assert!(!settings.acquisition.enabled);
+        assert!(!settings.is_acquisition_enabled());
+
+        settings.acquisition.enabled = true;
+        assert!(settings.is_acquisition_enabled());
+
+        settings.master_enabled = false;
+        assert!(
+            !settings.is_acquisition_enabled(),
+            "the master switch must still AND into the acquisition gate"
+        );
     }
 
     #[test]

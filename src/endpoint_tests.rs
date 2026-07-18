@@ -144,6 +144,7 @@ fn no_upstream_state_with_config(pool: sqlx::PgPool, config: Config) -> Arc<AppS
         arr_instances: Vec::new(),
         tmdb: None,
         embed: None,
+        download: None,
     })
 }
 
@@ -2085,6 +2086,59 @@ mod auth {
         let (status, _) = send(
             app_no_db_with_config(with_token_config()),
             get("/recommend/gaps?account_id=12345"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // MUSEM-05: the request-lifecycle surface can trigger a real
+    // download-client grab and serves request/lifecycle data, so all four
+    // routes must be gated identically to `/recommend*` above — a
+    // well-formed but tokenless request is rejected `401` before any
+    // handler (and therefore the pool, and any request data) is reached.
+    #[tokio::test]
+    async fn requests_create_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            post_json(
+                "/requests",
+                json!({"provider_ids": {"tmdb": "603"}, "kind": "movie", "title": "The Matrix", "quality_profile_id": 1}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn requests_list_without_token_is_401_and_never_serves_request_data() {
+        let (status, body) = send(
+            app_no_db_with_config(with_token_config()),
+            get("/requests"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Belt-and-suspenders: the 401 body must never carry a request list
+        // (proves this is a genuine pre-handler rejection, not an empty
+        // "no requests" 200 that happens to look similar).
+        assert!(body.get("request").is_none());
+        assert!(body.as_array().is_none());
+    }
+
+    #[tokio::test]
+    async fn requests_approve_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            post_empty("/requests/1/approve"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn requests_deny_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, _) = send(
+            app_no_db_with_config(with_token_config()),
+            post_empty("/requests/1/deny"),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);

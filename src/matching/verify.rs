@@ -156,15 +156,26 @@ fn combine(
     vision: Option<VisionAnswer>,
     reasons: Vec<String>,
 ) -> MatchVerdict {
-    // Nothing to judge at all -- distinct from a confirmed failure.
-    if matches!(liveness, LivenessOutcome::Empty) {
-        return MatchVerdict { outcome: VerdictOutcome::Inconclusive, confidence: 0.2, reasons };
-    }
-
     // A hard liveness failure overrides everything, including a "yes"
     // from vision: dead/stuck content can't actually confirm a title.
     if matches!(liveness, LivenessOutcome::Uniform | LivenessOutcome::AllIdentical) {
         return MatchVerdict { outcome: VerdictOutcome::Inconsistent, confidence: 0.7, reasons };
+    }
+
+    // No stills were available to judge at all. This must NOT suppress
+    // independent hard evidence from the other signals -- a file with no
+    // extractable stills but a grossly wrong runtime is still a mislabeled
+    // file, and must not get a free pass just because liveness had
+    // nothing to check. Checked BEFORE the "nothing to judge" fallback so
+    // a hard metadata contradiction always survives an empty still set
+    // (review finding: codex, MUSEL-C2).
+    if matches!(liveness, LivenessOutcome::Empty) {
+        if metadata_hard_contradiction {
+            return MatchVerdict { outcome: VerdictOutcome::Inconsistent, confidence: 0.55, reasons };
+        }
+        // Empty stills AND nothing else contradicts -- genuinely nothing
+        // to judge, distinct from a confirmed failure.
+        return MatchVerdict { outcome: VerdictOutcome::Inconclusive, confidence: 0.2, reasons };
     }
 
     match vision {
@@ -207,6 +218,7 @@ fn combine(
 mod tests {
     use super::*;
     use crate::error::MuseResult;
+    use crate::matching::liveness::fixtures::{real_black_jpeg, real_varied_jpeg};
     use async_trait::async_trait;
 
     struct MockVision {
@@ -231,22 +243,20 @@ mod tests {
         }
     }
 
-    /// A synthetic "live" still -- varied byte content whose mean/variance
-    /// genuinely differ per `seed` (see `liveness.rs`'s test-helper doc
-    /// comment for why a plain `% 256` wraparound shift doesn't actually
-    /// vary across seeds). This heuristic never decodes real JPEG pixels
-    /// (see `liveness.rs`'s module doc comment), so a deterministic varied
-    /// byte pattern is a faithful stand-in without needing a real media
-    /// fixture.
+    /// A still built from a REAL encoded JPEG with genuine varied/textured
+    /// content (`liveness::fixtures::real_varied_jpeg`) -- these
+    /// mismatch-harness tests exercise `verify_match`'s liveness signal
+    /// end-to-end, which as of the pixel-decode rewrite (review: codex,
+    /// MUSEL-C2) genuinely decodes the still, so a non-JPEG synthetic byte
+    /// array would just fail to decode here rather than testing anything
+    /// useful.
     fn live_still(seed: i64) -> Still {
-        Still {
-            bytes: (0..4000_i64).map(|i| ((i % 200) + seed * 25).clamp(0, 255) as u8).collect(),
-            timestamp_ms: seed * 1000,
-        }
+        Still { bytes: real_varied_jpeg(seed as u32), timestamp_ms: seed * 1000 }
     }
 
+    /// A still built from a REAL encoded solid-black JPEG.
     fn black_still(seed: i64) -> Still {
-        Still { bytes: vec![0u8; 3000], timestamp_ms: seed * 1000 }
+        Still { bytes: real_black_jpeg(), timestamp_ms: seed * 1000 }
     }
 
     fn correct_metadata() -> ProviderMetadata {
@@ -329,6 +339,23 @@ mod tests {
         let metadata = correct_metadata();
 
         let verdict = verify_match(&file, &metadata, &stills, None).await;
+
+        assert_eq!(verdict.outcome, VerdictOutcome::Inconsistent);
+        assert!(verdict.reasons.iter().any(|r| r.contains("runtime mismatch")));
+    }
+
+    #[tokio::test]
+    async fn gross_runtime_disagreement_flags_even_with_no_stills_at_all() {
+        // No stills extractable (e.g. ffmpeg unavailable) must NOT
+        // suppress independent hard evidence from metadata -- a grossly
+        // wrong runtime is still caught even when liveness has nothing to
+        // judge (review finding: codex, MUSEL-C2 -- an empty still set
+        // previously short-circuited straight to Inconclusive before the
+        // metadata check ever ran).
+        let file = file_with_runtime(22 * 60_000);
+        let metadata = correct_metadata();
+
+        let verdict = verify_match(&file, &metadata, &[], None).await;
 
         assert_eq!(verdict.outcome, VerdictOutcome::Inconsistent);
         assert!(verdict.reasons.iter().any(|r| r.contains("runtime mismatch")));

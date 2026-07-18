@@ -1,98 +1,120 @@
-//! MUSEL-C2: cheap byte-level "liveness" heuristics on extracted JPEG
-//! stills, to catch a file that decodes to dead/blank/slate content rather
-//! than real footage -- one of the three signals [`crate::matching::verify`]
-//! combines into a [`crate::matching::verify::MatchVerdict`].
+//! MUSEL-C2: "liveness" heuristics on extracted JPEG stills, to catch a
+//! file that decodes to dead/blank/slate content rather than real footage
+//! -- one of the three signals [`crate::matching::verify`] combines into a
+//! [`crate::matching::verify::MatchVerdict`].
 //!
-//! **Deliberately does NOT decode JPEG pixels.** `image`/a JPEG decoder is
-//! not currently a dependency of this crate, and full pixel decode is more
-//! than this signal needs. Instead this operates directly on the still's
-//! raw entropy-coded byte stream, which already carries the signal cheaply:
-//! a solid-color/black/slate frame's DCT blocks are almost entirely "all
-//! zero AC coefficients", so the JPEG entropy coder emits a highly
-//! repetitive run of end-of-block symbols -- the *compressed* byte stream
-//! itself ends up dominated by a narrow set of repeated byte values and has
-//! much lower byte-value variance than a frame with real, varied content.
-//! Mean/variance and a dominant-byte-ratio over the raw bytes are a
-//! decent, dependency-free proxy for "did this decode to something real"
-//! without ever needing to decode a pixel.
+//! **Decodes real pixels.** An earlier version of this module deliberately
+//! avoided a JPEG-decode dependency, instead running mean/variance/
+//! dominant-byte-ratio stats directly over the still's *compressed* byte
+//! stream (the theory being that a solid-color frame's DCT blocks are
+//! almost all "zero AC coefficients", so the entropy coder should emit a
+//! visibly more repetitive byte stream). **That was measured against a
+//! REAL encoded JPEG and proven wrong** (review finding: codex, MUSEL-C2):
+//! JPEG's Huffman/arithmetic entropy coding makes the *compressed* byte
+//! stream look statistically noisy/varied regardless of image content --
+//! that's the point of entropy coding, and it swamps the signal. Measured
+//! evidence (see this module's `debug_real_jpeg_stats`-derived numbers,
+//! captured in the MUSEL-C2 worktree report): a real solid-black 64x64
+//! JPEG's raw compressed bytes had variance ~6560 and a real
+//! varied/textured 64x64 JPEG had variance ~6070 -- statistically
+//! indistinguishable, and both far above what a byte-stream-only
+//! "uniform" threshold could plausibly use. The byte-level proxy simply
+//! does not work.
 //!
-//! This is a **documented simplification, not a substitute for true luma
-//! decode** (see the EDGE CASE note on visually-atypical-but-correct
-//! titles, e.g. black-and-white or otherwise low-contrast content, in
-//! `specs/S119b-muse-library-scan-matching.md`'s MUSEL-C2 item). If this
-//! proves too coarse in production, swap in a lightweight decode-and-
-//! downsample step behind the same [`StillStats`]/[`LivenessOutcome`] API
-//! without touching call sites in `verify.rs`.
+//! So this module decodes each still to real luma (grayscale) pixels via
+//! the `image` crate (`jpeg`-feature only -- no other format support) and
+//! computes mean/variance/dominant-value stats over the actual decoded
+//! pixel values, which DO carry the content signal directly: a genuinely
+//! solid-black image decodes to a luma buffer that actually is uniform. A
+//! still whose bytes don't decode as a JPEG at all (corrupt/truncated
+//! capture) is treated as maximally uniform -- "decodes to garbage" fails
+//! liveness, per the MUSEL-C2 spec's EDGE CASES, rather than panicking or
+//! silently skipping.
 
 use crate::matching::stills::Still;
 
-/// Byte-level statistics for one still, used to judge whether it plausibly
-/// decodes to real, varied content.
+/// Pixel-level statistics for one still, used to judge whether it
+/// genuinely decodes to real, varied visual content.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StillStats {
+    /// Number of luma pixels the still decoded to (0 if decode failed).
     pub len: usize,
+    /// Whether `still.bytes` decoded as a JPEG at all. `false` means every
+    /// other field is a maximally-uniform placeholder, not a real
+    /// measurement -- see [`analyze_still`].
+    pub decoded: bool,
     pub mean: f64,
     pub variance: f64,
-    /// Fraction of bytes equal to the single most common byte value in the
-    /// still. Close to 1.0 for a highly repetitive (near-uniform) stream.
+    /// Fraction of pixels equal to the single most common luma value in
+    /// the still. Close to 1.0 for a genuinely uniform/flat image.
     pub dominant_byte_ratio: f64,
 }
 
-/// Below this raw-byte variance, a still is treated as suspiciously
-/// uniform (a black/solid-color/slate frame rather than real content).
-/// Tuned against synthetic fixtures in this module's tests, not real
-/// footage -- see the module doc's note on visually-atypical titles if
-/// this needs loosening once real stills are observed in production.
-const UNIFORM_VARIANCE_THRESHOLD: f64 = 400.0;
+/// Below this luma variance, a still is treated as suspiciously uniform
+/// (a black/solid-color/slate frame rather than real content). Tuned and
+/// validated against REAL encoded JPEG fixtures in this module's tests
+/// (`real_black_jpeg`/`real_varied_jpeg`), not synthetic bytes -- see the
+/// module doc comment.
+const UNIFORM_VARIANCE_THRESHOLD: f64 = 25.0;
 
-/// Above this dominant-byte-ratio, a still is treated as suspiciously
-/// uniform even when variance alone doesn't trip (a highly repetitive
-/// compressed stream where a single byte value dominates).
-const UNIFORM_DOMINANT_BYTE_RATIO_THRESHOLD: f64 = 0.35;
+/// Above this dominant-pixel-ratio, a still is treated as suspiciously
+/// uniform even when variance alone doesn't trip (almost every pixel is
+/// the same luma value).
+const UNIFORM_DOMINANT_BYTE_RATIO_THRESHOLD: f64 = 0.6;
 
-/// Below this many bytes, a still is too small to plausibly be a decoded
-/// real frame (a truncated/near-empty capture) -- treated as uniform
-/// rather than a separate case, since it can't carry real content either.
-const MIN_PLAUSIBLE_STILL_BYTES: usize = 256;
+/// Below this many decoded pixels, a still is too small to plausibly
+/// carry real content (a 1x1 or otherwise degenerate decode) -- treated
+/// as uniform rather than a separate case.
+const MIN_PLAUSIBLE_STILL_PIXELS: usize = 64;
 
-/// Compute [`StillStats`] for one still. Pure/sync -- no I/O, no decode --
-/// so it's directly unit-testable on synthetic byte vectors that don't
-/// need to be real JPEGs (this heuristic never actually decodes them).
+/// Compute [`StillStats`] for one still by decoding it as a JPEG and
+/// analyzing its luma (grayscale) pixels. Never panics -- a decode
+/// failure (empty bytes, corrupt/truncated capture, not actually a JPEG)
+/// produces `decoded: false` and maximally-uniform placeholder stats
+/// (fails liveness, per the "garbage decodes fail liveness" edge case),
+/// rather than propagating an error or crashing the caller.
 pub fn analyze_still(still: &Still) -> StillStats {
-    let bytes = &still.bytes;
-    if bytes.is_empty() {
-        return StillStats {
-            len: 0,
-            mean: 0.0,
-            variance: 0.0,
-            dominant_byte_ratio: 1.0,
-        };
+    let placeholder_uniform = StillStats { len: 0, decoded: false, mean: 0.0, variance: 0.0, dominant_byte_ratio: 1.0 };
+
+    if still.bytes.is_empty() {
+        return placeholder_uniform;
     }
 
-    let len = bytes.len();
-    let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
+    let Ok(decoded) = image::load_from_memory_with_format(&still.bytes, image::ImageFormat::Jpeg) else {
+        return placeholder_uniform;
+    };
+
+    let luma = decoded.to_luma8();
+    let pixels = luma.as_raw();
+    if pixels.is_empty() {
+        return placeholder_uniform;
+    }
+
+    let len = pixels.len();
+    let sum: u64 = pixels.iter().map(|&p| p as u64).sum();
     let mean = sum as f64 / len as f64;
-    let variance = bytes
+    let variance = pixels
         .iter()
-        .map(|&b| {
-            let d = b as f64 - mean;
+        .map(|&p| {
+            let d = p as f64 - mean;
             d * d
         })
         .sum::<f64>()
         / len as f64;
 
     let mut counts = [0u32; 256];
-    for &b in bytes.iter() {
-        counts[b as usize] += 1;
+    for &p in pixels.iter() {
+        counts[p as usize] += 1;
     }
     let max_count = counts.into_iter().max().unwrap_or(0);
     let dominant_byte_ratio = max_count as f64 / len as f64;
 
-    StillStats { len, mean, variance, dominant_byte_ratio }
+    StillStats { len, decoded: true, mean, variance, dominant_byte_ratio }
 }
 
 fn is_uniform(stats: &StillStats) -> bool {
-    stats.len < MIN_PLAUSIBLE_STILL_BYTES
+    !stats.decoded
+        || stats.len < MIN_PLAUSIBLE_STILL_PIXELS
         || stats.variance < UNIFORM_VARIANCE_THRESHOLD
         || stats.dominant_byte_ratio > UNIFORM_DOMINANT_BYTE_RATIO_THRESHOLD
 }
@@ -169,50 +191,116 @@ pub fn check_liveness(stills: &[Still]) -> LivenessVerdict {
     LivenessVerdict { outcome: LivenessOutcome::Live, reasons }
 }
 
+/// Test-only REAL JPEG fixture generation, shared with
+/// `matching::verify`'s tests (`pub(crate)` so `verify.rs` can build the
+/// same authentic stills its own mismatch-harness tests need, rather than
+/// duplicating the encoder setup or -- worse -- falling back to
+/// non-JPEG synthetic bytes that this module's decode-based analysis
+/// would just reject as undecodable).
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod fixtures {
+    use crate::matching::stills::Still;
 
-    /// A synthetic "live" still: varied byte content whose mean/variance
-    /// genuinely differ per `seed` (a sawtooth shifted by `seed`, not
-    /// wrapped mod 256 -- a modulo-wrapped shift just rotates the same
-    /// 0..255 sweep and leaves the arithmetic mean almost unchanged across
-    /// seeds, which would make every "different" still look identical to
-    /// `stills_look_identical`). Not a real JPEG -- this heuristic never
-    /// decodes pixels, so a deterministic varied byte pattern is a
-    /// faithful stand-in for test purposes.
-    fn live_bytes(seed: i64) -> Vec<u8> {
-        (0..4000_i64)
-            .map(|i| ((i % 200) + seed * 25).clamp(0, 255) as u8)
-            .collect()
+    /// Encode a REAL JPEG (headers, quant tables, real Huffman-coded scan
+    /// data -- exactly the shape ffmpeg's `mjpeg` output has) via
+    /// `image`'s encoder, from an explicit per-pixel function.
+    pub(crate) fn encode_real_jpeg(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+        let mut img = image::RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                img.put_pixel(x, y, image::Rgb(pixel(x, y)));
+            }
+        }
+        let mut buf = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+        encoder.encode_image(&img).expect("jpeg encode should succeed");
+        buf
     }
 
-    fn black_bytes() -> Vec<u8> {
-        vec![0u8; 3000]
+    /// A real, solid-black encoded JPEG -- what ffmpeg emits for an
+    /// actual black/blank frame.
+    pub(crate) fn real_black_jpeg() -> Vec<u8> {
+        encode_real_jpeg(64, 64, |_, _| [0, 0, 0])
     }
 
-    fn still(bytes: Vec<u8>, ts: i64) -> Still {
+    /// A real, visually varied/textured encoded JPEG -- what ffmpeg emits
+    /// for a frame with genuine content. `seed` shifts the pattern so
+    /// several calls produce genuinely different (not just re-encoded
+    /// identical) images.
+    pub(crate) fn real_varied_jpeg(seed: u32) -> Vec<u8> {
+        encode_real_jpeg(64, 64, |x, y| {
+            [
+                (((x * 7 + y * 13 + seed * 41) % 256) as u8),
+                (((x * 3 + y * 29 + seed * 17) % 256) as u8),
+                (((x + y * 5 + seed * 61) % 256) as u8),
+            ]
+        })
+    }
+
+    pub(crate) fn real_still(bytes: Vec<u8>, ts: i64) -> Still {
         Still { bytes, timestamp_ms: ts }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{real_black_jpeg, real_still, real_varied_jpeg};
+    use super::*;
 
     #[test]
-    fn analyze_still_reports_high_variance_for_varied_bytes() {
-        let stats = analyze_still(&still(live_bytes(1), 0));
-        assert!(stats.variance > UNIFORM_VARIANCE_THRESHOLD);
+    fn analyze_still_decodes_real_varied_jpeg_with_high_variance() {
+        let stats = analyze_still(&real_still(real_varied_jpeg(1), 0));
+        assert!(stats.decoded);
+        assert!(
+            stats.variance > UNIFORM_VARIANCE_THRESHOLD,
+            "expected varied-image variance above {UNIFORM_VARIANCE_THRESHOLD}, got {}",
+            stats.variance
+        );
         assert!(stats.dominant_byte_ratio < UNIFORM_DOMINANT_BYTE_RATIO_THRESHOLD);
     }
 
     #[test]
-    fn analyze_still_reports_low_variance_for_black_bytes() {
-        let stats = analyze_still(&still(black_bytes(), 0));
-        assert_eq!(stats.variance, 0.0);
-        assert_eq!(stats.dominant_byte_ratio, 1.0);
+    fn analyze_still_decodes_real_black_jpeg_with_low_variance() {
+        let stats = analyze_still(&real_still(real_black_jpeg(), 0));
+        assert!(stats.decoded);
+        assert!(
+            stats.variance < UNIFORM_VARIANCE_THRESHOLD,
+            "expected black-frame variance below {UNIFORM_VARIANCE_THRESHOLD}, got {}",
+            stats.variance
+        );
+        assert!(stats.dominant_byte_ratio > UNIFORM_DOMINANT_BYTE_RATIO_THRESHOLD);
+    }
+
+    /// THE discrimination proof requested in review (codex, MUSEL-C2): a
+    /// real encoded black JPEG and a real encoded varied JPEG must
+    /// classify oppositely under `is_uniform`. This is what the earlier
+    /// compressed-byte-stream proxy failed (see the module doc comment
+    /// for the measured counter-evidence); pixel-decode-based stats pass.
+    #[test]
+    fn analyze_still_genuinely_discriminates_real_black_from_real_varied_jpeg() {
+        let black = analyze_still(&real_still(real_black_jpeg(), 0));
+        let varied = analyze_still(&real_still(real_varied_jpeg(1), 0));
+
+        assert!(is_uniform(&black), "a real black JPEG must classify as uniform: {black:?}");
+        assert!(!is_uniform(&varied), "a real varied JPEG must NOT classify as uniform: {varied:?}");
     }
 
     #[test]
     fn analyze_still_empty_bytes_does_not_panic() {
-        let stats = analyze_still(&still(Vec::new(), 0));
+        let stats = analyze_still(&real_still(Vec::new(), 0));
         assert_eq!(stats.len, 0);
+        assert!(!stats.decoded);
+    }
+
+    #[test]
+    fn analyze_still_undecodable_bytes_fail_liveness_not_panic() {
+        // Not a JPEG at all (garbage/truncated capture) -- must degrade
+        // to a maximally-uniform, non-decoded result, per the MUSEL-C2
+        // spec's "a file that decodes to garbage ... fails liveness"
+        // edge case, never a panic.
+        let stats = analyze_still(&real_still(vec![0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3], 0));
+        assert!(!stats.decoded);
+        assert!(is_uniform(&stats));
     }
 
     #[test]
@@ -223,21 +311,33 @@ mod tests {
 
     #[test]
     fn check_liveness_varied_stills_are_live() {
-        let stills = vec![still(live_bytes(1), 0), still(live_bytes(2), 1000), still(live_bytes(3), 2000)];
+        let stills = vec![
+            real_still(real_varied_jpeg(1), 0),
+            real_still(real_varied_jpeg(2), 1000),
+            real_still(real_varied_jpeg(3), 2000),
+        ];
         let verdict = check_liveness(&stills);
         assert_eq!(verdict.outcome, LivenessOutcome::Live);
     }
 
     #[test]
     fn check_liveness_all_black_stills_are_uniform() {
-        let stills = vec![still(black_bytes(), 0), still(black_bytes(), 1000), still(black_bytes(), 2000)];
+        let stills = vec![
+            real_still(real_black_jpeg(), 0),
+            real_still(real_black_jpeg(), 1000),
+            real_still(real_black_jpeg(), 2000),
+        ];
         let verdict = check_liveness(&stills);
         assert_eq!(verdict.outcome, LivenessOutcome::Uniform);
     }
 
     #[test]
     fn check_liveness_mixed_uniform_and_live_is_still_live_but_reports_the_count() {
-        let stills = vec![still(black_bytes(), 0), still(live_bytes(2), 1000), still(live_bytes(3), 2000)];
+        let stills = vec![
+            real_still(real_black_jpeg(), 0),
+            real_still(real_varied_jpeg(2), 1000),
+            real_still(real_varied_jpeg(3), 2000),
+        ];
         let verdict = check_liveness(&stills);
         assert_eq!(verdict.outcome, LivenessOutcome::Live);
         assert!(verdict.reasons.iter().any(|r| r.contains("1 of 3")));
@@ -245,8 +345,12 @@ mod tests {
 
     #[test]
     fn check_liveness_identical_live_stills_are_all_identical() {
-        let bytes = live_bytes(2);
-        let stills = vec![still(bytes.clone(), 0), still(bytes.clone(), 1000), still(bytes, 2000)];
+        let bytes = real_varied_jpeg(2);
+        let stills = vec![
+            real_still(bytes.clone(), 0),
+            real_still(bytes.clone(), 1000),
+            real_still(bytes, 2000),
+        ];
         let verdict = check_liveness(&stills);
         assert_eq!(verdict.outcome, LivenessOutcome::AllIdentical);
     }
@@ -255,7 +359,7 @@ mod tests {
     fn check_liveness_single_live_still_cannot_be_all_identical() {
         // Only one sample point -- nothing to compare against, so it's a
         // plain Live verdict rather than a spurious AllIdentical.
-        let verdict = check_liveness(&[still(live_bytes(1), 0)]);
+        let verdict = check_liveness(&[real_still(real_varied_jpeg(1), 0)]);
         assert_eq!(verdict.outcome, LivenessOutcome::Live);
     }
 }

@@ -82,6 +82,14 @@ pub struct MaintenanceSummary {
     pub arr_movies_upserted: usize,
     pub arr_series_upserted: usize,
 
+    /// MUSEM-06: the monitored "wanted" acquisition worker's own tally for
+    /// this pass — see `crate::acquisition::worker::run_wanted_pass`. A
+    /// `WantedPassSummary::default()` (every counter zero) means the
+    /// worker's own master-acquisition-gate check short-circuited it to a
+    /// no-op, same "ran but did nothing" posture `embed_ran`/`arr_ran`
+    /// establish for their own steps.
+    pub wanted: crate::acquisition::worker::WantedPassSummary,
+
     pub embed_ran: bool,
     pub embedded: usize,
     pub embed_skipped_unchanged: usize,
@@ -120,6 +128,24 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
     } else {
         tracing::debug!("MUSE-31: maintenance pass — no arr instances configured; skipping ingest step");
     }
+
+    // --- (a2) MUSEM-06: monitored "wanted" acquisition worker --------------
+    //
+    // Scheduled right after arr ingest (dependency order: ingest is what
+    // populates/refreshes `media_items`/`media_files`, which `list_wanted`'s
+    // cutoff comparison reads) and before embed/taste/divergence/enrichment,
+    // which don't depend on it and it doesn't depend on them. Gated on the
+    // master acquisition setting internally (`run_wanted_pass` checks it
+    // itself, and `fulfill_request` enforces it again unbypassably) — a
+    // deployment with acquisition off runs a harmless, cheap no-op here,
+    // same posture as every other optional step in this pass.
+    let wanted_deps = crate::acquisition::worker::WantedPassDeps {
+        pool: &state.pool,
+        config: &state.config,
+        prowlarr: state.prowlarr.as_ref(),
+        download: state.download.as_ref().map(|c| c as &dyn crate::download::DownloadClient),
+    };
+    summary.wanted = crate::acquisition::worker::run_wanted_pass(&wanted_deps).await;
 
     // --- (b) embed_stale -------------------------------------------------
     if let Some(embed_client) = state.embed.as_ref() {
@@ -220,6 +246,8 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
         arr_ran = summary.arr_ran,
         arr_movies_upserted = summary.arr_movies_upserted,
         arr_series_upserted = summary.arr_series_upserted,
+        wanted_grabbed = summary.wanted.grabbed,
+        wanted_needs_review = summary.wanted.needs_review,
         embedded = summary.embedded,
         embed_skipped_unchanged = summary.embed_skipped_unchanged,
         accounts_considered = summary.accounts_considered,

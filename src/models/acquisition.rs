@@ -57,6 +57,14 @@ pub struct MediaRequest {
     pub tier: Option<String>,
     pub quality_profile_id: Option<i64>,
     pub note: Option<String>,
+    /// MUSEM-06 follow-up (migration `0105_media_requests_monitored_item`):
+    /// the `monitored_items` row this request originated from, when
+    /// applicable. `NULL` for every `POST /requests`/`approve`/
+    /// `AcquisitionSink` request (MUSEM-05, no monitored item involved) —
+    /// only the wanted worker (`crate::acquisition::worker`) sets this. See
+    /// `repo::acquisition::has_open_worker_request_for_monitored_item`, the
+    /// consumer this column exists for.
+    pub monitored_item_id: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -70,6 +78,7 @@ pub struct NewMediaRequest {
     pub tier: Option<String>,
     pub quality_profile_id: Option<i64>,
     pub note: Option<String>,
+    pub monitored_item_id: Option<i64>,
 }
 
 /// `download_queue` — one row per in-flight/terminal grab. The DB enforces

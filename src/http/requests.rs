@@ -25,7 +25,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::acquisition::{fulfill_request, media_kind_str, AcquisitionDeps, FulfillOutcome};
+use crate::acquisition::{fulfill_request, media_kind_str, AcquisitionDeps, FulfillOptions, FulfillOutcome};
 use crate::arr::request::{classify_tier, RequestTier};
 use crate::download::DownloadClient;
 use crate::error::{MuseError, MuseResult};
@@ -162,6 +162,9 @@ pub async fn create_request_handler(
         tier: Some(format!("{tier:?}")),
         quality_profile_id: body.quality_profile_id,
         note: None,
+        // `POST /requests` is a <media-service>-style ask with no monitored item
+        // involved (see `migrations/0105_media_requests_monitored_item.sql`).
+        monitored_item_id: None,
     };
     let request = repo::acquisition::create_request(&state.pool, &new).await?;
 
@@ -172,7 +175,7 @@ pub async fn create_request_handler(
             prowlarr: state.prowlarr.as_ref(),
             download: download_client_ref(&state),
         };
-        Some(fulfill_request(&deps, &request).await?)
+        Some(fulfill_request(&deps, &request, &FulfillOptions::default()).await?)
     } else {
         None
     };
@@ -266,7 +269,7 @@ pub async fn approve_request_handler(
     // every other precondition) as the single grab chokepoint — see its own
     // doc — so this handler doesn't need (and must not duplicate) a
     // separate settings check here.
-    let outcome = fulfill_request(&deps, &request).await?;
+    let outcome = fulfill_request(&deps, &request, &FulfillOptions::default()).await?;
     let final_request = repo::acquisition::get_request(&state.pool, id).await?;
 
     Ok(Json(RequestResponse {
@@ -641,6 +644,13 @@ mod db_gated {
             RequestStatus::Failed.as_str(),
             "a missing download client must never surface as Failed"
         );
+        // MUSEM-06 follow-up (migration 0105): POST /requests is a
+        // <media-service>-style ask with no monitored item involved -- confirms
+        // the new column doesn't leak a stray value onto this path.
+        assert_eq!(
+            response.request.monitored_item_id, None,
+            "a POST /requests request must never have a monitored_item_id"
+        );
     }
 
     /// Approve is idempotent: approving an already-`Grabbed` request never
@@ -661,6 +671,7 @@ mod db_gated {
                 tier: None,
                 quality_profile_id: None,
                 note: None,
+                monitored_item_id: None,
             },
         )
         .await
@@ -703,6 +714,7 @@ mod db_gated {
                 // No quality profile -- fulfill_request can only Skip.
                 quality_profile_id: None,
                 note: None,
+                monitored_item_id: None,
             },
         )
         .await
@@ -742,6 +754,7 @@ mod db_gated {
                 tier: None,
                 quality_profile_id: None,
                 note: None,
+                monitored_item_id: None,
             },
         )
         .await
@@ -785,6 +798,7 @@ mod db_gated {
                 tier: None,
                 quality_profile_id: None,
                 note: None,
+                monitored_item_id: None,
             },
         )
         .await

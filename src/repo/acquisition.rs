@@ -156,9 +156,10 @@ pub async fn create_request(pool: &PgPool, new: &NewMediaRequest) -> MuseResult<
     sqlx::query_as::<_, MediaRequest>(
         r#"
         INSERT INTO media_requests (
-            provider_ids, media_kind, title, requested_by, tier, quality_profile_id, note
+            provider_ids, media_kind, title, requested_by, tier, quality_profile_id, note,
+            monitored_item_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING *
         "#,
     )
@@ -169,6 +170,7 @@ pub async fn create_request(pool: &PgPool, new: &NewMediaRequest) -> MuseResult<
     .bind(&new.tier)
     .bind(new.quality_profile_id)
     .bind(&new.note)
+    .bind(new.monitored_item_id)
     .fetch_one(pool)
     .await
     .map_err(MuseError::Database)
@@ -280,6 +282,82 @@ pub async fn list_download_queue_by_status(
     )
     .bind(status)
     .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// MUSEM-06: is `monitored_item_id` already active (`queued`/`downloading`,
+/// i.e. not yet `completed`/`imported`/`failed`/`removed`) in
+/// `download_queue`? The wanted worker's idempotency check — an item
+/// already mid-flight must be skipped, never re-grabbed, by two passes (or
+/// two ticks of the same pass) racing each other.
+pub async fn is_monitored_item_active_in_queue(
+    pool: &PgPool,
+    monitored_item_id: i64,
+) -> MuseResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM download_queue \
+         WHERE monitored_item_id = $1 AND status IN ('queued', 'downloading') \
+         LIMIT 1",
+    )
+    .bind(monitored_item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(row.is_some())
+}
+
+/// MUSEM-06 follow-up (review: codex): the real "has the wanted worker
+/// already surfaced a pending request for this monitored item" check —
+/// replaces the original `monitored_items.last_search_at IS NULL` proxy,
+/// which was wrong (a FAILED search also sets `last_search_at` without
+/// ever creating a request, so that proxy could permanently suppress a
+/// request the item genuinely needed once a later pass's search finally
+/// succeeded). "Open" means a `media_requests` row exists for
+/// `monitored_item_id` whose `status` is not one of the terminal values
+/// (`denied`/`failed`/`available`) — `requested`/`approved`/`searching`/
+/// `grabbed` all still count as "already accounted for," so the worker
+/// never creates a second request while an earlier one is still live in
+/// any non-terminal state.
+pub async fn has_open_worker_request_for_monitored_item(
+    pool: &PgPool,
+    monitored_item_id: i64,
+) -> MuseResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM media_requests \
+         WHERE monitored_item_id = $1 \
+           AND status NOT IN ('denied', 'failed', 'available') \
+         LIMIT 1",
+    )
+    .bind(monitored_item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(row.is_some())
+}
+
+/// MUSEM-06 follow-up (review: codex): the row-returning sibling of
+/// [`has_open_worker_request_for_monitored_item`] — lets the AutoApprovable
+/// path REUSE (rather than duplicate) an existing open request when a
+/// monitored item transitions from `NeedsReview`/`Blocked`/no-capability on
+/// an earlier pass to grabbable on a later one, so a `NeedsReview -> grab`
+/// transition upgrades the SAME request instead of orphaning the original
+/// row. Same "open = non-terminal status" definition. Deterministic when
+/// (in principle) more than one somehow exists: the oldest (lowest `id`)
+/// wins, so which row gets reused/fulfilled is never ambiguous.
+pub async fn get_open_worker_request_for_monitored_item(
+    pool: &PgPool,
+    monitored_item_id: i64,
+) -> MuseResult<Option<MediaRequest>> {
+    sqlx::query_as::<_, MediaRequest>(
+        "SELECT * FROM media_requests \
+         WHERE monitored_item_id = $1 \
+           AND status NOT IN ('denied', 'failed', 'available') \
+         ORDER BY id ASC \
+         LIMIT 1",
+    )
+    .bind(monitored_item_id)
+    .fetch_optional(pool)
     .await
     .map_err(MuseError::Database)
 }
@@ -684,6 +762,7 @@ mod db_gated {
                 tier: None,
                 quality_profile_id: None,
                 note: None,
+                monitored_item_id: None,
             },
         )
         .await
@@ -719,6 +798,7 @@ mod db_gated {
                 tier: None,
                 quality_profile_id: None,
                 note: None,
+                monitored_item_id: None,
             },
         )
         .await

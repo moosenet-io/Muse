@@ -140,6 +140,9 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `PROWLARR_URL` | *(none)* | Prowlarr base URL (availability report-pull). |
 | `PROWLARR_API_KEY` | *(none)* | Prowlarr API key. When both this and `PROWLARR_URL` are set, the report-pull worker is spawned. |
 | `TMDB_API_KEY` | *(none)* | TMDb API key (metadata, trending feed, `/query/resolve` beyond-the-library tier). |
+| `MUSE_TVDB_API_KEY` | *(none)* | TheTVDB v4 API key (MUSEL-A1 metadata provider — the primary TV-metadata source the `*arr` suite uses). `None` keeps `metadata::tvdb::TvdbClient::from_config` uninstantiable; TVDB metadata degrades to unavailable. |
+| `MUSE_TVDB_PIN` | *(none)* | Optional TheTVDB v4 subscriber PIN, paired with `MUSE_TVDB_API_KEY` for subscription-model keys. Most standard keys don't need one. |
+| `MUSE_TVDB_BASE_URL` | *(none → real API)* | TheTVDB v4 API base URL override. Exists for tests/an on-prem proxy, same seam `MUSE_TRAKT_BASE_URL` provides for Trakt. |
 | `MUSE_OLLAMA_URL` | *(none)* | Ollama base URL serving `nomic-embed-text` for local embeddings. |
 | `CHORD_URL` | *(none)* | Chord OpenAI-compatible base URL for routed local-model reasoning (rationale, taste notes, channel composition). |
 | `MUSE_SEARXNG_URL` | *(none)* | Fleet SearXNG base URL for forum/critic sentiment + "does it get good" enrichment. |
@@ -165,7 +168,7 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_QBIT_USER` | *(none)* | qBittorrent WebUI username. |
 | `MUSE_QBIT_PASS` | *(none)* | qBittorrent WebUI password. Muse has no `SecretManager`/vault crate of its own — like every other credential in this table, it is materialized into the process environment from <secret-manager> at runtime and read in exactly one place, `Config::from_env` (`src/config.rs`), never a scattered `std::env::var` elsewhere in the codebase. It's stored on `Config` (and handed to `download::qbit::QbitClient` via `Config::qbit()` → `download::config::QbitConfig`) wrapped in `download::config::QbitPassword`, whose `Debug`/`Display` always print `<redacted>` — it never appears in logs even if `Config`/`QbitConfig`/`QbitClient` is formatted wholesale. |
 
-That is **37 runtime environment variables** (plus the test-only `MUSE_TEST_DATABASE_URL`).
+That is **40 runtime environment variables** (plus the test-only `MUSE_TEST_DATABASE_URL`).
 
 `MUSE_ARR_INSTANCES` JSON entry shape (`src/arr/config.rs`):
 
@@ -177,6 +180,31 @@ That is **37 runtime environment variables** (plus the test-only `MUSE_TEST_DATA
    "api_key": "<from-vault>", "library_kind": "tv"}
 ]
 ```
+
+### Metadata provider layer (`src/metadata/`, MUSEL-A1)
+
+A provider-agnostic seam for normalized title metadata, separate from `trending::client::TmdbClient`
+(TMDb-specific, owns its own trending/popular/watch-provider surface). `metadata::MetadataProvider`
+is a small async trait — `resolve_by_id(kind, provider_id)` and `search(query, kind)` — implemented
+by `metadata::tvdb::TvdbClient` (TheTVDB v4, the primary TV-metadata source the `*arr` suite is
+keyed against) and, for tests, `metadata::MockMetadataProvider`. Every implementation is read-only:
+it only ever looks up metadata, never writes to the provider. Results normalize into
+`metadata::ProviderMetadata` — `provider_ids` (a `tvdb`/`tmdb`/`imdb`/… map), `title`, `overview`,
+`genres`, `images` (poster/backdrop URLs), `rating`, `first_aired`/`year`, `network` — every field
+beyond `provider_ids` is independently nullable, since providers disagree on per-title coverage.
+
+`metadata::tvdb::TvdbClient` mirrors `TmdbClient`'s shape (`struct { http, base_url, api_key }`,
+`new`, `from_config(config) -> Option<Self>`) with one addition TMDb doesn't need: TheTVDB v4
+requires a `POST /login` (api key [+ optional PIN] -> a bearer token) before any other call. The
+token is cached behind a shared lock and re-fetched exactly once, transparently, on a `401` —
+the same single-reauth shape `download::qbit::QbitClient` uses for its qBittorrent session cookie.
+`from_config` returns `None` when `MUSE_TVDB_API_KEY` is unset, same graceful-degrade posture as
+every other optional integration in `Config`; the token is never logged (a manual `Debug` impl
+redacts the API key, PIN, and token).
+
+This is what lets Muse identify/enrich titles without depending on `*arr` for metadata — a future
+resolver (MUSEL-A2) fans out to every configured provider (TMDb + TVDB + an IMDb-id bridge) and
+merges the results with a documented id-precedence rule.
 
 ### Download-client adapter (`src/download/`, MUSEM-02)
 

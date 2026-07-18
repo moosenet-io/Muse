@@ -15,6 +15,7 @@ mod cultural;
 pub mod curation;
 mod db;
 pub mod discord;
+pub mod download;
 pub mod embed;
 #[cfg(test)]
 mod endpoint_tests;

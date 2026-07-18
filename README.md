@@ -125,8 +125,11 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_MEDIA_ROOT` | `""` (empty) | Base path prepended to stored `relative_path`/`file_path` values for ffmpeg. Empty means "use stored paths as-is" (correct when they're already absolute). |
 | `MUSE_PROACTIVE_TICK_INTERVAL_SECS` | `3600` | How often the proactive generator worker runs the five generators for every account. |
 | `MUSE_TEST_DATABASE_URL` | *(none)* | **Test-only.** Points the DB-gated integration/live tests at a scratch Postgres; unset → those tests skip cleanly instead of failing. |
+| `MUSE_QBIT_URL` | *(none)* | qBittorrent WebUI base URL, e.g. `http://192.0.2.60:8080` (MUSEM-02 download-client adapter). All three `MUSE_QBIT_*` vars must be set together for `QbitConfig::from_env`/`QbitClient::from_env` to construct a client; otherwise download-client control degrades to unavailable, same posture as `PLEX_URL`/`PLEX_TOKEN`. |
+| `MUSE_QBIT_USER` | *(none)* | qBittorrent WebUI username. |
+| `MUSE_QBIT_PASS` | *(none)* | qBittorrent WebUI password. Read straight from the environment (<secret-manager>-materialized, never a literal) and wrapped in `download::config::QbitPassword`, whose `Debug`/`Display` always print `<redacted>` — it never appears in logs even if a `QbitConfig`/`QbitClient` is formatted wholesale. |
 
-That is **34 runtime environment variables** (plus the test-only `MUSE_TEST_DATABASE_URL`).
+That is **37 runtime environment variables** (plus the test-only `MUSE_TEST_DATABASE_URL`).
 
 `MUSE_ARR_INSTANCES` JSON entry shape (`src/arr/config.rs`):
 
@@ -138,6 +141,40 @@ That is **34 runtime environment variables** (plus the test-only `MUSE_TEST_DATA
    "api_key": "<from-vault>", "library_kind": "tv"}
 ]
 ```
+
+### Download-client adapter (`src/download/`, MUSEM-02)
+
+Muse's first *write* to an acquisition substrate: a `DownloadClient` trait (`add`/`list`/
+`info`/`delete`, `src/download/mod.rs`) with one live implementation, `QbitClient`
+(`src/download/qbit.rs`), against the qBittorrent WebUI **v2** API. It does NOT decide what to
+grab — that's a later item (MUSEM-04); this only executes an add/list/delete against
+qBittorrent once handed a `GrabRequest`. `MockDownloadClient` (also in `src/download/mod.rs`)
+records every `add` for later items' tests and performs no network I/O.
+
+- **Auth**: `POST /api/v2/auth/login` (form `username`/`password`) captures the `SID` session
+  cookie from `Set-Cookie`; the cookie is held per-client behind a shared lock (clones of one
+  `QbitClient` share a session) and sent back as a plain `Cookie` header on every subsequent
+  call, since this crate's `reqwest` dependency doesn't enable the `cookie_store` feature. A
+  `403` on any data call triggers exactly one transparent re-auth + retry; a second failure (or
+  any other status) surfaces as a typed `MuseError::Upstream`, never a panic.
+- **Add**: `POST /api/v2/torrents/add` — `urls=` (magnet URI or `.torrent` URL, both accepted),
+  optional `category=`/`savepath=` (omitted entirely, not sent empty, when the caller has no
+  opinion), `paused=`. qBittorrent's response body is a bare `"Ok."` with no hash, so the
+  returned `GrabReceipt.hash` is resolved client-side from the magnet's `xt=urn:btih:` when
+  present, and left `None` for a `.torrent`-URL add (no client-side way to know the infohash in
+  that case).
+- **List/info**: `GET /api/v2/torrents/info` (optionally `?hashes=`), parsed into
+  `TorrentStatus`.
+- **Delete**: `POST /api/v2/torrents/delete` (form `hashes=`/`deleteFiles=`).
+- **Construction**: `QbitClient::from_config(&QbitConfig)` or `QbitClient::from_env()`, backed
+  by `QbitConfig::from_env()` reading `MUSE_QBIT_URL`/`MUSE_QBIT_USER`/`MUSE_QBIT_PASS` — same
+  self-contained-module-config posture as `snapshot::acquisition::AcquisitionConfig`, rather
+  than three more fields on the already-large `Config` struct. Returns `None` (not an error)
+  when any of the three is unset — qBittorrent control is an optional, gracefully-degrading
+  dependency, same posture as `PlexClient::from_config`.
+- **Not wired into `AppState`/any route or worker yet** — this item ships the adapter only, in
+  isolation, covered by its own httpmock test suite (`cargo test --bin muse download::`).
+  Wiring it into a caller is a later MUSEM item.
 
 ## HTTP API surface (20 routes)
 
@@ -197,6 +234,7 @@ some capabilities need a manual invocation or a future worker/route to become li
 - `radar::divergence::recompute_divergence` — the you-vs-masses radar. No caller, no HTTP surface at all; `taste_divergence` is never computed automatically.
 - `arr::ingest::run` — library ingest. Parsed `MUSE_ARR_INSTANCES` is held in state, but no worker or route runs the ingest.
 - `tautulli::backfill::run` — one-time history import. No route/CLI/worker; intended to be driven by an orchestrator/ops step.
+- `download::qbit::QbitClient` — the qBittorrent download-client adapter (MUSEM-02). Nothing in `AppState`/any route/worker constructs or calls it yet; it exists as a tested, standalone seam awaiting a caller (grab-decision logic lands in a later MUSEM item).
 - `trending::snapshot_trending` — TMDb trending ingest. `main.rs` notes it as a "follow-on wiring item".
 - `channels::compose_channel_run` — the on-demand pseudo-TV director. Fully implemented + tested, but no HTTP route mounts it (the *linear* tuner uses its own `tuner::scheduler` grid-filler instead).
 - `enrichment::EnrichmentService::enrich_media_item` — external-enrichment cache population. Wired object on `AppState`, but nothing calls it outside tests.

@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -155,6 +156,74 @@ impl ChordClient {
 
         Ok(trimmed.to_string())
     }
+
+    /// `POST /v1/chat/completions` with a single image attached to the user
+    /// turn (the OpenAI-compatible multimodal `content: [{"type":"text",...},
+    /// {"type":"image_url",...}]` shape) — MUSEL-C2's frame-consistency
+    /// question (`matching::vision::ChordVisionVerifier`). Same
+    /// posture/timeout/error-mapping as [`ChordClient::chat_completion`];
+    /// this is the ONE Chord HTTP transport implementation in this crate —
+    /// `matching::vision` is a thin prompt/parse adapter over this method,
+    /// never a second direct client against Chord's endpoint.
+    pub async fn chat_completion_with_image(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        image_bytes: &[u8],
+        image_mime: &str,
+    ) -> MuseResult<String> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let encoded = BASE64_STANDARD.encode(image_bytes);
+        let data_url = format!("data:{image_mime};base64,{encoded}");
+
+        let request = serde_json::json!({
+            "model": model,
+            "temperature": 0.2,
+            "max_tokens": 150,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]},
+            ],
+        });
+
+        let resp = self.http.post(&url).json(&request).send().await?;
+
+        let status = resp.status();
+        let bytes = resp.bytes().await?;
+
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes).to_string();
+            return Err(MuseError::Upstream {
+                status: status.as_u16(),
+                message: format!("chord vision chat-completions request to {url} failed: {body}"),
+            });
+        }
+
+        let parsed: ChatCompletionResponse = serde_json::from_slice(&bytes).map_err(|e| MuseError::Upstream {
+            status: status.as_u16(),
+            message: format!("failed to parse chord vision chat-completions response from {url}: {e}"),
+        })?;
+
+        let content = parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .unwrap_or_default();
+
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(MuseError::upstream(format!(
+                "chord returned an empty vision chat-completion for model {model}"
+            )));
+        }
+
+        Ok(trimmed.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +302,49 @@ mod tests {
 
         let client = client_for(&server);
         assert!(client.chat_completion(DEFAULT_MODEL, "sys", "user").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_completion_with_image_sends_data_url_and_parses_response() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("data:image/jpeg;base64,")
+                .body_contains("image_url");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"choices": [{"message": {"role": "assistant", "content": "CONSISTENT: yes\nCONFIDENCE: 0.9\nREASON: matches."}}]}"#);
+        });
+
+        let client = client_for(&server);
+        let content = client
+            .chat_completion_with_image("vision-model", "sys", "user", &[0xFF, 0xD8, 0xFF, 0x01], "image/jpeg")
+            .await
+            .expect("chat_completion_with_image should succeed");
+
+        mock.assert();
+        assert!(content.contains("CONSISTENT: yes"));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_with_image_surfaces_upstream_error_status() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(503).body("vision model not loaded");
+        });
+
+        let client = client_for(&server);
+        let result = client
+            .chat_completion_with_image("vision-model", "sys", "user", &[1, 2, 3], "image/jpeg")
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MuseError::Upstream { status, .. } => assert_eq!(status, 503),
+            other => panic!("expected Upstream error, got {other:?}"),
+        }
     }
 
     #[test]

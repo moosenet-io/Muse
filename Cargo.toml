@@ -46,6 +46,22 @@ sha2 = "0.10"
 # src/metrics.rs). Same version pin as the reference pattern merged in
 # Terminus (PROMEX-01) and Chord (PROMEX-02).
 prometheus = "0.13"
+# MUSEL-C2: base64-encodes still-frame JPEG bytes into the OpenAI-compatible
+# `data:image/jpeg;base64,...` image_url payload Chord's vision endpoint
+# expects (src/taste_model/chord_client.rs `chat_completion_with_image`).
+# Encoding only -- not an image/JPEG decoder (see src/matching/liveness.rs
+# for why a decode dependency was deliberately avoided).
+base64 = "0.22"
+# MUSEL-C2 (review: codex): the still-liveness check (src/matching/
+# liveness.rs) decodes each sample still to real luma pixels before
+# computing mean/variance/dominant-value stats. An earlier byte-level
+# proxy over the still's *compressed* bytes (no decode) was tried first
+# to avoid this dependency, but was PROVEN not to discriminate: JPEG's
+# entropy coding makes the compressed byte stream look statistically
+# noisy/varied even for a genuinely solid-black frame (see the module doc
+# comment for the measured evidence), so liveness needs the real pixels.
+# `jpeg` feature only -- no other format decoders.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [dev-dependencies]
 httpmock = "0.7"

@@ -11,7 +11,18 @@
 //!
 //! TheTVDB v4 API shape assumed here (adapted from the public v4 OpenAPI
 //! spec, not independently verified against a live account in this
-//! session — see the worktree report for exactly what was assumed):
+//! session — see the worktree report for exactly what was assumed). Since
+//! that shape is unverified, the response DTOs below are deliberately
+//! tolerant of the older v3-style field names in case a live TheTVDB
+//! response (or an intermediary) doesn't match the v4 shape exactly: the
+//! title field accepts `name` (v4) or `seriesName`/`movieName` (v3-style)
+//! via `#[serde(alias = ...)]`, the image field accepts either a plain URL
+//! string (v4) or an object carrying a `url`/`image_url` field (v3-style),
+//! and the network field accepts either a flat string or an
+//! `originalNetwork: {name}` object. A live-API field-shape verification
+//! against a real TheTVDB v4 account remains a follow-up once
+//! `MUSE_TVDB_API_KEY` is provisioned (operator ops) — until then this
+//! tolerant parsing is the defensive middle ground.
 //! - `POST /login` body `{"apikey": "...", "pin": "..."}` (pin omitted when
 //!   unset) -> `{"status": "success", "data": {"token": "..."}}`.
 //! - Authenticated calls send `Authorization: Bearer <token>`.
@@ -286,17 +297,65 @@ struct DataEnvelope<T> {
     data: T,
 }
 
+/// Tolerant image field: TheTVDB v4 documents a plain URL string, but a v3-
+/// style response (or an intermediary/proxy) may instead send an object
+/// carrying a `url`/`image_url` field. Untagged so serde tries each variant
+/// in order and normalizes either shape down to the URL string via
+/// [`Self::into_url`].
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TvdbImage {
+    Url(String),
+    Object {
+        #[serde(alias = "image_url", default)]
+        url: Option<String>,
+    },
+}
+
+impl TvdbImage {
+    fn into_url(self) -> Option<String> {
+        match self {
+            TvdbImage::Url(s) => Some(s),
+            TvdbImage::Object { url } => url,
+        }
+    }
+}
+
+/// Tolerant network field: v4's base record nests it as `originalNetwork:
+/// {name}`, but a v3-style response may send a flat network name string
+/// instead. Untagged for the same reason as [`TvdbImage`].
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TvdbNetworkField {
+    Name(String),
+    Object {
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+impl TvdbNetworkField {
+    fn into_name(self) -> Option<String> {
+        match self {
+            TvdbNetworkField::Name(s) => Some(s),
+            TvdbNetworkField::Object { name } => name,
+        }
+    }
+}
+
 /// A TheTVDB v4 `/series/{id}` or `/movies/{id}` base record — permissive
 /// (`Option`/`#[serde(default)]`) like `trending::models::TmdbTitle`, since
-/// not every field is populated for every title.
+/// not every field is populated for every title. `name`/`image`/
+/// `originalNetwork` tolerate the v3-style field-name/shape variants too
+/// (see the module doc).
 #[derive(Debug, Deserialize)]
 struct TvdbRecord {
-    #[serde(default)]
+    #[serde(alias = "seriesName", alias = "movieName", default)]
     name: Option<String>,
     #[serde(default)]
     overview: Option<String>,
     #[serde(default)]
-    image: Option<String>,
+    image: Option<TvdbImage>,
     #[serde(default)]
     score: Option<f64>,
     #[serde(default)]
@@ -306,9 +365,8 @@ struct TvdbRecord {
     year: Option<String>,
     #[serde(default)]
     genres: Vec<TvdbGenre>,
-    #[serde(default)]
-    #[serde(rename = "originalNetwork")]
-    original_network: Option<TvdbNetwork>,
+    #[serde(alias = "network", rename = "originalNetwork", default)]
+    original_network: Option<TvdbNetworkField>,
     #[serde(default)]
     #[serde(rename = "remoteIds")]
     remote_ids: Vec<TvdbRemoteId>,
@@ -316,12 +374,6 @@ struct TvdbRecord {
 
 #[derive(Debug, Deserialize)]
 struct TvdbGenre {
-    #[serde(default)]
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TvdbNetwork {
     #[serde(default)]
     name: Option<String>,
 }
@@ -355,6 +407,7 @@ impl TvdbRecord {
             }
         }
 
+        let first_aired = self.first_aired.clone();
         ProviderMetadata {
             provider_ids,
             title: self.name,
@@ -365,17 +418,17 @@ impl TvdbRecord {
                 .filter_map(|g| g.name)
                 .collect(),
             images: ProviderImages {
-                poster_url: self.image,
+                poster_url: self.image.and_then(TvdbImage::into_url),
                 backdrop_url: None,
             },
             rating: self.score,
-            first_aired: self.first_aired.clone(),
+            first_aired: first_aired.clone(),
             year: self
                 .year
                 .as_deref()
                 .and_then(|y| y.parse::<i32>().ok())
-                .or_else(|| self.first_aired.as_deref().and_then(|d| d.get(0..4)).and_then(|y| y.parse().ok())),
-            network: self.original_network.and_then(|n| n.name),
+                .or_else(|| first_aired.as_deref().and_then(|d| d.get(0..4)).and_then(|y| y.parse().ok())),
+            network: self.original_network.and_then(TvdbNetworkField::into_name),
         }
     }
 }
@@ -387,12 +440,12 @@ impl TvdbRecord {
 struct TvdbSearchHit {
     #[serde(default)]
     tvdb_id: Option<String>,
-    #[serde(default)]
+    #[serde(alias = "seriesName", alias = "movieName", default)]
     name: Option<String>,
     #[serde(default)]
     overview: Option<String>,
-    #[serde(default)]
-    image_url: Option<String>,
+    #[serde(alias = "image", default)]
+    image_url: Option<TvdbImage>,
     #[serde(default)]
     score: Option<f64>,
     #[serde(default)]
@@ -432,7 +485,7 @@ impl TvdbSearchHit {
             overview: self.overview,
             genres: self.genres,
             images: ProviderImages {
-                poster_url: self.image_url,
+                poster_url: self.image_url.and_then(TvdbImage::into_url),
                 backdrop_url: None,
             },
             rating: self.score,
@@ -563,6 +616,95 @@ mod tests {
         assert_eq!(metadata.year, Some(2011));
     }
 
+    /// Closes a review finding: the v4 API shape assumed above
+    /// (`name`/string `image`/`originalNetwork: {name}`) is unverified
+    /// against a live TheTVDB account. This test feeds the client a
+    /// v3-style response instead (`seriesName`, an image OBJECT with a
+    /// `url` field, and a flat `network` string) and asserts it parses into
+    /// the exact same `ProviderMetadata` as the v4-shaped fixture above —
+    /// proving the tolerant `#[serde(alias = ...)]`/untagged-enum handling
+    /// actually works for both shapes, not just the assumed one.
+    #[tokio::test]
+    async fn resolve_by_id_tolerates_v3_style_field_names() {
+        let server = MockServer::start();
+        login_mock(&server, "tok");
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/series/121361")
+                .header("authorization", "Bearer tok");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "status": "success",
+                    "data": {
+                        "seriesName": "Game of Thrones",
+                        "overview": "Nine noble families fight for control.",
+                        "image": {"url": "https://artworks.thetvdb.com/poster.jpg"},
+                        "score": 9.1,
+                        "firstAired": "2011-04-17",
+                        "genres": [{"name": "Drama"}, {"name": "Fantasy"}],
+                        "network": "HBO",
+                        "remoteIds": [
+                            {"id": "tt0944947", "sourceName": "IMDB"}
+                        ]
+                    }
+                }));
+        });
+
+        let client = client_for(&server);
+        let metadata = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("resolve should not error")
+            .expect("series should be found");
+
+        mock.assert();
+        assert_eq!(metadata.title.as_deref(), Some("Game of Thrones"));
+        assert_eq!(metadata.network.as_deref(), Some("HBO"));
+        assert_eq!(
+            metadata.images.poster_url.as_deref(),
+            Some("https://artworks.thetvdb.com/poster.jpg")
+        );
+        assert_eq!(metadata.provider_ids.get("tvdb").map(String::as_str), Some("121361"));
+        assert_eq!(metadata.provider_ids.get("imdb").map(String::as_str), Some("tt0944947"));
+        assert_eq!(metadata.genres, vec!["Drama".to_string(), "Fantasy".to_string()]);
+        assert_eq!(metadata.year, Some(2011));
+    }
+
+    /// A v3-style `image_url` object (`{"image_url": "..."}` rather than
+    /// `{"url": "..."}`) is also tolerated — TheTVDB's own docs are
+    /// inconsistent about which key name a nested image object uses.
+    #[tokio::test]
+    async fn resolve_by_id_tolerates_image_object_with_image_url_key() {
+        let server = MockServer::start();
+        login_mock(&server, "tok");
+        server.mock(|when, then| {
+            when.method(GET).path("/movies/999");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "status": "success",
+                    "data": {
+                        "movieName": "Arrival",
+                        "image": {"image_url": "https://artworks.thetvdb.com/arrival.jpg"}
+                    }
+                }));
+        });
+
+        let client = client_for(&server);
+        let metadata = client
+            .resolve_by_id(MediaKind::Movie, "999")
+            .await
+            .expect("resolve should not error")
+            .expect("movie should be found");
+
+        assert_eq!(metadata.title.as_deref(), Some("Arrival"));
+        assert_eq!(
+            metadata.images.poster_url.as_deref(),
+            Some("https://artworks.thetvdb.com/arrival.jpg")
+        );
+    }
+
     #[tokio::test]
     async fn resolve_by_id_parses_movie_record() {
         let server = MockServer::start();
@@ -666,6 +808,51 @@ mod tests {
         mock.assert();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title.as_deref(), Some("Arrival"));
+        assert_eq!(hits[0].provider_ids.get("tmdb").map(String::as_str), Some("329865"));
+    }
+
+    /// v3-style search-hit shape: `movieName` instead of `name`, and a
+    /// nested `image_url` object instead of the v4-style flat `image_url`
+    /// string — same review finding as the resolve-by-id tests above,
+    /// closed for the `/search` path too.
+    #[tokio::test]
+    async fn search_tolerates_v3_style_field_names() {
+        let server = MockServer::start();
+        login_mock(&server, "tok");
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/search")
+                .query_param("query", "arrival")
+                .query_param("type", "movie");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "status": "success",
+                    "data": [
+                        {
+                            "tvdb_id": "12345",
+                            "movieName": "Arrival",
+                            "year": "2016",
+                            "genres": ["Sci-Fi"],
+                            "image": {"image_url": "https://artworks.thetvdb.com/arrival.jpg"},
+                            "remote_ids": [{"id": "329865", "sourceName": "TheMovieDB.com"}]
+                        }
+                    ]
+                }));
+        });
+
+        let client = client_for(&server);
+        let hits = client
+            .search("arrival", MediaKind::Movie)
+            .await
+            .expect("search should parse");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("Arrival"));
+        assert_eq!(
+            hits[0].images.poster_url.as_deref(),
+            Some("https://artworks.thetvdb.com/arrival.jpg")
+        );
         assert_eq!(hits[0].provider_ids.get("tmdb").map(String::as_str), Some("329865"));
     }
 

@@ -16,6 +16,11 @@
 //!   scheduled report-pull worker itself (MUSE-17): ties the client, parser,
 //!   and repo layer together into one pull -> parse -> upsert -> rollup
 //!   pass, run on a background loop.
+//! - [`search::search_releases`] — the on-demand targeted search entry
+//!   point (MUSEM-03): "search this specific title now," distinct from the
+//!   scheduled report-pull sweep above, feeding candidate
+//!   [`search::SearchRelease`]s to the release-decision engine (MUSEM-04)
+//!   rather than persisting anything itself.
 //!
 //! This module makes no writes to Prowlarr and never grabs anything; the
 //! persistence side (upserting into `indexers`/`releases`/`availability`)
@@ -26,10 +31,12 @@ mod models;
 mod parse;
 mod rate_limit;
 mod scheduler;
+mod search;
 mod worker;
 
 pub use client::ProwlarrClient;
 pub use models::{ProwlarrCapabilities, ProwlarrCategory, ProwlarrIndexer, ProwlarrRelease};
 pub use parse::{parse_release_name, ParsedRelease};
 pub use rate_limit::RateLimiter;
+pub use search::{search_releases, SearchRelease};
 pub use worker::{spawn_report_pull_worker, TickSummary};

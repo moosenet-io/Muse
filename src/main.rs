@@ -16,6 +16,7 @@ pub mod curation;
 pub mod decision;
 mod db;
 pub mod discord;
+pub mod download;
 pub mod embed;
 #[cfg(test)]
 mod endpoint_tests;

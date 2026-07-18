@@ -68,6 +68,8 @@ pub struct ProwlarrRelease {
     #[serde(default)]
     pub indexer: Option<String>,
     #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
     pub size: Option<i64>,
     #[serde(rename = "publishDate", default)]
     pub publish_date: Option<DateTime<Utc>>,
@@ -89,6 +91,19 @@ pub struct ProwlarrRelease {
     /// derive `releases.freeleech`. Field name and casing UNVERIFIED live.
     #[serde(rename = "indexerFlags", default)]
     pub indexer_flags: Vec<String>,
+    /// Prowlarr's own best-effort extraction of the release's IMDb id, from
+    /// the title/site metadata at search time (blueprint §4: present on the
+    /// release object itself, `0` meaning "unknown" rather than a real id --
+    /// see [`ProwlarrRelease::imdb_id`] for the normalized accessor). Kept
+    /// alongside, never instead of, Muse's own `parse::parse_release_name`
+    /// pass -- the blueprint explicitly warns against relying solely on
+    /// Prowlarr's guess.
+    #[serde(rename = "imdbId", default)]
+    pub imdb_id_raw: Option<i64>,
+    #[serde(rename = "tmdbId", default)]
+    pub tmdb_id_raw: Option<i64>,
+    #[serde(rename = "tvdbId", default)]
+    pub tvdb_id_raw: Option<i64>,
 }
 
 impl ProwlarrRelease {
@@ -103,5 +118,21 @@ impl ProwlarrRelease {
 
     pub fn category_ids(&self) -> Vec<i32> {
         self.categories.iter().map(|c| c.id).collect()
+    }
+
+    /// Normalized IMDb id: `None` when absent *or* `0` (Prowlarr's
+    /// "unknown" sentinel, blueprint §4), `Some(id)` otherwise.
+    pub fn imdb_id(&self) -> Option<i64> {
+        self.imdb_id_raw.filter(|&id| id != 0)
+    }
+
+    /// Normalized TMDb id, same `0` = unknown convention as [`Self::imdb_id`].
+    pub fn tmdb_id(&self) -> Option<i64> {
+        self.tmdb_id_raw.filter(|&id| id != 0)
+    }
+
+    /// Normalized TVDB id, same `0` = unknown convention as [`Self::imdb_id`].
+    pub fn tvdb_id(&self) -> Option<i64> {
+        self.tvdb_id_raw.filter(|&id| id != 0)
     }
 }

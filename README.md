@@ -52,7 +52,7 @@ Subsystem map (source module → concern):
 | `plex/` | Read-only Plex API client (libraries, sessions, ratings, watchlist, artwork) |
 | `tracker/` | **Native Tautulli-replacement**: webhook receiver + session poller + reconstruction |
 | `tautulli/` | One-time Tautulli history backfill importer |
-| `prowlarr/` | Availability report-pull worker (indexer sync, RSS pull, release parse, rollup) |
+| `prowlarr/` | Availability report-pull worker (indexer sync, RSS pull, release parse, rollup) + on-demand targeted search (`search_releases`) |
 | `decision/` | Pure release-decision/scoring engine ("what to grab") — see [Release-decision engine](#release-decision-engine) below |
 | `trending/` | TMDb trending/population feed + streaming-availability |
 | `embed/` | Local embedding pipeline (`nomic-embed-text` → pgvector) + cosine recall primitive |
@@ -67,6 +67,40 @@ Subsystem map (source module → concern):
 | `streaming/` | ffmpeg channel streaming engine (`/auto/v{id}`) |
 | `web/` | Channel-guide web page + JSON API + artwork proxy |
 | `plex_control/` | Plex Companion cast/play-queue client (library-only, unwired — see below) |
+
+## Acquisition domain schema (MUSEM-01)
+
+Muse today is a *read-only* observer of the operator's Radarr/Sonarr/Prowlarr fleet (`arr/`,
+`prowlarr/`). `migrations/0104_acquisition_domain.sql` lays the **schema + repository foundation**
+(`src/models/acquisition.rs`, `src/repo/acquisition.rs`) for a native write-path — monitoring
+("wanted"), requests, the download queue, typed history, and a blocklist — mirroring the
+Radarr/Sonarr data model (`quality` is a compound `{quality, revision}` value, custom formats are a
+named scored-matcher registry, history is typed `jsonb`, provider IDs are a keyed map). **This item
+is schema/repo only: no workers, no HTTP endpoints, nothing wired into a running deployment yet**
+(see "Wiring status" below and the later MUSEM items for the write path itself).
+
+Tables added:
+
+| Table | Purpose |
+|---|---|
+| `monitored_items` | The "wanted" driver — monitoring a title within a `library`, decoupled from whether a `media_items`/file exists yet |
+| `media_requests` | <media-service>-style request lifecycle (`requested → approved/denied → searching → grabbed → available`) |
+| `download_queue` | One row per in-flight/terminal grab; requires at least one of `request_id`/`monitored_item_id` (`download_queue_has_source` CHECK) |
+| `history_events` | Typed history (`event_type`-keyed `jsonb` payload), correlated to a download via `download_id` |
+| `blocklist` | Releases/hashes a future decision engine must never re-grab |
+
+The pre-existing quality-domain tables (`quality_definitions`, `quality_profiles`, `custom_formats`,
+`quality_profile_formats` — added in MUSE-02, `src/models/quality.rs` / `src/repo/quality.rs`) are
+reused by FK, **not redefined** — see the migration's header comment for why. `media_requests.kind`
+and the `status`/`event_type` columns are plain `text` (not a Postgres enum type) so a future
+`'music'` kind or a new status value never needs an `ALTER TYPE`; `src/models/acquisition.rs`
+provides the validated Rust-side enums (`RequestStatus`, `QueueStatus`, `HistoryEventType`) with
+`as_str()`/`FromStr` conversions.
+
+The hot "wanted" scan is `repo::acquisition::list_wanted(pool, library_id)`: everything monitored
+in a library that either has no file yet, or whose best on-disk file quality is strictly below its
+quality profile's cutoff (compared via `quality_definitions.sort_order`, never raw quality-tier
+ids, which are historical/non-contiguous per the blueprint).
 
 ## Running
 
@@ -117,6 +151,7 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_PROWLARR_TV_CATEGORIES` | `5000` | Comma-separated Newznab parent category ids treated as TV. |
 | `MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE` | `0.5` | Minimum release-name parse confidence before resolving a release to a title. |
 | `MUSE_RELEASE_EXPIRY_DAYS` | `21` | How long a rolling `releases` snapshot row lives before it's pruned. |
+| `MUSE_PROWLARR_SEARCH_MAX_PER_HOUR` | `30` | Rolling hourly cap on on-demand targeted searches (`prowlarr::search_releases`), shared with the report-pull worker's rate limiter. |
 | `MUSE_PUBLIC_URL` | *(none)* | LAN-reachable base URL advertised by the tuner (`/discover.json`, `/muse.m3u` stream URLs). Degrades to `http://{bind_addr}` (only correct when `bind_addr` is a real LAN address). |
 | `MUSE_HDHR_DEVICE_ID` | `MUSE0001` | HDHomeRun-emulation device id advertised in `/discover.json`. |
 | `MUSE_CHANNEL_GUIDE_WINDOW_HOURS` | `48` | Rolling linear-guide window the director keeps `channel_programs` filled to; also the XMLTV render window. |
@@ -126,8 +161,11 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_MEDIA_ROOT` | `""` (empty) | Base path prepended to stored `relative_path`/`file_path` values for ffmpeg. Empty means "use stored paths as-is" (correct when they're already absolute). |
 | `MUSE_PROACTIVE_TICK_INTERVAL_SECS` | `3600` | How often the proactive generator worker runs the five generators for every account. |
 | `MUSE_TEST_DATABASE_URL` | *(none)* | **Test-only.** Points the DB-gated integration/live tests at a scratch Postgres; unset → those tests skip cleanly instead of failing. |
+| `MUSE_QBIT_URL` | *(none)* | qBittorrent WebUI base URL, e.g. `http://192.0.2.60:8080` (MUSEM-02 download-client adapter). Read by the central `Config::from_env` like every other field in this table; all three `MUSE_QBIT_*` vars must be set together for `Config::qbit()` to return a live `QbitConfig` (see below), otherwise download-client control degrades to unavailable, same posture as `PLEX_URL`/`PLEX_TOKEN`. |
+| `MUSE_QBIT_USER` | *(none)* | qBittorrent WebUI username. |
+| `MUSE_QBIT_PASS` | *(none)* | qBittorrent WebUI password. Muse has no `SecretManager`/vault crate of its own — like every other credential in this table, it is materialized into the process environment from <secret-manager> at runtime and read in exactly one place, `Config::from_env` (`src/config.rs`), never a scattered `std::env::var` elsewhere in the codebase. It's stored on `Config` (and handed to `download::qbit::QbitClient` via `Config::qbit()` → `download::config::QbitConfig`) wrapped in `download::config::QbitPassword`, whose `Debug`/`Display` always print `<redacted>` — it never appears in logs even if `Config`/`QbitConfig`/`QbitClient` is formatted wholesale. |
 
-That is **34 runtime environment variables** (plus the test-only `MUSE_TEST_DATABASE_URL`).
+That is **37 runtime environment variables** (plus the test-only `MUSE_TEST_DATABASE_URL`).
 
 `MUSE_ARR_INSTANCES` JSON entry shape (`src/arr/config.rs`):
 
@@ -139,6 +177,43 @@ That is **34 runtime environment variables** (plus the test-only `MUSE_TEST_DATA
    "api_key": "<from-vault>", "library_kind": "tv"}
 ]
 ```
+
+### Download-client adapter (`src/download/`, MUSEM-02)
+
+Muse's first *write* to an acquisition substrate: a `DownloadClient` trait (`add`/`list`/
+`info`/`delete`, `src/download/mod.rs`) with one live implementation, `QbitClient`
+(`src/download/qbit.rs`), against the qBittorrent WebUI **v2** API. It does NOT decide what to
+grab — that's a later item (MUSEM-04); this only executes an add/list/delete against
+qBittorrent once handed a `GrabRequest`. `MockDownloadClient` (also in `src/download/mod.rs`)
+records every `add` for later items' tests and performs no network I/O.
+
+- **Auth**: `POST /api/v2/auth/login` (form `username`/`password`) captures the `SID` session
+  cookie from `Set-Cookie`; the cookie is held per-client behind a shared lock (clones of one
+  `QbitClient` share a session) and sent back as a plain `Cookie` header on every subsequent
+  call, since this crate's `reqwest` dependency doesn't enable the `cookie_store` feature. A
+  `403` on any data call triggers exactly one transparent re-auth + retry; a second failure (or
+  any other status) surfaces as a typed `MuseError::Upstream`, never a panic.
+- **Add**: `POST /api/v2/torrents/add`, sent as `multipart/form-data` (matching qBittorrent's
+  own WebUI v2 API docs) via `reqwest`'s `multipart` feature — `urls=` (magnet URI or
+  `.torrent` URL, both accepted), optional `category=`/`savepath=` parts (omitted entirely, not
+  sent empty, when the caller has no opinion), `paused=`. qBittorrent's response body is a bare
+  `"Ok."` with no hash, so the
+  returned `GrabReceipt.hash` is resolved client-side from the magnet's `xt=urn:btih:` when
+  present, and left `None` for a `.torrent`-URL add (no client-side way to know the infohash in
+  that case).
+- **List/info**: `GET /api/v2/torrents/info` (optionally `?hashes=`), parsed into
+  `TorrentStatus`.
+- **Delete**: `POST /api/v2/torrents/delete` (form `hashes=`/`deleteFiles=`).
+- **Construction**: `QbitClient::from_config(&QbitConfig)`, where the `QbitConfig` comes from
+  `Config::qbit()` (`src/config.rs`) — `MUSE_QBIT_URL`/`MUSE_QBIT_USER`/`MUSE_QBIT_PASS` are
+  read only inside the CENTRAL `Config::from_env`, same as every other credential in this
+  crate (`api_token`, `plex_token`, `tautulli_api_key`, ...); `download::config` itself does no
+  env reading — it's a plain data holder for `QbitConfig`/`QbitPassword`. `Config::qbit()`
+  returns `None` (not an error) unless all three vars are set — qBittorrent control is an
+  optional, gracefully-degrading dependency, same posture as `PlexClient::from_config`.
+- **Not wired into `AppState`/any route or worker yet** — this item ships the adapter only, in
+  isolation, covered by its own httpmock test suite (`cargo test --bin muse download::`).
+  Wiring it into a caller is a later MUSEM item.
 
 ## HTTP API surface (20 routes)
 
@@ -248,10 +323,13 @@ some capabilities need a manual invocation or a future worker/route to become li
 - `radar::divergence::recompute_divergence` — the you-vs-masses radar. No caller, no HTTP surface at all; `taste_divergence` is never computed automatically.
 - `arr::ingest::run` — library ingest. Parsed `MUSE_ARR_INSTANCES` is held in state, but no worker or route runs the ingest.
 - `tautulli::backfill::run` — one-time history import. No route/CLI/worker; intended to be driven by an orchestrator/ops step.
+- `download::qbit::QbitClient` — the qBittorrent download-client adapter (MUSEM-02). Nothing in `AppState`/any route/worker constructs or calls it yet; it exists as a tested, standalone seam awaiting a caller (grab-decision logic lands in a later MUSEM item).
 - `trending::snapshot_trending` — TMDb trending ingest. `main.rs` notes it as a "follow-on wiring item".
 - `channels::compose_channel_run` — the on-demand pseudo-TV director. Fully implemented + tested, but no HTTP route mounts it (the *linear* tuner uses its own `tuner::scheduler` grid-filler instead).
 - `enrichment::EnrichmentService::enrich_media_item` — external-enrichment cache population. Wired object on `AppState`, but nothing calls it outside tests.
 - `plex_control::*` — Plex Companion cast/play-queue client. Declared as a module but **not mounted anywhere** and never called — library-only, and never exercised against a real Plex server.
+- `repo::acquisition::*` (MUSEM-01) — the acquisition-domain schema + repository layer (monitoring/requests/download-queue/history/blocklist). No worker, decision engine, download-client adapter, or HTTP route calls any of it yet — this item is the write-path *foundation* only; see later MUSEM items in `specs/S119-muse-media-management.md`.
+- `prowlarr::search_releases` — on-demand targeted Prowlarr search (MUSEM-03). No HTTP route or worker calls it yet; it's the input the release-decision/scoring engine (MUSEM-04) is expected to drive, not a standalone entry point in this change.
 - `decision::decide_release` — the release-decision/scoring engine (MUSEM-04). Fully implemented and unit-tested, but nothing calls it yet: it awaits a targeted-search caller (MUSEM-03) upstream and a grab/persist caller (MUSEM-02/05) downstream.
 
 Consequence: in a fresh deployment with a fully populated library and Ollama/Chord configured,

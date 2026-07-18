@@ -4,6 +4,17 @@
 //! materialized into the process environment from <secret-manager> at deploy/runtime
 //! (the fleet-standard `.env`-from-<secret-manager> pattern). This module only reads
 //! `std::env::var`; it never authors a default secret value.
+//!
+//! This is the **one, central** place `std::env::var` is read for
+//! secret-shaped values (tokens/keys/passwords) in this crate (S1/S3) — Muse
+//! has no `SecretManager`/vault crate of its own, so "route secrets through
+//! config, not a scattered `std::env::var`" means routing them through
+//! *this* module's [`Config::from_env`], same as `api_token`/`plex_token`/
+//! every other credential field below. A module that needs a credential
+//! (e.g. `download::qbit::QbitClient`) takes it from a already-loaded
+//! [`Config`] (see [`Config::qbit`]) rather than reading its own env var.
+
+use crate::download::config::{QbitConfig, QbitPassword};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8090";
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -77,6 +88,20 @@ pub struct Config {
     /// `MUSE_ARR_INSTANCES` at runtime (<secret-manager>-materialized).
     pub arr_instances_json: Option<String>,
 
+    // --- MUSEM-02: qBittorrent download-client adapter
+    // (`download::qbit::QbitClient`). All three read together; see
+    // `Config::qbit`. ---
+    /// qBittorrent WebUI base URL, e.g. `http://192.0.2.60:8080`.
+    /// `MUSE_QBIT_URL`.
+    pub qbit_url: Option<String>,
+    /// qBittorrent WebUI username. `MUSE_QBIT_USER`.
+    pub qbit_user: Option<String>,
+    /// qBittorrent WebUI password, <secret-manager>-materialized at runtime, never
+    /// a literal (S1/S7). Wrapped in [`QbitPassword`] so it can never leak
+    /// through a `Debug`/`Display` of `Config` itself (this struct derives
+    /// `Debug`) — `MUSE_QBIT_PASS`.
+    pub qbit_pass: Option<QbitPassword>,
+
     // --- MUSE-17: Prowlarr report-pull worker (behavioral config, not
     // secret-shaped -- no vault involvement, same posture as MUSE_BIND_ADDR
     // above). ---
@@ -104,6 +129,14 @@ pub struct Config {
     /// `repo::release::prune_expired` removes it (spec S3.6: "expired rows
     /// are pruned"). Every re-seen release refreshes this on upsert.
     pub release_expiry_days: i64,
+    /// MUSEM-03: the rolling hourly cap on on-demand targeted searches
+    /// (`prowlarr::search::search_releases`), passed through to
+    /// `ProwlarrClient::targeted_search`'s `max_searches_per_hour`. Shares
+    /// the client's single `RateLimiter` instance with the report-pull
+    /// path, so this budgets on-demand search specifically -- "sparingly,
+    /// never fan a text search across all private indexers on a whim"
+    /// (blueprint §4b-C). `MUSE_PROWLARR_SEARCH_MAX_PER_HOUR`.
+    pub prowlarr_search_max_per_hour: u64,
 
     // --- MUSE-28: linear tuner (HDHomeRun-emulation + M3U + XMLTV) ---
     /// Public LAN base URL Plex/other players use to reach this Muse
@@ -432,11 +465,16 @@ impl Config {
             news_api_key: env_opt("MUSE_NEWS_API_KEY"),
             arr_instances_json: env_opt("MUSE_ARR_INSTANCES"),
 
+            qbit_url: env_opt("MUSE_QBIT_URL"),
+            qbit_user: env_opt("MUSE_QBIT_USER"),
+            qbit_pass: env_opt("MUSE_QBIT_PASS").map(QbitPassword::from),
+
             prowlarr_tick_interval_secs: env_u64("MUSE_PROWLARR_TICK_INTERVAL_SECS", 60),
             prowlarr_movie_categories: env_int_list("MUSE_PROWLARR_MOVIE_CATEGORIES", &[2000]),
             prowlarr_tv_categories: env_int_list("MUSE_PROWLARR_TV_CATEGORIES", &[5000]),
             prowlarr_resolve_min_confidence: env_f32("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", 0.5),
             release_expiry_days: env_i64("MUSE_RELEASE_EXPIRY_DAYS", 21),
+            prowlarr_search_max_per_hour: env_u64("MUSE_PROWLARR_SEARCH_MAX_PER_HOUR", 30),
 
             public_base_url: env_opt("MUSE_PUBLIC_URL"),
             hdhr_device_id: std::env::var("MUSE_HDHR_DEVICE_ID")
@@ -533,6 +571,22 @@ impl Config {
     ) -> crate::error::MuseResult<Vec<crate::arr::config::ArrInstanceConfig>> {
         crate::arr::config::load_arr_instances(self.arr_instances_json.as_deref())
     }
+
+    /// Assembles [`QbitConfig`] from the already-loaded `MUSE_QBIT_*`
+    /// fields. Returns `None` (not an error) unless all three are set —
+    /// qBittorrent download-client control is an optional, gracefully
+    /// degrading dependency, same posture as [`Self::plex_url`]/
+    /// [`Self::plex_token`] for `PlexClient::from_config`. This is the only
+    /// place `MUSE_QBIT_PASS` is read into a [`QbitConfig`]; callers (e.g.
+    /// `download::qbit::QbitClient::from_config`) never read the env
+    /// themselves.
+    pub fn qbit(&self) -> Option<QbitConfig> {
+        Some(QbitConfig {
+            url: self.qbit_url.clone()?,
+            user: self.qbit_user.clone()?,
+            pass: self.qbit_pass.clone()?,
+        })
+    }
 }
 
 /// Test/scaffold convenience -- NOT used by `from_env`, which always reads
@@ -561,11 +615,15 @@ impl Default for Config {
             ollama_url: None,
             chord_url: None,
             arr_instances_json: None,
+            qbit_url: None,
+            qbit_user: None,
+            qbit_pass: None,
             prowlarr_tick_interval_secs: 60,
             prowlarr_movie_categories: vec![2000],
             prowlarr_tv_categories: vec![5000],
             prowlarr_resolve_min_confidence: 0.5,
             release_expiry_days: 21,
+            prowlarr_search_max_per_hour: 30,
             searxng_url: None,
             news_url: None,
             news_api_key: None,
@@ -693,6 +751,7 @@ mod tests {
             "MUSE_PROWLARR_TV_CATEGORIES",
             "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
             "MUSE_RELEASE_EXPIRY_DAYS",
+            "MUSE_PROWLARR_SEARCH_MAX_PER_HOUR",
             "MUSE_PUBLIC_URL",
             "MUSE_HDHR_DEVICE_ID",
             "MUSE_CHANNEL_GUIDE_WINDOW_HOURS",
@@ -1014,6 +1073,7 @@ mod tests {
         std::env::set_var("MUSE_PROWLARR_TV_CATEGORIES", "5000,5010");
         std::env::set_var("MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE", "0.75");
         std::env::set_var("MUSE_RELEASE_EXPIRY_DAYS", "7");
+        std::env::set_var("MUSE_PROWLARR_SEARCH_MAX_PER_HOUR", "12");
 
         let cfg = Config::from_env();
 
@@ -1022,6 +1082,7 @@ mod tests {
         assert_eq!(cfg.prowlarr_tv_categories, vec![5000, 5010]);
         assert!((cfg.prowlarr_resolve_min_confidence - 0.75).abs() < f32::EPSILON);
         assert_eq!(cfg.release_expiry_days, 7);
+        assert_eq!(cfg.prowlarr_search_max_per_hour, 12);
 
         for key in [
             "MUSE_PROWLARR_TICK_INTERVAL_SECS",
@@ -1029,7 +1090,59 @@ mod tests {
             "MUSE_PROWLARR_TV_CATEGORIES",
             "MUSE_PROWLARR_RESOLVE_MIN_CONFIDENCE",
             "MUSE_RELEASE_EXPIRY_DAYS",
+            "MUSE_PROWLARR_SEARCH_MAX_PER_HOUR",
         ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn config_reads_qbit_settings_from_env_and_qbit_accessor_assembles_them() {
+        for key in ["MUSE_QBIT_URL", "MUSE_QBIT_USER", "MUSE_QBIT_PASS"] {
+            std::env::remove_var(key);
+        }
+
+        // Unset -> no live qbit config, gracefully, not an error.
+        assert!(Config::from_env().qbit().is_none());
+
+        std::env::set_var("MUSE_QBIT_URL", "http://192.0.2.60:8080");
+        std::env::set_var("MUSE_QBIT_USER", "admin");
+        std::env::set_var("MUSE_QBIT_PASS", "hunter2");
+
+        let cfg = Config::from_env();
+        assert_eq!(cfg.qbit_url.as_deref(), Some("http://192.0.2.60:8080"));
+        assert_eq!(cfg.qbit_user.as_deref(), Some("admin"));
+        assert_eq!(
+            cfg.qbit_pass.as_ref().map(|p| p.expose().to_string()),
+            Some("hunter2".to_string())
+        );
+        // MUSE_QBIT_PASS itself never appears verbatim in a Debug of Config.
+        assert!(!format!("{cfg:?}").contains("hunter2"));
+
+        let qbit = cfg.qbit().expect("all three vars set");
+        assert_eq!(qbit.url, "http://192.0.2.60:8080");
+        assert_eq!(qbit.user, "admin");
+        assert_eq!(qbit.pass.expose(), "hunter2");
+
+        for key in ["MUSE_QBIT_URL", "MUSE_QBIT_USER", "MUSE_QBIT_PASS"] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn qbit_accessor_none_when_only_partially_configured() {
+        for key in ["MUSE_QBIT_URL", "MUSE_QBIT_USER", "MUSE_QBIT_PASS"] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("MUSE_QBIT_URL", "http://192.0.2.60:8080");
+        std::env::set_var("MUSE_QBIT_USER", "admin");
+        // MUSE_QBIT_PASS intentionally left unset.
+
+        assert!(Config::from_env().qbit().is_none());
+
+        for key in ["MUSE_QBIT_URL", "MUSE_QBIT_USER", "MUSE_QBIT_PASS"] {
             std::env::remove_var(key);
         }
     }

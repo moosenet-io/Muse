@@ -13,6 +13,7 @@ mod config;
 pub mod conversational;
 mod cultural;
 pub mod curation;
+pub mod decision;
 mod db;
 pub mod discord;
 pub mod download;

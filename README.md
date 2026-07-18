@@ -125,9 +125,9 @@ RFC 5737 documentation IPs (`192.0.2.x`) and placeholder hostnames — never rea
 | `MUSE_MEDIA_ROOT` | `""` (empty) | Base path prepended to stored `relative_path`/`file_path` values for ffmpeg. Empty means "use stored paths as-is" (correct when they're already absolute). |
 | `MUSE_PROACTIVE_TICK_INTERVAL_SECS` | `3600` | How often the proactive generator worker runs the five generators for every account. |
 | `MUSE_TEST_DATABASE_URL` | *(none)* | **Test-only.** Points the DB-gated integration/live tests at a scratch Postgres; unset → those tests skip cleanly instead of failing. |
-| `MUSE_QBIT_URL` | *(none)* | qBittorrent WebUI base URL, e.g. `http://192.0.2.60:8080` (MUSEM-02 download-client adapter). All three `MUSE_QBIT_*` vars must be set together for `QbitConfig::from_env`/`QbitClient::from_env` to construct a client; otherwise download-client control degrades to unavailable, same posture as `PLEX_URL`/`PLEX_TOKEN`. |
+| `MUSE_QBIT_URL` | *(none)* | qBittorrent WebUI base URL, e.g. `http://192.0.2.60:8080` (MUSEM-02 download-client adapter). Read by the central `Config::from_env` like every other field in this table; all three `MUSE_QBIT_*` vars must be set together for `Config::qbit()` to return a live `QbitConfig` (see below), otherwise download-client control degrades to unavailable, same posture as `PLEX_URL`/`PLEX_TOKEN`. |
 | `MUSE_QBIT_USER` | *(none)* | qBittorrent WebUI username. |
-| `MUSE_QBIT_PASS` | *(none)* | qBittorrent WebUI password. Read straight from the environment (<secret-manager>-materialized, never a literal) and wrapped in `download::config::QbitPassword`, whose `Debug`/`Display` always print `<redacted>` — it never appears in logs even if a `QbitConfig`/`QbitClient` is formatted wholesale. |
+| `MUSE_QBIT_PASS` | *(none)* | qBittorrent WebUI password. Muse has no `SecretManager`/vault crate of its own — like every other credential in this table, it is materialized into the process environment from <secret-manager> at runtime and read in exactly one place, `Config::from_env` (`src/config.rs`), never a scattered `std::env::var` elsewhere in the codebase. It's stored on `Config` (and handed to `download::qbit::QbitClient` via `Config::qbit()` → `download::config::QbitConfig`) wrapped in `download::config::QbitPassword`, whose `Debug`/`Display` always print `<redacted>` — it never appears in logs even if `Config`/`QbitConfig`/`QbitClient` is formatted wholesale. |
 
 That is **37 runtime environment variables** (plus the test-only `MUSE_TEST_DATABASE_URL`).
 
@@ -166,12 +166,13 @@ records every `add` for later items' tests and performs no network I/O.
 - **List/info**: `GET /api/v2/torrents/info` (optionally `?hashes=`), parsed into
   `TorrentStatus`.
 - **Delete**: `POST /api/v2/torrents/delete` (form `hashes=`/`deleteFiles=`).
-- **Construction**: `QbitClient::from_config(&QbitConfig)` or `QbitClient::from_env()`, backed
-  by `QbitConfig::from_env()` reading `MUSE_QBIT_URL`/`MUSE_QBIT_USER`/`MUSE_QBIT_PASS` — same
-  self-contained-module-config posture as `snapshot::acquisition::AcquisitionConfig`, rather
-  than three more fields on the already-large `Config` struct. Returns `None` (not an error)
-  when any of the three is unset — qBittorrent control is an optional, gracefully-degrading
-  dependency, same posture as `PlexClient::from_config`.
+- **Construction**: `QbitClient::from_config(&QbitConfig)`, where the `QbitConfig` comes from
+  `Config::qbit()` (`src/config.rs`) — `MUSE_QBIT_URL`/`MUSE_QBIT_USER`/`MUSE_QBIT_PASS` are
+  read only inside the CENTRAL `Config::from_env`, same as every other credential in this
+  crate (`api_token`, `plex_token`, `tautulli_api_key`, ...); `download::config` itself does no
+  env reading — it's a plain data holder for `QbitConfig`/`QbitPassword`. `Config::qbit()`
+  returns `None` (not an error) unless all three vars are set — qBittorrent control is an
+  optional, gracefully-degrading dependency, same posture as `PlexClient::from_config`.
 - **Not wired into `AppState`/any route or worker yet** — this item ships the adapter only, in
   isolation, covered by its own httpmock test suite (`cargo test --bin muse download::`).
   Wiring it into a caller is a later MUSEM item.

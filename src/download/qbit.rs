@@ -77,16 +77,14 @@ impl QbitClient {
         })
     }
 
-    /// Build a client from a loaded [`QbitConfig`].
+    /// Build a client from a loaded [`QbitConfig`] (itself assembled from
+    /// the central `crate::config::Config` via `Config::qbit` — see that
+    /// module's doc). Mirrors `PlexClient::from_config`'s naming, but takes
+    /// the already-narrowed `QbitConfig` rather than the whole `Config`,
+    /// since a future caller typically already has `Some(QbitConfig)` in
+    /// hand from `Config::qbit()`'s `None`-means-unconfigured check.
     pub fn from_config(config: &QbitConfig) -> MuseResult<Self> {
         Self::new(config.url.clone(), config.user.clone(), config.pass.clone())
-    }
-
-    /// Build a client from `Config`/the environment directly, gracefully
-    /// degrading to `None` when `MUSE_QBIT_*` isn't fully configured —
-    /// same posture as `PlexClient::from_config`.
-    pub fn from_env() -> Option<MuseResult<Self>> {
-        QbitConfig::from_env().map(|cfg| Self::from_config(&cfg))
     }
 
     /// `POST /api/v2/auth/login` — authenticate and capture the `SID`

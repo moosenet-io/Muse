@@ -248,9 +248,30 @@ impl<'a> LibraryResolver for DbLibraryResolver<'a> {
                 resolve::TVDB => repo::media_metadata::find_by_tvdb_id(self.pool, file.kind_guess, &id).await?,
                 _ => None,
             };
-            if let Some(media_metadata_id) = local {
-                return Ok(ScanMatch::Matched { media_metadata_id });
-            }
+            // Review finding 1 (codex): an explicit id tag in the path is a
+            // caller-asserted, specific identity claim. If it doesn't
+            // resolve to a local catalog row, that must NOT fall through
+            // to the title/year match below -- doing so risks confidently
+            // attaching this file to a DIFFERENT title's row (the one that
+            // happens to share a title+year) even though the path itself
+            // named a specific id that isn't cataloged. This mirrors
+            // MUSEL-A2's `resolve_and_merge` rule: known-but-unresolvable
+            // ids never fall back to a title guess. The title/year and
+            // resolve_and_merge paths below are reachable ONLY when the
+            // path carried no explicit id tag at all.
+            return Ok(match local {
+                Some(media_metadata_id) => ScanMatch::Matched { media_metadata_id },
+                None => {
+                    tracing::info!(
+                        path = %file.relative_path,
+                        provider,
+                        id,
+                        "library scan: explicit id tag did not resolve to a local catalog row; \
+                         recording as unmatched rather than falling back to a title/year guess"
+                    );
+                    ScanMatch::Unmatched
+                }
+            });
         }
 
         if let Some(title) = &file.parsed.title {
@@ -402,7 +423,20 @@ async fn record_matched_file(
         .map(|e| e.to_lowercase());
     let media_info = container.map(|c| serde_json::json!({ "container": c }));
 
-    repo::media_file::upsert_scanned(pool, media_item.id, &file.relative_path, file.size_bytes, media_info).await?;
+    let (_media_file, file_changed) =
+        repo::media_file::upsert_scanned(pool, media_item.id, &file.relative_path, file.size_bytes, media_info)
+            .await?;
+
+    // Review finding 3 (codex): an idempotent rescan of an unchanged file
+    // (the size guard says nothing changed) must be a full no-op, not just
+    // "no duplicate media_files row" -- re-reading + re-writing the same
+    // sidecar art bytes into `artwork_cache` on every pass is unnecessary
+    // I/O and DB churn for a file that hasn't moved. Only (re-)cache art
+    // when `upsert_scanned` actually recorded a change (first sighting, or
+    // a genuine size change).
+    if !file_changed {
+        return Ok(0);
+    }
 
     let art = crate::library::sidecar::detect(&file.absolute_path);
     let mut cached = 0usize;
@@ -447,6 +481,35 @@ async fn cache_art(pool: &PgPool, media_item_id: i64, variant: &str, art_path: &
     }
 }
 
+/// Whether `candidate` (a `libraries.root_folder`) is contained within
+/// `root` (`MUSE_LIBRARY_ROOT`) — **path-component-aware**, not a raw
+/// string prefix (review finding 2, codex): `str::starts_with` would
+/// wrongly treat `/mnt/library2` as inside `/mnt/library`, since
+/// `"library2"` textually starts with `"library"`. [`Path::starts_with`]
+/// compares whole path components instead, so that case is correctly
+/// rejected while `/mnt/library/Movies` is correctly accepted.
+///
+/// Trailing slashes are trimmed first so `/mnt/library` and `/mnt/library/`
+/// compare equal. When both paths actually exist on disk, canonicalizes
+/// first (resolves `..`/symlinks) for the most accurate answer; falls back
+/// to a purely lexical, still component-aware comparison when either side
+/// doesn't exist yet (a not-yet-mounted `MUSE_LIBRARY_ROOT`, or a
+/// fixture-only path in a test with no real mount) — this function must
+/// stay correct without a live QNAP mount, same posture as the rest of
+/// MUSEL-B1's fixture-dir test suite.
+fn path_is_within_root(candidate: &str, root: &str) -> bool {
+    let candidate_norm = candidate.trim_end_matches('/');
+    let root_norm = root.trim_end_matches('/');
+
+    if let (Ok(candidate_canon), Ok(root_canon)) =
+        (std::fs::canonicalize(candidate_norm), std::fs::canonicalize(root_norm))
+    {
+        return candidate_canon.starts_with(&root_canon);
+    }
+
+    Path::new(candidate_norm).starts_with(Path::new(root_norm))
+}
+
 /// Top-level entry point: clean no-op when `MUSE_LIBRARY_ROOT`
 /// (`config.library_root`) is unset (the spec's inert-when-unmounted
 /// requirement — see MUSEL-B0). Scans every enabled `libraries` row whose
@@ -471,7 +534,7 @@ pub async fn run_scan(
         if !library.enabled {
             continue;
         }
-        if !library.root_folder.starts_with(library_root) {
+        if !path_is_within_root(&library.root_folder, library_root) {
             tracing::debug!(
                 library = %library.name,
                 root_folder = %library.root_folder,
@@ -730,11 +793,26 @@ mod tests {
     /// regressing the read-only guarantee.
     #[test]
     fn no_write_create_remove_calls_in_the_scan_and_sidecar_source() {
-        for path in [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/library/scan.rs"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/library/sidecar.rs"),
-        ] {
-            let source = fs::read_to_string(path).expect("read own source for the read-only structural proof");
+        // Review finding 4 (codex): scan the WHOLE `src/library/` production
+        // source directory, not just `scan.rs`+`sidecar.rs` by name -- so a
+        // future file added to this module (or a helper `mod.rs` picks up)
+        // that touches the library filesystem is caught by this guard too,
+        // without needing to remember to extend a hardcoded path list.
+        let library_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/library");
+        let mut rs_files: Vec<PathBuf> = fs::read_dir(library_dir)
+            .expect("read_dir the library module's own source directory")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        rs_files.sort();
+        assert!(
+            rs_files.len() >= 3,
+            "sanity check: expected to find at least mod.rs/scan.rs/sidecar.rs under {library_dir}, found {rs_files:?}"
+        );
+
+        for path in rs_files {
+            let source = fs::read_to_string(&path).expect("read own source for the read-only structural proof");
             // Only scan the module body above its own `#[cfg(test)]` block --
             // this very test's banned-string list otherwise self-triggers
             // (it necessarily contains the literal strings it's checking
@@ -762,8 +840,9 @@ mod tests {
             ] {
                 assert!(
                     !code_only.contains(banned),
-                    "found a write-shaped filesystem call `{banned}` in {path} — the library scanner/sidecar \
-                     modules must stay strictly read-only on the library filesystem"
+                    "found a write-shaped filesystem call `{banned}` in {} — the library module must stay \
+                     strictly read-only on the library filesystem",
+                    path.display()
                 );
             }
         }
@@ -943,9 +1022,14 @@ mod tests {
         assert_eq!(art.bytes.as_deref(), Some(&b"fixture-poster-bytes"[..]));
         assert_eq!(art.content_type.as_deref(), Some("image/jpeg"));
 
-        // Idempotent re-scan: no duplicate media_items/media_files rows.
+        // Idempotent re-scan: no duplicate media_items/media_files rows, AND
+        // (review finding 3, codex) no re-caching of unchanged sidecar art.
         let report2 = scan_library(&pool, &library, &resolver).await.expect("second scan_library pass");
         assert_eq!(report2.matched, 1);
+        assert_eq!(
+            report2.art_cached, 0,
+            "an unchanged rescan (size guard says nothing changed) must not re-cache sidecar art"
+        );
         let items_again = repo::media_item::list_by_library(&pool, library.id).await.expect("list media_items again");
         assert_eq!(items_again.len(), 1, "re-scanning must not create a duplicate media_items row");
         let files_again = repo::media_file::list_by_media_item(&pool, items[0].id)
@@ -954,5 +1038,132 @@ mod tests {
         assert_eq!(files_again.len(), 1, "re-scanning an unchanged file must not create a duplicate media_files row");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review finding 1 (codex) regression test: a file whose path carries
+    /// an explicit `{tmdb-...}` id tag that does NOT resolve locally must
+    /// stay unmatched even when its parsed title+year *would* exactly match
+    /// a different, already-cataloged row -- the explicit id tag must not
+    /// be silently discarded in favor of a title/year guess that could
+    /// attach the file to the wrong title's row.
+    #[tokio::test]
+    async fn explicit_id_tag_that_fails_to_resolve_does_not_fall_back_to_a_title_year_match() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!(
+                "MUSE_TEST_DATABASE_URL not set -- skipping \
+                 explicit_id_tag_that_fails_to_resolve_does_not_fall_back_to_a_title_year_match \
+                 (expected in the default test run; the crate does not require a live DB)"
+            );
+            return;
+        };
+
+        use uuid::Uuid;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect to MUSE_TEST_DATABASE_URL");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply cleanly");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let title = format!("MUSEL-B1 Id Tag Precedence Test {suffix}");
+
+        let dir = unique_dir(&format!("id-tag-precedence-{suffix}"));
+        // The folder name carries an explicit tmdb id tag that is NOT the
+        // one seeded below, but the filename's parsed title+year DOES
+        // exactly match the seeded row -- the resolver must still refuse
+        // to attach it.
+        let movie_dir = dir.join(format!("{title} (2021) {{tmdb-99999999-does-not-exist}}"));
+        fs::create_dir_all(&movie_dir).unwrap();
+        let media_path = movie_dir.join(format!("{title}.2021.1080p.BluRay.x264-GRP.mkv"));
+        fs::write(&media_path, b"fixture bytes").unwrap();
+
+        let library = repo::library::create(
+            &pool,
+            &crate::models::library::NewLibrary {
+                name: format!("MUSEL-B1 Id Tag Precedence Library {suffix}"),
+                kind: crate::models::library::LibraryKind::Movie,
+                root_folder: dir.to_string_lossy().to_string(),
+                source_arr_name: None,
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("seed library row");
+
+        repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &crate::models::media_metadata::NewMediaMetadata {
+                kind: crate::models::media_metadata::MediaKind::Movie,
+                tmdb_id: Some(format!("id-tag-precedence-tmdb-{suffix}")),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: title.clone(),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: None,
+                year: Some(2021),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("seed a media_metadata row whose title+year exactly matches the fixture file");
+
+        let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
+        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(
+            report.matched, 0,
+            "an unresolvable explicit id tag must never fall back to a confident title/year attach"
+        );
+        assert_eq!(report.unmatched, 1);
+
+        let items = repo::media_item::list_by_library(&pool, library.id).await.expect("list media_items");
+        assert!(items.is_empty(), "no media_items row should be created for the unresolved id-tagged file");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_is_within_root_is_component_aware_not_a_string_prefix() {
+        // Review finding 2 (codex): `/mnt/library2` must NOT be treated as
+        // inside `/mnt/library` just because the string "library2" starts
+        // with "library" -- these paths don't exist on disk in a test
+        // environment, so this also exercises the non-canonicalized,
+        // lexical-but-component-aware fallback path.
+        assert!(!path_is_within_root("/mnt/library2", "/mnt/library"));
+        assert!(!path_is_within_root("/mnt/library-other", "/mnt/library"));
+        assert!(path_is_within_root("/mnt/library/Movies", "/mnt/library"));
+        assert!(path_is_within_root("/mnt/library", "/mnt/library"));
+        // Trailing-slash normalization on either side.
+        assert!(path_is_within_root("/mnt/library/", "/mnt/library"));
+        assert!(path_is_within_root("/mnt/library/Movies", "/mnt/library/"));
+    }
+
+    #[test]
+    fn path_is_within_root_works_for_real_directories_too() {
+        // When both sides actually exist, the canonicalizing branch runs
+        // instead of the lexical fallback -- prove it agrees.
+        let root = unique_dir("containment-root");
+        let child = root.join("Movies");
+        fs::create_dir_all(&child).unwrap();
+        let sibling = unique_dir("containment-sibling");
+
+        assert!(path_is_within_root(&child.to_string_lossy(), &root.to_string_lossy()));
+        assert!(!path_is_within_root(&sibling.to_string_lossy(), &root.to_string_lossy()));
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&sibling).ok();
     }
 }

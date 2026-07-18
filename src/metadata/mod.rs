@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::error::MuseResult;
 
 pub mod config;
+pub mod resolve;
 pub mod tvdb;
 
 /// Which kind of title a lookup/search is for. Mirrors
@@ -58,14 +59,18 @@ pub struct ProviderMetadata {
     pub first_aired: Option<String>,
     pub year: Option<i32>,
     pub network: Option<String>,
+    /// TMDb-style free-text keywords (e.g. "time travel", "based on a
+    /// novel"). Added post-A1 (MUSEL-A2) as an additive, `Default`-backed
+    /// field. No concrete provider populates it yet — it exists so
+    /// `resolve_and_merge`'s merge and `repo::media_metadata::apply_enrichment`'s
+    /// persistence path are already wired for it.
+    pub keywords: Vec<String>,
     /// Runtime in minutes, where the provider states one. `None` both when
     /// the provider has no runtime for this title and when the concrete
     /// [`MetadataProvider`] implementation doesn't parse it yet (as of
-    /// MUSEL-C2, TheTVDB v4's base record/search-hit shapes this crate
-    /// deserializes don't carry `averageRuntime`/`runtime` — see
-    /// `metadata::tvdb::TvdbRecord`). Added for MUSEL-C2's `verify_match`
-    /// runtime-consistency signal (`matching::verify`); a future provider
-    /// or a richer TVDB parse can populate it without changing this shape.
+    /// MUSEL-C2, TheTVDB v4's shapes this crate deserializes don't carry
+    /// `averageRuntime`/`runtime`). Added for MUSEL-C2's `verify_match`
+    /// runtime-consistency signal (`matching::verify`).
     pub runtime_minutes: Option<i32>,
 }
 

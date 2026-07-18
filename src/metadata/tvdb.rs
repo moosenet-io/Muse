@@ -448,8 +448,11 @@ impl TvdbRecord {
                 .and_then(|y| y.parse::<i32>().ok())
                 .or_else(|| first_aired.as_deref().and_then(|d| d.get(0..4)).and_then(|y| y.parse().ok())),
             network: self.original_network.and_then(TvdbNetworkField::into_name),
-            // MUSEL-C2: not parsed from TheTVDB v4 yet -- see the doc
-            // comment on `ProviderMetadata::runtime_minutes`.
+            // MUSEL-A2: TheTVDB's extended record has no dedicated free-text
+            // keywords field — left empty (see ProviderMetadata::keywords).
+            keywords: Vec::new(),
+            // MUSEL-C2: runtime not parsed from TheTVDB v4 yet -- see the doc
+            // comment on ProviderMetadata::runtime_minutes.
             runtime_minutes: None,
         }
     }
@@ -518,8 +521,8 @@ impl TvdbSearchHit {
                 .and_then(|y| y.parse::<i32>().ok())
                 .or_else(|| self.first_air_time.as_deref().and_then(|d| d.get(0..4)).and_then(|y| y.parse().ok())),
             network: self.network,
-            // MUSEL-C2: not parsed from TheTVDB v4 yet -- see the doc
-            // comment on `ProviderMetadata::runtime_minutes`.
+            keywords: Vec::new(),
+            // MUSEL-C2: runtime not parsed from TheTVDB v4 yet.
             runtime_minutes: None,
         }
     }

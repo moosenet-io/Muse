@@ -37,6 +37,17 @@
 //!    enriched via `EnrichmentService::enrich_media_item`. Deduped across
 //!    accounts within one pass so the same title isn't enriched twice just
 //!    because two accounts are both watching it.
+//! 5. **MUSEL-A2 metadata resolve** — only when at least one
+//!    `metadata::MetadataProvider` is configured (`state.tmdb` and/or a
+//!    freshly-built `metadata::tvdb::TvdbClient::from_config`). Runs after
+//!    arr ingest (which is what actually creates/updates rows with known
+//!    provider ids) so there's something to resolve, and before `embed`
+//!    for the SAME reason `embed` runs after taste/divergence's data
+//!    dependency: a title enriched with a real `overview` embeds into a
+//!    richer, more useful vector than a bare title/year string. Bounded by
+//!    the same `Config::maintenance_enrichment_limit` knob step 4 uses
+//!    (`repo::media_metadata::find_needing_enrichment`) — up to that many
+//!    movie rows plus that many show rows per pass, oldest-unsynced-first.
 //!
 //! Every step is independently error-isolated and never panics: a failure
 //! in one step (or one account, or one instance) is logged and the pass
@@ -89,6 +100,16 @@ pub struct MaintenanceSummary {
     /// no-op, same "ran but did nothing" posture `embed_ran`/`arr_ran`
     /// establish for their own steps.
     pub wanted: crate::acquisition::worker::WantedPassSummary,
+
+    /// MUSEL-A2: `false` when no `metadata::MetadataProvider` was
+    /// configured this pass (neither TMDb nor TVDB) — the resolve step is
+    /// skipped entirely rather than running with zero providers (which
+    /// `metadata::resolve::resolve_and_merge` would itself just no-op on
+    /// anyway; skipping here also avoids the `find_needing_enrichment`
+    /// queries for no reason).
+    pub metadata_resolve_ran: bool,
+    pub metadata_resolved: usize,
+    pub metadata_resolve_failed: usize,
 
     pub embed_ran: bool,
     pub embedded: usize,
@@ -146,6 +167,42 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
         download: state.download.as_ref().map(|c| c as &dyn crate::download::DownloadClient),
     };
     summary.wanted = crate::acquisition::worker::run_wanted_pass(&wanted_deps).await;
+
+    // --- (a3) MUSEL-A2: metadata resolve + enrichment upsert --------------
+    //
+    // `state.tmdb` is already built at startup (MUSE-19); TVDB has no
+    // equivalent `AppState` field yet, so it's built fresh here from
+    // `state.config` each pass — cheap (just a `reqwest::Client` +
+    // an empty token cache) and the same "construct fresh per pass" posture
+    // step (c) already uses for `ChordClient::from_config` below. Both are
+    // `None` (skip this whole step) when unconfigured — graceful degrade,
+    // same as every other step in this pass.
+    let tvdb = crate::metadata::tvdb::TvdbClient::from_config(&state.config);
+    let mut named_providers: Vec<crate::metadata::resolve::NamedProvider<'_>> = Vec::new();
+    if let Some(tmdb) = state.tmdb.as_ref() {
+        named_providers.push(crate::metadata::resolve::NamedProvider::new(
+            crate::metadata::resolve::TMDB,
+            tmdb,
+        ));
+    }
+    if let Some(tvdb) = tvdb.as_ref() {
+        named_providers.push(crate::metadata::resolve::NamedProvider::new(
+            crate::metadata::resolve::TVDB,
+            tvdb,
+        ));
+    }
+
+    if !named_providers.is_empty() {
+        summary.metadata_resolve_ran = true;
+        let (resolved, failed) =
+            run_metadata_resolve_pass(&state.pool, &named_providers, state.config.maintenance_enrichment_limit).await;
+        summary.metadata_resolved = resolved;
+        summary.metadata_resolve_failed = failed;
+    } else {
+        tracing::debug!(
+            "MUSE-31/MUSEL-A2: maintenance pass — no metadata providers configured; skipping resolve step"
+        );
+    }
 
     // --- (b) embed_stale -------------------------------------------------
     if let Some(embed_client) = state.embed.as_ref() {
@@ -248,6 +305,8 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
         arr_series_upserted = summary.arr_series_upserted,
         wanted_grabbed = summary.wanted.grabbed,
         wanted_needs_review = summary.wanted.needs_review,
+        metadata_resolve_ran = summary.metadata_resolve_ran,
+        metadata_resolved = summary.metadata_resolved,
         embedded = summary.embedded,
         embed_skipped_unchanged = summary.embed_skipped_unchanged,
         accounts_considered = summary.accounts_considered,
@@ -258,6 +317,95 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
     );
 
     summary
+}
+
+/// MUSEL-A2: resolve + persist enrichment for up to `limit` candidate rows
+/// per `MediaKind` (movies and shows considered separately, each bounded
+/// independently — worst case `2 * limit` rows touched this pass).
+/// Returns `(resolved, failed)`. Never panics; a single row's resolve or
+/// persist failure is logged and the pass continues (same error-isolation
+/// posture as every other step in [`run_maintenance_pass`]).
+async fn run_metadata_resolve_pass(
+    pool: &sqlx::PgPool,
+    providers: &[crate::metadata::resolve::NamedProvider<'_>],
+    limit: i64,
+) -> (usize, usize) {
+    let mut resolved = 0usize;
+    let mut failed = 0usize;
+
+    for repo_kind in [
+        crate::models::media_metadata::MediaKind::Movie,
+        crate::models::media_metadata::MediaKind::Show,
+    ] {
+        let candidates = match crate::repo::media_metadata::find_needing_enrichment(pool, repo_kind, limit).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, kind = ?repo_kind, "MUSEL-A2: maintenance pass — could not list enrichment candidates; skipping this kind");
+                continue;
+            }
+        };
+
+        let resolve_kind = match repo_kind {
+            crate::models::media_metadata::MediaKind::Movie => crate::metadata::MediaKind::Movie,
+            crate::models::media_metadata::MediaKind::Show => crate::metadata::MediaKind::Series,
+        };
+
+        for row in candidates {
+            let mut ids = crate::metadata::resolve::ResolveIds::new().with_title(row.title.clone());
+            if let Some(tmdb_id) = &row.tmdb_id {
+                ids = ids.with_id(crate::metadata::resolve::TMDB, tmdb_id.clone());
+            }
+            if let Some(tvdb_id) = &row.tvdb_id {
+                ids = ids.with_id(crate::metadata::resolve::TVDB, tvdb_id.clone());
+            }
+            if let Some(imdb_id) = &row.imdb_id {
+                ids = ids.with_id(crate::metadata::resolve::IMDB, imdb_id.clone());
+            }
+
+            let resolved_match = match crate::metadata::resolve::resolve_and_merge(&ids, resolve_kind, providers).await
+            {
+                Ok(Some(resolved_match)) => resolved_match,
+                Ok(None) => {
+                    tracing::debug!(media_metadata_id = row.id, "MUSEL-A2: maintenance pass — nothing resolved this pass; continuing");
+                    continue;
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(error = %e, media_metadata_id = row.id, "MUSEL-A2: maintenance pass — resolve_and_merge failed; continuing");
+                    continue;
+                }
+            };
+
+            // Review finding 1 (S119b codex REQUEST_CHANGES): an automated
+            // background pass must never persist a `TitleSearch` (lowest-
+            // confidence, free-text) match as if it were authoritative.
+            // Only `MatchConfidence::Id` (resolved via a provider's own id
+            // lookup) is written to `media_metadata` here. A
+            // `TitleSearch` hit is discoverable in logs (see
+            // `resolve_and_merge`'s own `tracing::warn!` when it takes
+            // that path) for a future manual-review surface, but this
+            // unattended pass skips persisting it rather than risking a
+            // wrong-confident enrichment landing on the row unattended.
+            if resolved_match.confidence != crate::metadata::resolve::MatchConfidence::Id {
+                tracing::info!(
+                    media_metadata_id = row.id,
+                    "MUSEL-A2: maintenance pass — resolved via low-confidence title search; \
+                     skipping persistence (never auto-persisted as authoritative)"
+                );
+                continue;
+            }
+
+            match crate::repo::media_metadata::apply_enrichment(pool, row.id, &resolved_match.metadata).await {
+                Ok(_) => resolved += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(error = %e, media_metadata_id = row.id, "MUSEL-A2: maintenance pass — apply_enrichment failed; continuing");
+                }
+            }
+        }
+    }
+
+    (resolved, failed)
 }
 
 /// Spawn the maintenance worker's background loop. Always spawned (same

@@ -392,6 +392,16 @@ NULL` ("first encounter"); that was wrong, because a FAILED search also sets `la
 without creating a request, so a pass-1 search failure could permanently suppress the request a
 later, successful pass should have created. `last_search_at` is now purely a cooldown timer.
 
+The `AutoApprovable` branch applies the same "at most one worker-created request per monitored
+item" invariant, but by REUSE rather than refusal: `repo::acquisition::
+get_open_worker_request_for_monitored_item` fetches any existing open request for the item, and
+if one exists (e.g. a prior pass left it `Requested` because auto-tier was off, or availability
+wasn't confirmed grabbable yet), `fulfill_request` is called against THAT row — transitioning it to
+`Grabbed`/`Failed` in place — instead of creating a second request. A fresh request is only created
+when none exists yet. This branch's own protection against a double GRAB remains the
+`download_queue.monitored_item_id` check; the reuse-vs-create logic here is purely about never
+leaving a stale duplicate `Requested` row behind when an item's classification improves.
+
 Non-blocking: an unreachable Prowlarr/qBittorrent, a DB hiccup, or a metadata row deleted mid-pass
 is logged and the pass moves on to the next item — never a panic, never an aborted pass.
 

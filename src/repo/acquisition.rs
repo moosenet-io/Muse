@@ -336,6 +336,32 @@ pub async fn has_open_worker_request_for_monitored_item(
     Ok(row.is_some())
 }
 
+/// MUSEM-06 follow-up (review: codex): the row-returning sibling of
+/// [`has_open_worker_request_for_monitored_item`] — lets the AutoApprovable
+/// path REUSE (rather than duplicate) an existing open request when a
+/// monitored item transitions from `NeedsReview`/`Blocked`/no-capability on
+/// an earlier pass to grabbable on a later one, so a `NeedsReview -> grab`
+/// transition upgrades the SAME request instead of orphaning the original
+/// row. Same "open = non-terminal status" definition. Deterministic when
+/// (in principle) more than one somehow exists: the oldest (lowest `id`)
+/// wins, so which row gets reused/fulfilled is never ambiguous.
+pub async fn get_open_worker_request_for_monitored_item(
+    pool: &PgPool,
+    monitored_item_id: i64,
+) -> MuseResult<Option<MediaRequest>> {
+    sqlx::query_as::<_, MediaRequest>(
+        "SELECT * FROM media_requests \
+         WHERE monitored_item_id = $1 \
+           AND status NOT IN ('denied', 'failed', 'available') \
+         ORDER BY id ASC \
+         LIMIT 1",
+    )
+    .bind(monitored_item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
 pub async fn update_download_status(
     pool: &PgPool,
     id: i64,

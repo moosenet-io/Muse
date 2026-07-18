@@ -276,11 +276,17 @@ async fn process_wanted_item(
     // by asking the real question directly against `media_requests` (see
     // `repo::acquisition::has_open_worker_request_for_monitored_item`'s
     // doc for what "open" means).
-    let has_open_request =
-        match repo::acquisition::has_open_worker_request_for_monitored_item(deps.pool, item.monitored_item_id)
+    //
+    // THIRD follow-up (codex): fetches the actual row, not just a bool, so
+    // the AutoApprovable branch further below can REUSE it (fulfilling the
+    // SAME open request that a prior `NeedsReview`/`Blocked`/no-capability
+    // pass created) instead of creating a second one when this item
+    // transitions to grabbable -- see that branch's own comment.
+    let existing_open_request =
+        match repo::acquisition::get_open_worker_request_for_monitored_item(deps.pool, item.monitored_item_id)
             .await
         {
-            Ok(has_open_request) => has_open_request,
+            Ok(existing_open_request) => existing_open_request,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -290,6 +296,7 @@ async fn process_wanted_item(
                 return (ItemOutcome::Error, false);
             }
         };
+    let has_open_request = existing_open_request.is_some();
 
     // Metadata row deleted out from under this wanted row (a race between
     // list_wanted's snapshot and now) — skip cleanly, not a crash. Also
@@ -425,22 +432,34 @@ async fn process_wanted_item(
     }
 
     // `AutoApprovable` always needs a request row to hand `fulfill_request`
-    // (the actual grab attempt), regardless of `has_open_request` -- the
-    // create-once guard above is about not spamming PENDING requests for an
-    // outcome that never acts; a real grab attempt is a distinct event, and
-    // this branch's own idempotency comes from the `download_queue`
-    // `monitored_item_id` check at the top of this function (a second pass
-    // never even reaches here for an item that's already queued).
-    let request = match create_wanted_request(deps, item, media_kind, &format!("{tier:?}")).await {
-        Ok(request) => request,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                monitored_item_id = item.monitored_item_id,
-                "MUSEM-06: wanted pass — could not persist media_request; skipping item"
-            );
-            return (ItemOutcome::Error, true);
-        }
+    // (the actual grab attempt). Review finding (codex, MUSEM-06
+    // REQUEST_CHANGES, THIRD follow-up): if an earlier pass already left an
+    // OPEN request for this monitored item (e.g. it classified `NeedsReview`
+    // last time -- auto-tier was off, or availability wasn't confirmed --
+    // and only became `AutoApprovable` now that auto-tier is on / a fresh
+    // search found candidates), REUSE that same row rather than creating a
+    // second one: `fulfill_request` transitions ITS status to
+    // `Grabbed`/`Failed`, upgrading the original request in place instead of
+    // orphaning it behind a brand-new row. Only create a fresh request when
+    // none exists yet. This branch's OWN idempotency against a second grab
+    // remains the `download_queue` `monitored_item_id` check at the top of
+    // this function (a second pass never even reaches here for an item
+    // that's already queued) -- reuse-vs-create here is purely about not
+    // leaving a stale duplicate request behind, not about preventing a
+    // double grab.
+    let request = match existing_open_request {
+        Some(existing) => existing,
+        None => match create_wanted_request(deps, item, media_kind, &format!("{tier:?}")).await {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    monitored_item_id = item.monitored_item_id,
+                    "MUSEM-06: wanted pass — could not persist media_request; skipping item"
+                );
+                return (ItemOutcome::Error, true);
+            }
+        },
     };
 
     // Review finding 1 (opus) + finding 2 (codex, MUSEM-06 REQUEST_CHANGES):
@@ -1075,6 +1094,107 @@ mod db_gated {
                  failed search already touched last_search_at",
             );
         assert_eq!(request.status, RequestStatus::Requested.as_str());
+    }
+
+    /// FINAL follow-up (codex, MUSEM-06 REQUEST_CHANGES): the AutoApprovable
+    /// branch used to unconditionally create a NEW request, so a monitored
+    /// item that classified `NeedsReview` on pass 1 (leaving an open
+    /// `Requested` row) and then became `AutoApprovable` on pass 2 (auto-tier
+    /// now enabled) got a SECOND request created and fulfilled, orphaning
+    /// the first -- violating "at most one worker-created pending request
+    /// per monitored item." Proves the fix: pass 2 REUSES the same row
+    /// (`get_open_worker_request_for_monitored_item`), transitioning it to
+    /// `Grabbed` in place rather than leaving a stray `Requested` duplicate
+    /// behind.
+    #[tokio::test]
+    async fn needs_review_then_autoapprovable_reuses_the_same_request() {
+        let Some(pool) =
+            test_pool_or_skip("needs_review_then_autoapprovable_reuses_the_same_request").await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let library = seed_library(&pool).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+        let item = seed_wanted_item(&pool, &library, Some(profile_id)).await;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/search");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(search_response_body(
+                    "musem06-review-then-auto-guid",
+                    &format!("{}.2020.1080p.WEB-DL", item.title),
+                ));
+        });
+        let prowlarr = ProwlarrClient::new(server.base_url(), "test-key").expect("client");
+        let download = MockDownloadClient::new();
+        let mut settings = ExperienceSettings::default();
+        settings.acquisition.enabled = true;
+        let no_cooldown = chrono::Duration::zero();
+
+        // Pass 1: auto-tier off -- classifies NeedsReview, leaves one open
+        // Requested row.
+        let config_auto_off = test_config();
+        assert!(!config_auto_off.arr_request_auto_tier_enabled);
+        let deps1 = WantedPassDeps {
+            pool: &pool,
+            config: &config_auto_off,
+            prowlarr: Some(&prowlarr),
+            download: Some(&download),
+        };
+        let (outcome1, _) = process_wanted_item(&deps1, &settings, &item, no_cooldown).await;
+        assert_eq!(outcome1, ItemOutcome::NeedsReview);
+
+        let request_ids_after_pass1: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM media_requests WHERE monitored_item_id = $1")
+                .bind(item.monitored_item_id)
+                .fetch_all(&pool)
+                .await
+                .expect("list media_requests after pass 1");
+        assert_eq!(request_ids_after_pass1.len(), 1, "pass 1 must create exactly one request");
+        let original_request_id = request_ids_after_pass1[0];
+
+        // Pass 2: auto-tier now enabled -- the same search result classifies
+        // AutoApprovable. Must REUSE the pass-1 request, not create a
+        // second one.
+        let config_auto_on = Config {
+            arr_request_auto_tier_enabled: true,
+            ..test_config()
+        };
+        let deps2 = WantedPassDeps {
+            pool: &pool,
+            config: &config_auto_on,
+            prowlarr: Some(&prowlarr),
+            download: Some(&download),
+        };
+        let (outcome2, _) = process_wanted_item(&deps2, &settings, &item, no_cooldown).await;
+        assert_eq!(outcome2, ItemOutcome::Grabbed);
+        assert_eq!(download.added_count(), 1);
+
+        let requests_after_pass2: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, status FROM media_requests WHERE monitored_item_id = $1")
+                .bind(item.monitored_item_id)
+                .fetch_all(&pool)
+                .await
+                .expect("list media_requests after pass 2");
+        assert_eq!(
+            requests_after_pass2.len(),
+            1,
+            "pass 2 must NOT create a second request -- it must reuse the pass-1 row"
+        );
+        assert_eq!(requests_after_pass2[0].0, original_request_id, "the SAME request row must be reused");
+        assert_eq!(
+            requests_after_pass2[0].1,
+            RequestStatus::Grabbed.as_str(),
+            "the reused request must transition to Grabbed in place"
+        );
+
+        let queued = repo::acquisition::is_monitored_item_active_in_queue(&pool, item.monitored_item_id)
+            .await
+            .expect("check queue membership");
+        assert!(queued, "the grab must leave an active download_queue row");
     }
 
     #[tokio::test]

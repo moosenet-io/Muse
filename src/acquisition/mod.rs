@@ -504,6 +504,7 @@ impl MediaRequestSink for AcquisitionSink {
             tier: Some("auto_approvable".to_string()),
             quality_profile_id: self.quality_profile_id,
             note: None,
+            monitored_item_id: None,
         };
         let request = repo::acquisition::create_request(&self.pool, &new).await?;
 
@@ -712,6 +713,7 @@ mod db_gated {
                 tier: None,
                 quality_profile_id,
                 note: None,
+                monitored_item_id: None,
             },
         )
         .await

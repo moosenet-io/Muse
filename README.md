@@ -380,6 +380,18 @@ is_monitored_item_active_in_queue`'s `monitored_item_id`-keyed check actually fi
 item already `queued`/`downloading` is skipped on every subsequent pass, never re-searched or
 re-grabbed.
 
+**Create-once pending requests, keyed off real existence, not a timestamp proxy.** Every
+worker-created `media_requests` row also carries `monitored_item_id` (migration
+`0105_media_requests_monitored_item.sql`, `NULLABLE` — `POST /requests`/`approve`/
+`AcquisitionSink` still pass `NULL`, no monitored item involved). Before persisting a `Requested`
+row for a non-grabbed outcome (no-capability, `NeedsReview`, `Blocked`), the worker checks
+`repo::acquisition::has_open_worker_request_for_monitored_item` — an existing non-terminal
+(`requested`/`approved`/`searching`/`grabbed`) request for that monitored item — and only creates
+a new one when none exists. An earlier version keyed this off `monitored_items.last_search_at IS
+NULL` ("first encounter"); that was wrong, because a FAILED search also sets `last_search_at`
+without creating a request, so a pass-1 search failure could permanently suppress the request a
+later, successful pass should have created. `last_search_at` is now purely a cooldown timer.
+
 Non-blocking: an unreachable Prowlarr/qBittorrent, a DB hiccup, or a metadata row deleted mid-pass
 is logged and the pass moves on to the next item — never a panic, never an aborted pass.
 

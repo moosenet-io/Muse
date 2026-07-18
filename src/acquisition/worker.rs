@@ -262,15 +262,34 @@ async fn process_wanted_item(
             return (ItemOutcome::CooldownActive, false);
         }
     }
-    // Review finding (codex, follow-up to finding 3): the FIRST time this
-    // monitored item is ever processed (`last_search_at` was still `NULL`)
-    // is the only time the no-capability path below should persist a
-    // `Requested` request -- every later encounter (within or past the
-    // cooldown) must touch `last_search_at` like the searched path does
-    // (so the cooldown guard above actually applies to it next pass) but
-    // must NOT create a second request row. Captured here, before
-    // `last_search_at` gets updated below.
-    let is_first_encounter = monitored.last_search_at.is_none();
+
+    // Review finding (codex, MUSEM-06 REQUEST_CHANGES, second follow-up):
+    // create-once for every non-grabbed persist path (no-capability AND
+    // NeedsReview/Blocked below) must be keyed off whether a request
+    // ACTUALLY EXISTS for this monitored item, not off `last_search_at`
+    // being non-`NULL`. The original `last_search_at.is_none()` proxy was
+    // wrong: `last_search_at` is ALSO set after a FAILED search (see
+    // below), which creates no request at all -- so a pass-1 search
+    // failure followed by a pass-2 success-but-`NeedsReview` would
+    // permanently suppress the request this item genuinely needed, since
+    // `last_search_at` was already non-`NULL` from the failed pass. Fixed
+    // by asking the real question directly against `media_requests` (see
+    // `repo::acquisition::has_open_worker_request_for_monitored_item`'s
+    // doc for what "open" means).
+    let has_open_request =
+        match repo::acquisition::has_open_worker_request_for_monitored_item(deps.pool, item.monitored_item_id)
+            .await
+        {
+            Ok(has_open_request) => has_open_request,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    monitored_item_id = item.monitored_item_id,
+                    "MUSEM-06: wanted pass — could not check for an existing open request; skipping item"
+                );
+                return (ItemOutcome::Error, false);
+            }
+        };
 
     // Metadata row deleted out from under this wanted row (a race between
     // list_wanted's snapshot and now) — skip cleanly, not a crash. Also
@@ -300,13 +319,11 @@ async fn process_wanted_item(
     // REQUEST_CHANGES) still applies: this must NOT silently vanish, it must
     // persist a `Requested` `media_request` for the operator, same "persist
     // but never act" posture as every other non-`AutoApprovable` outcome
-    // below. A FOLLOW-UP finding (codex): that persist must be create-ONCE,
-    // not repeated every pass -- `last_search_at` doubles as the "have we
-    // already surfaced this" guard (`is_first_encounter`, captured above),
-    // exactly like a real search would leave it, so this item's cooldown is
-    // honored on subsequent passes too and no duplicate request is created.
+    // below. That persist is create-ONCE (`!has_open_request`, computed
+    // above) -- so this item's cooldown/create-once discipline is honored on
+    // subsequent passes too and no duplicate request is created.
     let Some(prowlarr) = deps.prowlarr else {
-        persist_pending_request_once(deps, item, media_kind, is_first_encounter, "no Prowlarr client configured")
+        persist_pending_request_once(deps, item, media_kind, has_open_request, "no Prowlarr client configured")
             .await;
         return (ItemOutcome::NoCapability, false);
     };
@@ -315,7 +332,7 @@ async fn process_wanted_item(
             deps,
             item,
             media_kind,
-            is_first_encounter,
+            has_open_request,
             "no quality_profile_id set on this monitored item",
         )
         .await;
@@ -379,7 +396,7 @@ async fn process_wanted_item(
     // establish.
     //
     // Follow-up finding (opus, MUSEM-06 REQUEST_CHANGES): this persist must
-    // be create-ONCE too, same `is_first_encounter` guard as the
+    // be create-ONCE too, same `!has_open_request` guard as the
     // no-capability branches above -- otherwise a monitored item that keeps
     // classifying `NeedsReview` (auto-tier off, or never confirmed
     // grabbable) gets a brand-new `Requested` request every ~cooldown-
@@ -387,7 +404,7 @@ async fn process_wanted_item(
     // `Requested` request is ever persisted per monitored item across
     // EVERY non-grabbed outcome (no-capability, NeedsReview, Blocked).
     if tier != RequestTier::AutoApprovable {
-        if is_first_encounter {
+        if !has_open_request {
             if let Err(e) = create_wanted_request(deps, item, media_kind, &format!("{tier:?}")).await {
                 tracing::warn!(
                     error = %e,
@@ -400,7 +417,7 @@ async fn process_wanted_item(
             tracing::debug!(
                 monitored_item_id = item.monitored_item_id,
                 ?tier,
-                "MUSEM-06: wanted pass — item already has a request from a prior pass; not \
+                "MUSEM-06: wanted pass — item already has an open request from a prior pass; not \
                  creating a second one"
             );
         }
@@ -408,7 +425,7 @@ async fn process_wanted_item(
     }
 
     // `AutoApprovable` always needs a request row to hand `fulfill_request`
-    // (the actual grab attempt), regardless of `is_first_encounter` -- the
+    // (the actual grab attempt), regardless of `has_open_request` -- the
     // create-once guard above is about not spamming PENDING requests for an
     // outcome that never acts; a real grab attempt is a distinct event, and
     // this branch's own idempotency comes from the `download_queue`
@@ -473,24 +490,29 @@ async fn process_wanted_item(
 /// and manually act on it, same "persist but never act" posture as every
 /// other non-`AutoApprovable` outcome.
 ///
-/// ## Follow-up finding (codex): create-once, not every pass
+/// ## Follow-up finding (codex, twice): create-once, keyed off real existence
 /// The FIRST version of this persisted a new request on EVERY pass a
 /// no-capability item was considered (nothing here ever touched
 /// `last_search_at`, so the cooldown guard never applied to it either) --
 /// a deployment with no Prowlarr, or one monitored item missing a quality
 /// profile, would spam a fresh `Requested` row every maintenance tick
-/// forever. Fixed by treating `last_search_at` as durable "have I already
-/// surfaced this" state, exactly the way a real search leaves it:
+/// forever. The SECOND version fixed that with a `last_search_at IS NULL`
+/// ("first encounter") proxy -- which was itself wrong, because a FAILED
+/// search (see the search-error branch above) also sets `last_search_at`
+/// without ever creating a request, so that proxy could permanently
+/// suppress a request a later, successful pass should have created. Fixed
+/// for real by asking the actual question: does an open (non-terminal)
+/// `media_requests` row already exist for this monitored item
+/// (`repo::acquisition::has_open_worker_request_for_monitored_item`,
+/// computed once by the caller and passed in as `has_open_request`)?
 /// - ALWAYS touches `last_search_at` (best-effort, same as the searched
-///   path) -- so the cooldown guard at the top of `process_wanted_item`
-///   skips this item on subsequent passes within the cooldown window,
-///   same as any other processed item.
-/// - Creates the `media_request` row ONLY when `is_first_encounter` is
-///   `true` (the caller passes `monitored.last_search_at.is_none()`,
-///   captured BEFORE this call touches it) -- i.e. only the very first
-///   time this monitored item is ever processed. Every later encounter
-///   still marks the item processed (cooldown-gated) but never creates a
-///   second request.
+///   path) -- purely a cooldown timer now, so the cooldown guard at the
+///   top of `process_wanted_item` skips this item on subsequent passes
+///   within the cooldown window, same as any other processed item.
+/// - Creates the `media_request` row ONLY when `has_open_request` is
+///   `false`. Every later encounter still marks the item processed
+///   (cooldown-gated) but never creates a second request while an earlier
+///   one is still open.
 ///
 /// Best-effort throughout: a failure to touch `last_search_at` or persist
 /// the request is logged, never escalated (the item was already going to
@@ -499,17 +521,17 @@ async fn persist_pending_request_once(
     deps: &WantedPassDeps<'_>,
     item: &WantedItem,
     media_kind: &str,
-    is_first_encounter: bool,
+    has_open_request: bool,
     reason: &str,
 ) {
     touch_last_search_best_effort(deps.pool, item.monitored_item_id).await;
 
-    if !is_first_encounter {
+    if has_open_request {
         tracing::debug!(
             monitored_item_id = item.monitored_item_id,
             reason,
-            "MUSEM-06: wanted pass — no-capability item already has a request from a prior pass; \
-             not creating a second one"
+            "MUSEM-06: wanted pass — no-capability item already has an open request from a prior \
+             pass; not creating a second one"
         );
         return;
     }
@@ -543,6 +565,13 @@ async fn create_wanted_request(
         tier: Some(tier_label.to_string()),
         quality_profile_id: item.quality_profile_id,
         note: Some(format!("MUSEM-06 wanted worker: monitored_item_id={}", item.monitored_item_id)),
+        // Review finding (codex, MUSEM-06 REQUEST_CHANGES): every worker-
+        // created request (both the NeedsReview/Blocked persist path and
+        // the AutoApprovable grab path -- this helper backs both, see its
+        // call sites) correlates back to the monitored item it came from.
+        // This is what `has_open_worker_request_for_monitored_item` keys
+        // off of for the create-once guard.
+        monitored_item_id: Some(item.monitored_item_id),
     };
     repo::acquisition::create_request(deps.pool, &new_request).await
 }
@@ -954,6 +983,98 @@ mod db_gated {
             request_count, 1,
             "a second NeedsReview encounter must never create a second media_request"
         );
+    }
+
+    /// THE GAP (codex, MUSEM-06 REQUEST_CHANGES, second follow-up): the
+    /// `last_search_at IS NULL` ("first encounter") create-once proxy was
+    /// wrong because a FAILED search also sets `last_search_at` without
+    /// ever creating a request. Sequence proven fixed here: pass 1's search
+    /// fails (touches `last_search_at`, creates NO request) -> pass 2's
+    /// search succeeds and classifies `NeedsReview` -> a request MUST still
+    /// be created on pass 2, because `has_open_worker_request_for_monitored_item`
+    /// correctly reports "no open request yet" (unlike the old
+    /// `last_search_at.is_none()` proxy, which would have wrongly reported
+    /// "already surfaced" and silently suppressed this request forever).
+    #[tokio::test]
+    async fn failed_search_then_successful_needs_review_still_persists_a_request_on_the_second_pass() {
+        let Some(pool) = test_pool_or_skip(
+            "failed_search_then_successful_needs_review_still_persists_a_request_on_the_second_pass",
+        )
+        .await
+        else {
+            return;
+        };
+        save_settings(&pool, true).await;
+        let library = seed_library(&pool).await;
+        let profile_id = seed_profile_allowing_web_1080p(&pool).await;
+        let item = seed_wanted_item(&pool, &library, Some(profile_id)).await;
+
+        let config = test_config();
+        assert!(!config.arr_request_auto_tier_enabled, "auto-tier stays off for both passes");
+        let download = MockDownloadClient::new();
+        let mut settings = ExperienceSettings::default();
+        settings.acquisition.enabled = true;
+        let no_cooldown = chrono::Duration::zero();
+
+        // Pass 1: Prowlarr unreachable -- the search fails. Nothing listens
+        // on this address, same pattern as prowlarr_unreachable_search_failed_item_skipped.
+        let unreachable_prowlarr = ProwlarrClient::new("http://127.0.0.1:1", "test-key").expect("client");
+        let deps1 = WantedPassDeps {
+            pool: &pool,
+            config: &config,
+            prowlarr: Some(&unreachable_prowlarr),
+            download: Some(&download),
+        };
+        let (outcome1, searched1) = process_wanted_item(&deps1, &settings, &item, no_cooldown).await;
+        assert_eq!(outcome1, ItemOutcome::SearchFailed);
+        assert!(searched1);
+        assert!(
+            request_for_monitored_item(&pool, item.monitored_item_id).await.is_none(),
+            "a failed search must never persist a request"
+        );
+        let monitored_after_pass1 = repo::acquisition::get_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect("reload monitored_item after pass 1");
+        assert!(
+            monitored_after_pass1.last_search_at.is_some(),
+            "even a failed search must still touch last_search_at (it's a cooldown timer, not \
+             the create-once key anymore)"
+        );
+
+        // Pass 2: Prowlarr reachable now -- the search succeeds and
+        // classifies NeedsReview (auto-tier is off). This is THE GAP: the
+        // old last_search_at-based guard would have wrongly treated pass
+        // 1's failed search as "already surfaced" and never created this
+        // request.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/search");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(search_response_body(
+                    "musem06-failed-then-review-guid",
+                    &format!("{}.2020.1080p.WEB-DL", item.title),
+                ));
+        });
+        let working_prowlarr = ProwlarrClient::new(server.base_url(), "test-key").expect("client");
+        let deps2 = WantedPassDeps {
+            pool: &pool,
+            config: &config,
+            prowlarr: Some(&working_prowlarr),
+            download: Some(&download),
+        };
+        let (outcome2, searched2) = process_wanted_item(&deps2, &settings, &item, no_cooldown).await;
+        assert_eq!(outcome2, ItemOutcome::NeedsReview);
+        assert!(searched2);
+        assert_eq!(download.added_count(), 0);
+
+        let request = request_for_monitored_item(&pool, item.monitored_item_id)
+            .await
+            .expect(
+                "THE GAP: a request must be created on the second pass even though pass 1's \
+                 failed search already touched last_search_at",
+            );
+        assert_eq!(request.status, RequestStatus::Requested.as_str());
     }
 
     #[tokio::test]

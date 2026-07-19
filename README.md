@@ -1,55 +1,142 @@
 <h1 align="center">Muse</h1>
 
-<p align="center"><em>**Muse is an AI-native media curation & taste companion** — a private, local-inference-first "brain" for a Plex library. It owns taste modeling, curation, metadata, availability intelligence, proactive recommendations, and a pseudo-TV channel director, backed by a **mandatory Postgres + pgvector** database, while Plex stays the playback surface and qBittorrent stays the acquisition tool.</em></p>
+<p align="center"><em>The Lumina Constellation's media-management module: an AI-native curation & taste brain for a Plex library — acquisition, library scan, metadata, availability intelligence, taste modeling, and a pseudo-TV channel director, backed by Postgres + pgvector.</em></p>
 
-<p align="center">
+<p align="center">Rust · 1 binary (<code>muse</code>) · 216 modules · 3,317 KG nodes · 2,554 functions · 463 structs · 47 migrations · analyzed <code>34d8427</code></p>
 
-![build](https://img.shields.io/badge/build-passing-brightgreen) ![version](https://img.shields.io/badge/version-auto-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey) ![docs](https://img.shields.io/badge/docs-MUSE-informational)
-
-</p>
-
-<p align="center">Docs · Quickstart · Reference · Architecture · [Changelog](CHANGELOG.md)</p>
+<p align="center"><a href="docs/index.md">Docs</a> · <a href="docs/getting-started.md">Getting started</a> · <a href="docs/reference/index.md">Reference</a> · <a href="docs/architecture.md">Architecture</a> · <a href="docs/guides/index.md">Guides</a></p>
 
 ---
 
+## What is Muse
+
+Muse is a self-hosted Rust service that owns the *brain* of a personal media stack while
+leaving the existing playback and download surfaces in place: **Plex stays the playback
+surface, qBittorrent stays the download tool**, and Muse sits between them. It ingests
+library state from a multi-instance Radarr/Sonarr fleet, tracks playback natively
+(webhook + poller — the Tautulli replacement), pulls per-indexer availability from
+Prowlarr, resolves metadata across TMDb and TheTVDB, derives per-account taste profiles
+from real watch behavior (pgvector embeddings via a local Ollama model), and turns all of
+that into recommendations, proactive nudges, and composed pseudo-TV channels that Plex
+tunes into like an HDHomeRun.
+
+Muse is built **strangler-fig**: *arr and Tautulli are retired one function at a time,
+each phase shipping independent value, with the high-blast-radius parts (library import,
+writes to the live stack) deliberately last. The read paths against Plex/*arr/Prowlarr
+are structurally read-only; the first write-capable path — the acquisition pipeline
+(request → targeted search → release-decision scoring → qBittorrent grab) — is gated at
+a single chokepoint with tiered safety classification that defaults to manual review.
+Every external integration is optional and config-gated: an unconfigured client returns
+`None` at startup and its features degrade gracefully instead of failing the process.
+
+Muse is a peer of the rest of the constellation — **Harmony** (build orchestrator),
+**Chord** (inference proxy; Muse routes its LLM reasoning and vision calls through
+Chord's OpenAI-compatible endpoint, never a hosted model), **Terminus** (tool hub), and
+**Lumina** (assistant, which consumes Muse's proactive outbox). All behavioral data —
+embeddings, taste, telemetry — stays in Muse's own local Postgres; only non-personal
+metadata lookups egress.
+
+## Architecture
+
 ```mermaid
 flowchart LR
-    subgraph m__["."]
-        A[Client] --> B[Core]
-        B --> C[Output]
-    end
+    plex[plex client] --> tracker[tracker: webhook + poller]
+    tracker --> repo[(repo: Postgres + pgvector)]
+    arr[arr ingest, 8-instance fleet] --> repo
+    library[library scan, read-only FS] --> repo
+    metadata[metadata: TMDb / TVDB] --> repo
+    prowlarr[prowlarr report-pull] --> repo
+    prowlarr --> decision[decision: release scoring]
+    decision --> download[download: qBittorrent]
+    repo --> embed[embed: Ollama pgvector]
+    embed --> taste[taste_model] --> curation --> proactive
+    repo --> channels[channels director] --> tuner[tuner: HDHR / M3U / XMLTV] --> streaming[streaming: ffmpeg MPEG-TS]
+    curation --> web[web / HTTP API]
+    tuner --> web
 ```
 
-## Why MUSE
+A fuller derived diagram, per-subsystem narrative, and the end-to-end request flow are in
+[docs/architecture.md](docs/architecture.md).
 
-- **Muse is an AI-native media curation & taste companion** — a private, local-inference-first "brain" for a Plex library.
-- It owns taste modeling, curation, metadata, availability intelligence, proactive recommendations, and a pseudo-TV channel director, backed by a **mandatory Postgres + pgvector** database, while Plex stays the playback surface and qBittorrent stays the acquisition tool.
-- Muse is built **strangler-fig**: it keeps qBittorrent (acquisition) and Plex (consumption) and owns the *brain* (taste, curation, metadata, release selection, organization).
-- Each phase ships independent value and *arr/Tautulli are retired one function at a time — import (the only high-blast-radius part) is dead last.
-- Everything shipped so far is **Phase 0 + Phase 0.
-- 5: read-only, benign playback only, zero blast radius against the live stack**.
-- It is a peer to the rest of the constellation — **Harmony** (build orchestrator), **Chord** (inference proxy/orchestrator), **Terminus** (tool hub), and **Lumina** (assistant).
+## Subsystems
 
-## Quick Start
+| Subsystem | What it does | Reference |
+|---|---|---|
+| `repo` | The sqlx query layer — the only place raw SQL lives (279 KG nodes, one module per table group) | [reference/repo](docs/reference/repo.md) |
+| `models` | Typed rows + `New*` insert structs for the arr-shaped core schema and the telemetry/taste layer | [reference/models](docs/reference/models.md) |
+| `tracker` | Native Plex playback tracker: webhook + session poller + idempotent session reconstruction | [reference/tracker](docs/reference/tracker.md) |
+| `arr` | Read-only multi-instance Radarr/Sonarr ingest + tiered request-safety classification | [reference/arr](docs/reference/arr.md) |
+| `prowlarr` | Polite, rate-limited indexer report-pull, release-name parsing, targeted search | [reference/prowlarr](docs/reference/prowlarr.md) |
+| `metadata` | Provider-agnostic metadata seam: TheTVDB v4 client + normalized provider shape | [reference/metadata](docs/reference/metadata.md) |
+| `channels` | The channel composer/director — deterministic lineups, LLM-optional rationale, named presets | [reference/channels](docs/reference/channels.md) |
+| `tuner` | HDHomeRun emulation + M3U + XMLTV so Plex Live TV tunes Muse channels | [reference/tuner](docs/reference/tuner.md) |
+| `snapshot` | Guarded, read-only snapshot ingestion for testing against real-shaped data | [reference/snapshot](docs/reference/snapshot.md) |
+| `cultural` | The "what's hot / the talk" layer: trending ∩ library ∩ taste, cached and config-gated | [reference/cultural](docs/reference/cultural.md) |
+| `discord` | Discord bot core: allowlisted friends, default-private consent, brain-driven replies | [reference/discord](docs/reference/discord.md) |
+| `premiere` | Scheduled premiere events, RSVP, discussion threads, engagement-tiered request budgets | [reference/premiere](docs/reference/premiere.md) |
 
-_No quickstart content generated yet -- see Getting Started for the full tutorial._
+The full inventory — including `curation`, `taste_model`, `embed`, `recall`, `acquisition`,
+`decision`, `download`, `library`, `matching`, `watch_together`, `taste_review`, `web`,
+and the rest — is in the [reference index](docs/reference/index.md).
 
-## Architecture at a glance
+## Quick start
 
-It owns taste modeling, curation, metadata, availability intelligence, proactive recommendations, and a pseudo-TV channel director, backed by a **mandatory Postgres + pgvector** database, while Plex stays the playback surface and qBittorrent stays the acquisition tool. See Architecture for the full component and data-flow breakdown.
+Muse is one binary with one required backing service (Postgres with pgvector):
 
-## Contributing
+```sh
+cargo build --release            # toolchain pinned to 1.97.0 (rust-toolchain.toml)
+export MUSE_DATABASE_URL=...     # Postgres DSN; migrations run at startup
+./target/release/muse            # serves HTTP on MUSE_BIND_ADDR (default 0.0.0.0:8090)
+```
 
-See the project's build pipeline docs for the contribution process.
+Everything else is optional and enabled by configuration alone: `PLEX_URL`/`PLEX_TOKEN`
+(playback tracking), `MUSE_ARR_INSTANCES` (library ingest), `PROWLARR_URL`/
+`PROWLARR_API_KEY` (availability), `TMDB_API_KEY` + `MUSE_TVDB_API_KEY` (metadata),
+`MUSE_OLLAMA_URL` (embeddings), `CHORD_URL` (LLM rationale), `MUSE_QBIT_*` (grabs),
+`MUSE_API_TOKEN` (endpoint auth — protected routes answer 503 until it is set or
+`MUSE_AUTH_DISABLED` is explicitly opted into). Secret values are materialized into the
+environment from the vault at runtime, never authored in files.
 
-## License
+The binary also carries three operator-only subcommands that never run at service
+startup: `muse snapshot-acquire`, `muse shadow-run`, and `muse parity-report` — see the
+[snapshot pipeline guide](docs/guides/snapshot-pipeline.md).
 
-See [LICENSE](LICENSE).
+Full walkthrough: [docs/getting-started.md](docs/getting-started.md).
 
 ## Documentation
 
-See [the documentation index](docs/index.md) for the full reference.
+| Page | What's in it |
+|---|---|
+| [docs/index.md](docs/index.md) | Documentation hub and full navigation |
+| [docs/architecture.md](docs/architecture.md) | Constellation position, process shape, data flows, worker inventory, module layering |
+| [docs/getting-started.md](docs/getting-started.md) | Build, configure, first run, verification |
+| [docs/reference/index.md](docs/reference/index.md) | Per-subsystem reference pages (12) + the full module inventory |
+| [docs/guides/index.md](docs/guides/index.md) | Operator guides: Plex tuner setup, acquisition pipeline, snapshot/shadow/parity CLIs |
+| [docs/schema.md](docs/schema.md) | The Postgres data model, grouped by concern |
+| [docs/runbooks.md](docs/runbooks.md) | Operational runbooks |
+| [docs/behavior-spec.md](docs/behavior-spec.md) | Behavioral contracts: taste derivation, ranking, proactive triggers, degradation invariants |
+| [docs/EXPERIENCE_LAYER.md](docs/EXPERIENCE_LAYER.md) | The MUSEX experience layer and its opt-in-only privacy model |
+| [docs/TESTING.md](docs/TESTING.md) | Test strategy: pure-function units + `MUSE_TEST_DATABASE_URL`-gated live-DB tests |
 
-- [Architecture at a glance](docs/reference/architecture-at-a-glance.md)
-- [Acquisition domain schema (MUSEM-01)](docs/reference/acquisition-domain-schema-musem-01.md)
-- [Running](docs/reference/running.md)
+## At a glance
+
+- **Scale:** 3,317 knowledge-graph nodes (2,554 functions, 463 structs, 72 enums, 12
+  traits) across 216 modules; 8,159 intra-crate call/reference edges; 83 cross-subsystem
+  edges; 47 SQL migrations.
+- **Status:** foundation (S96) + media-management Sprint 1 (S119, acquisition write-path)
+  + library scan/matching (S119b) are merged. Several implemented features are not yet
+  production-wired — the honest inventory is
+  [wiring status](docs/reference/wiring-status-what-actually-runs.md).
+- **Founding specs:** [`specs/S96-muse-foundation.md`](specs/S96-muse-foundation.md),
+  [`specs/S119-muse-media-management.md`](specs/S119-muse-media-management.md),
+  [`specs/S119b-muse-library-scan-matching.md`](specs/S119b-muse-library-scan-matching.md).
+
+## Contributing
+
+Every code change goes through the constellation's spec/build pipeline (Plane ingest →
+worktree → test gate → dual review → merge → verify). See the build reports in the repo
+root for how prior sprints ran.
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 moosenet.

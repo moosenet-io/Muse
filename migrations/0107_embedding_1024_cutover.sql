@@ -26,9 +26,22 @@
 -- ===========================================================================
 
 -- ---------------------------------------------------------------------------
--- Step 0: FAIL-SAFE GUARD. Abort (rolling back this migration) if any row that
--- CAN be backfilled (source_text present) still lacks embedding_1024. This is
--- what makes back-to-back auto-run safe.
+-- Step 0a: TAKE AN EXCLUSIVE LOCK before anything else. sqlx runs this whole
+-- migration in ONE transaction, so this lock is held through the guard check,
+-- the DELETE, and the column swap — quiescing all concurrent application DML
+-- on `embeddings`. Without it there is a TOCTOU: under READ COMMITTED a
+-- concurrent writer could INSERT a row AFTER the Step-0b guard passes but
+-- BEFORE the Step-1 DELETE, and that row (embedding_1024 NULL) would then be
+-- deleted / lost. sqlx's advisory MIGRATION lock does NOT block application
+-- DML, so we need a real table lock here. `embeddings` is the only table this
+-- migration mutates, so it's the only one that needs locking.
+-- ---------------------------------------------------------------------------
+LOCK TABLE embeddings IN ACCESS EXCLUSIVE MODE;
+
+-- ---------------------------------------------------------------------------
+-- Step 0b: FAIL-SAFE GUARD. Abort (rolling back this migration) if any row
+-- that CAN be backfilled (source_text present) still lacks embedding_1024.
+-- This is what makes back-to-back auto-run safe.
 -- ---------------------------------------------------------------------------
 DO $$
 BEGIN

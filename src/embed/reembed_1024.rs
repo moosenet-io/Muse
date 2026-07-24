@@ -9,8 +9,10 @@
 //! 1. **migration `0106_embedding_1024.sql`** — adds `embeddings.embedding_1024`
 //!    (`vector(1024)`, nullable) + `embeddings.model_1024` (text, nullable),
 //!    and widens every derived centroid column to `vector(1024)` (their old
-//!    768 values are discarded; they are recomputed in step 4, never
-//!    re-embedded).
+//!    768 values are dropped/nulled; they are recomputed in step 4, never
+//!    re-embedded). Persona ROWS + `persona_members` are PRESERVED (their
+//!    centroid is nulled in place, not deleted) so no irrecoverable
+//!    operator/user persona intent is lost.
 //! 2. **[`backfill_1024`]** (this module) — re-embeds every row's
 //!    `source_text` through Chord and writes `embedding_1024`/`model_1024`.
 //!    Rows with `source_text IS NULL` CANNOT be reproduced and are left

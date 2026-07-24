@@ -7,21 +7,26 @@
 //! each service picking its own local Ollama model.
 //!
 //! Construction is via [`ChordEmbedClient::from_config`], which returns
-//! `None` when neither `CHORD_EMBEDDINGS_URL` nor `CHORD_URL` is configured —
-//! callers treat embeddings as an optional, gracefully-degrading dependency
-//! exactly like the former `OllamaEmbedClient` did (and like
+//! `None` when the embeddings endpoint is not fully configured — callers
+//! treat embeddings as an optional, gracefully-degrading dependency exactly
+//! like the former `OllamaEmbedClient` did (and like
 //! `PlexClient`/`ProwlarrClient`/`TmdbClient`).
 //!
-//! ## Auth (S125 deviation note)
-//! The sibling [`crate::taste_model::chord_client::ChordClient`] (chat/vision)
-//! currently sends NO auth header, so there is no pre-existing "Chord JWT
-//! plumbing" to literally reuse. This client therefore introduces an
-//! *optional* bearer credential — `CHORD_API_TOKEN`
-//! ([`crate::config::Config::chord_api_token`]) — attached only when set,
-//! materialized from <secret-manager> at runtime, never a literal (S1/S7). When the
-//! Chord proxy is unauthenticated (the current deploy), leave it unset and
-//! the client posts without an `Authorization` header, unchanged from the
-//! Ollama-era behavior.
+//! ## Auth — the bearer token is REQUIRED (S125 review finding)
+//! Chord's `/v1/embeddings` is JWT-gated: an unauthenticated POST returns
+//! `401 "Missing Authorization header"`, so a tokenless client would silently
+//! 401 on every row. The token is therefore a REQUIRED field of this client
+//! (`CHORD_API_TOKEN`, [`crate::config::Config::chord_api_token`]) — a
+//! `ChordEmbedClient` cannot be constructed without one, which structurally
+//! guarantees we never post unauthenticated. [`ChordEmbedClient::from_config`]
+//! logs a loud error and returns `None` when a Chord URL is set but
+//! `CHORD_API_TOKEN` is missing (a misconfiguration), rather than degrading
+//! to a silent 401 storm. The token is materialized from <secret-manager> at
+//! runtime, never a literal (S1/S7).
+//!
+//! NOTE: the sibling chat/vision [`crate::taste_model::chord_client::ChordClient`]
+//! does not yet send this header (chat wasn't observed to be JWT-gated); if
+//! that changes, wire `chord_api_token` into it too.
 
 use std::time::Duration;
 
@@ -29,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::{MuseError, MuseResult};
+use crate::models::embedding::EMBEDDING_DIM;
 
 /// Generous but bounded — <host>'s GPU is shared with a permanent
 /// `lemonade-coder` production serve, so a request can queue behind other
@@ -62,16 +68,16 @@ struct EmbeddingData {
 pub struct ChordEmbedClient {
     http: reqwest::Client,
     base_url: String,
-    /// Optional bearer credential (`CHORD_API_TOKEN`). `None` posts without
-    /// an `Authorization` header (current unauthenticated Chord deploy).
-    api_token: Option<String>,
+    /// REQUIRED bearer credential (`CHORD_API_TOKEN`). Non-optional so a
+    /// client can never post unauthenticated (Chord embeddings are JWT-gated).
+    api_token: String,
 }
 
 impl ChordEmbedClient {
     /// Build a client against a specific Chord base URL (e.g. the proxy root
-    /// `http://192.0.2.20:8099`, or an httpmock server in tests). The
-    /// `/v1/embeddings` path is appended per call.
-    pub fn new(base_url: impl Into<String>) -> MuseResult<Self> {
+    /// `http://192.0.2.20:8099`, or an httpmock server in tests) with the
+    /// required bearer token. The `/v1/embeddings` path is appended per call.
+    pub fn new(base_url: impl Into<String>, api_token: impl Into<String>) -> MuseResult<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -80,57 +86,61 @@ impl ChordEmbedClient {
         Ok(Self {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            api_token: None,
+            api_token: api_token.into(),
         })
-    }
-
-    /// Attach an optional bearer token (builder-style). `None` is a no-op.
-    pub fn with_token(mut self, api_token: Option<String>) -> Self {
-        self.api_token = api_token;
-        self
     }
 
     /// Build a client from `Config`. Prefers `CHORD_EMBEDDINGS_URL`
     /// ([`Config::chord_embeddings_url`]) and falls back to the shared
     /// `CHORD_URL` ([`Config::chord_url`]) — both point at the same Chord
-    /// proxy, so a deployment that already sets `CHORD_URL` gets embeddings
-    /// routing for free, while `CHORD_EMBEDDINGS_URL` exists as an explicit
-    /// override seam. Returns `None` when neither is set (or the client
-    /// fails to construct) — the embedding pipeline degrades to "nothing to
-    /// do" rather than blocking startup or a caller. Never panics.
+    /// proxy. Returns `None` when:
+    /// - neither URL is set (embeddings simply unconfigured — quiet degrade),
+    ///   or
+    /// - a URL IS set but `CHORD_API_TOKEN` is missing — a MISCONFIGURATION,
+    ///   logged at ERROR (Chord embeddings need a JWT; we refuse to build a
+    ///   client that would 401 on every call rather than post unauthenticated).
+    ///
+    /// Never panics.
     pub fn from_config(config: &Config) -> Option<Self> {
         let url = config
             .chord_embeddings_url
             .clone()
             .or_else(|| config.chord_url.clone())?;
 
-        match Self::new(url) {
-            Ok(client) => Some(client.with_token(config.chord_api_token.clone())),
+        let Some(token) = config.chord_api_token.clone() else {
+            tracing::error!(
+                "CHORD_API_TOKEN required — Chord embeddings need a JWT, but a Chord URL is \
+                 configured with no token; embeddings DISABLED (set CHORD_API_TOKEN)"
+            );
+            return None;
+        };
+
+        match Self::new(url, token) {
+            Ok(client) => Some(client),
             Err(e) => {
-                tracing::warn!(error = %e, "failed to construct Chord embed client; embeddings will degrade");
+                tracing::error!(error = %e, "failed to construct Chord embed client; embeddings DISABLED");
                 None
             }
         }
     }
 
     /// Embed a single piece of text with the given model via Chord's
-    /// `/v1/embeddings`, returning the raw vector. Callers are responsible
-    /// for validating dimensionality matches what they intend to store (the
-    /// `embeddings` table pins `vector(1024)` for `qwen3-embedding` post
-    /// S125). Signature is intentionally identical to the former
-    /// `OllamaEmbedClient::embed` so every call site is a drop-in repoint.
+    /// `/v1/embeddings`, returning the raw vector. The returned vector's
+    /// length is validated to equal [`EMBEDDING_DIM`] (1024) — a wrong-dim
+    /// vector is an error, never stored (it would corrupt the pgvector space
+    /// / fail the column width). Signature is intentionally identical to the
+    /// former `OllamaEmbedClient::embed` so every call site is a drop-in
+    /// repoint.
     pub async fn embed(&self, model: &str, text: &str) -> MuseResult<Vec<f32>> {
         let url = format!("{}/v1/embeddings", self.base_url);
 
-        let mut req = self
+        let resp = self
             .http
             .post(&url)
-            .json(&EmbeddingsRequest { input: text, model });
-        if let Some(token) = &self.api_token {
-            req = req.bearer_auth(token);
-        }
-
-        let resp = req.send().await?;
+            .bearer_auth(&self.api_token)
+            .json(&EmbeddingsRequest { input: text, model })
+            .send()
+            .await?;
 
         let status = resp.status();
         let bytes = resp.bytes().await?;
@@ -156,6 +166,19 @@ impl ChordEmbedClient {
             )));
         }
 
+        // Dimension guard: never hand back (and never let a caller store) a
+        // vector that isn't the pinned 1024 width. A mismatch means the model
+        // routed by Chord isn't the expected `qwen3-embedding` — surface it
+        // loudly rather than corrupting the vector store.
+        if embedding.len() != EMBEDDING_DIM as usize {
+            return Err(MuseError::upstream(format!(
+                "chord embedding for model {model} has wrong dimensionality: got {}, expected {} \
+                 (EMBEDDING_DIM) — refusing to store a wrong-dim vector",
+                embedding.len(),
+                EMBEDDING_DIM
+            )));
+        }
+
         Ok(embedding)
     }
 }
@@ -165,20 +188,35 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
 
+    const TEST_TOKEN: &str = "test-chord-jwt";
+
     fn client_for(server: &MockServer) -> ChordEmbedClient {
-        ChordEmbedClient::new(server.base_url()).expect("client should construct")
+        ChordEmbedClient::new(server.base_url(), TEST_TOKEN).expect("client should construct")
+    }
+
+    /// A JSON body whose `data[0].embedding` is a full [`EMBEDDING_DIM`]-length
+    /// vector — its first three entries are `[a, b, c]`, the rest `0.0`. Lets
+    /// tests assert on recognizable leading values while still passing the
+    /// dimensionality guard.
+    fn body_with_full_vector(a: f32, b: f32, c: f32) -> String {
+        let mut v = vec![0.0_f32; EMBEDDING_DIM as usize];
+        v[0] = a;
+        v[1] = b;
+        v[2] = c;
+        serde_json::json!({ "data": [{ "embedding": v }] }).to_string()
     }
 
     #[tokio::test]
-    async fn embed_sends_openai_shape_and_parses_vector_from_data() {
+    async fn embed_sends_openai_shape_and_parses_full_width_vector() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/embeddings")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
                 .json_body(serde_json::json!({"input": "Arrival (2016)", "model": "qwen3-embedding"}));
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"data": [{"embedding": [0.1, 0.2, 0.3]}]}"#);
+                .body(body_with_full_vector(0.1, 0.2, 0.3));
         });
 
         let client = client_for(&server);
@@ -188,26 +226,50 @@ mod tests {
             .expect("embed should succeed");
 
         mock.assert();
-        assert_eq!(vector, vec![0.1, 0.2, 0.3]);
+        assert_eq!(vector.len(), EMBEDDING_DIM as usize);
+        assert_eq!(&vector[0..3], &[0.1, 0.2, 0.3]);
     }
 
     #[tokio::test]
-    async fn embed_attaches_bearer_when_token_configured() {
+    async fn embed_always_attaches_bearer() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/embeddings")
-                .header("authorization", "Bearer secret-chord-token");
+                .header("authorization", format!("Bearer {TEST_TOKEN}"));
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"data": [{"embedding": [1.0, 2.0]}]}"#);
+                .body(body_with_full_vector(1.0, 2.0, 3.0));
         });
 
-        let client = client_for(&server).with_token(Some("secret-chord-token".to_string()));
+        let client = client_for(&server);
         let vector = client.embed("qwen3-embedding", "anything").await.expect("embed should succeed");
 
         mock.assert();
-        assert_eq!(vector, vec![1.0, 2.0]);
+        assert_eq!(vector.len(), EMBEDDING_DIM as usize);
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_wrong_dimensionality_vector() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/embeddings");
+            // A 3-long vector — not EMBEDDING_DIM. Must be rejected, never stored.
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"data": [{"embedding": [0.1, 0.2, 0.3]}]}"#);
+        });
+
+        let client = client_for(&server);
+        let result = client.embed("qwen3-embedding", "anything").await;
+        assert!(result.is_err(), "a wrong-dim vector must be an error, never returned");
+        match result.unwrap_err() {
+            MuseError::Upstream { message, .. } => assert!(
+                message.contains("wrong dimensionality"),
+                "error should name the dimensionality mismatch, got: {message}"
+            ),
+            other => panic!("expected Upstream dimensionality error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -225,6 +287,21 @@ mod tests {
         match result.unwrap_err() {
             MuseError::Upstream { status, .. } => assert_eq!(status, 500),
             other => panic!("expected Upstream error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_surfaces_401_when_chord_rejects_auth() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/embeddings");
+            then.status(401).body("Missing Authorization header");
+        });
+
+        let client = client_for(&server);
+        match client.embed("qwen3-embedding", "anything").await.unwrap_err() {
+            MuseError::Upstream { status, .. } => assert_eq!(status, 401),
+            other => panic!("expected Upstream 401, got {other:?}"),
         }
     }
 
@@ -277,14 +354,25 @@ mod tests {
     }
 
     #[test]
+    fn from_config_returns_none_when_url_set_but_token_missing() {
+        // RFC 5737 TEST-NET address — never a real fleet host.
+        let mut config = Config::default();
+        config.chord_url = Some("http://192.0.2.20:8099".to_string());
+        // No CHORD_API_TOKEN -> refuse to build a client that would 401.
+        assert!(
+            ChordEmbedClient::from_config(&config).is_none(),
+            "a URL without a token must NOT yield a client (would post unauthenticated / 401)"
+        );
+    }
+
+    #[test]
     fn from_config_prefers_embeddings_url_then_falls_back_to_chord_url() {
         // RFC 5737 TEST-NET addresses — never real fleet hosts.
         let mut config = Config::default();
+        config.chord_api_token = Some("a-token".to_string());
         config.chord_url = Some("http://192.0.2.20:8099".to_string());
-        assert!(
-            ChordEmbedClient::from_config(&config).is_some(),
-            "CHORD_URL alone should be enough to construct the embed client"
-        );
+        let client = ChordEmbedClient::from_config(&config).expect("CHORD_URL + token should construct");
+        assert_eq!(client.base_url, "http://192.0.2.20:8099");
 
         config.chord_embeddings_url = Some("http://192.0.2.30:8099".to_string());
         let client = ChordEmbedClient::from_config(&config).expect("dedicated embeddings url should construct");

@@ -95,31 +95,39 @@ struct BackfillRow {
 
 /// Re-embed every backfillable `embeddings` row's `source_text` through Chord
 /// (`qwen3-embedding`, 1024) and write the result into `embedding_1024` /
-/// `model_1024`. Idempotent + resumable: pages by ascending `id` over rows
-/// WHERE `embedding_1024 IS NULL AND source_text IS NOT NULL`, so re-running
-/// after a partial/failed run simply resumes on the rows still missing a
-/// vector. Runs to completion (drains all pages) within one call; a
-/// per-row failure is logged and skipped rather than aborting the run.
+/// `model_1024`.
 ///
-/// Runs BETWEEN migration `0106` (which adds `embedding_1024`) and migration
-/// `0107` (the cutover) — see the module docs.
+/// **Per-row resilient (never loses ground on a bad row):** pages by a
+/// KEYSET cursor on ascending `id` (`... AND id > $last_id`), advancing the
+/// cursor past every row it attempts — success OR failure. A row whose Chord
+/// re-embed or write fails is logged, counted, and left `NULL` (so a later
+/// run — which resets the cursor and re-selects any still-`NULL` row —
+/// retries it); it does NOT abort the page and, crucially, does NOT block the
+/// rows behind it (the old "always page from the top" approach let a cluster
+/// of persistently-failing rows starve everything after them). Only truly
+/// unbackfillable rows (`source_text IS NULL`) are expected to remain `NULL`
+/// after a clean run.
+///
+/// Idempotent + resumable across calls. Runs BETWEEN migration `0106` (which
+/// adds `embedding_1024`) and migration `0107` (the cutover) — see the module
+/// docs. The `0107` cutover is guarded to REFUSE to run while any backfillable
+/// row is still `NULL`, so a partial/failed backfill can never lead to data
+/// loss.
 pub async fn backfill_1024(pool: &PgPool, client: &ChordEmbedClient) -> MuseResult<BackfillSummary> {
     let mut summary = BackfillSummary::default();
+    let mut last_id: i64 = 0;
 
     loop {
-        // Always page from the top: a successfully-written row drops out of
-        // this predicate, so the "next" NULL page is whatever remains. A row
-        // that FAILED keeps NULL and would be re-selected forever — guard
-        // against that by tracking whether a full page made zero progress.
         let rows = sqlx::query_as::<_, BackfillRow>(
             r#"
             SELECT id, source_text
             FROM embeddings
-            WHERE embedding_1024 IS NULL AND source_text IS NOT NULL
+            WHERE embedding_1024 IS NULL AND source_text IS NOT NULL AND id > $1
             ORDER BY id
-            LIMIT $1
+            LIMIT $2
             "#,
         )
+        .bind(last_id)
         .bind(BACKFILL_PAGE_SIZE)
         .fetch_all(pool)
         .await
@@ -129,31 +137,25 @@ pub async fn backfill_1024(pool: &PgPool, client: &ChordEmbedClient) -> MuseResu
             break;
         }
 
-        let mut progressed = false;
         for row in &rows {
+            // Advance the cursor for EVERY attempted row (success or failure)
+            // so a failing row never blocks the rows after it, and a page can
+            // never re-select rows we already tried this run.
+            last_id = row.id;
+
             match client.embed(DEFAULT_EMBEDDING_MODEL, &row.source_text).await {
                 Ok(vector) => match write_embedding_1024(pool, row.id, vector).await {
-                    Ok(()) => {
-                        summary.embedded += 1;
-                        progressed = true;
-                    }
+                    Ok(()) => summary.embedded += 1,
                     Err(e) => {
                         summary.failed += 1;
-                        tracing::warn!(embedding_id = row.id, error = %e, "S125 backfill: failed to write embedding_1024; continuing");
+                        tracing::warn!(embedding_id = row.id, error = %e, "S125 backfill: failed to write embedding_1024; leaving NULL for retry, continuing");
                     }
                 },
                 Err(e) => {
                     summary.failed += 1;
-                    tracing::warn!(embedding_id = row.id, error = %e, "S125 backfill: Chord re-embed failed; continuing");
+                    tracing::warn!(embedding_id = row.id, error = %e, "S125 backfill: Chord re-embed failed; leaving NULL for retry, continuing");
                 }
             }
-        }
-
-        // If an entire page failed to write a single row, the same page would
-        // be re-selected on the next loop -> stop rather than spin forever.
-        if !progressed {
-            tracing::warn!("S125 backfill: a full page made no progress (every row failed); stopping this run");
-            break;
         }
     }
 

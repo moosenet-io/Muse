@@ -2,21 +2,51 @@
 -- `embedding_1024` column to be THE `embedding` column and rebuilds the HNSW
 -- index at 1024 dims.
 --
--- PRECONDITION (orchestrator-enforced, NOT expressible in SQL): the re-embed
--- backfill (`embed::reembed_1024::backfill_1024`) has run and
--- `embed::reembed_1024::count_pending_backfill` returns 0 — i.e. every row
--- that CAN be re-embedded (source_text present) now has `embedding_1024`.
--- Running this before then would DELETE still-unbackfilled rows (see step 1).
+-- =====================  DATA-SAFETY / AUTO-RUN CONTRACT  =====================
+-- Muse auto-runs ALL pending migrations at startup (`sqlx::migrate!`), so on
+-- an existing vector store 0106 and THIS file would run back-to-back with no
+-- backfill in between. That would be catastrophic (drop the populated 768
+-- column before 1024 is filled). This migration is therefore made FAIL-SAFE
+-- by the guard in Step 0 below: it RAISES and aborts (rolling back this whole
+-- migration — no column is touched) whenever the backfill is incomplete.
 --
--- ORDER in the overall sequence:
---   0106 (add col + widen centroids) -> backfill_1024 -> [THIS] -> recompute_all_centroids
+-- Behavior of the guard:
+--   * Fresh/empty deploy (no 768 rows): guard finds nothing pending -> passes
+--     -> clean cutover to a 1024 schema. Seamless.
+--   * Existing store, backfill NOT yet run: guard RAISES -> 0107 rolls back
+--     and is recorded as NOT applied -> startup logs the error and continues
+--     on the intermediate (0106-applied) schema with the OLD embedding column
+--     fully intact. NO DATA LOSS.
+--
+-- REQUIRED MANUAL SEQUENCE for an existing production store:
+--   1. apply 0106                              (adds embedding_1024, widens centroids)
+--   2. embed::reembed_1024::backfill_1024      (until count_pending_backfill() == 0)
+--   3. apply 0107  (THIS)                      (guard passes, cutover proceeds)
+--   4. embed::reembed_1024::recompute_all_centroids
+-- ===========================================================================
 
 -- ---------------------------------------------------------------------------
--- Step 1: drop rows we could not reproduce. Any row still missing
--- `embedding_1024` here has no `source_text` to re-embed (or repeatedly
--- failed the backfill) — its 768 vector cannot be carried forward into the
--- 1024 space, so it is removed. Such rows re-materialize naturally on the
--- next incremental embed pass once their `source_text` is recomposed.
+-- Step 0: FAIL-SAFE GUARD. Abort (rolling back this migration) if any row that
+-- CAN be backfilled (source_text present) still lacks embedding_1024. This is
+-- what makes back-to-back auto-run safe.
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM embeddings
+        WHERE embedding_1024 IS NULL AND source_text IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION
+            'S125 cutover blocked: embedding_1024 backfill incomplete — run reembed_1024::backfill_1024 first (see this migration''s header for the required manual sequence)';
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Step 1: drop rows we could not reproduce. After the guard, the ONLY rows
+-- still missing `embedding_1024` are those with no `source_text` to re-embed
+-- — their 768 vector cannot be carried forward into the 1024 space, so they
+-- are removed. Such rows re-materialize naturally on the next incremental
+-- embed pass once their `source_text` is recomposed.
 -- ---------------------------------------------------------------------------
 DELETE FROM embeddings WHERE embedding_1024 IS NULL;
 

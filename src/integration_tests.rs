@@ -1054,10 +1054,10 @@ async fn telemetry_taste_embeddings_schema_migrates_and_round_trips() {
     assert!(watchlist[0].fulfilled);
 
     // --- embeddings (pgvector) ---
-    let vector = vec![0.01_f32; 768];
+    let vector = vec![0.01_f32; 1024];
     let embedding = repo::embedding::upsert(
         &pool,
-        &NewEmbedding::nomic(
+        &NewEmbedding::qwen3(
             EmbeddingEntityKind::MediaItem,
             item.id,
             vector.clone(),
@@ -1066,7 +1066,7 @@ async fn telemetry_taste_embeddings_schema_migrates_and_round_trips() {
     )
     .await
     .expect("upsert embedding");
-    assert_eq!(embedding.dim, 768);
+    assert_eq!(embedding.dim, 1024);
 
     let fetched_embedding = repo::embedding::get(&pool, "media_item", item.id, "nomic-embed-text")
         .await
@@ -1098,7 +1098,7 @@ async fn telemetry_taste_embeddings_schema_migrates_and_round_trips() {
             keyword_affinity: serde_json::json!({"slow-burn": 0.6}),
             runtime_pref: None,
             quality_sensitivity: None,
-            overall_centroid: Some(pgvector::Vector::from(vec![0.02_f32; 768])),
+            overall_centroid: Some(pgvector::Vector::from(vec![0.02_f32; 1024])),
             model_notes: Some("Loves cerebral, slow-burn sci-fi.".to_string()),
         },
     )
@@ -1111,7 +1111,7 @@ async fn telemetry_taste_embeddings_schema_migrates_and_round_trips() {
         &NewTasteContextCentroid {
             account_id: account.id,
             context_key: "weekend_evening".to_string(),
-            centroid: pgvector::Vector::from(vec![0.03_f32; 768]),
+            centroid: pgvector::Vector::from(vec![0.03_f32; 1024]),
             sample_size: 12,
         },
     )

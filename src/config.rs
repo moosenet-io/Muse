@@ -64,6 +64,23 @@ pub struct Config {
     pub tmdb_api_key: Option<String>,
     pub ollama_url: Option<String>,
     pub chord_url: Option<String>,
+    /// S125: base URL of Chord's standardized `/v1/embeddings` endpoint
+    /// (`CHORD_EMBEDDINGS_URL`). `None` (the default) makes
+    /// [`crate::embed::ChordEmbedClient::from_config`] fall back to
+    /// [`Self::chord_url`] (same Chord proxy) — this exists purely as an
+    /// explicit override seam for a deployment that fronts embeddings on a
+    /// different host/port than chat. Not secret-shaped (a host, not a
+    /// credential); never a literal here (S1), materialized at runtime.
+    pub chord_embeddings_url: Option<String>,
+    /// S125: optional bearer credential for Chord's HTTP surface
+    /// (`CHORD_API_TOKEN`), <secret-manager>-materialized at runtime, never a
+    /// literal (S1/S7). `None` (the current unauthenticated Chord deploy)
+    /// posts without an `Authorization` header — same graceful posture as
+    /// every other optional credential here. NOTE (S125 deviation): the
+    /// sibling chat/vision `taste_model::chord_client::ChordClient` does not
+    /// yet read this; only the embeddings client does. If/when the Chord
+    /// proxy requires auth, wire this into that client too.
+    pub chord_api_token: Option<String>,
 
     // --- MUSEL-A1: TheTVDB v4 metadata provider (`metadata::tvdb::TvdbClient`).
     // All three read together; see `Config::tvdb`. ---
@@ -523,6 +540,8 @@ impl Config {
             tmdb_api_key: env_opt("TMDB_API_KEY"),
             ollama_url: env_opt("MUSE_OLLAMA_URL"),
             chord_url: env_opt("CHORD_URL"),
+            chord_embeddings_url: env_opt("CHORD_EMBEDDINGS_URL"),
+            chord_api_token: env_opt("CHORD_API_TOKEN"),
             tvdb_api_key: env_opt("MUSE_TVDB_API_KEY").map(QbitPassword::from),
             tvdb_pin: env_opt("MUSE_TVDB_PIN").map(QbitPassword::from),
             tvdb_base_url: env_opt("MUSE_TVDB_BASE_URL"),
@@ -704,6 +723,8 @@ impl Default for Config {
             tmdb_api_key: None,
             ollama_url: None,
             chord_url: None,
+            chord_embeddings_url: None,
+            chord_api_token: None,
             tvdb_api_key: None,
             tvdb_pin: None,
             tvdb_base_url: None,

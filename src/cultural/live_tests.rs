@@ -61,7 +61,7 @@ async fn seed_rich_taste_profile(pool: &sqlx::PgPool, account_id: i64, centroid:
 async fn seed_item_embedding(pool: &sqlx::PgPool, media_item_id: i64, embedding: Vec<f32>) {
     repo::embedding::upsert(
         pool,
-        &NewEmbedding::nomic(
+        &NewEmbedding::qwen3(
             EmbeddingEntityKind::MediaItem,
             media_item_id,
             embedding,
@@ -130,7 +130,7 @@ async fn orchestration_never_forwards_account_data_to_the_trend_source() {
             account_id: Some(account.id),
             name: persona_name.clone(),
             kind: PERSONA_KIND_EXPLICIT.to_string(),
-            centroid: pgvector::Vector::from(vec![0.1_f32; 768]),
+            centroid: pgvector::Vector::from(vec![0.1_f32; 1024]),
             defining_signals: serde_json::json!({}),
             metadata: serde_json::json!({}),
             sample_size: 1,
@@ -198,8 +198,8 @@ async fn orchestration_never_forwards_account_data_to_the_trend_source() {
     // Rich taste profile + a matching item embedding so the owned+trending
     // title clears the taste-intersection's TASTE_RELEVANCE_MIN filter
     // (identical vectors -> cosine 1.0) and actually surfaces.
-    seed_rich_taste_profile(&pool, account.id, vec![0.1_f32; 768]).await;
-    seed_item_embedding(&pool, item.id, vec![0.1_f32; 768]).await;
+    seed_rich_taste_profile(&pool, account.id, vec![0.1_f32; 1024]).await;
+    seed_item_embedding(&pool, item.id, vec![0.1_f32; 1024]).await;
 
     let mock = MockTrendSource::new(
         vec![TrendEntry {
@@ -343,7 +343,7 @@ async fn sparse_profile_routes_to_cold_start_while_rich_profile_uses_the_interse
     )
     .await
     .expect("upsert routing show item");
-    seed_item_embedding(&pool, item.id, vec![0.1_f32; 768]).await;
+    seed_item_embedding(&pool, item.id, vec![0.1_f32; 1024]).await;
 
     let mock = MockTrendSource::new(
         vec![TrendEntry {
@@ -401,7 +401,7 @@ async fn sparse_profile_routes_to_cold_start_while_rich_profile_uses_the_interse
     )
     .await
     .expect("create rich account");
-    seed_rich_taste_profile(&pool, rich_account.id, vec![0.1_f32; 768]).await;
+    seed_rich_taste_profile(&pool, rich_account.id, vec![0.1_f32; 1024]).await;
 
     let rich_result = recommend_cultural(&pool, rich_account.id, &mock, &cache, "US")
         .await

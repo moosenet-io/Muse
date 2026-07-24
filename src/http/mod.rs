@@ -25,7 +25,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::arr::ArrInstanceConfig;
 use crate::config::Config;
-use crate::embed::OllamaEmbedClient;
+use crate::embed::ChordEmbedClient;
 use crate::enrichment::EnrichmentService;
 use crate::error::MuseError;
 use crate::plex::PlexClient;
@@ -60,10 +60,10 @@ pub struct AppState {
     /// (never a 500) rather than failing.
     pub tmdb: Option<TmdbClient>,
     /// Query-embedding client for MUSE-09's `/query/resolve` vector tier
-    /// (the same `OllamaEmbedClient` type MUSE-08's embed pipeline uses).
+    /// (the same `ChordEmbedClient` type MUSE-08's embed pipeline uses).
     /// `None` when `MUSE_OLLAMA_URL` isn't configured — the vector tier
     /// degrades to skipped, falling through to pg_trgm.
-    pub embed: Option<OllamaEmbedClient>,
+    pub embed: Option<ChordEmbedClient>,
     /// MUSEM-05: the qBittorrent download client the request-lifecycle
     /// endpoints (`crate::http::requests`) grab through. `None` when
     /// `MUSE_QBIT_URL`/`MUSE_QBIT_USER`/`MUSE_QBIT_PASS` aren't fully

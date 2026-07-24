@@ -75,7 +75,7 @@ use crate::arr::request::{
     NoopMediaRequestSink,
 };
 use crate::discord::identity::{FriendIdentity, TrustedFriends};
-use crate::embed::OllamaEmbedClient;
+use crate::embed::ChordEmbedClient;
 use crate::error::MuseResult;
 use crate::http::AppState;
 use crate::models::embedding::DEFAULT_EMBEDDING_MODEL;
@@ -134,7 +134,7 @@ pub struct ConversationalOutcome {
 /// missing title the ladder surfaces.
 pub async fn handle_conversational_request(
     pool: &PgPool,
-    embed: Option<&OllamaEmbedClient>,
+    embed: Option<&ChordEmbedClient>,
     tmdb: Option<&TmdbClient>,
     arr_instances: &[ArrInstanceConfig],
     sink: &dyn MediaRequestSink,
@@ -296,7 +296,7 @@ pub async fn run_conversational(
     friends: &TrustedFriends,
     discord_user_id: Option<&str>,
     pool: &PgPool,
-    embed: Option<&OllamaEmbedClient>,
+    embed: Option<&ChordEmbedClient>,
     tmdb: Option<&TmdbClient>,
     arr_instances: &[ArrInstanceConfig],
     sink: &dyn MediaRequestSink,
@@ -637,7 +637,7 @@ fn has_matching_arr_instance(arr_instances: &[ArrInstanceConfig], kind: MediaKin
 /// library-vector-first ANN over the MUSE-08 embeddings.
 async fn vector_tier(
     pool: &PgPool,
-    embed: Option<&OllamaEmbedClient>,
+    embed: Option<&ChordEmbedClient>,
     query: &str,
     limit: i64,
     max_distance: f64,

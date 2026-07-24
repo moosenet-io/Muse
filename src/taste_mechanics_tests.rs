@@ -382,7 +382,7 @@ mod pgvector_mechanics {
         for (id, v) in ids.iter().zip(vectors.iter()) {
             repo::embedding::upsert(
                 pool,
-                &NewEmbedding::nomic(EmbeddingEntityKind::MediaItem, *id, v.clone(), None),
+                &NewEmbedding::qwen3(EmbeddingEntityKind::MediaItem, *id, v.clone(), None),
             )
             .await
             .expect("upsert fixed embedding");
@@ -636,7 +636,7 @@ mod centroid_mechanics {
         for ((_, item), v) in loaded.items.iter().zip(vectors.iter()) {
             repo::embedding::upsert(
                 &pool,
-                &NewEmbedding::nomic(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
+                &NewEmbedding::qwen3(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
             )
             .await
             .expect("upsert fixed embedding");
@@ -747,7 +747,7 @@ mod context_centroid_mechanics {
         for ((_, item), v) in loaded.items.iter().zip(vectors.iter()) {
             repo::embedding::upsert(
                 &pool,
-                &NewEmbedding::nomic(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
+                &NewEmbedding::qwen3(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
             )
             .await
             .expect("upsert fixed embedding");

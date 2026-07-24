@@ -146,7 +146,7 @@ mod tests {
             account_id: Some(1),
             name: "test-persona".to_string(),
             kind: PERSONA_KIND_DERIVED.to_string(),
-            centroid: pgvector::Vector::from(vec![0.0f32; 768]),
+            centroid: pgvector::Vector::from(vec![0.0f32; 1024]),
             defining_signals,
             metadata: json!({}),
             sample_size: 3,

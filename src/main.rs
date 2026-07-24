@@ -159,10 +159,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // MUSE-09: the query-embedding side of the MUSE-08 embed client. Reuses
-    // the same `OllamaEmbedClient` type the embedder pipeline uses to embed
+    // the same `ChordEmbedClient` type the embedder pipeline uses to embed
     // `media_item`s, just pointed at a caller's free-text query instead of
     // a title's composed source text.
-    let embed_client = crate::embed::OllamaEmbedClient::from_config(&config);
+    let embed_client = crate::embed::ChordEmbedClient::from_config(&config);
     tracing::info!(
         embed_configured = embed_client.is_some(),
         "embed client initialized"

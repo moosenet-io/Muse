@@ -258,15 +258,15 @@ async fn similar_ranks_the_hand_inserted_nearest_embedding_first() {
     // the many all-ones/[1;768] embeddings other live-DB tests seed into the
     // shared DB — otherwise those exact matches would outrank `close_item`
     // and, past the recall handler's clamped result limit, crowd it out.
-    let seed_vec: Vec<f32> = (0..768).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+    let seed_vec: Vec<f32> = (0..1024).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
     let mut close_vec = seed_vec.clone();
     close_vec[1] = -0.99; // a hair off the seed → nearest, but a distinct row
-    let far_vec: Vec<f32> = (0..768).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect();
+    let far_vec: Vec<f32> = (0..1024).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect();
 
     for (item_id, vector) in [(seed_item.id, seed_vec), (close_item.id, close_vec), (far_item.id, far_vec)] {
         repo::embedding::upsert(
             &pool,
-            &NewEmbedding::nomic(EmbeddingEntityKind::MediaItem, item_id, vector, Some(format!("source {item_id}"))),
+            &NewEmbedding::qwen3(EmbeddingEntityKind::MediaItem, item_id, vector, Some(format!("source {item_id}"))),
         )
         .await
         .expect("insert embedding");

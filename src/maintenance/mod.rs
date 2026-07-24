@@ -638,13 +638,13 @@ mod tests {
         // Ollama needed) -- state.embed is left None below, so embed_stale
         // never runs this pass; this only proves the DOWNSTREAM consumers
         // (overall_centroid aggregation) don't choke on a real row existing.
-        let mut vector = vec![0.0_f32; 768];
+        let mut vector = vec![0.0_f32; 1024];
         for (i, v) in vector.iter_mut().enumerate() {
             *v = if i % 2 == 0 { 1.0 } else { -1.0 };
         }
         crate::repo::embedding::upsert(
             &pool,
-            &NewEmbedding::nomic(
+            &NewEmbedding::qwen3(
                 EmbeddingEntityKind::MediaItem,
                 item.id,
                 vector,

@@ -44,7 +44,7 @@ use crate::models::embedding::{EmbeddingEntityKind, EmbeddingMatch, NewEmbedding
 use crate::models::media_metadata::MediaKind;
 use crate::repo;
 
-use super::ollama::OllamaEmbedClient;
+use super::chord::ChordEmbedClient;
 
 /// How many `media_item` rows to pull from Postgres per page while scanning
 /// for stale/missing embeddings. Purely a DB-scan chunk size — unrelated to
@@ -172,7 +172,7 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// can't run away scanning a huge, fully-current library. Safe to call
 /// repeatedly on a schedule (e.g. a future worker) — each call makes
 /// forward progress and never re-does settled work.
-pub async fn embed_stale(pool: &PgPool, client: &OllamaEmbedClient, batch: usize) -> MuseResult<EmbedOutcome> {
+pub async fn embed_stale(pool: &PgPool, client: &ChordEmbedClient, batch: usize) -> MuseResult<EmbedOutcome> {
     let mut outcome = EmbedOutcome::default();
 
     if batch == 0 {
@@ -245,12 +245,12 @@ pub async fn embed_stale(pool: &PgPool, client: &OllamaEmbedClient, batch: usize
     Ok(outcome)
 }
 
-async fn embed_one(pool: &PgPool, client: &OllamaEmbedClient, media_item_id: i64, source_text: &str) -> MuseResult<()> {
+async fn embed_one(pool: &PgPool, client: &ChordEmbedClient, media_item_id: i64, source_text: &str) -> MuseResult<()> {
     let vector = client.embed(DEFAULT_EMBEDDING_MODEL, source_text).await?;
 
     repo::embedding::upsert(
         pool,
-        &NewEmbedding::nomic(
+        &NewEmbedding::qwen3(
             EmbeddingEntityKind::MediaItem,
             media_item_id,
             vector,
@@ -578,14 +578,14 @@ mod tests {
         // Hand-insert embeddings with known vectors (no live Ollama needed):
         // the query vector is closest to `target_item`'s vector by
         // construction, and far from `decoy_item`'s.
-        let query_vec = vec![1.0_f32; 768];
-        let mut target_vec = vec![1.0_f32; 768];
+        let query_vec = vec![1.0_f32; 1024];
+        let mut target_vec = vec![1.0_f32; 1024];
         target_vec[0] = 0.99; // nearly identical to the query
-        let decoy_vec = vec![-1.0_f32; 768]; // maximally dissimilar (cosine)
+        let decoy_vec = vec![-1.0_f32; 1024]; // maximally dissimilar (cosine)
 
         repo::embedding::upsert(
             &pool,
-            &NewEmbedding::nomic(
+            &NewEmbedding::qwen3(
                 EmbeddingEntityKind::MediaItem,
                 target_item.id,
                 target_vec,
@@ -597,7 +597,7 @@ mod tests {
 
         repo::embedding::upsert(
             &pool,
-            &NewEmbedding::nomic(
+            &NewEmbedding::qwen3(
                 EmbeddingEntityKind::MediaItem,
                 decoy_item.id,
                 decoy_vec,
@@ -634,7 +634,7 @@ mod tests {
         // re-composition that matches it as unchanged, i.e. embed_stale
         // would skip it rather than re-embedding needlessly. We exercise
         // the candidate query directly (rather than embed_stale, which
-        // needs a real OllamaEmbedClient) since that's the piece with the
+        // needs a real ChordEmbedClient) since that's the piece with the
         // change-detection logic under test. Scoped to this test's own ids
         // (not a page scan) so the assertion holds regardless of how many
         // rows other tests have accumulated in a shared test database.

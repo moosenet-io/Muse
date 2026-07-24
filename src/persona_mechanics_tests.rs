@@ -108,7 +108,7 @@ mod context_cluster_derivation {
         for ((_, item), v) in loaded.items.iter().zip(vectors.iter()) {
             repo::embedding::upsert(
                 pool,
-                &NewEmbedding::nomic(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
+                &NewEmbedding::qwen3(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
             )
             .await
             .expect("upsert fixed embedding");
@@ -333,7 +333,7 @@ mod explicit_derivation {
         for ((_, item), v) in loaded.items.iter().zip(vectors.iter()) {
             repo::embedding::upsert(
                 &pool,
-                &NewEmbedding::nomic(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
+                &NewEmbedding::qwen3(EmbeddingEntityKind::MediaItem, item.id, v.clone(), None),
             )
             .await
             .expect("upsert fixed embedding");

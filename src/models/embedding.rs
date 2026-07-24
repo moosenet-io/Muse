@@ -1,14 +1,16 @@
 //! `embeddings` — pgvector recall over library items/people/collections and
-//! taste centroids (spec §3.4). Dim is pinned to 768 (nomic-embed-text, S96
-//! §0.7); see `migrations/0018_embeddings.sql`.
+//! taste centroids (spec §3.4). Dim is pinned to 1024 (qwen3-embedding, via
+//! Chord's standardized `/v1/embeddings`, S125); see
+//! `migrations/0018_embeddings.sql` + the S125 `..._embedding_1024.sql`
+//! migrations that widen it from the original nomic-embed-text 768.
 
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-pub const EMBEDDING_DIM: i32 = 768;
-pub const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+pub const EMBEDDING_DIM: i32 = 1024;
+pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,9 +62,11 @@ pub struct NewEmbedding {
 
 impl NewEmbedding {
     /// Build a new embedding row using the pinned default model/dim
-    /// (nomic-embed-text, 768) — the common case; pass `model`/`dim`
-    /// explicitly via the struct literal for a non-default model.
-    pub fn nomic(entity_kind: EmbeddingEntityKind, entity_id: i64, embedding: Vec<f32>, source_text: Option<String>) -> Self {
+    /// (qwen3-embedding, 1024, via Chord — S125) — the common case; pass
+    /// `model`/`dim` explicitly via the struct literal for a non-default
+    /// model. (Renamed from `nomic()` in S125 when the fleet standardized
+    /// embeddings onto Chord's `qwen3-embedding`.)
+    pub fn qwen3(entity_kind: EmbeddingEntityKind, entity_id: i64, embedding: Vec<f32>, source_text: Option<String>) -> Self {
         Self {
             entity_kind,
             entity_id,

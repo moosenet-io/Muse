@@ -11,6 +11,7 @@
 //! does not stand up its own HTTP server or app state.
 
 pub mod artwork;
+pub mod dashboard;
 pub mod graph;
 pub mod guide;
 pub mod settings;
@@ -40,6 +41,19 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/api/channels", get(guide::list_channels_handler))
         .route("/api/channels/:id/lineup", get(guide::lineup_handler))
         .route("/art/:kind/:id", get(artwork::art_handler))
+        // MWEBX-05 (S126): the MUSE web "detail bench" READ surface — the
+        // non-sensitive browse screens (library grid/table/detail, discover,
+        // and the honest subsystem health grid). Deliberately UNAUTHENTICATED,
+        // same posture as the channel-guide JSON above: these carry only
+        // library titles + same-origin `/art` proxy URLs + wiring-state, no
+        // per-account or credential data. The per-account/operational reads
+        // (requests, taste, curation, indexers/rss) live on
+        // [`protected_routes`] instead. See `crate::web::dashboard`.
+        .route("/api/library", get(dashboard::get_library))
+        .route("/api/library/table", get(dashboard::get_library_table))
+        .route("/api/library/:id", get(dashboard::get_library_detail))
+        .route("/api/discover", get(dashboard::get_discover))
+        .route("/api/subsystems", get(dashboard::get_subsystems))
 }
 
 /// Routes this module contributes that MUST be protected by
@@ -63,4 +77,20 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
             "/api/settings",
             get(settings::get_settings_handler).put(settings::put_settings_handler),
         )
+        // MWEBX-05 (S126): the per-account / operational READ screens. These
+        // are protected for the same reason `/api/settings` + `/api/graph/*`
+        // are (CAP-SEC-01/03): requests/queue expose the operator's request
+        // pipeline, taste/curation are per-account taste data, and the
+        // Prowlarr indexer list is operational config (private-tracker names).
+        // All read-only — the write/approve/grab path stays on the separate
+        // MUSEM-05 `/requests` router. `/api/requests/queue` is registered
+        // BEFORE `/api/requests/:id` so the static segment wins.
+        .route("/api/requests", get(dashboard::get_requests))
+        .route("/api/requests/queue", get(dashboard::get_requests_queue))
+        .route("/api/requests/:id", get(dashboard::get_request_detail))
+        .route("/api/taste", get(dashboard::get_taste))
+        .route("/api/curation", get(dashboard::get_curation))
+        .route("/api/indexers", get(dashboard::get_indexers))
+        .route("/api/indexers/rss", get(dashboard::get_rss))
+        .route("/api/rss", get(dashboard::get_rss))
 }

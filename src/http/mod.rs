@@ -224,6 +224,11 @@ fn ops_routes() -> Router<Arc<AppState>> {
         .route("/ingest/arr", post(ops::ingest_arr))
         .route("/ingest/tautulli", post(ops::ingest_tautulli))
         .route("/maintenance", post(ops::run_maintenance_now))
+        // MWEBX-05 (S126): on-demand read-only library scan/refresh — the
+        // door the MUSE web Library screen calls to (re)build the library
+        // before re-reading `/api/library*`. See
+        // `crate::web::dashboard::trigger_library_scan`.
+        .route("/library/scan", post(crate::web::dashboard::trigger_library_scan))
 }
 
 /// MUSE-28/29: the linear tuner surface — HDHomeRun-emulation discovery

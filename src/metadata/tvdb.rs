@@ -357,45 +357,62 @@ impl TvdbClient {
 
     /// `GET /shows/en/{tvdbId}` — the Skyhook series record. Movie-kind
     /// lookups aren't served here (Skyhook is series-only; movies go through
-    /// the Radarr proxy in `TmdbClient`). A 404 maps to `Ok(None)`.
+    /// the Radarr proxy in `TmdbClient`).
+    ///
+    /// Fail-open (codex): the key-less Skyhook proxy is best-effort
+    /// enrichment, never a hard dependency. A 404 (absent), a transport error
+    /// (DNS/refused/timeout), a 5xx, or an unparseable body all degrade to
+    /// `Ok(None)` — resolution never fails because the public proxy is
+    /// unreachable or flaky.
     async fn skyhook_show(&self, id: &str) -> MuseResult<Option<ProviderMetadata>> {
         let url = self.skyhook_url(&["shows", "en", id])?;
-        let (status, bytes) = self.skyhook_send(url).await?;
-        if status == StatusCode::NOT_FOUND.as_u16() {
+        let (status, bytes) = match self.skyhook_send(url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::debug!(error = %e, id = %id, "AMETA-3: Skyhook show request failed; degrading to None (fail-open)");
+                return Ok(None);
+            }
+        };
+        // 404 and every other non-2xx alike → None, logged once.
+        if !(200..300).contains(&status) {
+            tracing::debug!(status, id = %id, "AMETA-3: Skyhook show non-2xx; degrading to None (fail-open)");
             return Ok(None);
         }
-        if !(200..300).contains(&status) {
-            let body = String::from_utf8_lossy(&bytes).to_string();
-            return Err(MuseError::Upstream {
-                status,
-                message: format!("skyhook request to /shows/en/{id} failed: {body}"),
-            });
+        match serde_json::from_slice::<SkyhookShow>(&bytes) {
+            Ok(show) => Ok(Some(show.into_metadata())),
+            Err(e) => {
+                tracing::debug!(error = %e, id = %id, "AMETA-3: Skyhook show parse failed; degrading to None (fail-open)");
+                Ok(None)
+            }
         }
-        let show: SkyhookShow =
-            serde_json::from_slice(&bytes).map_err(|e| MuseError::Upstream {
-                status,
-                message: format!("failed to parse skyhook show response: {e}"),
-            })?;
-        Ok(Some(show.into_metadata()))
     }
 
     /// `GET /search/en/{term}` — Skyhook series search (thin records).
+    /// Fail-open like [`Self::skyhook_show`]: transport/HTTP/parse failures
+    /// degrade to an empty result set rather than erroring.
     async fn skyhook_search(&self, term: &str) -> MuseResult<Vec<ProviderMetadata>> {
         let url = self.skyhook_url(&["search", "en", term])?;
-        let (status, bytes) = self.skyhook_send(url).await?;
+        let (status, bytes) = match self.skyhook_send(url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::debug!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
+                return Ok(Vec::new());
+            }
+        };
         if !(200..300).contains(&status) {
-            let body = String::from_utf8_lossy(&bytes).to_string();
-            return Err(MuseError::Upstream {
+            tracing::debug!(
                 status,
-                message: format!("skyhook search failed: {body}"),
-            });
+                "AMETA-3: Skyhook search non-2xx; degrading to empty (fail-open)"
+            );
+            return Ok(Vec::new());
         }
-        let hits: Vec<SkyhookShow> =
-            serde_json::from_slice(&bytes).map_err(|e| MuseError::Upstream {
-                status,
-                message: format!("failed to parse skyhook search response: {e}"),
-            })?;
-        Ok(hits.into_iter().map(SkyhookShow::into_metadata).collect())
+        match serde_json::from_slice::<Vec<SkyhookShow>>(&bytes) {
+            Ok(hits) => Ok(hits.into_iter().map(SkyhookShow::into_metadata).collect()),
+            Err(e) => {
+                tracing::debug!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
+                Ok(Vec::new())
+            }
+        }
     }
 }
 
@@ -712,13 +729,26 @@ impl TvdbSearchHit {
 // (`Option`/`#[serde(default)]`) since Skyhook omits fields per title.
 
 /// One entry of a Skyhook `images[]` array, e.g.
-/// `{"coverType":"poster","url":"https://artworks.thetvdb.com/..."}`.
+/// `{"coverType":"poster","url":"https://artworks.thetvdb.com/..."}`. Some
+/// records carry a relative `url` alongside an absolute `remoteUrl` — prefer
+/// the latter (same posture as `RadarrImage` in `trending::client`).
 #[derive(Debug, Deserialize)]
 struct SkyhookImage {
     #[serde(rename = "coverType", default)]
     cover_type: Option<String>,
     #[serde(default)]
     url: Option<String>,
+    #[serde(rename = "remoteUrl", default)]
+    remote_url: Option<String>,
+}
+
+impl SkyhookImage {
+    /// Prefer the absolute `remoteUrl`; fall back to `url` (which may be a
+    /// proxy-relative path). Discarding a usable absolute URL in favour of a
+    /// relative one would break artwork rendering (codex finding).
+    fn best_url(&self) -> Option<String> {
+        self.remote_url.clone().or_else(|| self.url.clone())
+    }
 }
 
 /// A Skyhook series record (`GET /shows/en/{tvdbId}` /
@@ -766,7 +796,7 @@ impl SkyhookShow {
             self.images
                 .iter()
                 .find(|img| img.cover_type.as_deref() == Some(want))
-                .and_then(|img| img.url.clone())
+                .and_then(SkyhookImage::best_url)
         };
 
         let first_aired = self.first_aired.clone().filter(|s| !s.is_empty());
@@ -1420,6 +1450,75 @@ mod tests {
             hits[0].provider_ids.get("tvdb").map(String::as_str),
             Some("121361")
         );
+    }
+
+    #[tokio::test]
+    async fn skyhook_image_prefers_remote_url_over_relative_url() {
+        // codex fix: a Skyhook image with a relative `url` AND an absolute
+        // `remoteUrl` must map the absolute one (mirrors the Radarr adapter);
+        // storing the relative path would break artwork.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/shows/en/121361");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "title": "Game of Thrones",
+                    "tvdbId": 121361,
+                    "images": [
+                        {"coverType": "poster", "url": "/relative/poster.jpg", "remoteUrl": "https://artworks.thetvdb.com/poster.jpg"}
+                    ]
+                }));
+        });
+
+        let client = skyhook_client_for(&server);
+        let metadata = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("resolve should not error")
+            .expect("series should be found");
+
+        assert_eq!(
+            metadata.images.poster_url.as_deref(),
+            Some("https://artworks.thetvdb.com/poster.jpg"),
+            "remoteUrl must win over the relative url"
+        );
+    }
+
+    #[tokio::test]
+    async fn skyhook_resolve_and_search_fail_open_on_connection_error() {
+        // Fail-open (codex): an unreachable Skyhook proxy degrades to
+        // None/empty, never Err.
+        let client =
+            TvdbClient::new_skyhook("http://127.0.0.1:1").expect("client should construct");
+
+        let resolved = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("connection error must degrade to Ok(None), not Err");
+        assert!(resolved.is_none());
+
+        let hits = client
+            .search("thrones", MediaKind::Series)
+            .await
+            .expect("connection error must degrade to Ok(empty), not Err");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skyhook_resolve_fails_open_on_5xx() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/shows/en/121361");
+            then.status(502).body("bad gateway");
+        });
+
+        let client = skyhook_client_for(&server);
+        let resolved = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("5xx must degrade to Ok(None), not Err");
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]

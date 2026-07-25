@@ -14,6 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::header::ACCEPT;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
 use crate::config::Config;
 use crate::error::{MuseError, MuseResult};
@@ -369,10 +370,18 @@ impl TmdbClient {
             format!("/movie/{provider_id}")
         };
 
+        // Fail-open (codex): the key-less proxy is a best-effort enrichment
+        // source, never a hard dependency. A 404 (title absent), a transport
+        // error (DNS/refused/timeout), or a 5xx all degrade to `Ok(None)` —
+        // metadata resolution must never fail because the public proxy is
+        // unreachable or flaky.
         match self.get::<RadarrMovie>(&path, &[]).await {
             Ok(movie) => Ok(Some(radarr_proxy_to_provider_metadata(movie))),
             Err(MuseError::Upstream { status: 404, .. }) => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::debug!(error = %e, path = %path, "AMETA-2: Radarr proxy resolve failed; degrading to None (fail-open)");
+                Ok(None)
+            }
         }
     }
 
@@ -388,11 +397,21 @@ impl TmdbClient {
         if media_type == TmdbMediaType::Tv {
             return Ok(Vec::new());
         }
-        let movies: Vec<RadarrMovie> = self.get("/search", &[("q", query)]).await?;
-        Ok(movies
-            .into_iter()
-            .map(radarr_proxy_to_provider_metadata)
-            .collect())
+        // Fail-open (codex): any transport/HTTP error degrades to an empty
+        // result set rather than failing the caller.
+        match self
+            .get::<Vec<RadarrMovie>>("/search", &[("q", query)])
+            .await
+        {
+            Ok(movies) => Ok(movies
+                .into_iter()
+                .map(radarr_proxy_to_provider_metadata)
+                .collect()),
+            Err(e) => {
+                tracing::debug!(error = %e, "AMETA-2: Radarr proxy search failed; degrading to empty (fail-open)");
+                Ok(Vec::new())
+            }
+        }
     }
 }
 
@@ -1017,6 +1036,49 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title.as_deref(), Some("The Matrix"));
         assert_eq!(hits[0].provider_ids.get("tmdb"), Some(&"603".to_string()));
+    }
+
+    #[tokio::test]
+    async fn proxy_resolve_and_search_fail_open_on_connection_error() {
+        // Fail-open (codex): an unreachable proxy (refused connection) must
+        // degrade to None/empty, never Err — metadata resolution can't fail
+        // because the public proxy is down.
+        let client = TmdbClient::new_proxy("http://127.0.0.1:1").expect("client should construct");
+
+        let resolved = MetadataProvider::resolve_by_id(&client, MetadataKind::Movie, "603")
+            .await
+            .expect("connection error must degrade to Ok(None), not Err");
+        assert!(resolved.is_none());
+
+        let hits = MetadataProvider::search(&client, "matrix", MetadataKind::Movie)
+            .await
+            .expect("connection error must degrade to Ok(empty), not Err");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_resolve_and_search_fail_open_on_5xx() {
+        // A proxy 5xx is not a hard failure either — degrade to None/empty.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/movie/603");
+            then.status(503).body("upstream unavailable");
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/search");
+            then.status(500).body("boom");
+        });
+
+        let client = proxy_client_for(&server);
+        let resolved = MetadataProvider::resolve_by_id(&client, MetadataKind::Movie, "603")
+            .await
+            .expect("5xx must degrade to Ok(None), not Err");
+        assert!(resolved.is_none());
+
+        let hits = MetadataProvider::search(&client, "matrix", MetadataKind::Movie)
+            .await
+            .expect("5xx must degrade to Ok(empty), not Err");
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

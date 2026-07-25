@@ -13,6 +13,69 @@
 
 use serde::Deserialize;
 
+/// Deserialization helpers for Tautulli's loosely-typed JSON.
+///
+/// Tautulli emits numeric fields inconsistently: a real integer for
+/// well-formed rows, but an **empty string** `""` (not `null`, not a number)
+/// for fields that don't apply to a given item — e.g. `parent_rating_key`,
+/// `grandparent_rating_key`, `media_index`, `parent_media_index` on a movie
+/// (parentless), or `year` on items with no release year. A bare
+/// `Option<i64>` does **not** save us here: serde maps JSON `null` → `None`,
+/// but delegates the empty string to `i64`, which rejects it with
+/// `invalid type: string "", expected i64`, and — because
+/// `serde_json::from_slice` is all-or-nothing — a single such field fails the
+/// entire `get_history` page (all 1872 rows, zero imported).
+///
+/// [`de::empty_string_as_none`] tolerates all three shapes: a JSON number, a
+/// numeric string (`"123"`), or an empty string / whitespace / `null` → `None`.
+mod de {
+    use serde::{Deserialize, Deserializer};
+    use std::fmt::Display;
+    use std::str::FromStr;
+
+    /// Deserialize a numeric field that Tautulli may send as a JSON number, a
+    /// numeric string, or an empty string. Empty string / whitespace / `null`
+    /// → `None`; a non-empty string is parsed via `FromStr`.
+    ///
+    /// Generic over the numeric target `T` (`i64`, `i32`, `f64`, `f32`, ...)
+    /// so one helper covers every numeric field on every Tautulli struct.
+    pub(super) fn empty_string_as_none<'de, D, T>(
+        deserializer: D,
+    ) -> Result<Option<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FromStr + Deserialize<'de>,
+        <T as FromStr>::Err: Display,
+    {
+        // Untagged: a JSON number deserializes straight into `T`; anything
+        // else (including a numeric string or `""`) falls through to `Str`.
+        // `Option<_>` in front handles JSON `null` → `None` before the
+        // untagged enum is consulted.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum NumOrStr<T> {
+            Num(T),
+            Str(String),
+        }
+
+        match Option::<NumOrStr<T>>::deserialize(deserializer)? {
+            None => Ok(None),
+            Some(NumOrStr::Num(v)) => Ok(Some(v)),
+            Some(NumOrStr::Str(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    trimmed
+                        .parse::<T>()
+                        .map(Some)
+                        .map_err(serde::de::Error::custom)
+                }
+            }
+        }
+    }
+}
+
 /// Top-level Tautulli response envelope, generic over the `data` payload
 /// shape (varies per `cmd`).
 #[derive(Debug, Deserialize)]
@@ -46,22 +109,36 @@ pub(crate) struct HistoryData {
 /// numeric Plex ratingKeys in Tautulli's JSON; kept as `i64` here and
 /// stringified at the call site to match `media_items.plex_rating_key`
 /// /`episodes.plex_rating_key` (`text` columns, per MUSE-02).
+///
+/// **Numeric-field robustness:** every integer/float field below carries
+/// `#[serde(default, deserialize_with = "de::empty_string_as_none")]` because
+/// Tautulli sends `""` (empty string) rather than `null`/a number for fields
+/// that don't apply to a given item (movies are parentless, some items lack a
+/// `year`, etc.). Without this, one `""` fails the whole `get_history` page.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HistoryRow {
     /// Tautulli's own dedup key for a (possibly multi-part) playback —
     /// stored verbatim as `play_sessions.tautulli_ref_id`.
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub reference_id: Option<i64>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub id: Option<i64>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub row_id: Option<i64>,
     /// Unix seconds.
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub started: Option<i64>,
     /// Unix seconds.
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub stopped: Option<i64>,
     /// Seconds actually played (session length, not necessarily full media
     /// runtime — see [`crate::tautulli::backfill`] for how this is combined
     /// with `get_metadata`'s `duration` when enrichment is available).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub duration: Option<i64>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub paused_counter: Option<i32>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub user_id: Option<i64>,
     pub user: Option<String>,
     pub friendly_name: Option<String>,
@@ -70,17 +147,33 @@ pub struct HistoryRow {
     pub product: Option<String>,
     pub ip_address: Option<String>,
     pub session_key: Option<String>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub rating_key: Option<i64>,
+    /// `""` on movies/parentless items (observed live: 169/1872 rows).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub parent_rating_key: Option<i64>,
+    /// `""` on movies/parentless items (observed live: 169/1872 rows).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub grandparent_rating_key: Option<i64>,
+    /// Episode number within a season (`""` on parentless items — 169 rows).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
+    pub media_index: Option<i64>,
+    /// Season number (`""` on parentless items — 169 rows).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
+    pub parent_media_index: Option<i64>,
+    /// Release year (`""` when Tautulli has no year — observed 72 rows).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
+    pub year: Option<i64>,
     pub full_title: Option<String>,
     pub title: Option<String>,
     /// `'movie' | 'episode' | 'track' | 'clip' | ...`
     pub media_type: Option<String>,
     /// 0-100 (Tautulli reports a percentage, not a 0-1 fraction).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub percent_complete: Option<f64>,
     /// Tautulli's own finished determination: `0` (not watched), `0.5`
     /// (partially watched), `1` (watched/scrobbled).
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub watched_status: Option<f64>,
 }
 
@@ -101,9 +194,11 @@ impl HistoryRow {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MetadataInfo {
     pub media_type: Option<String>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub rating_key: Option<i64>,
     pub title: Option<String>,
     /// Full media runtime, milliseconds.
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub duration: Option<i64>,
 }
 
@@ -122,10 +217,14 @@ pub struct StreamData {
     pub container: Option<String>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub audio_channels: Option<f32>,
     pub video_resolution: Option<String>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub bitrate: Option<i32>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub width: Option<i32>,
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub height: Option<i32>,
     pub transcode_reason: Option<String>,
 }
@@ -170,5 +269,154 @@ mod tests {
         assert_eq!(parse_decision_kind(Some("burst")), None);
         assert_eq!(parse_decision_kind(None), None);
         assert_eq!(parse_decision_kind(Some("")), None);
+    }
+
+    /// Regression: a movie (parentless) row from a live Tautulli `get_history`
+    /// page sends `""` for `parent_rating_key`, `grandparent_rating_key`,
+    /// `media_index`, `parent_media_index`, and `year`. Before the tolerant
+    /// deserializer this failed the whole page with
+    /// `invalid type: string "", expected i64`. It must now parse those to
+    /// `None` while keeping the well-formed numeric fields intact.
+    #[test]
+    fn movie_row_with_empty_string_numerics_parses_to_none() {
+        let json = r#"{
+            "reference_id": 4321,
+            "id": 4321,
+            "row_id": 4321,
+            "started": 1700000000,
+            "stopped": 1700006300,
+            "duration": 6300,
+            "paused_counter": 0,
+            "user_id": 55,
+            "rating_key": 12345,
+            "parent_rating_key": "",
+            "grandparent_rating_key": "",
+            "media_index": "",
+            "parent_media_index": "",
+            "year": "",
+            "media_type": "movie",
+            "title": "Blade Runner 2049",
+            "percent_complete": 97,
+            "watched_status": 1
+        }"#;
+
+        let row: HistoryRow = serde_json::from_str(json).expect("movie row must parse");
+
+        // Well-formed numerics survive.
+        assert_eq!(row.reference_id, Some(4321));
+        assert_eq!(row.rating_key, Some(12345));
+        assert_eq!(row.user_id, Some(55));
+        assert_eq!(row.duration, Some(6300));
+        assert_eq!(row.percent_complete, Some(97.0));
+        assert_eq!(row.watched_status, Some(1.0));
+
+        // Empty-string numerics degrade to None instead of failing the page.
+        assert_eq!(row.parent_rating_key, None);
+        assert_eq!(row.grandparent_rating_key, None);
+        assert_eq!(row.media_index, None);
+        assert_eq!(row.parent_media_index, None);
+        assert_eq!(row.year, None);
+    }
+
+    /// A normal episode row (all parent keys populated) still parses every
+    /// numeric field to `Some(n)` — the fix must not regress well-formed rows.
+    #[test]
+    fn episode_row_with_populated_numerics_parses_to_some() {
+        let json = r#"{
+            "reference_id": 9001,
+            "row_id": 9001,
+            "started": 1700100000,
+            "stopped": 1700105700,
+            "duration": 2700,
+            "user_id": 55,
+            "rating_key": 88888,
+            "parent_rating_key": 88800,
+            "grandparent_rating_key": 88000,
+            "media_index": 4,
+            "parent_media_index": 2,
+            "year": 2019,
+            "media_type": "episode",
+            "title": "The Long Night",
+            "percent_complete": 88,
+            "watched_status": 1
+        }"#;
+
+        let row: HistoryRow = serde_json::from_str(json).expect("episode row must parse");
+
+        assert_eq!(row.rating_key, Some(88888));
+        assert_eq!(row.parent_rating_key, Some(88800));
+        assert_eq!(row.grandparent_rating_key, Some(88000));
+        assert_eq!(row.media_index, Some(4));
+        assert_eq!(row.parent_media_index, Some(2));
+        assert_eq!(row.year, Some(2019));
+    }
+
+    /// Tautulli is also known to stringify otherwise-numeric values (e.g.
+    /// `"rating_key": "12345"`) and to send `null`. Both must be accepted:
+    /// a numeric string parses, `null` and `""` both become `None`.
+    #[test]
+    fn numeric_strings_and_null_are_tolerated() {
+        let json = r#"{
+            "reference_id": "7777",
+            "rating_key": "12345",
+            "parent_rating_key": null,
+            "year": "  ",
+            "percent_complete": "50.5"
+        }"#;
+
+        let row: HistoryRow = serde_json::from_str(json).expect("mixed row must parse");
+
+        assert_eq!(row.reference_id, Some(7777));
+        assert_eq!(row.rating_key, Some(12345));
+        assert_eq!(row.parent_rating_key, None); // JSON null
+        assert_eq!(row.year, None); // whitespace-only string
+        assert_eq!(row.percent_complete, Some(50.5)); // numeric string → f64
+    }
+
+    /// A full `get_history` page (envelope + `HistoryData`) containing a
+    /// mix of movie and episode rows must deserialize as a whole — this is
+    /// the all-or-nothing path that previously imported zero of 1872 rows.
+    #[test]
+    fn history_page_with_mixed_rows_parses_whole() {
+        let json = r#"{
+            "response": {
+                "result": "success",
+                "message": null,
+                "data": {
+                    "recordsFiltered": 2,
+                    "recordsTotal": 2,
+                    "data": [
+                        {
+                            "reference_id": 1,
+                            "rating_key": 100,
+                            "parent_rating_key": "",
+                            "grandparent_rating_key": "",
+                            "media_index": "",
+                            "year": "",
+                            "media_type": "movie"
+                        },
+                        {
+                            "reference_id": 2,
+                            "rating_key": 200,
+                            "parent_rating_key": 190,
+                            "grandparent_rating_key": 180,
+                            "media_index": 3,
+                            "year": 2021,
+                            "media_type": "episode"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let env: Envelope<HistoryData> =
+            serde_json::from_str(json).expect("full history page must parse");
+        assert_eq!(env.response.result, "success");
+        assert_eq!(env.response.data.records_total, 2);
+        assert_eq!(env.response.data.data.len(), 2);
+        assert_eq!(env.response.data.data[0].parent_rating_key, None);
+        assert_eq!(env.response.data.data[0].year, None);
+        assert_eq!(env.response.data.data[1].parent_rating_key, Some(190));
+        assert_eq!(env.response.data.data[1].year, Some(2021));
     }
 }

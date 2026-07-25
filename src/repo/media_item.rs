@@ -72,6 +72,28 @@ pub async fn get_by_plex_rating_key(pool: &PgPool, plex_rating_key: &str) -> Mus
         .map_err(MuseError::Database)
 }
 
+/// BSEED-1: resolve a `media_metadata_id` (the shared, provider-keyed catalog
+/// row) to a concrete `media_items.id` — the last hop of GUID-based Tautulli
+/// session resolution: a history row's `tmdb://`/`tvdb://`/`imdb://` GUID
+/// resolves to a `media_metadata_id` via `repo::media_metadata::find_by_*_id`,
+/// and this turns that into the per-library instance the session attaches to.
+///
+/// A metadata row can, in principle, back more than one `media_items` row
+/// (the table's UNIQUE is `(library_id, media_metadata_id)` — the same title
+/// present in two libraries); the lowest `id` is chosen deterministically so
+/// re-resolution is stable across runs. Returns `Ok(None)` (not an error)
+/// when nothing references the metadata yet — a normal "arr hasn't ingested an
+/// instance for this catalog row" case, not a failure.
+pub async fn find_by_media_metadata_id(pool: &PgPool, media_metadata_id: i64) -> MuseResult<Option<i64>> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM media_items WHERE media_metadata_id = $1 ORDER BY id LIMIT 1",
+    )
+    .bind(media_metadata_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
 pub async fn list_by_metadata(pool: &PgPool, media_metadata_id: i64) -> MuseResult<Vec<MediaItem>> {
     sqlx::query_as::<_, MediaItem>(
         "SELECT * FROM media_items WHERE media_metadata_id = $1 ORDER BY id",

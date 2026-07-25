@@ -78,6 +78,51 @@ pub async fn ingest_tautulli(State(state): State<Arc<AppState>>) -> MuseResult<J
     })))
 }
 
+/// Upper bound on how many unresolved sessions the on-demand
+/// `POST /ops/library/resolve` re-resolution pass processes in one call —
+/// generous (the pre-existing Tautulli backfill is ~1.5k rows), so a single
+/// operator-triggered run drains the whole backlog.
+const OPS_RESOLVE_LIMIT: i64 = 100_000;
+
+/// `POST /ops/library/resolve` — BSEED-2: re-resolve previously-imported
+/// Tautulli sessions that never matched a library item (`media_item_id IS
+/// NULL`) against the now-populated catalog (arr ingest). This is the door
+/// that turns the pre-existing imported watch history into taste input once
+/// `media_items` carry matchable ids.
+///
+/// Supplies a Tautulli client when configured so sessions imported *before*
+/// migration 0108 (no stored Plex keys — the pre-existing ~1.5k) can be
+/// rehydrated from `get_history`/`get_metadata` and unblocked; sessions
+/// imported after 0108 re-resolve fully offline regardless. Always `200`: the
+/// pass is fully error-isolated (per-session failures are logged and skipped),
+/// and an upstream Tautulli/paging failure degrades to "resolved what it could
+/// offline" rather than erroring.
+pub async fn resolve_library(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let tautulli = crate::tautulli::TautulliClient::from_config(&state.config);
+    let summary = match crate::tautulli::backfill::resolve_existing_unresolved(
+        &state.pool,
+        tautulli.as_ref(),
+        &crate::tautulli::backfill::BackfillOptions::default(),
+        OPS_RESOLVE_LIMIT,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(e) => {
+            tracing::warn!(error = %e, "POST /ops/library/resolve — re-resolution pass failed; returning empty summary");
+            crate::tautulli::backfill::ResolveSummary::default()
+        }
+    };
+
+    Json(json!({
+        "sessions_considered": summary.sessions_considered,
+        "resolved": summary.resolved,
+        "deduped_conflicts": summary.deduped_conflicts,
+        "still_unresolved": summary.still_unresolved,
+        "tautulli_used": summary.tautulli_used,
+    }))
+}
+
 /// `POST /ops/maintenance` — run one full [`crate::maintenance::run_maintenance_pass`]
 /// pass, right now. Never fails (every step inside the pass is already
 /// error-isolated — see that module's docs); always `200`, useful to prime
@@ -92,6 +137,11 @@ pub async fn run_maintenance_now(State(state): State<Arc<AppState>>) -> Json<Val
         "arr_instances_skipped": summary.arr_instances_skipped,
         "arr_movies_upserted": summary.arr_movies_upserted,
         "arr_series_upserted": summary.arr_series_upserted,
+        "resolve_ran": summary.resolve_ran,
+        "sessions_resolved": summary.sessions_resolved,
+        "sessions_deduped": summary.sessions_deduped,
+        "watch_stats_rebuilt": summary.watch_stats_rebuilt,
+        "watch_stats_rebuild_failed": summary.watch_stats_rebuild_failed,
         "embed_ran": summary.embed_ran,
         "embedded": summary.embedded,
         "embed_skipped_unchanged": summary.embed_skipped_unchanged,

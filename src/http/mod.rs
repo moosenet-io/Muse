@@ -224,6 +224,10 @@ fn ops_routes() -> Router<Arc<AppState>> {
         .route("/ingest/arr", post(ops::ingest_arr))
         .route("/ingest/tautulli", post(ops::ingest_tautulli))
         .route("/maintenance", post(ops::run_maintenance_now))
+        // BSEED-2: on-demand re-resolution of previously-unresolved Tautulli
+        // sessions against the now-populated catalog. Bearer-protected (this
+        // whole `ops` router is nested under `protected`).
+        .route("/library/resolve", post(ops::resolve_library))
         // MWEBX-05 (S126): on-demand read-only library scan/refresh — the
         // door the MUSE web Library screen calls to (re)build the library
         // before re-reading `/api/library*`. See

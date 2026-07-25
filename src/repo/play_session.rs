@@ -1,5 +1,6 @@
 //! Repo functions for `play_sessions` + `play_session_media_info`.
 
+use sqlx::error::DatabaseError;
 use sqlx::{FromRow, PgPool};
 
 use crate::error::{MuseError, MuseResult};
@@ -256,6 +257,133 @@ pub async fn attach_tautulli_ref(
     .await
     .map_err(MuseError::Database)?;
     Ok(())
+}
+
+/// BSEED-2: an unresolved session's row, carrying the stored Plex identifying
+/// keys the re-resolution pass re-matches against later-arriving `media_items`
+/// (see migration `0108_play_sessions_plex_refs.sql`). Only the columns the
+/// resolver needs are selected; `media_item_id`/`episode_id` are known-NULL by
+/// the `list_unresolved` filter so they aren't re-selected.
+#[derive(Debug, Clone, FromRow)]
+pub struct UnresolvedSession {
+    pub id: i64,
+    pub account_id: Option<i64>,
+    pub tautulli_ref_id: Option<i64>,
+    pub plex_rating_key: Option<String>,
+    pub plex_grandparent_rating_key: Option<String>,
+    pub plex_grandparent_guid: Option<String>,
+    pub plex_guids: serde_json::Value,
+}
+
+/// BSEED-2: sessions that never resolved to a library item/episode
+/// (`media_item_id IS NULL AND episode_id IS NULL`), oldest-first, bounded by
+/// `limit`. These are the rows the re-resolution pass re-matches against the
+/// (now arr-populated) catalog. Backed by the partial index added in migration
+/// 0108 so the scan stays cheap as resolved sessions accumulate.
+pub async fn list_unresolved(pool: &PgPool, limit: i64) -> MuseResult<Vec<UnresolvedSession>> {
+    sqlx::query_as::<_, UnresolvedSession>(
+        r#"
+        SELECT id, account_id, tautulli_ref_id,
+               plex_rating_key, plex_grandparent_rating_key,
+               plex_grandparent_guid, plex_guids
+        FROM play_sessions
+        WHERE media_item_id IS NULL AND episode_id IS NULL
+        ORDER BY started_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// Persist the Plex identifying keys a session resolved from (BSEED-2), so a
+/// future re-resolution can re-match it offline (no Tautulli round-trip).
+/// `guids` is the JSON array of provider-GUID strings. Never touches any other
+/// column.
+pub async fn set_plex_refs(
+    pool: &PgPool,
+    play_session_id: i64,
+    plex_rating_key: Option<&str>,
+    plex_grandparent_rating_key: Option<&str>,
+    plex_guids: &serde_json::Value,
+    plex_grandparent_guid: Option<&str>,
+) -> MuseResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE play_sessions SET
+            plex_rating_key = $2,
+            plex_grandparent_rating_key = $3,
+            plex_guids = $4,
+            plex_grandparent_guid = $5
+        WHERE id = $1
+        "#,
+    )
+    .bind(play_session_id)
+    .bind(plex_rating_key)
+    .bind(plex_grandparent_rating_key)
+    .bind(plex_guids)
+    .bind(plex_grandparent_guid)
+    .execute(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(())
+}
+
+/// Outcome of [`set_media_ref`] — distinguishes a clean resolution from one
+/// that collided with the `(account_id, media_item_id, episode_id,
+/// started_at)` UNIQUE (BSEED-2's flagged hazard: two previously-NULL rows can
+/// now resolve to the same key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetMediaRefOutcome {
+    /// The session was updated in place with its resolved media/episode ref.
+    Updated,
+    /// The update would have duplicated an already-resolved session for the
+    /// same `(account, item, episode, started_at)`; this now-redundant
+    /// duplicate row was deleted instead (the equivalent watch is already
+    /// counted by the surviving row).
+    ConflictDeduped,
+}
+
+/// BSEED-2: attach a freshly-resolved `(media_item_id, episode_id)` to a
+/// previously-unresolved session. Because resolving two distinct NULL-keyed
+/// rows can now land on the same `(account_id, media_item_id, episode_id,
+/// started_at)` (the table's UNIQUE — Postgres treated the NULL refs as
+/// distinct until now), a plain `UPDATE` can raise a unique violation. That is
+/// handled, not propagated: on `23505` the redundant duplicate is deleted
+/// (the surviving, already-resolved row represents the same watch), keeping
+/// re-resolution idempotent and collision-safe.
+pub async fn set_media_ref(
+    pool: &PgPool,
+    play_session_id: i64,
+    media_item_id: Option<i64>,
+    episode_id: Option<i64>,
+) -> MuseResult<SetMediaRefOutcome> {
+    let result = sqlx::query(
+        "UPDATE play_sessions SET media_item_id = $2, episode_id = $3 WHERE id = $1",
+    )
+    .bind(play_session_id)
+    .bind(media_item_id)
+    .bind(episode_id)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(_) => Ok(SetMediaRefOutcome::Updated),
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            // An equivalent, already-resolved session exists for this
+            // (account, item, episode, started_at). Drop this duplicate rather
+            // than leaving a permanently-unresolvable row behind.
+            sqlx::query("DELETE FROM play_sessions WHERE id = $1")
+                .bind(play_session_id)
+                .execute(pool)
+                .await
+                .map_err(MuseError::Database)?;
+            Ok(SetMediaRefOutcome::ConflictDeduped)
+        }
+        Err(e) => Err(MuseError::Database(e)),
+    }
 }
 
 /// One finished session's context fields — the raw input MUSE-10's

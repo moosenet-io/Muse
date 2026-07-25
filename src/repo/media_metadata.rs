@@ -159,6 +159,21 @@ pub async fn find_by_tvdb_id(pool: &PgPool, kind: MediaKind, tvdb_id: &str) -> M
         .map_err(MuseError::Database)
 }
 
+/// BSEED-1: resolve a provider `imdb_id` (+ kind) to an existing
+/// `media_metadata.id` — the IMDb-equivalent of [`find_by_tmdb_id`] /
+/// [`find_by_tvdb_id`], used by the Tautulli session resolver to match a
+/// history row's `imdb://tt…` GUID against an already-cataloged (arr-ingested)
+/// row. `imdb_id` is stored verbatim (`tt…`), so this is an exact match on the
+/// same string form the GUID parser yields.
+pub async fn find_by_imdb_id(pool: &PgPool, kind: MediaKind, imdb_id: &str) -> MuseResult<Option<i64>> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM media_metadata WHERE kind = $1 AND imdb_id = $2")
+        .bind(kind)
+        .bind(imdb_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}
+
 /// Best-effort resolve a parsed release (title + optional year) to an
 /// existing `media_metadata` row via an exact, case-insensitive title match
 /// (+ year equality when a year was parsed). Used by the Prowlarr

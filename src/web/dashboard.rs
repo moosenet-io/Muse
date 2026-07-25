@@ -33,6 +33,7 @@
 //! - Curation reuses the MUSE-11 candidate gatherers (`crate::curation`).
 //! - Indexers/RSS read the MUSE-16 Prowlarr client (`crate::prowlarr`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::error::MuseResult;
+use crate::error::{MuseError, MuseResult};
 use crate::http::AppState;
 use crate::models::media_metadata::MediaKind;
 use crate::repo;
@@ -896,13 +897,62 @@ pub async fn get_rss(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// `POST /ops/library/scan` — trigger a read-only library scan on demand
-/// (MUSEL-B1 `run_scan`), building the same metadata providers the
-/// maintenance pass uses. Clean no-op (empty reports) when
-/// `MUSE_LIBRARY_ROOT` is unset / the mount is absent. Returns the
-/// aggregated scan counts. This is the write-nothing "refresh the library"
-/// door the web Library screen calls before re-reading `/api/library`.
+/// Process-global in-flight flag for the library scan (MWEBX-05 review,
+/// codex High): a scan is a bounded, resource-heavy pass (walks the RO mount,
+/// upserts catalog rows, caches artwork) — two of them stacking wastes work
+/// and races the same rows. This flag makes the trigger single-flight: a
+/// second call while one is running is rejected `409` rather than launching a
+/// parallel scan. Process-global (single-process service), reset on the
+/// [`ScanInFlightGuard`]'s `Drop` so it clears even if `run_scan` errors or
+/// panics.
+static SCAN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII release for [`SCAN_IN_FLIGHT`] — clears the flag on drop (normal
+/// return, `?`-propagated error, or unwind), so a failed scan never wedges
+/// the trigger permanently.
+struct ScanInFlightGuard;
+
+impl Drop for ScanInFlightGuard {
+    fn drop(&mut self) {
+        SCAN_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// `POST /ops/library/scan` — trigger a library scan on demand (MUSEL-B1
+/// `run_scan`), building the same metadata providers the maintenance pass
+/// uses. Clean no-op (empty reports) when `MUSE_LIBRARY_ROOT` is unset / the
+/// mount is absent. Returns the aggregated scan counts. This is the "refresh
+/// the library" door the web Library screen calls before re-reading
+/// `/api/library`.
+///
+/// ## Posture (MWEBX-05 review, codex High): guarded ops action, not a public POST
+/// A library SCAN is a **read-only-of-MEDIA cataloging** operation: it reads
+/// the read-only QNAP mount and writes ONLY Muse's own internal catalog
+/// tables (`media_items`/`media_files`/`media_metadata`) + the artwork cache.
+/// It is NOT an acquisition/grab write, so it is correctly NOT behind the
+/// dual-safety gate — that gate governs downloads/grabs, a different and
+/// dangerous class of write. The right guard for a cataloging write is
+/// **Bearer auth + single-flight**, which is exactly what protects it:
+/// - Bearer auth: this route is nested under `/ops`, which
+///   `crate::http::router` mounts on the `protected` sub-router behind
+///   `auth::require_api_token` — there is no public trigger (a tokenless call
+///   is rejected before this handler runs).
+/// - Single-flight: [`SCAN_IN_FLIGHT`] rejects a concurrent call with `409`
+///   so scans can't stack/spam (the DoS-via-repeated-scan vector the review
+///   flagged).
 pub async fn trigger_library_scan(State(state): State<Arc<AppState>>) -> MuseResult<Json<Value>> {
+    // Acquire the single-flight slot; a second concurrent scan is a clean
+    // 409, never a parallel launch.
+    if SCAN_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(MuseError::Conflict(
+            "a library scan is already running; try again once it finishes".to_string(),
+        ));
+    }
+    let _in_flight = ScanInFlightGuard;
+
     let tvdb = crate::metadata::tvdb::TvdbClient::from_config(&state.config);
     let mut providers: Vec<crate::metadata::resolve::NamedProvider<'_>> = Vec::new();
     if let Some(tmdb) = state.tmdb.as_ref() {

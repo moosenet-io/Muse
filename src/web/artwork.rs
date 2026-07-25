@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
@@ -107,7 +108,109 @@ pub async fn art_handler(
         }
     }
 
+    // MWEBX-05 (S126): provider-artwork fallback. When nothing is cached and
+    // there's no Plex path (e.g. a QNAP/MUSEL-scanned title, or a Discover
+    // title with only TMDb/TVDB metadata), resolve the real poster/backdrop
+    // URL from `media_metadata.images` and proxy it server-side (public
+    // provider URL, no token), caching the bytes for next time. Any failure
+    // degrades to the placeholder — never a 404/500.
+    if let Some(resp) = try_provider_artwork(&state, &kind, id, variant).await {
+        return resp;
+    }
+
     placeholder_response()
+}
+
+/// Extract the first image URL of `cover_type` from a `media_metadata.images`
+/// jsonb array (the Radarr/Sonarr shape `[{coverType, url, remoteUrl}]` this
+/// crate writes — see `repo::media_metadata::add_image_entry_if_absent`).
+/// Prefers `remoteUrl` (the absolute provider URL) over a possibly-relative
+/// `url`.
+fn image_url_for(images: &serde_json::Value, cover_type: &str) -> Option<String> {
+    images.as_array()?.iter().find_map(|entry| {
+        let ct = entry.get("coverType")?.as_str()?;
+        if ct != cover_type {
+            return None;
+        }
+        entry
+            .get("remoteUrl")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("url").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+    })
+}
+
+/// Resolve + proxy a real poster/backdrop from provider metadata, caching it
+/// into `artwork_cache` on success. `None` when the entity can't be resolved,
+/// carries no provider image URL, or the fetch fails — the caller then serves
+/// the placeholder. Read-only and token-free: provider poster/backdrop URLs
+/// (TMDb/TVDB) are public.
+async fn try_provider_artwork(
+    state: &crate::http::AppState,
+    kind: &str,
+    id: i64,
+    variant: &str,
+) -> Option<Response> {
+    // Resolve the entity to a `media_metadata` id (the images live there).
+    let metadata_id = match kind {
+        "media_metadata" => id,
+        "media_item" => {
+            crate::repo::media_item::get(&state.pool, id)
+                .await
+                .ok()?
+                .media_metadata_id
+        }
+        _ => return None,
+    };
+
+    let metadata = crate::repo::media_metadata::get(&state.pool, metadata_id)
+        .await
+        .ok()?;
+
+    let cover_type = match variant {
+        "fanart" | "backdrop" => "fanart",
+        _ => "poster",
+    };
+    let url = image_url_for(&metadata.images, cover_type)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        tracing::debug!(kind, id, %url, status = resp.status().as_u16(), "provider artwork fetch non-success; placeholder");
+        return None;
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .to_string();
+    let bytes = resp.bytes().await.ok()?.to_vec();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    // Best-effort cache under the ORIGINAL (kind,id,variant) key so a repeat
+    // request is a cache hit, not another provider round-trip.
+    if let Err(e) = crate::repo::artwork_cache::store_bytes(
+        &state.pool,
+        kind,
+        id,
+        variant,
+        Some(&url),
+        &content_type,
+        &bytes,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, kind, id, "failed to cache provider artwork; serving it uncached this time");
+    }
+
+    Some(image_response(&content_type, bytes, false))
 }
 
 fn image_response(content_type: &str, bytes: Vec<u8>, cache_hit: bool) -> Response {

@@ -9,6 +9,7 @@ pub mod acquisition;
 pub mod artwork_cache;
 pub mod availability;
 pub mod channel;
+pub mod dashboard;
 pub mod embedding;
 pub mod episode;
 pub mod external_enrichment;

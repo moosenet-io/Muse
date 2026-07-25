@@ -11,7 +11,15 @@ use crate::models::watch_stats::{NewWatchStats, Rating, WatchStats, WatchlistEnt
 
 /// Full-replace upsert — the recompute worker always writes the complete
 /// recomputed aggregate for an (account, item) pair, never a delta.
-pub async fn upsert_watch_stats(pool: &PgPool, new: &NewWatchStats) -> MuseResult<WatchStats> {
+///
+/// Generic over the executor so callers can run it either against a `&PgPool`
+/// (the historical callers) or inside a transaction (`&mut *tx`) — the BSEED-4
+/// aggregator rebuilds an account's whole `watch_stats` set atomically in one
+/// transaction (see `taste_model::aggregate`).
+pub async fn upsert_watch_stats<'e, E>(executor: E, new: &NewWatchStats) -> MuseResult<WatchStats>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, WatchStats>(
         r#"
         INSERT INTO watch_stats (
@@ -41,7 +49,7 @@ pub async fn upsert_watch_stats(pool: &PgPool, new: &NewWatchStats) -> MuseResul
     .bind(new.last_watched_at)
     .bind(new.abandoned)
     .bind(new.first_watched_at)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map_err(MuseError::Database)
 }

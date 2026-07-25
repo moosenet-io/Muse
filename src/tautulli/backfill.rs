@@ -31,15 +31,18 @@
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use ipnetwork::IpNetwork;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::error::MuseResult;
 use crate::models::account::NewAccount;
+use crate::models::media_metadata::MediaKind;
 use crate::models::play_session::{NewPlaySession, NewPlaySessionMediaInfo};
 use crate::repo;
+use crate::repo::play_session::SetMediaRefOutcome;
 
 use super::client::TautulliClient;
-use super::models::{parse_decision_kind, HistoryRow};
+use super::models::{parse_decision_kind, HistoryRow, MetadataInfo};
 
 /// `percent_complete >= COMPLETE_THRESHOLD` marks a session finished when
 /// Tautulli's own `watched_status` doesn't already say so — spec §3.3/§4-D.
@@ -164,13 +167,6 @@ async fn import_row(
     }
 
     let account_id = resolve_account(pool, row).await?;
-    let (media_item_id, episode_id) = resolve_media(pool, row).await?;
-
-    if media_item_id.is_some() || episode_id.is_some() {
-        summary.resolved_media += 1;
-    } else {
-        summary.unresolved_media += 1;
-    }
 
     let Some(started_at) = row.started.and_then(unix_seconds_to_utc) else {
         // Without a `started` timestamp there is no meaningful session to
@@ -179,22 +175,40 @@ async fn import_row(
     };
     let stopped_at = row.stopped.and_then(unix_seconds_to_utc);
 
-    // Prefer the true media runtime from get_metadata (best-effort) over the
-    // history row's own play-duration, which is watched time, not runtime.
-    let mut duration_ms = row.duration.map(|s| s * 1000);
-    if options.enrich_metadata {
-        if let Some(rating_key) = row.rating_key_str() {
-            match client.get_metadata(&rating_key).await {
-                Ok(Some(meta)) if meta.duration.is_some() => duration_ms = meta.duration,
-                Ok(_) => {}
-                Err(e) => tracing::debug!(
-                    rating_key,
-                    error = %e,
-                    "get_metadata enrichment failed; using history-row duration estimate"
-                ),
-            }
+    // Fetch get_metadata once (best-effort). It supplies both the item's true
+    // runtime AND — for BSEED-1 GUID resolution — the provider `guids` /
+    // `grandparent_guid`. A failure degrades to no-metadata (history-row
+    // duration + rating-key-only resolution) and never fails the row.
+    let metadata = if options.enrich_metadata {
+        match row.rating_key_str() {
+            Some(rating_key) => match client.get_metadata(&rating_key).await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    tracing::debug!(rating_key, error = %e, "get_metadata enrichment failed; degrading to history-row data");
+                    None
+                }
+            },
+            None => None,
         }
+    } else {
+        None
+    };
+
+    let keys = keys_from_history(row, metadata.as_ref());
+    let (media_item_id, episode_id) = resolve_media(pool, &keys).await?;
+
+    if media_item_id.is_some() || episode_id.is_some() {
+        summary.resolved_media += 1;
+    } else {
+        summary.unresolved_media += 1;
     }
+
+    // Prefer the true media runtime from get_metadata over the history row's
+    // own play-duration, which is watched time, not runtime.
+    let duration_ms = metadata
+        .as_ref()
+        .and_then(|m| m.duration)
+        .or_else(|| row.duration.map(|s| s * 1000));
 
     let watched_ms = row.duration.map(|s| s * 1000);
     let percent_complete = row.percent_complete.map(|p| (p / 100.0) as f32);
@@ -263,6 +277,22 @@ async fn import_row(
     let session = repo::play_session::upsert(pool, &new_session).await?;
     summary.imported += 1;
 
+    // BSEED-2: persist the Plex identifying keys so a later re-resolution pass
+    // can re-match this session offline (no Tautulli round-trip) once its
+    // media_item exists. Best-effort — a stamp failure never fails the import.
+    if let Err(e) = repo::play_session::set_plex_refs(
+        pool,
+        session.id,
+        keys.rating_key.as_deref(),
+        keys.grandparent_rating_key.as_deref(),
+        &guids_to_json(&keys.guids),
+        keys.grandparent_guid.as_deref(),
+    )
+    .await
+    {
+        tracing::debug!(session_id = session.id, error = %e, "failed to persist plex refs for re-resolution; continuing");
+    }
+
     if options.enrich_stream_data {
         if let Some(row_id) = row.row_id {
             match client.get_stream_data(row_id).await {
@@ -318,40 +348,445 @@ async fn resolve_account(pool: &PgPool, row: &HistoryRow) -> MuseResult<Option<i
     Ok(Some(account.id))
 }
 
-/// Resolve a history row's Plex `rating_key` onto a library `media_item`
-/// and/or `episode`, per spec §4-D ("Resolve to media_item/episode where
-/// possible ... else leave the media ref NULL"):
-/// - `media_type == "movie"` (or anything else non-episode): `rating_key` →
-///   `media_items.plex_rating_key`.
-/// - `media_type == "episode"`: `rating_key` → `episodes.plex_rating_key`
-///   (also yields the owning show's `media_item_id`); if the episode itself
-///   isn't in the library yet, fall back to resolving just the show via
-///   `grandparent_rating_key` so the session is at least attributable to a
-///   show-level media_item.
-async fn resolve_media(pool: &PgPool, row: &HistoryRow) -> MuseResult<(Option<i64>, Option<i64>)> {
-    let is_episode = row.media_type.as_deref() == Some("episode");
+/// The identifying keys a session can be resolved from — either derived from a
+/// live Tautulli history row + its `get_metadata` ([`keys_from_history`]), or
+/// rehydrated from a session's stored `plex_*` columns for offline
+/// re-resolution ([`keys_from_unresolved`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolveKeys {
+    pub is_episode: bool,
+    /// The item's own Plex ratingKey (movie or episode).
+    pub rating_key: Option<String>,
+    /// The owning show's Plex ratingKey (episodes only).
+    pub grandparent_rating_key: Option<String>,
+    /// The item's own provider GUIDs (`imdb://`/`tmdb://`/`tvdb://`).
+    pub guids: Vec<String>,
+    /// The owning show's provider GUID (episodes only).
+    pub grandparent_guid: Option<String>,
+    /// Title + year for the movie-only title/year resolution fallback.
+    pub title: Option<String>,
+    pub year: Option<i32>,
+}
 
-    if is_episode {
-        if let Some(rating_key) = row.rating_key_str() {
-            if let Some(episode) = repo::episode::find_by_plex_rating_key(pool, &rating_key).await? {
+/// Build [`ResolveKeys`] from a live Tautulli history row plus its
+/// (best-effort) `get_metadata`. Guids/grandparent_guid come from
+/// `get_metadata` (the history row itself doesn't carry them); year prefers
+/// the history row's own value, falling back to metadata.
+fn keys_from_history(row: &HistoryRow, metadata: Option<&MetadataInfo>) -> ResolveKeys {
+    ResolveKeys {
+        is_episode: row.media_type.as_deref() == Some("episode"),
+        rating_key: row.rating_key_str(),
+        grandparent_rating_key: row.grandparent_rating_key_str(),
+        guids: metadata.map(|m| m.guids()).unwrap_or_default(),
+        grandparent_guid: metadata.and_then(|m| m.grandparent_guid.clone()),
+        title: row.full_title.clone().or_else(|| row.title.clone()),
+        year: row
+            .year
+            .map(|y| y as i32)
+            .or_else(|| metadata.and_then(|m| m.year).map(|y| y as i32)),
+    }
+}
+
+/// Rehydrate [`ResolveKeys`] from a session's stored `plex_*` columns for
+/// offline re-resolution (BSEED-2). Episode-ness is inferred from the presence
+/// of a stored show-level key, since the session row doesn't persist
+/// `media_type` directly.
+fn keys_from_unresolved(row: &repo::play_session::UnresolvedSession) -> ResolveKeys {
+    let guids = row
+        .plex_guids
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    ResolveKeys {
+        is_episode: row.plex_grandparent_guid.is_some() || row.plex_grandparent_rating_key.is_some(),
+        rating_key: row.plex_rating_key.clone(),
+        grandparent_rating_key: row.plex_grandparent_rating_key.clone(),
+        guids,
+        grandparent_guid: row.plex_grandparent_guid.clone(),
+        // Title/year aren't persisted on the session — offline re-resolution
+        // relies on the (more reliable) rating-key + GUID paths.
+        title: None,
+        year: None,
+    }
+}
+
+/// A JSON array of the session's provider-GUID strings, for persistence via
+/// `repo::play_session::set_plex_refs`.
+fn guids_to_json(guids: &[String]) -> serde_json::Value {
+    serde_json::Value::Array(guids.iter().cloned().map(serde_json::Value::String).collect())
+}
+
+/// Which provider a parsed Plex GUID names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidProvider {
+    Tmdb,
+    Tvdb,
+    Imdb,
+}
+
+/// Parse a Plex/Tautulli provider GUID into `(provider, id)`. Handles both the
+/// modern short scheme (`tmdb://335984`, `tvdb://121361`, `imdb://tt1856101`)
+/// and the legacy Plex-agent form (`com.plexapp.agents.imdb://tt…?lang=en`,
+/// `com.plexapp.agents.themoviedb://…`, `com.plexapp.agents.thetvdb://…`). Any
+/// query string / trailing path is stripped. Returns `None` for a
+/// non-provider GUID (`plex://…`, `local://…`) or an empty id — those simply
+/// don't participate in matching.
+fn parse_provider_guid(raw: &str) -> Option<(GuidProvider, String)> {
+    let (scheme, rest) = raw.trim().split_once("://")?;
+    let scheme = scheme
+        .trim_start_matches("com.plexapp.agents.")
+        .to_ascii_lowercase();
+    let id = rest.split(['?', '/']).next().unwrap_or(rest).trim();
+    if id.is_empty() {
+        return None;
+    }
+    let provider = match scheme.as_str() {
+        "tmdb" | "themoviedb" | "moviedb" => GuidProvider::Tmdb,
+        "tvdb" | "thetvdb" => GuidProvider::Tvdb,
+        "imdb" => GuidProvider::Imdb,
+        _ => return None,
+    };
+    Some((provider, id.to_string()))
+}
+
+/// Match `guids` against a cataloged `media_metadata` row of `kind` (via
+/// `find_by_{tmdb,tvdb,imdb}_id`), then resolve that to a concrete
+/// `media_items.id`. Returns `Ok(None)` when none match — a normal "not in the
+/// catalog yet" case.
+///
+/// **Provider precedence is enforced explicitly (tmdb → tvdb → imdb),
+/// independent of the order the GUIDs happened to arrive in** (FIX A): `tmdb_id`
+/// and `tvdb_id` are the unique catalog keys, but `imdb_id` is NOT unique in
+/// `media_metadata`, so trying imdb first (just because it appeared first in the
+/// array) could cross-link the session to a duplicate/inconsistent IMDb record
+/// when a correct tmdb/tvdb match existed. All GUIDs are parsed up front, then
+/// tried tmdb-first; imdb is the last-resort key.
+async fn match_guid_to_media_item(
+    pool: &PgPool,
+    guids: &[String],
+    kind: MediaKind,
+) -> MuseResult<Option<i64>> {
+    let mut tmdb_ids = Vec::new();
+    let mut tvdb_ids = Vec::new();
+    let mut imdb_ids = Vec::new();
+    for guid in guids {
+        if let Some((provider, id)) = parse_provider_guid(guid) {
+            match provider {
+                GuidProvider::Tmdb => tmdb_ids.push(id),
+                GuidProvider::Tvdb => tvdb_ids.push(id),
+                GuidProvider::Imdb => imdb_ids.push(id),
+            }
+        }
+    }
+
+    // Try each provider in strict priority order; within a provider, the first
+    // id that resolves to a catalog row + media_item wins.
+    for id in &tmdb_ids {
+        if let Some(mm_id) = repo::media_metadata::find_by_tmdb_id(pool, kind, id).await? {
+            if let Some(item_id) = repo::media_item::find_by_media_metadata_id(pool, mm_id).await? {
+                return Ok(Some(item_id));
+            }
+        }
+    }
+    for id in &tvdb_ids {
+        if let Some(mm_id) = repo::media_metadata::find_by_tvdb_id(pool, kind, id).await? {
+            if let Some(item_id) = repo::media_item::find_by_media_metadata_id(pool, mm_id).await? {
+                return Ok(Some(item_id));
+            }
+        }
+    }
+    for id in &imdb_ids {
+        if let Some(mm_id) = repo::media_metadata::find_by_imdb_id(pool, kind, id).await? {
+            if let Some(item_id) = repo::media_item::find_by_media_metadata_id(pool, mm_id).await? {
+                return Ok(Some(item_id));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Resolve a session's [`ResolveKeys`] onto a library `media_item` and/or
+/// `episode`, per spec §4-D and BSEED-1. Match order (first hit wins):
+///
+/// - **Episode:** episode `plex_rating_key` → show `grandparent_rating_key`
+///   → show `grandparent_guid` (tmdb/tvdb/imdb → `media_metadata` show →
+///   `media_item`). The episode's own GUIDs identify the *episode*, not a show
+///   `media_metadata` row, so they're intentionally not used for show matching.
+/// - **Movie:** `plex_rating_key` → the item's GUIDs (tmdb/tvdb/imdb →
+///   `media_metadata` movie → `media_item`) → exact title+year (real year
+///   only, mirroring the scanner's own guard).
+///
+/// The `plex_rating_key` path stays the first-choice match (unchanged behavior
+/// from before BSEED-1); GUID/title matching only augments it, which is what
+/// lets arr-ingested items (carrying tmdb/tvdb/imdb ids but `plex_rating_key =
+/// NULL`) resolve with no Plex library sync. Nothing matched → `(None, None)`,
+/// the session stays unresolved (never an error).
+pub(crate) async fn resolve_media(
+    pool: &PgPool,
+    keys: &ResolveKeys,
+) -> MuseResult<(Option<i64>, Option<i64>)> {
+    if keys.is_episode {
+        // 1. Exact episode by its own ratingKey.
+        if let Some(rating_key) = &keys.rating_key {
+            if let Some(episode) = repo::episode::find_by_plex_rating_key(pool, rating_key).await? {
                 return Ok((Some(episode.media_item_id), Some(episode.id)));
             }
         }
-        if let Some(show_rating_key) = row.grandparent_rating_key_str() {
-            if let Some(show) = repo::media_item::find_by_plex_rating_key(pool, &show_rating_key).await? {
+        // 2. Owning show by its ratingKey.
+        if let Some(show_rating_key) = &keys.grandparent_rating_key {
+            if let Some(show) = repo::media_item::find_by_plex_rating_key(pool, show_rating_key).await? {
                 return Ok((Some(show.id), None));
+            }
+        }
+        // 3. Owning show by its provider GUID (arr-ingested shows carry
+        //    tvdb/tmdb/imdb ids). Attributes the session to the show-level
+        //    media_item even when the specific episode isn't cataloged.
+        if let Some(grandparent_guid) = &keys.grandparent_guid {
+            let show_guids = [grandparent_guid.clone()];
+            if let Some(item_id) = match_guid_to_media_item(pool, &show_guids, MediaKind::Show).await? {
+                return Ok((Some(item_id), None));
             }
         }
         return Ok((None, None));
     }
 
-    if let Some(rating_key) = row.rating_key_str() {
-        if let Some(item) = repo::media_item::find_by_plex_rating_key(pool, &rating_key).await? {
+    // Movie (or any non-episode media type).
+    // 1. Exact movie by ratingKey.
+    if let Some(rating_key) = &keys.rating_key {
+        if let Some(item) = repo::media_item::find_by_plex_rating_key(pool, rating_key).await? {
             return Ok((Some(item.id), None));
+        }
+    }
+    // 2. Movie by provider GUID (the arr-ingest path).
+    if let Some(item_id) = match_guid_to_media_item(pool, &keys.guids, MediaKind::Movie).await? {
+        return Ok((Some(item_id), None));
+    }
+    // 3. Exact title + year (real year only — never a yearless title match,
+    //    mirroring the library scanner's own guard).
+    if let (Some(title), Some(year)) = (&keys.title, keys.year) {
+        if let Some(mm_id) =
+            repo::media_metadata::find_by_title_year(pool, MediaKind::Movie, title, Some(year)).await?
+        {
+            if let Some(item_id) = repo::media_item::find_by_media_metadata_id(pool, mm_id).await? {
+                return Ok((Some(item_id), None));
+            }
         }
     }
 
     Ok((None, None))
+}
+
+/// Summary of one [`resolve_existing_unresolved`] pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveSummary {
+    /// Unresolved sessions examined this pass.
+    pub sessions_considered: usize,
+    /// Sessions newly resolved (a media/episode ref attached in place).
+    pub resolved: usize,
+    /// Sessions whose newly-resolved key collided with an already-resolved
+    /// session and were deduped away (the redundant duplicate deleted).
+    pub deduped_conflicts: usize,
+    /// Sessions still unresolvable this pass (no matching catalog row / no
+    /// usable keys).
+    pub still_unresolved: usize,
+    /// Whether a Tautulli client was available to rehydrate keys for sessions
+    /// that had none stored (the pre-migration backfill).
+    pub tautulli_used: bool,
+}
+
+/// BSEED-2: re-resolve already-imported sessions that never matched a library
+/// item (`media_item_id IS NULL AND episode_id IS NULL`) against the
+/// now-populated catalog — the door that turns the pre-existing imported
+/// Tautulli history into taste input once arr ingest has run. Idempotent and
+/// safe to re-run: a session that still doesn't match is simply left
+/// unresolved.
+///
+/// Two key sources, in order of preference per session:
+/// 1. **Stored keys** (`plex_*` columns) — sessions imported after migration
+///    0108 carry their identifying keys and re-resolve fully **offline** (no
+///    Tautulli round-trip). This is the path the maintenance pass uses.
+/// 2. **Tautulli rehydration** — sessions imported *before* 0108 have no
+///    stored keys; when a `tautulli` client is supplied, this re-pages
+///    `get_history` (once) to recover each session's ratingKeys, fetches
+///    `get_metadata` for its GUIDs, resolves, and — on success — stamps the
+///    keys back so subsequent passes can resolve it offline. This is the path
+///    `POST /ops/library/resolve` uses to unblock the pre-existing 1544.
+///
+/// Never returns `Err` for a single bad session — each is error-isolated and
+/// logged, matching the crate's graceful-degrade posture.
+/// Hard cap on how many Tautulli history records the one-time keyless
+/// rehydration paging (`build_ref_map`) will read, so a pathologically large
+/// history can't make `POST /ops/library/resolve` unbounded. The pre-existing
+/// backfill is ~1.5k rows; this is generous headroom while still bounded.
+const MAX_REHYDRATION_RECORDS: i64 = 250_000;
+
+/// Whether an unresolved session carries enough stored Plex identity to be
+/// re-resolved **offline** (no Tautulli round-trip). True when ANY stored key
+/// is present — crucially including the show-level `grandparent` fields, which
+/// alone are enough to resolve an episode's owning show (FIX 3: an
+/// episode row that persisted only a `grandparent_guid` must not be skipped
+/// forever on the offline path).
+fn has_stored_keys(session: &repo::play_session::UnresolvedSession) -> bool {
+    session.plex_rating_key.is_some()
+        || session.plex_grandparent_rating_key.is_some()
+        || session.plex_grandparent_guid.is_some()
+        || session
+            .plex_guids
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+}
+
+pub async fn resolve_existing_unresolved(
+    pool: &PgPool,
+    tautulli: Option<&TautulliClient>,
+    options: &BackfillOptions,
+    limit: i64,
+) -> MuseResult<ResolveSummary> {
+    let mut summary = ResolveSummary {
+        tautulli_used: tautulli.is_some(),
+        ..Default::default()
+    };
+
+    let unresolved = repo::play_session::list_unresolved(pool, limit).await?;
+
+    // Build the Tautulli `reference_id -> HistoryRow` rehydration map AT MOST
+    // ONCE for the whole batch (FIX 1), and only when it's actually needed: a
+    // client is available AND at least one row lacks stored keys. Paging is
+    // bounded (`MAX_REHYDRATION_RECORDS`). Fail-open: if paging fails, skip
+    // keyless rehydration this pass (degrade to offline-only) rather than
+    // erroring or — the original bug — re-paging the entire history per row.
+    let needs_rehydration = unresolved.iter().any(|s| !has_stored_keys(s));
+    let ref_map: Option<HashMap<i64, HistoryRow>> = match tautulli {
+        Some(client) if needs_rehydration => match build_ref_map(client, options).await {
+            Ok(map) => Some(map),
+            Err(e) => {
+                tracing::warn!(error = %e, "BSEED-2: could not page Tautulli history for keyless rehydration; skipping it this pass (offline-only)");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    for session in &unresolved {
+        summary.sessions_considered += 1;
+        match resolve_one_unresolved(pool, tautulli, session, ref_map.as_ref()).await {
+            Ok(Some(SetMediaRefOutcome::Updated)) => summary.resolved += 1,
+            Ok(Some(SetMediaRefOutcome::ConflictDeduped)) => summary.deduped_conflicts += 1,
+            Ok(None) => summary.still_unresolved += 1,
+            Err(e) => {
+                summary.still_unresolved += 1;
+                tracing::warn!(session_id = session.id, error = %e, "re-resolution failed for this session; continuing");
+            }
+        }
+    }
+
+    tracing::info!(
+        sessions_considered = summary.sessions_considered,
+        resolved = summary.resolved,
+        deduped_conflicts = summary.deduped_conflicts,
+        still_unresolved = summary.still_unresolved,
+        tautulli_used = summary.tautulli_used,
+        "BSEED-2: re-resolution pass complete"
+    );
+
+    Ok(summary)
+}
+
+/// Resolve a single unresolved session; returns the `set_media_ref` outcome on
+/// a hit, or `None` when it still can't be matched. Isolated so
+/// [`resolve_existing_unresolved`]'s loop can log-and-continue per session.
+/// `ref_map` is the already-built (at-most-once) rehydration map — this
+/// function never pages Tautulli itself, only reads the shared map.
+async fn resolve_one_unresolved(
+    pool: &PgPool,
+    tautulli: Option<&TautulliClient>,
+    session: &repo::play_session::UnresolvedSession,
+    ref_map: Option<&HashMap<i64, HistoryRow>>,
+) -> MuseResult<Option<SetMediaRefOutcome>> {
+    // Prefer stored keys (offline). Rehydrate from the pre-built ref-map only
+    // when the session has none stored and a client + map are available.
+    let (keys, stamp) = if has_stored_keys(session) {
+        (keys_from_unresolved(session), false)
+    } else if let (Some(client), Some(ref_id), Some(map)) =
+        (tautulli, session.tautulli_ref_id, ref_map)
+    {
+        let Some(history_row) = map.get(&ref_id) else {
+            return Ok(None);
+        };
+        // Fetch GUIDs from get_metadata (best-effort) so arr-ingested items
+        // can match; degrade to ratingKey-only on failure.
+        let metadata = match history_row.rating_key_str() {
+            Some(rating_key) => client.get_metadata(&rating_key).await.unwrap_or(None),
+            None => None,
+        };
+        (keys_from_history(history_row, metadata.as_ref()), true)
+    } else {
+        return Ok(None);
+    };
+
+    let (media_item_id, episode_id) = resolve_media(pool, &keys).await?;
+    if media_item_id.is_none() && episode_id.is_none() {
+        return Ok(None);
+    }
+
+    // Persist the keys for future offline re-resolution (only needed when they
+    // were rehydrated from Tautulli rather than already stored).
+    if stamp {
+        if let Err(e) = repo::play_session::set_plex_refs(
+            pool,
+            session.id,
+            keys.rating_key.as_deref(),
+            keys.grandparent_rating_key.as_deref(),
+            &guids_to_json(&keys.guids),
+            keys.grandparent_guid.as_deref(),
+        )
+        .await
+        {
+            tracing::debug!(session_id = session.id, error = %e, "failed to stamp rehydrated plex refs; continuing");
+        }
+    }
+
+    let outcome = repo::play_session::set_media_ref(pool, session.id, media_item_id, episode_id).await?;
+    Ok(Some(outcome))
+}
+
+/// Page Tautulli's `get_history` into a `reference_id -> HistoryRow` map ONCE,
+/// so pre-migration sessions (which stored no keys) can have their ratingKeys
+/// recovered for re-resolution. Bounded by [`MAX_REHYDRATION_RECORDS`] — a
+/// history larger than that is truncated (logged) rather than paged without
+/// limit, keeping the on-demand endpoint's cost bounded.
+async fn build_ref_map(
+    client: &TautulliClient,
+    options: &BackfillOptions,
+) -> MuseResult<HashMap<i64, HistoryRow>> {
+    let mut map = HashMap::new();
+    let mut start: i64 = 0;
+    loop {
+        if start >= MAX_REHYDRATION_RECORDS {
+            tracing::warn!(
+                records_read = start,
+                cap = MAX_REHYDRATION_RECORDS,
+                "BSEED-2: Tautulli history exceeded the rehydration cap; truncating the ref-map"
+            );
+            break;
+        }
+        let page = client.get_history(start, options.page_size).await?;
+        if page.rows.is_empty() {
+            break;
+        }
+        for row in &page.rows {
+            if let Some(ref_id) = row.reference_id {
+                map.insert(ref_id, row.clone());
+            }
+        }
+        start += page.rows.len() as i64;
+        if start >= page.records_filtered {
+            break;
+        }
+    }
+    Ok(map)
 }
 
 fn unix_seconds_to_utc(secs: i64) -> Option<DateTime<Utc>> {
@@ -404,6 +839,115 @@ mod tests {
     fn unix_seconds_to_utc_round_trips() {
         let dt = unix_seconds_to_utc(1_700_000_000).expect("valid unix timestamp should parse");
         assert_eq!(dt.timestamp(), 1_700_000_000);
+    }
+
+    /// BSEED-1: the GUID parser must handle both the modern short scheme and
+    /// the legacy Plex-agent form, strip query strings, and reject
+    /// non-provider GUIDs.
+    #[test]
+    fn parse_provider_guid_handles_all_forms() {
+        assert_eq!(
+            parse_provider_guid("tmdb://335984"),
+            Some((GuidProvider::Tmdb, "335984".to_string()))
+        );
+        assert_eq!(
+            parse_provider_guid("tvdb://121361"),
+            Some((GuidProvider::Tvdb, "121361".to_string()))
+        );
+        assert_eq!(
+            parse_provider_guid("imdb://tt1856101"),
+            Some((GuidProvider::Imdb, "tt1856101".to_string()))
+        );
+        // Legacy Plex-agent forms + query string stripping.
+        assert_eq!(
+            parse_provider_guid("com.plexapp.agents.imdb://tt1856101?lang=en"),
+            Some((GuidProvider::Imdb, "tt1856101".to_string()))
+        );
+        assert_eq!(
+            parse_provider_guid("com.plexapp.agents.themoviedb://335984?lang=en"),
+            Some((GuidProvider::Tmdb, "335984".to_string()))
+        );
+        assert_eq!(
+            parse_provider_guid("com.plexapp.agents.thetvdb://121361/2/3?lang=en"),
+            Some((GuidProvider::Tvdb, "121361".to_string()))
+        );
+        // Non-provider GUIDs / empties are ignored.
+        assert_eq!(parse_provider_guid("plex://movie/5d776b59ad5437001f79c6f8"), None);
+        assert_eq!(parse_provider_guid("local://12345"), None);
+        assert_eq!(parse_provider_guid("tmdb://"), None);
+        assert_eq!(parse_provider_guid("not-a-guid"), None);
+    }
+
+    /// `keys_from_history` pulls guids/grandparent_guid from `get_metadata`
+    /// (the history row alone doesn't carry them) and prefers the history
+    /// row's own year.
+    #[test]
+    fn keys_from_history_merges_row_and_metadata() {
+        use crate::tautulli::MetadataInfo;
+
+        let row = HistoryRow {
+            media_type: Some("episode".to_string()),
+            rating_key: Some(990001),
+            grandparent_rating_key: Some(500),
+            title: Some("The Long Night".to_string()),
+            year: Some(2019),
+            ..Default::default()
+        };
+        let meta: MetadataInfo = serde_json::from_str(
+            r#"{"guids": ["tvdb://7366144"], "grandparent_guid": "tvdb://121361", "year": 1999}"#,
+        )
+        .unwrap();
+
+        let keys = keys_from_history(&row, Some(&meta));
+        assert!(keys.is_episode);
+        assert_eq!(keys.rating_key.as_deref(), Some("990001"));
+        assert_eq!(keys.grandparent_rating_key.as_deref(), Some("500"));
+        assert_eq!(keys.guids, vec!["tvdb://7366144".to_string()]);
+        assert_eq!(keys.grandparent_guid.as_deref(), Some("tvdb://121361"));
+        assert_eq!(keys.year, Some(2019), "history-row year wins over metadata year");
+    }
+
+    /// FIX 3: an episode that persisted ONLY its owning show's `grandparent_guid`
+    /// (no rating keys, no item guids) still has enough to resolve offline —
+    /// `has_stored_keys` must return `true`, and `keys_from_unresolved` must
+    /// surface the grandparent guid as an episode key. A session with nothing
+    /// stored is (correctly) not offline-resolvable.
+    #[test]
+    fn has_stored_keys_true_for_grandparent_guid_only_episode() {
+        use crate::repo::play_session::UnresolvedSession;
+
+        let grandparent_only = UnresolvedSession {
+            id: 1,
+            account_id: Some(5),
+            tautulli_ref_id: Some(99),
+            plex_rating_key: None,
+            plex_grandparent_rating_key: None,
+            plex_grandparent_guid: Some("tvdb://121361".to_string()),
+            plex_guids: serde_json::json!([]),
+        };
+        assert!(
+            has_stored_keys(&grandparent_only),
+            "a grandparent-guid-only episode must be treated as offline-resolvable"
+        );
+        let keys = keys_from_unresolved(&grandparent_only);
+        assert!(keys.is_episode, "grandparent presence implies an episode");
+        assert_eq!(keys.grandparent_guid.as_deref(), Some("tvdb://121361"));
+
+        // Also true when only the grandparent RATING KEY is stored.
+        let grandparent_rk_only = UnresolvedSession {
+            plex_grandparent_guid: None,
+            plex_grandparent_rating_key: Some("500".to_string()),
+            ..grandparent_only.clone()
+        };
+        assert!(has_stored_keys(&grandparent_rk_only));
+
+        // Nothing stored -> not offline-resolvable.
+        let empty = UnresolvedSession {
+            plex_grandparent_guid: None,
+            plex_grandparent_rating_key: None,
+            ..grandparent_only.clone()
+        };
+        assert!(!has_stored_keys(&empty));
     }
 
     /// Mocked-Tautulli, live-DB round trip: `run()` against an httpmock
@@ -768,5 +1312,483 @@ mod tests {
             Some(reference_id),
             "the native row should be stamped with tautulli provenance"
         );
+    }
+
+    /// BSEED-1 (live-DB, gated on `MUSE_TEST_DATABASE_URL`): an arr-ingested
+    /// movie carries a `tmdb_id` but `plex_rating_key = NULL`. A session whose
+    /// `plex_rating_key` misses must still resolve via its `tmdb://` GUID
+    /// (`resolve_media` → `find_by_tmdb_id` → `find_by_media_metadata_id`) —
+    /// the whole point of BSEED-1 (no Plex library sync needed).
+    #[tokio::test]
+    async fn resolve_media_matches_movie_by_tmdb_guid_without_plex_rating_key() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping resolve_media_matches_movie_by_tmdb_guid_without_plex_rating_key");
+            return;
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let tmdb_id = format!("bseed1-tmdb-{suffix}");
+
+        let library = repo::library::create(
+            &pool,
+            &NewLibrary {
+                name: format!("bseed1-lib-{suffix}"),
+                kind: LibraryKind::Movie,
+                root_folder: "/media/bseed1/".to_string(),
+                source_arr_name: Some("radarr".to_string()),
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("create library");
+
+        let metadata = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(tmdb_id.clone()),
+                tvdb_id: None,
+                imdb_id: Some(format!("tt{suffix}")),
+                provider_ids: serde_json::json!({}),
+                title: format!("BSEED-1 GUID Movie {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: Some(110),
+                year: Some(2017),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("upsert media_metadata");
+
+        // arr-ingested: NO plex_rating_key.
+        let item = repo::media_item::upsert(
+            &pool,
+            &NewMediaItem {
+                library_id: library.id,
+                media_metadata_id: metadata.id,
+                path: format!("/media/bseed1/movie-{suffix}"),
+                monitored: true,
+                quality_profile_id: None,
+                minimum_availability: None,
+                plex_rating_key: None,
+                added_at: None,
+            },
+        )
+        .await
+        .expect("upsert media_item");
+
+        // A session whose rating_key doesn't match anything, but whose tmdb
+        // GUID does.
+        let keys = ResolveKeys {
+            is_episode: false,
+            rating_key: Some("does-not-exist-99999".to_string()),
+            grandparent_rating_key: None,
+            guids: vec![format!("tmdb://{tmdb_id}"), "imdb://tt-nope".to_string()],
+            grandparent_guid: None,
+            title: None,
+            year: None,
+        };
+
+        let (mi, ep) = resolve_media(&pool, &keys).await.expect("resolve");
+        assert_eq!(mi, Some(item.id), "must resolve via tmdb GUID");
+        assert_eq!(ep, None);
+
+        // And a bare imdb GUID resolves too (find_by_imdb_id path).
+        let keys_imdb = ResolveKeys {
+            guids: vec![format!("imdb://tt{suffix}")],
+            ..ResolveKeys::default()
+        };
+        let (mi2, _) = resolve_media(&pool, &keys_imdb).await.expect("resolve imdb");
+        assert_eq!(mi2, Some(item.id), "must resolve via imdb GUID");
+    }
+
+    /// FIX A (live-DB, gated): provider precedence (tmdb → tvdb → imdb) is
+    /// enforced regardless of GUID array order. A session whose guids list
+    /// `imdb://` BEFORE `tmdb://`, where the imdb id belongs to a DIFFERENT
+    /// (wrong) movie and the tmdb id to the correct one, must resolve to the
+    /// TMDB match — never the earlier-in-array imdb one (imdb_id isn't unique).
+    #[tokio::test]
+    async fn match_guid_enforces_tmdb_precedence_over_earlier_imdb() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping match_guid_enforces_tmdb_precedence_over_earlier_imdb");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let correct_tmdb = format!("fixA-tmdb-correct-{suffix}");
+        let wrong_imdb = format!("tt-fixA-wrong-{suffix}");
+
+        let library = repo::library::create(
+            &pool,
+            &NewLibrary {
+                name: format!("fixA-lib-{suffix}"),
+                kind: LibraryKind::Movie,
+                root_folder: "/media/fixA/".to_string(),
+                source_arr_name: Some("radarr".to_string()),
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("library");
+
+        // WRONG movie: carries the imdb id the session lists first.
+        let wrong_md = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(format!("fixA-tmdb-wrong-{suffix}")),
+                tvdb_id: None,
+                imdb_id: Some(wrong_imdb.clone()),
+                provider_ids: serde_json::json!({}),
+                title: format!("Wrong Movie {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: Some(90),
+                year: Some(2001),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("wrong md");
+        let wrong_item = repo::media_item::upsert(
+            &pool,
+            &NewMediaItem {
+                library_id: library.id,
+                media_metadata_id: wrong_md.id,
+                path: format!("/media/fixA/wrong-{suffix}"),
+                monitored: true,
+                quality_profile_id: None,
+                minimum_availability: None,
+                plex_rating_key: None,
+                added_at: None,
+            },
+        )
+        .await
+        .expect("wrong item");
+
+        // CORRECT movie: carries the tmdb id the session lists second.
+        let correct_md = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(correct_tmdb.clone()),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: format!("Correct Movie {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: Some(100),
+                year: Some(2002),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("correct md");
+        let correct_item = repo::media_item::upsert(
+            &pool,
+            &NewMediaItem {
+                library_id: library.id,
+                media_metadata_id: correct_md.id,
+                path: format!("/media/fixA/correct-{suffix}"),
+                monitored: true,
+                quality_profile_id: None,
+                minimum_availability: None,
+                plex_rating_key: None,
+                added_at: None,
+            },
+        )
+        .await
+        .expect("correct item");
+
+        // imdb (wrong) listed BEFORE tmdb (correct) in the array.
+        let keys = ResolveKeys {
+            is_episode: false,
+            guids: vec![format!("imdb://{wrong_imdb}"), format!("tmdb://{correct_tmdb}")],
+            ..ResolveKeys::default()
+        };
+        let (mi, _) = resolve_media(&pool, &keys).await.expect("resolve");
+        assert_eq!(
+            mi,
+            Some(correct_item.id),
+            "tmdb precedence must win over an earlier-in-array imdb match"
+        );
+        assert_ne!(mi, Some(wrong_item.id), "must NOT cross-link via the non-unique imdb id");
+    }
+
+    /// BSEED-2 (live-DB, gated): a previously-imported unresolved session with
+    /// stored `plex_guids` re-resolves offline once the matching `media_item`
+    /// exists, AND the `(account, item, episode, started_at)` UNIQUE collision
+    /// is handled — a second unresolved session that resolves to the same key
+    /// is deduped, not a hard error.
+    #[tokio::test]
+    async fn resolve_existing_unresolved_resolves_offline_and_handles_unique_collision() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping resolve_existing_unresolved_resolves_offline_and_handles_unique_collision");
+            return;
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let tmdb_id = format!("bseed2-tmdb-{suffix}");
+
+        let account = repo::account::upsert_by_plex_account_id(
+            &pool,
+            &NewAccount {
+                plex_account_id: Some(format!("bseed2-acct-{suffix}")),
+                username: Some(format!("bseed2_{suffix}")),
+                friendly_name: None,
+                is_home_user: true,
+                is_primary: false,
+            },
+        )
+        .await
+        .expect("account");
+
+        let library = repo::library::create(
+            &pool,
+            &NewLibrary {
+                name: format!("bseed2-lib-{suffix}"),
+                kind: LibraryKind::Movie,
+                root_folder: "/media/bseed2/".to_string(),
+                source_arr_name: Some("radarr".to_string()),
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("library");
+
+        let metadata = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(tmdb_id.clone()),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: format!("BSEED-2 Movie {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: Some(100),
+                year: Some(2019),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("metadata");
+
+        let item = repo::media_item::upsert(
+            &pool,
+            &NewMediaItem {
+                library_id: library.id,
+                media_metadata_id: metadata.id,
+                path: format!("/media/bseed2/movie-{suffix}"),
+                monitored: true,
+                quality_profile_id: None,
+                minimum_availability: None,
+                plex_rating_key: None,
+                added_at: None,
+            },
+        )
+        .await
+        .expect("item");
+
+        // Two unresolved sessions at the SAME started_at (distinct only because
+        // their media refs were NULL) with the same stored tmdb GUID — after
+        // resolution both would key on (account, item, NULL, started_at),
+        // colliding on the UNIQUE. The collision must be deduped, not fatal.
+        let started_at = unix_seconds_to_utc(1_700_500_000).expect("ts");
+        let guids = guids_to_json(&[format!("tmdb://{tmdb_id}")]);
+        let mut session_ids = Vec::new();
+        for i in 0..2 {
+            let s = repo::play_session::upsert(
+                &pool,
+                &NewPlaySession {
+                    account_id: Some(account.id),
+                    media_item_id: None,
+                    episode_id: None,
+                    session_key: Some(format!("bseed2-{suffix}-{i}")),
+                    tautulli_ref_id: Some((Uuid::new_v4().as_u128() % 1_000_000) as i64),
+                    started_at,
+                    stopped_at: None,
+                    duration_ms: Some(100 * 60 * 1000),
+                    watched_ms: Some(90 * 60 * 1000),
+                    view_offset_ms: Some(90 * 60 * 1000),
+                    percent_complete: Some(0.9),
+                    paused_counter: 0,
+                    paused_ms: 0,
+                    is_finished: true,
+                    is_abandoned: false,
+                    player: None,
+                    platform: None,
+                    product: None,
+                    device: None,
+                    ip_address: None,
+                    started_hour: Some(20),
+                    started_dow: Some(5),
+                    is_cinema_context: None,
+                },
+            )
+            .await
+            .expect("insert unresolved session");
+            repo::play_session::set_plex_refs(&pool, s.id, None, None, &guids, None)
+                .await
+                .expect("stamp guids");
+            session_ids.push(s.id);
+        }
+
+        // Offline re-resolution (no Tautulli client).
+        let summary = resolve_existing_unresolved(&pool, None, &BackfillOptions::default(), 1000)
+            .await
+            .expect("re-resolution pass");
+
+        assert!(summary.sessions_considered >= 2);
+        assert_eq!(summary.resolved, 1, "first session resolves in place");
+        assert_eq!(summary.deduped_conflicts, 1, "the colliding duplicate is deduped");
+
+        // Exactly one surviving resolved session for this (account, item).
+        let survivors = repo::play_session::list_for_media_item(&pool, item.id)
+            .await
+            .expect("list");
+        let mine: Vec<_> = survivors.iter().filter(|s| s.account_id == Some(account.id)).collect();
+        assert_eq!(mine.len(), 1, "collision must leave exactly one resolved session");
+        assert_eq!(mine[0].media_item_id, Some(item.id));
+    }
+
+    /// FIX 1 (live-DB, gated): keyless unresolved sessions must trigger the
+    /// Tautulli rehydration ref-map to be paged AT MOST ONCE per resolve call —
+    /// not once per keyless row (the original unbounded-per-row bug). Two
+    /// keyless sessions ⇒ exactly one `get_history` paging.
+    #[tokio::test]
+    async fn resolve_existing_unresolved_builds_ref_map_at_most_once() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping resolve_existing_unresolved_builds_ref_map_at_most_once");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let account = repo::account::upsert_by_plex_account_id(
+            &pool,
+            &NewAccount {
+                plex_account_id: Some(format!("fix1-acct-{suffix}")),
+                username: Some(format!("fix1_{suffix}")),
+                friendly_name: None,
+                is_home_user: true,
+                is_primary: false,
+            },
+        )
+        .await
+        .expect("account");
+
+        // Two keyless unresolved sessions (no stored plex keys), each with a
+        // tautulli_ref_id present in the mocked history.
+        let r1 = (Uuid::new_v4().as_u128() % 1_000_000) as i64;
+        let r2 = (Uuid::new_v4().as_u128() % 1_000_000) as i64 + 1_000_000;
+        for (i, r) in [r1, r2].into_iter().enumerate() {
+            repo::play_session::upsert(
+                &pool,
+                &NewPlaySession {
+                    account_id: Some(account.id),
+                    media_item_id: None,
+                    episode_id: None,
+                    session_key: Some(format!("fix1-{suffix}-{i}")),
+                    tautulli_ref_id: Some(r),
+                    started_at: unix_seconds_to_utc(1_700_600_000 + i as i64).unwrap(),
+                    stopped_at: None,
+                    duration_ms: None,
+                    watched_ms: None,
+                    view_offset_ms: None,
+                    percent_complete: None,
+                    paused_counter: 0,
+                    paused_ms: 0,
+                    is_finished: false,
+                    is_abandoned: false,
+                    player: None,
+                    platform: None,
+                    product: None,
+                    device: None,
+                    ip_address: None,
+                    started_hour: None,
+                    started_dow: None,
+                    is_cinema_context: None,
+                },
+            )
+            .await
+            .expect("insert keyless session");
+        }
+
+        let server = MockServer::start();
+        let history_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v2").query_param("cmd", "get_history");
+            then.status(200).header("content-type", "application/json").body(format!(
+                r#"{{"response":{{"result":"success","data":{{"recordsFiltered":2,"recordsTotal":2,"data":[
+                    {{"reference_id":{r1},"rating_key":111,"media_type":"movie"}},
+                    {{"reference_id":{r2},"rating_key":222,"media_type":"movie"}}
+                ]}}}}}}"#
+            ));
+        });
+        // get_metadata returns nothing useful -> the sessions stay unresolved;
+        // this test only asserts the history was paged exactly once.
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v2").query_param("cmd", "get_metadata");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"response":{"result":"success","data":{}}}"#);
+        });
+
+        let client = TautulliClient::new(server.base_url(), "k").expect("client");
+        let _ = resolve_existing_unresolved(&pool, Some(&client), &BackfillOptions::default(), 10_000)
+            .await
+            .expect("re-resolution");
+
+        // Exactly one paging of get_history, regardless of how many keyless
+        // rows were processed — the ref-map is built once and reused.
+        history_mock.assert_hits(1);
     }
 }

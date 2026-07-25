@@ -79,6 +79,21 @@ use std::time::Duration as StdDuration;
 use crate::http::AppState;
 use crate::taste_model::chord_client::ChordClient;
 
+/// BSEED-2: how many unresolved sessions the periodic (offline) re-resolution
+/// step re-matches per maintenance pass. Bounded so a large unresolved backlog
+/// doesn't make a single tick unbounded; the backlog drains over successive
+/// passes (each pass permanently resolves what it can).
+const DEFAULT_MAINTENANCE_RESOLVE_LIMIT: i64 = 5000;
+
+/// FIX 2b: whether taste should be recomputed for an account this pass. Taste
+/// is derived from `watch_stats`, so a recompute is skipped when that account's
+/// `watch_stats` aggregation failed (its rebuild rolled back to the prior
+/// state; recomputing from it would treat a stale set as freshly authoritative
+/// and, worse, mask that the intended aggregation never landed).
+fn should_recompute_taste(aggregate_result: &crate::error::MuseResult<usize>) -> bool {
+    aggregate_result.is_ok()
+}
+
 /// Outcome of one [`run_maintenance_pass`] call. Every counter is a plain
 /// "how much happened", not a pass/fail — failures are counted separately
 /// (`*_failed`) rather than aborting the pass, per the module docs.
@@ -116,7 +131,18 @@ pub struct MaintenanceSummary {
     pub embed_skipped_unchanged: usize,
     pub embed_failed: usize,
 
+    /// BSEED-2: `true` once the offline re-resolution step has run this pass
+    /// (it always runs — a harmless no-op when there are no unresolved
+    /// sessions). `sessions_resolved`/`sessions_deduped` are its tally.
+    pub resolve_ran: bool,
+    pub sessions_resolved: usize,
+    pub sessions_deduped: usize,
+
     pub accounts_considered: usize,
+    /// BSEED-4: `play_sessions` → `watch_stats` aggregates written this pass
+    /// (summed across accounts), plus per-account failures.
+    pub watch_stats_rebuilt: usize,
+    pub watch_stats_rebuild_failed: usize,
     pub taste_recomputed: usize,
     pub taste_failed: usize,
     pub divergence_recomputed: usize,
@@ -148,6 +174,34 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
         }
     } else {
         tracing::debug!("MUSE-31: maintenance pass — no arr instances configured; skipping ingest step");
+    }
+
+    // --- (a1) BSEED-2: offline re-resolution of unresolved sessions ---------
+    //
+    // Re-match previously-unresolved `play_sessions` (media_item_id NULL)
+    // against the catalog arr ingest just refreshed — the "resolve" in the
+    // resolve → aggregate → recompute chain. Offline only (no Tautulli
+    // round-trip) so the periodic pass stays cheap: it resolves sessions that
+    // carry stored plex keys (imported after migration 0108). The one-time
+    // rehydration of pre-migration sessions (the pre-existing 1544) is the
+    // operator-run `POST /ops/library/resolve` route, which supplies a Tautulli
+    // client. Error-isolated like every other step.
+    match crate::tautulli::backfill::resolve_existing_unresolved(
+        &state.pool,
+        None,
+        &crate::tautulli::backfill::BackfillOptions::default(),
+        DEFAULT_MAINTENANCE_RESOLVE_LIMIT,
+    )
+    .await
+    {
+        Ok(resolve_summary) => {
+            summary.resolve_ran = true;
+            summary.sessions_resolved = resolve_summary.resolved;
+            summary.sessions_deduped = resolve_summary.deduped_conflicts;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "MUSE-31/BSEED-2: maintenance pass — re-resolution failed this pass; continuing");
+        }
     }
 
     // --- (a2) MUSEM-06: monitored "wanted" acquisition worker --------------
@@ -236,11 +290,31 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
     let mut enrichment_targets: HashSet<(i64, String)> = HashSet::new();
 
     for account in &accounts {
-        match crate::taste_model::recompute_taste(&state.pool, chord.as_ref(), account.id).await {
-            Ok(_) => summary.taste_recomputed += 1,
+        // --- BSEED-4: aggregate resolved play_sessions -> watch_stats BEFORE
+        // recompute_taste, since the taste derivation reads watch_stats. This
+        // is the "aggregate" in resolve -> aggregate -> recompute: without it,
+        // even resolved sessions produce zero taste signals.
+        let aggregate_result =
+            crate::taste_model::aggregate::rebuild_watch_stats_for_account(&state.pool, account.id).await;
+        match &aggregate_result {
+            Ok(written) => summary.watch_stats_rebuilt += *written,
             Err(e) => {
-                summary.taste_failed += 1;
-                tracing::warn!(error = %e, account_id = account.id, "MUSE-31: maintenance pass — recompute_taste failed for this account; continuing");
+                summary.watch_stats_rebuild_failed += 1;
+                tracing::warn!(error = %e, account_id = account.id, "MUSE-31/BSEED-4: maintenance pass — watch_stats aggregation failed for this account; skipping recompute_taste, continuing");
+            }
+        }
+
+        // FIX 2b: only recompute taste when this account's aggregation
+        // succeeded. Recomputing from a failed/rolled-back aggregation would
+        // derive the profile from a stale-or-partial `watch_stats` set as if it
+        // were authoritative; skip it and isolate the failure to this account.
+        if should_recompute_taste(&aggregate_result) {
+            match crate::taste_model::recompute_taste(&state.pool, chord.as_ref(), account.id).await {
+                Ok(_) => summary.taste_recomputed += 1,
+                Err(e) => {
+                    summary.taste_failed += 1;
+                    tracing::warn!(error = %e, account_id = account.id, "MUSE-31: maintenance pass — recompute_taste failed for this account; continuing");
+                }
             }
         }
 
@@ -307,9 +381,12 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
         wanted_needs_review = summary.wanted.needs_review,
         metadata_resolve_ran = summary.metadata_resolve_ran,
         metadata_resolved = summary.metadata_resolved,
+        sessions_resolved = summary.sessions_resolved,
+        sessions_deduped = summary.sessions_deduped,
         embedded = summary.embedded,
         embed_skipped_unchanged = summary.embed_skipped_unchanged,
         accounts_considered = summary.accounts_considered,
+        watch_stats_rebuilt = summary.watch_stats_rebuilt,
         taste_recomputed = summary.taste_recomputed,
         divergence_recomputed = summary.divergence_recomputed,
         enrichment_attempted = summary.enrichment_attempted,
@@ -482,6 +559,18 @@ mod tests {
     /// Pure guard-logic checks: a `MaintenanceSummary::default()` reports
     /// every step as not-run, matching the "nothing configured -> harmless
     /// no-op pass" posture without needing a live DB/AppState at all.
+    /// FIX 2b: taste is recomputed only when the account's watch_stats
+    /// aggregation succeeded — an `Err` aggregate result must gate out the
+    /// recompute so the profile is never derived from a rolled-back/partial set.
+    #[test]
+    fn should_recompute_taste_only_on_aggregate_success() {
+        assert!(should_recompute_taste(&Ok(3)));
+        assert!(should_recompute_taste(&Ok(0)));
+        assert!(!should_recompute_taste(&Err(crate::error::MuseError::NotFound(
+            "aggregation failed".to_string()
+        ))));
+    }
+
     #[test]
     fn default_summary_reports_every_step_as_not_run() {
         let summary = MaintenanceSummary::default();

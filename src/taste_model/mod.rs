@@ -60,6 +60,7 @@
 //! Multi-user strict: every step is scoped to one `account_id`; taste is
 //! never blended across accounts (spec §3.2 `accounts` comment).
 
+pub mod aggregate;
 pub mod chord_client;
 pub mod profile;
 pub mod recompute;

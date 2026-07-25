@@ -187,10 +187,11 @@ impl HistoryRow {
     }
 }
 
-/// `get_metadata` payload — only the fields the backfill importer uses to
-/// enrich a history row (true media runtime for a more accurate
+/// `get_metadata` payload — the fields the backfill importer uses to enrich a
+/// history row: the item's true media runtime (for a more accurate
 /// `percent_complete`/`duration_ms` than the session-length-only `duration`
-/// on [`HistoryRow`]).
+/// on [`HistoryRow`]) and, for BSEED-1 GUID resolution, the provider `guids`
+/// (`imdb://`/`tmdb://`/`tvdb://`) plus the show-level `grandparent_guid`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MetadataInfo {
     pub media_type: Option<String>,
@@ -200,6 +201,50 @@ pub struct MetadataInfo {
     /// Full media runtime, milliseconds.
     #[serde(default, deserialize_with = "de::empty_string_as_none")]
     pub duration: Option<i64>,
+    /// Release year — used as the second key of the title+year resolution
+    /// fallback (BSEED-1). `""`/absent → `None`, like every other numeric.
+    #[serde(default, deserialize_with = "de::empty_string_as_none")]
+    pub year: Option<i64>,
+    /// Provider GUIDs for this item — Tautulli/Plex emit these either as an
+    /// array of bare strings (`["imdb://tt1856101", "tmdb://335984"]`) or as
+    /// an array of `{"id": "..."}` objects depending on version; both shapes
+    /// are tolerated by [`GuidEntry`]. Use [`MetadataInfo::guids`] to read the
+    /// flattened string list rather than this field directly.
+    #[serde(default)]
+    pub guids: Vec<GuidEntry>,
+    /// The owning show's GUID for an episode (`grandparent_guid`) — how a TV
+    /// session resolves onto an *arr-ingested show `media_metadata` row (which
+    /// carries the show's tvdb/tmdb/imdb id) without a Plex library sync.
+    pub grandparent_guid: Option<String>,
+}
+
+/// One entry of a Tautulli/Plex `guids` array — either a bare string
+/// (`"imdb://tt1856101"`) or a `{"id": "imdb://tt1856101"}` object, depending
+/// on the Tautulli/Plex-agent version. Deserialized permissively (untagged)
+/// so an unexpected shape degrades to being ignored rather than failing the
+/// whole `get_metadata` parse — same posture as the rest of this module.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum GuidEntry {
+    Str(String),
+    Obj { id: String },
+}
+
+impl GuidEntry {
+    fn as_str(&self) -> &str {
+        match self {
+            GuidEntry::Str(s) => s,
+            GuidEntry::Obj { id } => id,
+        }
+    }
+}
+
+impl MetadataInfo {
+    /// The flattened provider-GUID strings for this item, regardless of which
+    /// wire shape Tautulli sent (see [`GuidEntry`]).
+    pub fn guids(&self) -> Vec<String> {
+        self.guids.iter().map(|g| g.as_str().to_string()).collect()
+    }
 }
 
 /// `get_stream_data` payload — session-level quality/transcode detail,
@@ -371,6 +416,56 @@ mod tests {
         assert_eq!(row.parent_rating_key, None); // JSON null
         assert_eq!(row.year, None); // whitespace-only string
         assert_eq!(row.percent_complete, Some(50.5)); // numeric string → f64
+    }
+
+    /// BSEED-1: `get_metadata` for a movie carries a bare-string `guids`
+    /// array (`imdb://`/`tmdb://`) and a real `year`; both must parse and be
+    /// readable via [`MetadataInfo::guids`].
+    #[test]
+    fn metadata_info_parses_bare_string_guids_and_year() {
+        let json = r#"{
+            "media_type": "movie",
+            "rating_key": 335984,
+            "title": "Blade Runner 2049",
+            "duration": 9840000,
+            "year": 2017,
+            "guids": ["imdb://tt1856101", "tmdb://335984"]
+        }"#;
+
+        let meta: MetadataInfo = serde_json::from_str(json).expect("movie metadata must parse");
+        assert_eq!(meta.year, Some(2017));
+        assert_eq!(meta.guids(), vec!["imdb://tt1856101".to_string(), "tmdb://335984".to_string()]);
+        assert!(meta.grandparent_guid.is_none());
+    }
+
+    /// BSEED-1: some Tautulli/Plex-agent versions emit `guids` as an array of
+    /// `{"id": ...}` objects, and an episode carries a `grandparent_guid` for
+    /// its owning show. Both shapes must be tolerated.
+    #[test]
+    fn metadata_info_parses_object_guids_and_grandparent_guid() {
+        let json = r#"{
+            "media_type": "episode",
+            "rating_key": 990001,
+            "title": "The Long Night",
+            "guids": [{"id": "imdb://tt6027908"}, {"id": "tvdb://7366144"}],
+            "grandparent_guid": "tvdb://121361"
+        }"#;
+
+        let meta: MetadataInfo = serde_json::from_str(json).expect("episode metadata must parse");
+        assert_eq!(meta.guids(), vec!["imdb://tt6027908".to_string(), "tvdb://7366144".to_string()]);
+        assert_eq!(meta.grandparent_guid.as_deref(), Some("tvdb://121361"));
+    }
+
+    /// An item with no `guids`/`grandparent_guid`/`year` at all still parses
+    /// (every field defaulted) — the permissive posture the rest of the
+    /// module relies on.
+    #[test]
+    fn metadata_info_without_guids_parses_to_empty() {
+        let meta: MetadataInfo =
+            serde_json::from_str(r#"{"media_type": "movie", "duration": 6300000}"#).expect("must parse");
+        assert!(meta.guids().is_empty());
+        assert!(meta.grandparent_guid.is_none());
+        assert!(meta.year.is_none());
     }
 
     /// A full `get_history` page (envelope + `HistoryData`) containing a

@@ -186,30 +186,46 @@ pub async fn find_by_imdb_id(pool: &PgPool, kind: MediaKind, imdb_id: &str) -> M
 /// above): a curation/availability signal is only as trustworthy as its
 /// resolution, and a wrong match silently feeding curation is worse than a
 /// visibly-unresolved release.
+///
+/// **Resolves ONLY when the match is unambiguous** (FIX B): `(kind,
+/// lower(title), year)` is not a unique key, so two different titles sharing a
+/// title+year would otherwise let a blind `LIMIT 1` cross-link to an arbitrary
+/// one. Instead this fetches up to two candidates and returns `Some` only when
+/// exactly one exists; zero or more-than-one → `None` (leave it unresolved
+/// rather than guess). This is a last-resort fallback (only reached when a
+/// session/release carries no tmdb/tvdb/imdb id at all), so correctness beats
+/// coverage. The year-absent branch is even more ambiguous and follows the
+/// same rule.
 pub async fn find_by_title_year(
     pool: &PgPool,
     kind: MediaKind,
     title: &str,
     year: Option<i32>,
 ) -> MuseResult<Option<i64>> {
-    match year {
+    let candidates: Vec<i64> = match year {
         Some(y) => sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM media_metadata WHERE kind = $1 AND lower(title) = lower($2) AND year = $3 LIMIT 1",
+            "SELECT id FROM media_metadata WHERE kind = $1 AND lower(title) = lower($2) AND year = $3 LIMIT 2",
         )
         .bind(kind)
         .bind(title)
         .bind(y)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await
-        .map_err(MuseError::Database),
+        .map_err(MuseError::Database)?,
         None => sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM media_metadata WHERE kind = $1 AND lower(title) = lower($2) LIMIT 1",
+            "SELECT id FROM media_metadata WHERE kind = $1 AND lower(title) = lower($2) LIMIT 2",
         )
         .bind(kind)
         .bind(title)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await
-        .map_err(MuseError::Database),
+        .map_err(MuseError::Database)?,
+    };
+
+    // Exactly one → unambiguous resolution; zero or ambiguous (≥2) → None.
+    match candidates.as_slice() {
+        [only] => Ok(Some(*only)),
+        _ => Ok(None),
     }
 }
 
@@ -706,6 +722,117 @@ mod tests {
             poster_entries[0].get("url").and_then(|u| u.as_str()),
             Some(curated_poster.as_str()),
             "the pre-existing poster URL must be left untouched, not replaced by the fresh provider's URL"
+        );
+    }
+
+    /// FIX B (live-DB, gated): `find_by_title_year` resolves ONLY when the
+    /// title+year match is unambiguous. A unique title+year returns that id;
+    /// two different movies sharing the exact title+year return `None` (never a
+    /// blind pick). The year-absent branch follows the same rule.
+    #[tokio::test]
+    async fn find_by_title_year_resolves_only_when_unambiguous() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!(
+                "MUSE_TEST_DATABASE_URL not set — skipping find_by_title_year_resolves_only_when_unambiguous"
+            );
+            return;
+        };
+
+        use sqlx::postgres::PgPoolOptions;
+        use uuid::Uuid;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // Unique title+year -> resolves to exactly that row.
+        let unique_title = format!("FIXB Unique {suffix}");
+        let unique = upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(format!("fixB-unique-{suffix}")),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: unique_title.clone(),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: None,
+                year: Some(1990),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("seed unique");
+
+        assert_eq!(
+            find_by_title_year(&pool, MediaKind::Movie, &unique_title, Some(1990))
+                .await
+                .expect("query"),
+            Some(unique.id),
+            "a unique title+year must resolve"
+        );
+        // Year-absent, still unique title -> resolves.
+        assert_eq!(
+            find_by_title_year(&pool, MediaKind::Movie, &unique_title, None)
+                .await
+                .expect("query"),
+            Some(unique.id),
+            "a unique title (year absent) must resolve"
+        );
+
+        // Two different movies sharing the SAME title+year -> ambiguous -> None.
+        let dup_title = format!("FIXB Ambiguous {suffix}");
+        for n in 0..2 {
+            upsert_by_tmdb(
+                &pool,
+                &NewMediaMetadata {
+                    kind: MediaKind::Movie,
+                    tmdb_id: Some(format!("fixB-dup-{n}-{suffix}")),
+                    tvdb_id: None,
+                    imdb_id: None,
+                    provider_ids: serde_json::json!({}),
+                    title: dup_title.clone(),
+                    sort_title: None,
+                    original_title: None,
+                    original_language: None,
+                    status: None,
+                    overview: None,
+                    studio: None,
+                    network: None,
+                    runtime_minutes: None,
+                    year: Some(1985),
+                    images: serde_json::json!([]),
+                },
+            )
+            .await
+            .expect("seed dup");
+        }
+
+        assert_eq!(
+            find_by_title_year(&pool, MediaKind::Movie, &dup_title, Some(1985))
+                .await
+                .expect("query"),
+            None,
+            "an ambiguous title+year (2 rows) must NOT be resolved — correctness over coverage"
+        );
+        assert_eq!(
+            find_by_title_year(&pool, MediaKind::Movie, &dup_title, None)
+                .await
+                .expect("query"),
+            None,
+            "the year-absent branch must also refuse an ambiguous match"
         );
     }
 }

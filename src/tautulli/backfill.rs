@@ -449,30 +449,60 @@ fn parse_provider_guid(raw: &str) -> Option<(GuidProvider, String)> {
     Some((provider, id.to_string()))
 }
 
-/// Match any of `guids` against a cataloged `media_metadata` row of `kind`
-/// (via `find_by_{tmdb,tvdb,imdb}_id`), then resolve that to a concrete
-/// `media_items.id`. First GUID that resolves wins. Returns `Ok(None)` when
-/// none match — a normal "not in the catalog yet" case.
+/// Match `guids` against a cataloged `media_metadata` row of `kind` (via
+/// `find_by_{tmdb,tvdb,imdb}_id`), then resolve that to a concrete
+/// `media_items.id`. Returns `Ok(None)` when none match — a normal "not in the
+/// catalog yet" case.
+///
+/// **Provider precedence is enforced explicitly (tmdb → tvdb → imdb),
+/// independent of the order the GUIDs happened to arrive in** (FIX A): `tmdb_id`
+/// and `tvdb_id` are the unique catalog keys, but `imdb_id` is NOT unique in
+/// `media_metadata`, so trying imdb first (just because it appeared first in the
+/// array) could cross-link the session to a duplicate/inconsistent IMDb record
+/// when a correct tmdb/tvdb match existed. All GUIDs are parsed up front, then
+/// tried tmdb-first; imdb is the last-resort key.
 async fn match_guid_to_media_item(
     pool: &PgPool,
     guids: &[String],
     kind: MediaKind,
 ) -> MuseResult<Option<i64>> {
+    let mut tmdb_ids = Vec::new();
+    let mut tvdb_ids = Vec::new();
+    let mut imdb_ids = Vec::new();
     for guid in guids {
-        let Some((provider, id)) = parse_provider_guid(guid) else {
-            continue;
-        };
-        let mm_id = match provider {
-            GuidProvider::Tmdb => repo::media_metadata::find_by_tmdb_id(pool, kind, &id).await?,
-            GuidProvider::Tvdb => repo::media_metadata::find_by_tvdb_id(pool, kind, &id).await?,
-            GuidProvider::Imdb => repo::media_metadata::find_by_imdb_id(pool, kind, &id).await?,
-        };
-        if let Some(mm_id) = mm_id {
+        if let Some((provider, id)) = parse_provider_guid(guid) {
+            match provider {
+                GuidProvider::Tmdb => tmdb_ids.push(id),
+                GuidProvider::Tvdb => tvdb_ids.push(id),
+                GuidProvider::Imdb => imdb_ids.push(id),
+            }
+        }
+    }
+
+    // Try each provider in strict priority order; within a provider, the first
+    // id that resolves to a catalog row + media_item wins.
+    for id in &tmdb_ids {
+        if let Some(mm_id) = repo::media_metadata::find_by_tmdb_id(pool, kind, id).await? {
             if let Some(item_id) = repo::media_item::find_by_media_metadata_id(pool, mm_id).await? {
                 return Ok(Some(item_id));
             }
         }
     }
+    for id in &tvdb_ids {
+        if let Some(mm_id) = repo::media_metadata::find_by_tvdb_id(pool, kind, id).await? {
+            if let Some(item_id) = repo::media_item::find_by_media_metadata_id(pool, mm_id).await? {
+                return Ok(Some(item_id));
+            }
+        }
+    }
+    for id in &imdb_ids {
+        if let Some(mm_id) = repo::media_metadata::find_by_imdb_id(pool, kind, id).await? {
+            if let Some(item_id) = repo::media_item::find_by_media_metadata_id(pool, mm_id).await? {
+                return Ok(Some(item_id));
+            }
+        }
+    }
+
     Ok(None)
 }
 
@@ -1383,6 +1413,136 @@ mod tests {
         };
         let (mi2, _) = resolve_media(&pool, &keys_imdb).await.expect("resolve imdb");
         assert_eq!(mi2, Some(item.id), "must resolve via imdb GUID");
+    }
+
+    /// FIX A (live-DB, gated): provider precedence (tmdb → tvdb → imdb) is
+    /// enforced regardless of GUID array order. A session whose guids list
+    /// `imdb://` BEFORE `tmdb://`, where the imdb id belongs to a DIFFERENT
+    /// (wrong) movie and the tmdb id to the correct one, must resolve to the
+    /// TMDB match — never the earlier-in-array imdb one (imdb_id isn't unique).
+    #[tokio::test]
+    async fn match_guid_enforces_tmdb_precedence_over_earlier_imdb() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping match_guid_enforces_tmdb_precedence_over_earlier_imdb");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let correct_tmdb = format!("fixA-tmdb-correct-{suffix}");
+        let wrong_imdb = format!("tt-fixA-wrong-{suffix}");
+
+        let library = repo::library::create(
+            &pool,
+            &NewLibrary {
+                name: format!("fixA-lib-{suffix}"),
+                kind: LibraryKind::Movie,
+                root_folder: "/media/fixA/".to_string(),
+                source_arr_name: Some("radarr".to_string()),
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("library");
+
+        // WRONG movie: carries the imdb id the session lists first.
+        let wrong_md = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(format!("fixA-tmdb-wrong-{suffix}")),
+                tvdb_id: None,
+                imdb_id: Some(wrong_imdb.clone()),
+                provider_ids: serde_json::json!({}),
+                title: format!("Wrong Movie {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: Some(90),
+                year: Some(2001),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("wrong md");
+        let wrong_item = repo::media_item::upsert(
+            &pool,
+            &NewMediaItem {
+                library_id: library.id,
+                media_metadata_id: wrong_md.id,
+                path: format!("/media/fixA/wrong-{suffix}"),
+                monitored: true,
+                quality_profile_id: None,
+                minimum_availability: None,
+                plex_rating_key: None,
+                added_at: None,
+            },
+        )
+        .await
+        .expect("wrong item");
+
+        // CORRECT movie: carries the tmdb id the session lists second.
+        let correct_md = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(correct_tmdb.clone()),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: format!("Correct Movie {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: Some(100),
+                year: Some(2002),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("correct md");
+        let correct_item = repo::media_item::upsert(
+            &pool,
+            &NewMediaItem {
+                library_id: library.id,
+                media_metadata_id: correct_md.id,
+                path: format!("/media/fixA/correct-{suffix}"),
+                monitored: true,
+                quality_profile_id: None,
+                minimum_availability: None,
+                plex_rating_key: None,
+                added_at: None,
+            },
+        )
+        .await
+        .expect("correct item");
+
+        // imdb (wrong) listed BEFORE tmdb (correct) in the array.
+        let keys = ResolveKeys {
+            is_episode: false,
+            guids: vec![format!("imdb://{wrong_imdb}"), format!("tmdb://{correct_tmdb}")],
+            ..ResolveKeys::default()
+        };
+        let (mi, _) = resolve_media(&pool, &keys).await.expect("resolve");
+        assert_eq!(
+            mi,
+            Some(correct_item.id),
+            "tmdb precedence must win over an earlier-in-array imdb match"
+        );
+        assert_ne!(mi, Some(wrong_item.id), "must NOT cross-link via the non-unique imdb id");
     }
 
     /// BSEED-2 (live-DB, gated): a previously-imported unresolved session with

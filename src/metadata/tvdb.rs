@@ -55,8 +55,27 @@ use crate::error::{MuseError, MuseResult};
 use super::{MediaKind, MetadataProvider, ProviderImages, ProviderMetadata};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api4.thetvdb.com/v4";
+/// AMETA-1: Sonarr's public Skyhook TVDB proxy — the key-less default the
+/// client points at when no `MUSE_TVDB_API_KEY` is configured. Unauthenticated
+/// (no `POST /login` bearer dance), exactly as Sonarr uses it so a user never
+/// registers a TheTVDB API key. Overridable via `MUSE_SKYHOOK_URL`.
+pub const DEFAULT_SKYHOOK_URL: &str = "https://skyhook.sonarr.tv/v1/tvdb";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGIN_PATH: &str = "/login";
+
+/// How a [`TvdbClient`] talks to its backend (AMETA-1).
+///
+/// - [`TvdbMode::Api`] — the real TheTVDB v4 API: `POST /login` for a bearer
+///   token, then `/series|movies/{id}/extended` + `/search`.
+/// - [`TvdbMode::Skyhook`] — the key-less public proxy at
+///   `skyhook.sonarr.tv`: no login, series only, `GET /shows/en/{tvdbId}` +
+///   `GET /search/en/{term}`, and a different response shape (genres as
+///   string arrays, `images[]` with `coverType`, inline `runtime`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TvdbMode {
+    Api,
+    Skyhook,
+}
 
 /// A typed, read-only TheTVDB v4 client. Cheap to `Clone` (the cached bearer
 /// token lives behind an `Arc<RwLock<_>>` internally via `reqwest::Client`'s
@@ -68,6 +87,7 @@ pub struct TvdbClient {
     api_key: String,
     pin: Option<String>,
     token: std::sync::Arc<RwLock<Option<String>>>,
+    mode: TvdbMode,
 }
 
 // Manual `Debug` (not `#[derive(Debug)]`) so a stray `tracing::debug!(client
@@ -93,6 +113,23 @@ impl TvdbClient {
         api_key: impl Into<String>,
         pin: Option<String>,
     ) -> MuseResult<Self> {
+        Self::with_mode(base_url, api_key, pin, TvdbMode::Api)
+    }
+
+    /// Build a key-less Skyhook-mode client against a Skyhook-compatible base
+    /// URL (the real `https://skyhook.sonarr.tv/v1/tvdb`, or an httpmock
+    /// server in tests). No credentials, no `POST /login` — Skyhook is
+    /// unauthenticated.
+    pub fn new_skyhook(base_url: impl Into<String>) -> MuseResult<Self> {
+        Self::with_mode(base_url, String::new(), None, TvdbMode::Skyhook)
+    }
+
+    fn with_mode(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        pin: Option<String>,
+        mode: TvdbMode,
+    ) -> MuseResult<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -104,24 +141,56 @@ impl TvdbClient {
             api_key: api_key.into(),
             pin,
             token: std::sync::Arc::new(RwLock::new(None)),
+            mode,
         })
     }
 
-    /// Build a client from `Config` (`MUSE_TVDB_API_KEY`[/`MUSE_TVDB_PIN`]).
-    /// Returns `None` when unset/empty — same graceful-degrade posture as
-    /// `TmdbClient::from_config`: TheTVDB is an optional metadata provider,
-    /// never a startup-blocking dependency.
-    pub fn from_config(config: &Config) -> Option<Self> {
-        let tvdb = config.tvdb()?;
+    /// Whether this client is in key-less Skyhook (proxy) mode (AMETA-1).
+    pub fn is_skyhook_mode(&self) -> bool {
+        self.mode == TvdbMode::Skyhook
+    }
 
-        match Self::new(
-            tvdb.base_url,
-            tvdb.api_key.expose().to_string(),
-            tvdb.pin.map(|p| p.expose().to_string()),
-        ) {
-            Ok(client) => Some(client),
+    /// Build a client from `Config`. Precedence (AMETA-1/3):
+    /// 1. `MUSE_TVDB_API_KEY` set → real TheTVDB v4 API (today's `/login`
+    ///    path, full record).
+    /// 2. else `metadata_keyless` (default true) → **key-less Skyhook mode**
+    ///    against `MUSE_SKYHOOK_URL` (default `skyhook.sonarr.tv`), so a fresh
+    ///    deploy gets series posters/genres/overview/runtime with zero
+    ///    operator key setup and no `/login`.
+    /// 3. else (`metadata_keyless=false`, no key) → `None`.
+    pub fn from_config(config: &Config) -> Option<Self> {
+        if let Some(tvdb) = config.tvdb() {
+            return match Self::new(
+                tvdb.base_url,
+                tvdb.api_key.expose().to_string(),
+                tvdb.pin.map(|p| p.expose().to_string()),
+            ) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to construct TheTVDB client; TVDB metadata will degrade");
+                    None
+                }
+            };
+        }
+
+        if !config.metadata_keyless {
+            return None;
+        }
+
+        let base_url = config
+            .skyhook_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SKYHOOK_URL.to_string());
+        match Self::new_skyhook(base_url) {
+            Ok(client) => {
+                tracing::info!(
+                    base_url = %client.base_url,
+                    "AMETA-1: MUSE_TVDB_API_KEY unset — using key-less Sonarr Skyhook proxy (series enrichment, no login)"
+                );
+                Some(client)
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to construct TheTVDB client; TVDB metadata will degrade");
+                tracing::warn!(error = %e, "failed to construct key-less Skyhook client; TVDB metadata will degrade");
                 None
             }
         }
@@ -155,10 +224,11 @@ impl TvdbClient {
             });
         }
 
-        let envelope: LoginEnvelope = serde_json::from_slice(&bytes).map_err(|e| MuseError::Upstream {
-            status: status.as_u16(),
-            message: format!("failed to parse tvdb login response: {e}"),
-        })?;
+        let envelope: LoginEnvelope =
+            serde_json::from_slice(&bytes).map_err(|e| MuseError::Upstream {
+                status: status.as_u16(),
+                message: format!("failed to parse tvdb login response: {e}"),
+            })?;
 
         let token = envelope.data.token;
         *self.token.write().await = Some(token.clone());
@@ -182,7 +252,11 @@ impl TvdbClient {
     /// `QbitClient::send_with_reauth`'s `403` handling). A second `401` (or
     /// any other status) is surfaced to the caller as a typed error, never
     /// a panic.
-    async fn get_with_reauth(&self, path: &str, query: &[(&str, &str)]) -> MuseResult<(u16, Vec<u8>)> {
+    async fn get_with_reauth(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> MuseResult<(u16, Vec<u8>)> {
         let url = format!("{}{path}", self.base_url);
 
         let token = self.ensure_token().await?;
@@ -213,7 +287,11 @@ impl TvdbClient {
         Ok((status, bytes))
     }
 
-    async fn get_data<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> MuseResult<Option<T>> {
+    async fn get_data<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> MuseResult<Option<T>> {
         let (status, bytes) = self.get_with_reauth(path, query).await?;
 
         if status == StatusCode::NOT_FOUND.as_u16() {
@@ -227,10 +305,11 @@ impl TvdbClient {
             });
         }
 
-        let envelope: DataEnvelope<T> = serde_json::from_slice(&bytes).map_err(|e| MuseError::Upstream {
-            status,
-            message: format!("failed to parse tvdb response from {path}: {e}"),
-        })?;
+        let envelope: DataEnvelope<T> =
+            serde_json::from_slice(&bytes).map_err(|e| MuseError::Upstream {
+                status,
+                message: format!("failed to parse tvdb response from {path}: {e}"),
+            })?;
         Ok(Some(envelope.data))
     }
 
@@ -249,6 +328,92 @@ impl TvdbClient {
     async fn get_movie(&self, id: &str) -> MuseResult<Option<TvdbRecord>> {
         self.get_data(&format!("/movies/{id}/extended"), &[]).await
     }
+
+    // --- AMETA-3: key-less Sonarr Skyhook (skyhook.sonarr.tv) mode ----------
+
+    /// Unauthenticated GET for Skyhook mode — no bearer token, no `/login`.
+    /// Takes a fully-built [`reqwest::Url`] so path segments (the search
+    /// term) are percent-encoded safely.
+    async fn skyhook_send(&self, url: reqwest::Url) -> MuseResult<(u16, Vec<u8>)> {
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await?.to_vec();
+        Ok((status, bytes))
+    }
+
+    fn skyhook_url(&self, segments: &[&str]) -> MuseResult<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| MuseError::Upstream {
+            status: 0,
+            message: format!("invalid skyhook base url {}: {e}", self.base_url),
+        })?;
+        url.path_segments_mut()
+            .map_err(|_| MuseError::Upstream {
+                status: 0,
+                message: "skyhook base url cannot be a base".to_string(),
+            })?
+            .extend(segments);
+        Ok(url)
+    }
+
+    /// `GET /shows/en/{tvdbId}` — the Skyhook series record. Movie-kind
+    /// lookups aren't served here (Skyhook is series-only; movies go through
+    /// the Radarr proxy in `TmdbClient`).
+    ///
+    /// Fail-open (codex): the key-less Skyhook proxy is best-effort
+    /// enrichment, never a hard dependency. A 404 (absent), a transport error
+    /// (DNS/refused/timeout), a 5xx, or an unparseable body all degrade to
+    /// `Ok(None)` — resolution never fails because the public proxy is
+    /// unreachable or flaky.
+    async fn skyhook_show(&self, id: &str) -> MuseResult<Option<ProviderMetadata>> {
+        let url = self.skyhook_url(&["shows", "en", id])?;
+        let (status, bytes) = match self.skyhook_send(url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::debug!(error = %e, id = %id, "AMETA-3: Skyhook show request failed; degrading to None (fail-open)");
+                return Ok(None);
+            }
+        };
+        // 404 and every other non-2xx alike → None, logged once.
+        if !(200..300).contains(&status) {
+            tracing::debug!(status, id = %id, "AMETA-3: Skyhook show non-2xx; degrading to None (fail-open)");
+            return Ok(None);
+        }
+        match serde_json::from_slice::<SkyhookShow>(&bytes) {
+            Ok(show) => Ok(Some(show.into_metadata())),
+            Err(e) => {
+                tracing::debug!(error = %e, id = %id, "AMETA-3: Skyhook show parse failed; degrading to None (fail-open)");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `GET /search/en/{term}` — Skyhook series search (thin records).
+    /// Fail-open like [`Self::skyhook_show`]: transport/HTTP/parse failures
+    /// degrade to an empty result set rather than erroring.
+    async fn skyhook_search(&self, term: &str) -> MuseResult<Vec<ProviderMetadata>> {
+        let url = self.skyhook_url(&["search", "en", term])?;
+        let (status, bytes) = match self.skyhook_send(url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::debug!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
+                return Ok(Vec::new());
+            }
+        };
+        if !(200..300).contains(&status) {
+            tracing::debug!(
+                status,
+                "AMETA-3: Skyhook search non-2xx; degrading to empty (fail-open)"
+            );
+            return Ok(Vec::new());
+        }
+        match serde_json::from_slice::<Vec<SkyhookShow>>(&bytes) {
+            Ok(hits) => Ok(hits.into_iter().map(SkyhookShow::into_metadata).collect()),
+            Err(e) => {
+                tracing::debug!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
+                Ok(Vec::new())
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -258,6 +423,15 @@ impl MetadataProvider for TvdbClient {
         kind: MediaKind,
         provider_id: &str,
     ) -> MuseResult<Option<ProviderMetadata>> {
+        // AMETA-3: key-less Skyhook mode — series only, no login.
+        if self.mode == TvdbMode::Skyhook {
+            return match kind {
+                MediaKind::Series => self.skyhook_show(provider_id).await,
+                // Skyhook serves TV; movies aren't available here.
+                MediaKind::Movie => Ok(None),
+            };
+        }
+
         let record = match kind {
             MediaKind::Series => self.get_series(provider_id).await?,
             MediaKind::Movie => self.get_movie(provider_id).await?,
@@ -265,8 +439,16 @@ impl MetadataProvider for TvdbClient {
         Ok(record.map(|r| r.into_metadata(provider_id)))
     }
 
-    /// `GET /search?query=..&type=series|movie`.
+    /// `GET /search?query=..&type=series|movie` (Api mode) or
+    /// `GET /search/en/{term}` (Skyhook mode, series only).
     async fn search(&self, query: &str, kind: MediaKind) -> MuseResult<Vec<ProviderMetadata>> {
+        if self.mode == TvdbMode::Skyhook {
+            return match kind {
+                MediaKind::Series => self.skyhook_search(query).await,
+                MediaKind::Movie => Ok(Vec::new()),
+            };
+        }
+
         let type_param = match kind {
             MediaKind::Series => "series",
             MediaKind::Movie => "movie",
@@ -290,7 +472,11 @@ impl MetadataProvider for TvdbClient {
                 message: format!("failed to parse tvdb search response: {e}"),
             })?;
 
-        Ok(envelope.data.into_iter().map(TvdbSearchHit::into_metadata).collect())
+        Ok(envelope
+            .data
+            .into_iter()
+            .map(TvdbSearchHit::into_metadata)
+            .collect())
     }
 }
 
@@ -431,11 +617,7 @@ impl TvdbRecord {
             provider_ids,
             title: self.name,
             overview: self.overview,
-            genres: self
-                .genres
-                .into_iter()
-                .filter_map(|g| g.name)
-                .collect(),
+            genres: self.genres.into_iter().filter_map(|g| g.name).collect(),
             images: ProviderImages {
                 poster_url: self.image.and_then(TvdbImage::into_url),
                 backdrop_url: None,
@@ -446,7 +628,12 @@ impl TvdbRecord {
                 .year
                 .as_deref()
                 .and_then(|y| y.parse::<i32>().ok())
-                .or_else(|| first_aired.as_deref().and_then(|d| d.get(0..4)).and_then(|y| y.parse().ok())),
+                .or_else(|| {
+                    first_aired
+                        .as_deref()
+                        .and_then(|d| d.get(0..4))
+                        .and_then(|y| y.parse().ok())
+                }),
             network: self.original_network.and_then(TvdbNetworkField::into_name),
             // MUSEL-A2: TheTVDB's extended record has no dedicated free-text
             // keywords field — left empty (see ProviderMetadata::keywords).
@@ -519,11 +706,122 @@ impl TvdbSearchHit {
                 .year
                 .as_deref()
                 .and_then(|y| y.parse::<i32>().ok())
-                .or_else(|| self.first_air_time.as_deref().and_then(|d| d.get(0..4)).and_then(|y| y.parse().ok())),
+                .or_else(|| {
+                    self.first_air_time
+                        .as_deref()
+                        .and_then(|d| d.get(0..4))
+                        .and_then(|y| y.parse().ok())
+                }),
             network: self.network,
             keywords: Vec::new(),
             // MUSEL-C2: runtime not parsed from TheTVDB v4 yet.
             runtime_minutes: None,
+        }
+    }
+}
+
+// --- AMETA-3: Sonarr Skyhook (skyhook.sonarr.tv) response shapes -----------
+//
+// Skyhook's JSON differs from TheTVDB v4's: `genres` is a plain string array,
+// art is an `images[]` array tagged by `coverType` (absolute URLs), `runtime`
+// is inline (fills MUSEL-C2's always-`None` gap), and ids come as top-level
+// `tvdbId`/`imdbId`/`tmdbId` (no `remoteIds` envelope). Permissive
+// (`Option`/`#[serde(default)]`) since Skyhook omits fields per title.
+
+/// One entry of a Skyhook `images[]` array, e.g.
+/// `{"coverType":"poster","url":"https://artworks.thetvdb.com/..."}`. Some
+/// records carry a relative `url` alongside an absolute `remoteUrl` — prefer
+/// the latter (same posture as `RadarrImage` in `trending::client`).
+#[derive(Debug, Deserialize)]
+struct SkyhookImage {
+    #[serde(rename = "coverType", default)]
+    cover_type: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(rename = "remoteUrl", default)]
+    remote_url: Option<String>,
+}
+
+impl SkyhookImage {
+    /// Prefer the absolute `remoteUrl`; fall back to `url` (which may be a
+    /// proxy-relative path). Discarding a usable absolute URL in favour of a
+    /// relative one would break artwork rendering (codex finding).
+    fn best_url(&self) -> Option<String> {
+        self.remote_url.clone().or_else(|| self.url.clone())
+    }
+}
+
+/// A Skyhook series record (`GET /shows/en/{tvdbId}` /
+/// `GET /search/en/{term}` element).
+#[derive(Debug, Deserialize)]
+struct SkyhookShow {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(rename = "firstAired", default)]
+    first_aired: Option<String>,
+    /// Runtime in minutes — fills `ProviderMetadata::runtime_minutes`
+    /// (MUSEL-C2), which the TheTVDB v4 mapping leaves `None`.
+    #[serde(default)]
+    runtime: Option<i32>,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    images: Vec<SkyhookImage>,
+    #[serde(rename = "tvdbId", default)]
+    tvdb_id: Option<i64>,
+    #[serde(rename = "imdbId", default)]
+    imdb_id: Option<String>,
+    #[serde(rename = "tmdbId", default)]
+    tmdb_id: Option<i64>,
+}
+
+impl SkyhookShow {
+    fn into_metadata(self) -> ProviderMetadata {
+        let mut provider_ids = std::collections::HashMap::new();
+        if let Some(tvdb_id) = self.tvdb_id {
+            provider_ids.insert("tvdb".to_string(), tvdb_id.to_string());
+        }
+        if let Some(imdb_id) = self.imdb_id.filter(|s| !s.is_empty()) {
+            provider_ids.insert("imdb".to_string(), imdb_id);
+        }
+        if let Some(tmdb_id) = self.tmdb_id {
+            provider_ids.insert("tmdb".to_string(), tmdb_id.to_string());
+        }
+
+        let find_image = |want: &str| -> Option<String> {
+            self.images
+                .iter()
+                .find(|img| img.cover_type.as_deref() == Some(want))
+                .and_then(SkyhookImage::best_url)
+        };
+
+        let first_aired = self.first_aired.clone().filter(|s| !s.is_empty());
+        let year = first_aired
+            .as_deref()
+            .filter(|d| d.len() >= 4)
+            .and_then(|d| d[0..4].parse::<i32>().ok());
+
+        ProviderMetadata {
+            provider_ids,
+            title: self.title.filter(|s| !s.is_empty()),
+            overview: self.overview.filter(|s| !s.is_empty()),
+            genres: self.genres.into_iter().filter(|g| !g.is_empty()).collect(),
+            images: ProviderImages {
+                poster_url: find_image("poster"),
+                backdrop_url: find_image("fanart"),
+            },
+            // Skyhook exposes no numeric rating on the show record.
+            rating: None,
+            first_aired,
+            year,
+            network: self.network.filter(|s| !s.is_empty()),
+            keywords: Vec::new(),
+            // MUSEL-C2: Skyhook carries runtime — populate it.
+            runtime_minutes: self.runtime.filter(|m| *m > 0),
         }
     }
 }
@@ -638,9 +936,18 @@ mod tests {
         mock.assert();
         assert_eq!(metadata.title.as_deref(), Some("Game of Thrones"));
         assert_eq!(metadata.network.as_deref(), Some("HBO"));
-        assert_eq!(metadata.provider_ids.get("tvdb").map(String::as_str), Some("121361"));
-        assert_eq!(metadata.provider_ids.get("imdb").map(String::as_str), Some("tt0944947"));
-        assert_eq!(metadata.genres, vec!["Drama".to_string(), "Fantasy".to_string()]);
+        assert_eq!(
+            metadata.provider_ids.get("tvdb").map(String::as_str),
+            Some("121361")
+        );
+        assert_eq!(
+            metadata.provider_ids.get("imdb").map(String::as_str),
+            Some("tt0944947")
+        );
+        assert_eq!(
+            metadata.genres,
+            vec!["Drama".to_string(), "Fantasy".to_string()]
+        );
         assert_eq!(metadata.year, Some(2011));
     }
 
@@ -693,9 +1000,18 @@ mod tests {
             metadata.images.poster_url.as_deref(),
             Some("https://artworks.thetvdb.com/poster.jpg")
         );
-        assert_eq!(metadata.provider_ids.get("tvdb").map(String::as_str), Some("121361"));
-        assert_eq!(metadata.provider_ids.get("imdb").map(String::as_str), Some("tt0944947"));
-        assert_eq!(metadata.genres, vec!["Drama".to_string(), "Fantasy".to_string()]);
+        assert_eq!(
+            metadata.provider_ids.get("tvdb").map(String::as_str),
+            Some("121361")
+        );
+        assert_eq!(
+            metadata.provider_ids.get("imdb").map(String::as_str),
+            Some("tt0944947")
+        );
+        assert_eq!(
+            metadata.genres,
+            vec!["Drama".to_string(), "Fantasy".to_string()]
+        );
         assert_eq!(metadata.year, Some(2011));
     }
 
@@ -767,7 +1083,10 @@ mod tests {
 
         mock.assert();
         assert_eq!(metadata.title.as_deref(), Some("Arrival"));
-        assert_eq!(metadata.overview.as_deref(), Some("A linguist deciphers an alien language."));
+        assert_eq!(
+            metadata.overview.as_deref(),
+            Some("A linguist deciphers an alien language.")
+        );
         assert_eq!(metadata.genres, vec!["Sci-Fi".to_string()]);
         assert_eq!(metadata.year, Some(2016));
         // The critical remoteIds -> provider_ids bridge (codex review
@@ -855,7 +1174,10 @@ mod tests {
         mock.assert();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title.as_deref(), Some("Arrival"));
-        assert_eq!(hits[0].provider_ids.get("tmdb").map(String::as_str), Some("329865"));
+        assert_eq!(
+            hits[0].provider_ids.get("tmdb").map(String::as_str),
+            Some("329865")
+        );
     }
 
     /// v3-style search-hit shape: `movieName` instead of `name`, and a
@@ -900,7 +1222,10 @@ mod tests {
             hits[0].images.poster_url.as_deref(),
             Some("https://artworks.thetvdb.com/arrival.jpg")
         );
-        assert_eq!(hits[0].provider_ids.get("tmdb").map(String::as_str), Some("329865"));
+        assert_eq!(
+            hits[0].provider_ids.get("tmdb").map(String::as_str),
+            Some("329865")
+        );
     }
 
     /// The critical re-auth path: a stale cached token is rejected once with
@@ -920,7 +1245,9 @@ mod tests {
             when.method(POST).path(LOGIN_PATH);
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(serde_json::json!({"status": "success", "data": {"token": "fresh-token"}}));
+                .json_body(
+                    serde_json::json!({"status": "success", "data": {"token": "fresh-token"}}),
+                );
         });
         let retry_mock = server.mock(|when, then| {
             when.method(GET)
@@ -946,20 +1273,263 @@ mod tests {
     }
 
     #[test]
-    fn from_config_returns_none_when_unconfigured() {
+    fn from_config_returns_none_when_keyless_disabled_and_no_key() {
+        // AMETA-1: keyless off + no key ⇒ unavailable (old posture).
         let config = Config {
+            metadata_keyless: false,
             ..Default::default()
         };
         assert!(TvdbClient::from_config(&config).is_none());
     }
 
     #[test]
-    fn from_config_builds_client_when_configured() {
+    fn from_config_builds_real_api_client_when_key_set() {
+        // Raw MUSE_TVDB_API_KEY always wins → real-API mode.
         let config = Config {
-            tvdb_api_key: Some(crate::download::config::QbitPassword::from("abc123".to_string())),
+            tvdb_api_key: Some(crate::download::config::QbitPassword::from(
+                "abc123".to_string(),
+            )),
+            metadata_keyless: true,
             ..Default::default()
         };
-        assert!(TvdbClient::from_config(&config).is_some());
+        let client = TvdbClient::from_config(&config).expect("key ⇒ Some");
+        assert!(
+            !client.is_skyhook_mode(),
+            "a raw key must select real-API mode"
+        );
+    }
+
+    #[test]
+    fn from_config_builds_keyless_skyhook_when_no_key() {
+        // AMETA-1: the headline behavior — no key + keyless default true ⇒
+        // Some(Skyhook mode) instead of None.
+        let config = Config {
+            metadata_keyless: true,
+            ..Default::default()
+        };
+        let client = TvdbClient::from_config(&config).expect("keyless ⇒ Some");
+        assert!(client.is_skyhook_mode(), "no key must select Skyhook mode");
+        assert_eq!(client.base_url, DEFAULT_SKYHOOK_URL);
+    }
+
+    #[test]
+    fn from_config_honors_skyhook_base_url_override() {
+        let config = Config {
+            metadata_keyless: true,
+            skyhook_base_url: Some("http://skyhook.test.invalid/v1/tvdb".to_string()),
+            ..Default::default()
+        };
+        let client = TvdbClient::from_config(&config).expect("keyless ⇒ Some");
+        assert!(client.is_skyhook_mode());
+        assert_eq!(client.base_url, "http://skyhook.test.invalid/v1/tvdb");
+    }
+
+    // --- AMETA-3: Skyhook key-less proxy mode -------------------------------
+
+    fn skyhook_client_for(server: &MockServer) -> TvdbClient {
+        TvdbClient::new_skyhook(server.base_url()).expect("skyhook client should construct")
+    }
+
+    #[tokio::test]
+    async fn skyhook_resolve_by_id_parses_series_shape_no_login() {
+        let server = MockServer::start();
+        // NOTE: no /login mock registered — Skyhook mode must not call it.
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/shows/en/121361");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "title": "Game of Thrones",
+                    "overview": "Nine noble families fight for control.",
+                    "firstAired": "2011-04-17",
+                    "runtime": 60,
+                    "network": "HBO",
+                    "genres": ["Drama", "Fantasy"],
+                    "images": [
+                        {"coverType": "poster", "url": "https://artworks.thetvdb.com/poster.jpg"},
+                        {"coverType": "fanart", "url": "https://artworks.thetvdb.com/fanart.jpg"}
+                    ],
+                    "tvdbId": 121361,
+                    "imdbId": "tt0944947",
+                    "tmdbId": 1399
+                }));
+        });
+
+        let client = skyhook_client_for(&server);
+        let metadata = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("resolve should not error")
+            .expect("series should be found");
+
+        mock.assert();
+        assert_eq!(metadata.title.as_deref(), Some("Game of Thrones"));
+        assert_eq!(metadata.network.as_deref(), Some("HBO"));
+        assert_eq!(metadata.runtime_minutes, Some(60));
+        assert_eq!(
+            metadata.genres,
+            vec!["Drama".to_string(), "Fantasy".to_string()]
+        );
+        assert_eq!(metadata.year, Some(2011));
+        assert_eq!(
+            metadata.images.poster_url.as_deref(),
+            Some("https://artworks.thetvdb.com/poster.jpg")
+        );
+        assert_eq!(
+            metadata.images.backdrop_url.as_deref(),
+            Some("https://artworks.thetvdb.com/fanart.jpg")
+        );
+        assert_eq!(
+            metadata.provider_ids.get("tvdb").map(String::as_str),
+            Some("121361")
+        );
+        assert_eq!(
+            metadata.provider_ids.get("imdb").map(String::as_str),
+            Some("tt0944947")
+        );
+        assert_eq!(
+            metadata.provider_ids.get("tmdb").map(String::as_str),
+            Some("1399")
+        );
+    }
+
+    #[tokio::test]
+    async fn skyhook_resolve_movie_kind_is_none_series_only_proxy() {
+        // Skyhook is series-only; a Movie lookup no-ops to None (movies go
+        // through the Radarr proxy) — and makes no HTTP call.
+        let server = MockServer::start();
+        let client = skyhook_client_for(&server);
+        let result = client
+            .resolve_by_id(MediaKind::Movie, "12345")
+            .await
+            .expect("movie-on-series-proxy should not error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn skyhook_resolve_returns_none_for_404() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/shows/en/999999");
+            then.status(404).body("not found");
+        });
+
+        let client = skyhook_client_for(&server);
+        let result = client
+            .resolve_by_id(MediaKind::Series, "999999")
+            .await
+            .expect("404 should not be an error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn skyhook_search_parses_hits() {
+        // Single-token term (no percent-encoding needed) keeps the path
+        // matcher unambiguous on the gate; the term is still routed through
+        // `Url::path_segments_mut`, which percent-encodes any spaces/specials.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/search/en/thrones");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([
+                    {"title": "Game of Thrones", "tvdbId": 121361, "genres": ["Drama"]}
+                ]));
+        });
+
+        let client = skyhook_client_for(&server);
+        let hits = client
+            .search("thrones", MediaKind::Series)
+            .await
+            .expect("search should parse");
+
+        mock.assert();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("Game of Thrones"));
+        assert_eq!(
+            hits[0].provider_ids.get("tvdb").map(String::as_str),
+            Some("121361")
+        );
+    }
+
+    #[tokio::test]
+    async fn skyhook_image_prefers_remote_url_over_relative_url() {
+        // codex fix: a Skyhook image with a relative `url` AND an absolute
+        // `remoteUrl` must map the absolute one (mirrors the Radarr adapter);
+        // storing the relative path would break artwork.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/shows/en/121361");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "title": "Game of Thrones",
+                    "tvdbId": 121361,
+                    "images": [
+                        {"coverType": "poster", "url": "/relative/poster.jpg", "remoteUrl": "https://artworks.thetvdb.com/poster.jpg"}
+                    ]
+                }));
+        });
+
+        let client = skyhook_client_for(&server);
+        let metadata = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("resolve should not error")
+            .expect("series should be found");
+
+        assert_eq!(
+            metadata.images.poster_url.as_deref(),
+            Some("https://artworks.thetvdb.com/poster.jpg"),
+            "remoteUrl must win over the relative url"
+        );
+    }
+
+    #[tokio::test]
+    async fn skyhook_resolve_and_search_fail_open_on_connection_error() {
+        // Fail-open (codex): an unreachable Skyhook proxy degrades to
+        // None/empty, never Err.
+        let client =
+            TvdbClient::new_skyhook("http://127.0.0.1:1").expect("client should construct");
+
+        let resolved = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("connection error must degrade to Ok(None), not Err");
+        assert!(resolved.is_none());
+
+        let hits = client
+            .search("thrones", MediaKind::Series)
+            .await
+            .expect("connection error must degrade to Ok(empty), not Err");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skyhook_resolve_fails_open_on_5xx() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/shows/en/121361");
+            then.status(502).body("bad gateway");
+        });
+
+        let client = skyhook_client_for(&server);
+        let resolved = client
+            .resolve_by_id(MediaKind::Series, "121361")
+            .await
+            .expect("5xx must degrade to Ok(None), not Err");
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn skyhook_search_movie_kind_is_empty() {
+        let server = MockServer::start();
+        let client = skyhook_client_for(&server);
+        let hits = client
+            .search("anything", MediaKind::Movie)
+            .await
+            .expect("movie search on series-only proxy should not error");
+        assert!(hits.is_empty());
     }
 
     #[test]

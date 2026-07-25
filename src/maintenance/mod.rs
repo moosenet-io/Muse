@@ -85,6 +85,15 @@ use crate::taste_model::chord_client::ChordClient;
 /// passes (each pass permanently resolves what it can).
 const DEFAULT_MAINTENANCE_RESOLVE_LIMIT: i64 = 5000;
 
+/// FIX 2b: whether taste should be recomputed for an account this pass. Taste
+/// is derived from `watch_stats`, so a recompute is skipped when that account's
+/// `watch_stats` aggregation failed (its rebuild rolled back to the prior
+/// state; recomputing from it would treat a stale set as freshly authoritative
+/// and, worse, mask that the intended aggregation never landed).
+fn should_recompute_taste(aggregate_result: &crate::error::MuseResult<usize>) -> bool {
+    aggregate_result.is_ok()
+}
+
 /// Outcome of one [`run_maintenance_pass`] call. Every counter is a plain
 /// "how much happened", not a pass/fail — failures are counted separately
 /// (`*_failed`) rather than aborting the pass, per the module docs.
@@ -285,19 +294,27 @@ pub async fn run_maintenance_pass(state: &AppState) -> MaintenanceSummary {
         // recompute_taste, since the taste derivation reads watch_stats. This
         // is the "aggregate" in resolve -> aggregate -> recompute: without it,
         // even resolved sessions produce zero taste signals.
-        match crate::taste_model::aggregate::rebuild_watch_stats_for_account(&state.pool, account.id).await {
-            Ok(written) => summary.watch_stats_rebuilt += written,
+        let aggregate_result =
+            crate::taste_model::aggregate::rebuild_watch_stats_for_account(&state.pool, account.id).await;
+        match &aggregate_result {
+            Ok(written) => summary.watch_stats_rebuilt += *written,
             Err(e) => {
                 summary.watch_stats_rebuild_failed += 1;
-                tracing::warn!(error = %e, account_id = account.id, "MUSE-31/BSEED-4: maintenance pass — watch_stats aggregation failed for this account; continuing");
+                tracing::warn!(error = %e, account_id = account.id, "MUSE-31/BSEED-4: maintenance pass — watch_stats aggregation failed for this account; skipping recompute_taste, continuing");
             }
         }
 
-        match crate::taste_model::recompute_taste(&state.pool, chord.as_ref(), account.id).await {
-            Ok(_) => summary.taste_recomputed += 1,
-            Err(e) => {
-                summary.taste_failed += 1;
-                tracing::warn!(error = %e, account_id = account.id, "MUSE-31: maintenance pass — recompute_taste failed for this account; continuing");
+        // FIX 2b: only recompute taste when this account's aggregation
+        // succeeded. Recomputing from a failed/rolled-back aggregation would
+        // derive the profile from a stale-or-partial `watch_stats` set as if it
+        // were authoritative; skip it and isolate the failure to this account.
+        if should_recompute_taste(&aggregate_result) {
+            match crate::taste_model::recompute_taste(&state.pool, chord.as_ref(), account.id).await {
+                Ok(_) => summary.taste_recomputed += 1,
+                Err(e) => {
+                    summary.taste_failed += 1;
+                    tracing::warn!(error = %e, account_id = account.id, "MUSE-31: maintenance pass — recompute_taste failed for this account; continuing");
+                }
             }
         }
 
@@ -542,6 +559,18 @@ mod tests {
     /// Pure guard-logic checks: a `MaintenanceSummary::default()` reports
     /// every step as not-run, matching the "nothing configured -> harmless
     /// no-op pass" posture without needing a live DB/AppState at all.
+    /// FIX 2b: taste is recomputed only when the account's watch_stats
+    /// aggregation succeeded — an `Err` aggregate result must gate out the
+    /// recompute so the profile is never derived from a rolled-back/partial set.
+    #[test]
+    fn should_recompute_taste_only_on_aggregate_success() {
+        assert!(should_recompute_taste(&Ok(3)));
+        assert!(should_recompute_taste(&Ok(0)));
+        assert!(!should_recompute_taste(&Err(crate::error::MuseError::NotFound(
+            "aggregation failed".to_string()
+        ))));
+    }
+
     #[test]
     fn default_summary_reports_every_step_as_not_run() {
         let summary = MaintenanceSummary::default();

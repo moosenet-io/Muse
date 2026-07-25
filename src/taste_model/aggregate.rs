@@ -55,7 +55,14 @@ struct WatchStatsAgg {
 /// - `first/last_watched_at` = min/max `started_at`
 /// - `abandoned`       = any session abandoned AND never finished
 pub async fn rebuild_watch_stats_for_account(pool: &PgPool, account_id: i64) -> MuseResult<usize> {
-    let aggregates = sqlx::query_as::<_, WatchStatsAgg>(
+    let aggregates = compute_aggregates(pool, account_id).await?;
+    write_aggregates(pool, account_id, &aggregates).await
+}
+
+/// The per-`media_item` aggregates for `account_id`'s resolved sessions. Split
+/// out (read-only) so the write half can be a single atomic transaction.
+async fn compute_aggregates(pool: &PgPool, account_id: i64) -> MuseResult<Vec<WatchStatsAgg>> {
+    sqlx::query_as::<_, WatchStatsAgg>(
         r#"
         SELECT
             media_item_id,
@@ -74,7 +81,20 @@ pub async fn rebuild_watch_stats_for_account(pool: &PgPool, account_id: i64) -> 
     .bind(account_id)
     .fetch_all(pool)
     .await
-    .map_err(MuseError::Database)?;
+    .map_err(MuseError::Database)
+}
+
+/// Write the account's aggregates into `watch_stats` in a SINGLE transaction
+/// (FIX 2a): the whole rebuild commits all-or-nothing, so a transient failure
+/// mid-way rolls back and leaves `watch_stats` at its prior consistent state
+/// (never a half-old/half-new mix that a subsequent taste recompute would read
+/// as if authoritative). Returns the number of aggregates written.
+async fn write_aggregates(
+    pool: &PgPool,
+    account_id: i64,
+    aggregates: &[WatchStatsAgg],
+) -> MuseResult<usize> {
+    let mut tx = pool.begin().await.map_err(MuseError::Database)?;
 
     let mut written = 0usize;
     for agg in aggregates {
@@ -86,8 +106,10 @@ pub async fn rebuild_watch_stats_for_account(pool: &PgPool, account_id: i64) -> 
         // `is_abandoned = !is_finished && ...` rule in the backfill importer.
         let abandoned = agg.any_abandoned && finished_count == 0;
 
+        // On error, `?` returns and `tx` is dropped → the whole rebuild rolls
+        // back (no partial write survives).
         repo::watch_stats::upsert_watch_stats(
-            pool,
+            &mut *tx,
             &NewWatchStats {
                 account_id,
                 media_item_id: agg.media_item_id,
@@ -105,6 +127,7 @@ pub async fn rebuild_watch_stats_for_account(pool: &PgPool, account_id: i64) -> 
         written += 1;
     }
 
+    tx.commit().await.map_err(MuseError::Database)?;
     Ok(written)
 }
 
@@ -311,5 +334,152 @@ mod tests {
             .expect("row still present");
         assert_eq!(stats_again.play_count, 3);
         assert_eq!(stats_again.finished_count, 2);
+    }
+
+    /// FIX 2a (live-DB, gated): the watch_stats rebuild is atomic. A failure
+    /// mid-transaction (here: a second aggregate referencing a nonexistent
+    /// `media_item_id` → FK violation) must roll back the ENTIRE write, leaving
+    /// the prior `watch_stats` row untouched — never a half-old/half-new mix
+    /// that a subsequent taste recompute would read as authoritative.
+    #[tokio::test]
+    async fn write_aggregates_rolls_back_on_mid_loop_failure() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping write_aggregates_rolls_back_on_mid_loop_failure");
+            return;
+        };
+        use crate::models::account::NewAccount;
+        use crate::models::library::{LibraryKind, NewLibrary};
+        use crate::models::media_item::NewMediaItem;
+        use crate::models::media_metadata::{MediaKind, NewMediaMetadata};
+        use sqlx::postgres::PgPoolOptions;
+        use uuid::Uuid;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let account = repo::account::create(
+            &pool,
+            &NewAccount {
+                plex_account_id: Some(format!("fix2a-acct-{suffix}")),
+                username: Some(format!("fix2a_{suffix}")),
+                friendly_name: None,
+                is_home_user: false,
+                is_primary: false,
+            },
+        )
+        .await
+        .expect("account");
+        let library = repo::library::create(
+            &pool,
+            &NewLibrary {
+                name: format!("fix2a-lib-{suffix}"),
+                kind: LibraryKind::Movie,
+                root_folder: "/media/fix2a".into(),
+                source_arr_name: None,
+                source_arr_url: None,
+            },
+        )
+        .await
+        .expect("lib");
+        let metadata = repo::media_metadata::upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(format!("fix2a-tmdb-{suffix}")),
+                tvdb_id: None,
+                imdb_id: None,
+                provider_ids: serde_json::json!({}),
+                title: format!("FIX2a {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: Some(90),
+                year: Some(2020),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("md");
+        let item = repo::media_item::upsert(
+            &pool,
+            &NewMediaItem {
+                library_id: library.id,
+                media_metadata_id: metadata.id,
+                path: format!("/media/fix2a/{suffix}"),
+                monitored: true,
+                quality_profile_id: None,
+                minimum_availability: None,
+                plex_rating_key: None,
+                added_at: None,
+            },
+        )
+        .await
+        .expect("item");
+
+        // Prior consistent state: a sentinel watch_stats row.
+        repo::watch_stats::upsert_watch_stats(
+            &pool,
+            &NewWatchStats {
+                account_id: account.id,
+                media_item_id: item.id,
+                play_count: 999,
+                finished_count: 7,
+                rewatch_count: 6,
+                total_watched_ms: 12345,
+                avg_percent: Some(0.5),
+                last_watched_at: None,
+                abandoned: false,
+                first_watched_at: None,
+            },
+        )
+        .await
+        .expect("seed prior");
+
+        // Two aggregates: the first valid (would overwrite the sentinel), the
+        // second referencing a nonexistent media_item_id → FK violation mid-tx.
+        let aggregates = vec![
+            WatchStatsAgg {
+                media_item_id: item.id,
+                play_count: 3,
+                finished_count: 2,
+                total_watched_ms: 500,
+                avg_percent: Some(0.9),
+                last_watched_at: None,
+                first_watched_at: None,
+                any_abandoned: false,
+            },
+            WatchStatsAgg {
+                media_item_id: 9_999_999_999,
+                play_count: 1,
+                finished_count: 0,
+                total_watched_ms: 1,
+                avg_percent: None,
+                last_watched_at: None,
+                first_watched_at: None,
+                any_abandoned: true,
+            },
+        ];
+
+        let result = write_aggregates(&pool, account.id, &aggregates).await;
+        assert!(result.is_err(), "a mid-loop FK violation must surface as an error");
+
+        // Rolled back: the sentinel row is untouched (the valid first upsert did
+        // NOT survive the failed transaction).
+        let stats = repo::watch_stats::get_watch_stats(&pool, account.id, item.id)
+            .await
+            .expect("get")
+            .expect("row still present");
+        assert_eq!(stats.play_count, 999, "prior watch_stats must be intact after rollback");
+        assert_eq!(stats.finished_count, 7);
+        assert_eq!(stats.total_watched_ms, 12345);
     }
 }

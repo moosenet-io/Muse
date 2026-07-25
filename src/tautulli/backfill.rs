@@ -585,6 +585,29 @@ pub struct ResolveSummary {
 ///
 /// Never returns `Err` for a single bad session — each is error-isolated and
 /// logged, matching the crate's graceful-degrade posture.
+/// Hard cap on how many Tautulli history records the one-time keyless
+/// rehydration paging (`build_ref_map`) will read, so a pathologically large
+/// history can't make `POST /ops/library/resolve` unbounded. The pre-existing
+/// backfill is ~1.5k rows; this is generous headroom while still bounded.
+const MAX_REHYDRATION_RECORDS: i64 = 250_000;
+
+/// Whether an unresolved session carries enough stored Plex identity to be
+/// re-resolved **offline** (no Tautulli round-trip). True when ANY stored key
+/// is present — crucially including the show-level `grandparent` fields, which
+/// alone are enough to resolve an episode's owning show (FIX 3: an
+/// episode row that persisted only a `grandparent_guid` must not be skipped
+/// forever on the offline path).
+fn has_stored_keys(session: &repo::play_session::UnresolvedSession) -> bool {
+    session.plex_rating_key.is_some()
+        || session.plex_grandparent_rating_key.is_some()
+        || session.plex_grandparent_guid.is_some()
+        || session
+            .plex_guids
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+}
+
 pub async fn resolve_existing_unresolved(
     pool: &PgPool,
     tautulli: Option<&TautulliClient>,
@@ -598,13 +621,27 @@ pub async fn resolve_existing_unresolved(
 
     let unresolved = repo::play_session::list_unresolved(pool, limit).await?;
 
-    // Lazily built (only when a session lacks stored keys AND a Tautulli client
-    // is available): reference_id -> history row, so we can recover ratingKeys.
-    let mut ref_map: Option<HashMap<i64, HistoryRow>> = None;
+    // Build the Tautulli `reference_id -> HistoryRow` rehydration map AT MOST
+    // ONCE for the whole batch (FIX 1), and only when it's actually needed: a
+    // client is available AND at least one row lacks stored keys. Paging is
+    // bounded (`MAX_REHYDRATION_RECORDS`). Fail-open: if paging fails, skip
+    // keyless rehydration this pass (degrade to offline-only) rather than
+    // erroring or — the original bug — re-paging the entire history per row.
+    let needs_rehydration = unresolved.iter().any(|s| !has_stored_keys(s));
+    let ref_map: Option<HashMap<i64, HistoryRow>> = match tautulli {
+        Some(client) if needs_rehydration => match build_ref_map(client, options).await {
+            Ok(map) => Some(map),
+            Err(e) => {
+                tracing::warn!(error = %e, "BSEED-2: could not page Tautulli history for keyless rehydration; skipping it this pass (offline-only)");
+                None
+            }
+        },
+        _ => None,
+    };
 
     for session in &unresolved {
         summary.sessions_considered += 1;
-        match resolve_one_unresolved(pool, tautulli, options, session, &mut ref_map).await {
+        match resolve_one_unresolved(pool, tautulli, session, ref_map.as_ref()).await {
             Ok(Some(SetMediaRefOutcome::Updated)) => summary.resolved += 1,
             Ok(Some(SetMediaRefOutcome::ConflictDeduped)) => summary.deduped_conflicts += 1,
             Ok(None) => summary.still_unresolved += 1,
@@ -630,30 +667,21 @@ pub async fn resolve_existing_unresolved(
 /// Resolve a single unresolved session; returns the `set_media_ref` outcome on
 /// a hit, or `None` when it still can't be matched. Isolated so
 /// [`resolve_existing_unresolved`]'s loop can log-and-continue per session.
+/// `ref_map` is the already-built (at-most-once) rehydration map — this
+/// function never pages Tautulli itself, only reads the shared map.
 async fn resolve_one_unresolved(
     pool: &PgPool,
     tautulli: Option<&TautulliClient>,
-    options: &BackfillOptions,
     session: &repo::play_session::UnresolvedSession,
-    ref_map: &mut Option<HashMap<i64, HistoryRow>>,
+    ref_map: Option<&HashMap<i64, HistoryRow>>,
 ) -> MuseResult<Option<SetMediaRefOutcome>> {
-    // Prefer stored keys (offline). Rehydrate from Tautulli only when the
-    // session has none stored and a client is available.
-    let has_stored_keys = session.plex_rating_key.is_some()
-        || session.plex_grandparent_rating_key.is_some()
-        || session
-            .plex_guids
-            .as_array()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
-
-    let (keys, stamp) = if has_stored_keys {
+    // Prefer stored keys (offline). Rehydrate from the pre-built ref-map only
+    // when the session has none stored and a client + map are available.
+    let (keys, stamp) = if has_stored_keys(session) {
         (keys_from_unresolved(session), false)
-    } else if let (Some(client), Some(ref_id)) = (tautulli, session.tautulli_ref_id) {
-        if ref_map.is_none() {
-            *ref_map = Some(build_ref_map(client, options).await?);
-        }
-        let map = ref_map.as_ref().expect("ref_map populated just above");
+    } else if let (Some(client), Some(ref_id), Some(map)) =
+        (tautulli, session.tautulli_ref_id, ref_map)
+    {
         let Some(history_row) = map.get(&ref_id) else {
             return Ok(None);
         };
@@ -694,9 +722,11 @@ async fn resolve_one_unresolved(
     Ok(Some(outcome))
 }
 
-/// Page all of Tautulli's `get_history` into a `reference_id -> HistoryRow`
-/// map, so pre-migration sessions (which stored no keys) can have their
-/// ratingKeys recovered for re-resolution.
+/// Page Tautulli's `get_history` into a `reference_id -> HistoryRow` map ONCE,
+/// so pre-migration sessions (which stored no keys) can have their ratingKeys
+/// recovered for re-resolution. Bounded by [`MAX_REHYDRATION_RECORDS`] — a
+/// history larger than that is truncated (logged) rather than paged without
+/// limit, keeping the on-demand endpoint's cost bounded.
 async fn build_ref_map(
     client: &TautulliClient,
     options: &BackfillOptions,
@@ -704,6 +734,14 @@ async fn build_ref_map(
     let mut map = HashMap::new();
     let mut start: i64 = 0;
     loop {
+        if start >= MAX_REHYDRATION_RECORDS {
+            tracing::warn!(
+                records_read = start,
+                cap = MAX_REHYDRATION_RECORDS,
+                "BSEED-2: Tautulli history exceeded the rehydration cap; truncating the ref-map"
+            );
+            break;
+        }
         let page = client.get_history(start, options.page_size).await?;
         if page.rows.is_empty() {
             break;
@@ -837,6 +875,49 @@ mod tests {
         assert_eq!(keys.guids, vec!["tvdb://7366144".to_string()]);
         assert_eq!(keys.grandparent_guid.as_deref(), Some("tvdb://121361"));
         assert_eq!(keys.year, Some(2019), "history-row year wins over metadata year");
+    }
+
+    /// FIX 3: an episode that persisted ONLY its owning show's `grandparent_guid`
+    /// (no rating keys, no item guids) still has enough to resolve offline —
+    /// `has_stored_keys` must return `true`, and `keys_from_unresolved` must
+    /// surface the grandparent guid as an episode key. A session with nothing
+    /// stored is (correctly) not offline-resolvable.
+    #[test]
+    fn has_stored_keys_true_for_grandparent_guid_only_episode() {
+        use crate::repo::play_session::UnresolvedSession;
+
+        let grandparent_only = UnresolvedSession {
+            id: 1,
+            account_id: Some(5),
+            tautulli_ref_id: Some(99),
+            plex_rating_key: None,
+            plex_grandparent_rating_key: None,
+            plex_grandparent_guid: Some("tvdb://121361".to_string()),
+            plex_guids: serde_json::json!([]),
+        };
+        assert!(
+            has_stored_keys(&grandparent_only),
+            "a grandparent-guid-only episode must be treated as offline-resolvable"
+        );
+        let keys = keys_from_unresolved(&grandparent_only);
+        assert!(keys.is_episode, "grandparent presence implies an episode");
+        assert_eq!(keys.grandparent_guid.as_deref(), Some("tvdb://121361"));
+
+        // Also true when only the grandparent RATING KEY is stored.
+        let grandparent_rk_only = UnresolvedSession {
+            plex_grandparent_guid: None,
+            plex_grandparent_rating_key: Some("500".to_string()),
+            ..grandparent_only.clone()
+        };
+        assert!(has_stored_keys(&grandparent_rk_only));
+
+        // Nothing stored -> not offline-resolvable.
+        let empty = UnresolvedSession {
+            plex_grandparent_guid: None,
+            plex_grandparent_rating_key: None,
+            ..grandparent_only.clone()
+        };
+        assert!(!has_stored_keys(&empty));
     }
 
     /// Mocked-Tautulli, live-DB round trip: `run()` against an httpmock
@@ -1452,5 +1533,102 @@ mod tests {
         let mine: Vec<_> = survivors.iter().filter(|s| s.account_id == Some(account.id)).collect();
         assert_eq!(mine.len(), 1, "collision must leave exactly one resolved session");
         assert_eq!(mine[0].media_item_id, Some(item.id));
+    }
+
+    /// FIX 1 (live-DB, gated): keyless unresolved sessions must trigger the
+    /// Tautulli rehydration ref-map to be paged AT MOST ONCE per resolve call —
+    /// not once per keyless row (the original unbounded-per-row bug). Two
+    /// keyless sessions ⇒ exactly one `get_history` paging.
+    #[tokio::test]
+    async fn resolve_existing_unresolved_builds_ref_map_at_most_once() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping resolve_existing_unresolved_builds_ref_map_at_most_once");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let account = repo::account::upsert_by_plex_account_id(
+            &pool,
+            &NewAccount {
+                plex_account_id: Some(format!("fix1-acct-{suffix}")),
+                username: Some(format!("fix1_{suffix}")),
+                friendly_name: None,
+                is_home_user: true,
+                is_primary: false,
+            },
+        )
+        .await
+        .expect("account");
+
+        // Two keyless unresolved sessions (no stored plex keys), each with a
+        // tautulli_ref_id present in the mocked history.
+        let r1 = (Uuid::new_v4().as_u128() % 1_000_000) as i64;
+        let r2 = (Uuid::new_v4().as_u128() % 1_000_000) as i64 + 1_000_000;
+        for (i, r) in [r1, r2].into_iter().enumerate() {
+            repo::play_session::upsert(
+                &pool,
+                &NewPlaySession {
+                    account_id: Some(account.id),
+                    media_item_id: None,
+                    episode_id: None,
+                    session_key: Some(format!("fix1-{suffix}-{i}")),
+                    tautulli_ref_id: Some(r),
+                    started_at: unix_seconds_to_utc(1_700_600_000 + i as i64).unwrap(),
+                    stopped_at: None,
+                    duration_ms: None,
+                    watched_ms: None,
+                    view_offset_ms: None,
+                    percent_complete: None,
+                    paused_counter: 0,
+                    paused_ms: 0,
+                    is_finished: false,
+                    is_abandoned: false,
+                    player: None,
+                    platform: None,
+                    product: None,
+                    device: None,
+                    ip_address: None,
+                    started_hour: None,
+                    started_dow: None,
+                    is_cinema_context: None,
+                },
+            )
+            .await
+            .expect("insert keyless session");
+        }
+
+        let server = MockServer::start();
+        let history_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v2").query_param("cmd", "get_history");
+            then.status(200).header("content-type", "application/json").body(format!(
+                r#"{{"response":{{"result":"success","data":{{"recordsFiltered":2,"recordsTotal":2,"data":[
+                    {{"reference_id":{r1},"rating_key":111,"media_type":"movie"}},
+                    {{"reference_id":{r2},"rating_key":222,"media_type":"movie"}}
+                ]}}}}}}"#
+            ));
+        });
+        // get_metadata returns nothing useful -> the sessions stay unresolved;
+        // this test only asserts the history was paged exactly once.
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v2").query_param("cmd", "get_metadata");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"response":{"result":"success","data":{}}}"#);
+        });
+
+        let client = TautulliClient::new(server.base_url(), "k").expect("client");
+        let _ = resolve_existing_unresolved(&pool, Some(&client), &BackfillOptions::default(), 10_000)
+            .await
+            .expect("re-resolution");
+
+        // Exactly one paging of get_history, regardless of how many keyless
+        // rows were processed — the ref-map is built once and reused.
+        history_mock.assert_hits(1);
     }
 }

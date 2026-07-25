@@ -2,9 +2,12 @@
 //!
 //! Mirrors `crate::plex::PlexClient`'s shape: a pure typed HTTP client that
 //! persists nothing itself (the ingest routine in `trending::mod` owns
-//! persistence), and constructs via [`TmdbClient::from_config`], which
-//! returns `None` when `TMDB_API_KEY` isn't configured — trending features
-//! degrade gracefully rather than blocking startup.
+//! persistence), and constructs via [`TmdbClient::from_config`]. When
+//! `TMDB_API_KEY` is configured it talks to the real TMDb API; when it isn't
+//! (and `metadata_keyless` is on, the default) it falls back to the key-less
+//! Radarr public metadata proxy ([`TmdbMode::RadarrProxy`], AMETA-1) so
+//! metadata enrichment works with zero operator key setup — trending/
+//! watch-providers degrade gracefully in that mode rather than blocking.
 
 use std::time::Duration;
 
@@ -14,14 +17,21 @@ use serde::de::DeserializeOwned;
 
 use crate::config::Config;
 use crate::error::{MuseError, MuseResult};
-use crate::metadata::{MediaKind as MetadataKind, MetadataProvider, ProviderImages, ProviderMetadata};
+use crate::metadata::{
+    MediaKind as MetadataKind, MetadataProvider, ProviderImages, ProviderMetadata,
+};
 
+pub use super::models::RegionProviders;
 use super::models::{
     ResultsEnvelope, TmdbDetails, TmdbFindResults, TmdbTitle, WatchProvidersEnvelope,
 };
-pub use super::models::RegionProviders;
 
 const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/3";
+/// AMETA-1: Radarr's public TMDb metadata proxy — the key-less default the
+/// client points at when no `TMDB_API_KEY` is configured. This is exactly the
+/// proxy Radarr itself uses so a user never registers a TMDb API key; no auth,
+/// no `api_key` query param. Overridable via `MUSE_TMDB_METADATA_URL`.
+pub const DEFAULT_RADARR_PROXY_URL: &str = "https://api.radarr.video/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// TMDb's image CDN base — `poster_path`/`backdrop_path` come back as
 /// bare relative paths (e.g. `/abc123.jpg`); this is prefixed to build a
@@ -63,12 +73,29 @@ impl TrendingWindow {
     }
 }
 
+/// How a [`TmdbClient`] talks to its backend (AMETA-1).
+///
+/// - [`TmdbMode::Api`] — the real `api.themoviedb.org` v3 API: every GET
+///   carries an `api_key` query param, `resolve_by_id`/`search` parse TMDb's
+///   own JSON, and trending/popular/watch-providers all work.
+/// - [`TmdbMode::RadarrProxy`] — the key-less public proxy at
+///   `api.radarr.video`: no `api_key`, movie records only, and a different
+///   response shape (genres as string arrays, `images[]` with `coverType`
+///   instead of `poster_path`). The proxy has **no** `/trending` or
+///   `/watch/providers`, so those degrade to empty in this mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmdbMode {
+    Api,
+    RadarrProxy,
+}
+
 /// A typed, read-only TMDb client.
 #[derive(Debug, Clone)]
 pub struct TmdbClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    mode: TmdbMode,
 }
 
 impl TmdbClient {
@@ -76,6 +103,22 @@ impl TmdbClient {
     /// real `https://api.themoviedb.org/3`, or an httpmock server in tests)
     /// and API key.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> MuseResult<Self> {
+        Self::with_mode(base_url, api_key, TmdbMode::Api)
+    }
+
+    /// Build a key-less proxy-mode client against a Radarr-metadata-proxy-
+    /// compatible base URL (the real `https://api.radarr.video/v1`, or an
+    /// httpmock server in tests). No API key is carried; requests parse the
+    /// Radarr proxy JSON shape rather than TMDb's own.
+    pub fn new_proxy(base_url: impl Into<String>) -> MuseResult<Self> {
+        Self::with_mode(base_url, String::new(), TmdbMode::RadarrProxy)
+    }
+
+    fn with_mode(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        mode: TmdbMode,
+    ) -> MuseResult<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -85,20 +128,49 @@ impl TmdbClient {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
+            mode,
         })
     }
 
-    /// Build a client from `Config` (`TMDB_API_KEY`) against the real TMDb
-    /// API. Returns `None` when unset/empty — callers (and the trending
-    /// ingest routine) treat TMDb as an optional, gracefully-degrading
-    /// dependency, same as `PlexClient::from_config`.
+    /// Build a client from `Config`. Precedence (AMETA-1/2):
+    /// 1. `TMDB_API_KEY` set → real TMDb API (today's behavior, full
+    ///    trending + metadata).
+    /// 2. else `metadata_keyless` (default true) → **key-less proxy mode**
+    ///    against `MUSE_TMDB_METADATA_URL` (default `api.radarr.video`), so a
+    ///    fresh deploy gets poster/genre/overview enrichment with zero
+    ///    operator key setup. Trending/watch-providers degrade to empty in
+    ///    this mode (the proxy has no such endpoints).
+    /// 3. else (`metadata_keyless=false`, no key) → `None`, the old
+    ///    graceful-degrade posture.
     pub fn from_config(config: &Config) -> Option<Self> {
-        let api_key = config.tmdb_api_key.clone()?;
+        if let Some(api_key) = config.tmdb_api_key.clone() {
+            return match Self::new(DEFAULT_BASE_URL, api_key) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to construct TMDb client; trending features will degrade");
+                    None
+                }
+            };
+        }
 
-        match Self::new(DEFAULT_BASE_URL, api_key) {
-            Ok(client) => Some(client),
+        if !config.metadata_keyless {
+            return None;
+        }
+
+        let base_url = config
+            .tmdb_metadata_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RADARR_PROXY_URL.to_string());
+        match Self::new_proxy(base_url) {
+            Ok(client) => {
+                tracing::info!(
+                    base_url = %client.base_url,
+                    "AMETA-1: TMDB_API_KEY unset — using key-less Radarr metadata proxy (movie enrichment only; trending/watch-providers disabled)"
+                );
+                Some(client)
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to construct TMDb client; trending features will degrade");
+                tracing::warn!(error = %e, "failed to construct key-less TMDb proxy client; metadata enrichment will degrade");
                 None
             }
         }
@@ -107,7 +179,11 @@ impl TmdbClient {
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> MuseResult<T> {
         let url = format!("{}{}", self.base_url, path);
 
-        let mut all_query: Vec<(&str, &str)> = vec![("api_key", self.api_key.as_str())];
+        // Proxy mode is key-less — never append an `api_key` param.
+        let mut all_query: Vec<(&str, &str)> = match self.mode {
+            TmdbMode::Api => vec![("api_key", self.api_key.as_str())],
+            TmdbMode::RadarrProxy => Vec::new(),
+        };
         all_query.extend_from_slice(query);
 
         let resp = self
@@ -135,23 +211,46 @@ impl TmdbClient {
         })
     }
 
+    /// Whether this client is in key-less Radarr-proxy mode (AMETA-1). The
+    /// proxy serves only movie lookup/search — trending, popular and
+    /// watch-providers have no proxy endpoint and degrade to empty.
+    pub fn is_proxy_mode(&self) -> bool {
+        self.mode == TmdbMode::RadarrProxy
+    }
+
     /// `GET /trending/{media_type}/{window}` — the day-one trending source.
+    ///
+    /// **Proxy-mode caveat (AMETA-2):** `api.radarr.video` has no `/trending`
+    /// endpoint, so in [`TmdbMode::RadarrProxy`] this degrades to an empty
+    /// list (logged once) rather than erroring — trending remains a
+    /// real-key-only feature; only metadata enrichment works key-less.
     pub async fn trending(
         &self,
         media_type: TmdbMediaType,
         window: TrendingWindow,
     ) -> MuseResult<Vec<TmdbTitle>> {
+        if self.mode == TmdbMode::RadarrProxy {
+            tracing::debug!(
+                "AMETA-2: trending unavailable in key-less proxy mode; returning empty"
+            );
+            return Ok(Vec::new());
+        }
         let path = format!("/trending/{}/{}", media_type.as_path(), window.as_str());
         let envelope: ResultsEnvelope<TmdbTitle> = self.get(&path, &[]).await?;
         Ok(envelope.results)
     }
 
-    /// `GET /movie|tv/popular` — region-configurable.
+    /// `GET /movie|tv/popular` — region-configurable. Degrades to empty in
+    /// key-less proxy mode (no proxy endpoint), same as [`Self::trending`].
     pub async fn popular(
         &self,
         media_type: TmdbMediaType,
         region: Option<&str>,
     ) -> MuseResult<Vec<TmdbTitle>> {
+        if self.mode == TmdbMode::RadarrProxy {
+            tracing::debug!("AMETA-2: popular unavailable in key-less proxy mode; returning empty");
+            return Ok(Vec::new());
+        }
         let path = format!("/{}/popular", media_type.as_path());
         let query: Vec<(&str, &str)> = match region {
             Some(r) => vec![("region", r)],
@@ -172,7 +271,8 @@ impl TmdbClient {
     /// popularity, which would defeat the relevance ranking for a
     /// free-text query.
     pub async fn search_multi(&self, query: &str) -> MuseResult<Vec<TmdbTitle>> {
-        let envelope: ResultsEnvelope<TmdbTitle> = self.get("/search/multi", &[("query", query)]).await?;
+        let envelope: ResultsEnvelope<TmdbTitle> =
+            self.get("/search/multi", &[("query", query)]).await?;
         Ok(envelope.results)
     }
 
@@ -183,6 +283,12 @@ impl TmdbClient {
         media_type: TmdbMediaType,
         tmdb_id: &str,
     ) -> MuseResult<std::collections::HashMap<String, RegionProviders>> {
+        if self.mode == TmdbMode::RadarrProxy {
+            tracing::debug!(
+                "AMETA-2: watch_providers unavailable in key-less proxy mode; returning empty"
+            );
+            return Ok(std::collections::HashMap::new());
+        }
         let path = format!("/{}/{}/watch/providers", media_type.as_path(), tmdb_id);
         let envelope: WatchProvidersEnvelope = self.get(&path, &[]).await?;
         Ok(envelope.results)
@@ -197,7 +303,8 @@ impl TmdbClient {
     /// — a title simply absent from TMDb, not an error.
     async fn get_details(&self, media_type: TmdbMediaType, id: &str) -> MuseResult<TmdbDetails> {
         let path = format!("/{}/{}", media_type.as_path(), id);
-        self.get(&path, &[("append_to_response", "external_ids")]).await
+        self.get(&path, &[("append_to_response", "external_ids")])
+            .await
     }
 
     /// `GET /find/{imdb_id}?external_source=imdb_id` — the IMDb-id bridge.
@@ -237,6 +344,56 @@ impl TmdbClient {
             Err(e) => Err(e),
         }
     }
+
+    // --- AMETA-2: key-less Radarr-proxy (api.radarr.video) resolve/search ---
+
+    /// Resolve a single movie via the Radarr metadata proxy:
+    /// `GET /movie/{tmdbId}`, or `GET /movie/imdb/{imdbId}` when `provider_id`
+    /// is an IMDb id (the `tt`-prefixed bridge, replacing TMDb's `/find`).
+    /// The proxy is movie-only, so a `Series` kind resolves to `Ok(None)`
+    /// (series go through the Skyhook path in `TvdbClient`). A 404 is a
+    /// well-formed "not on the proxy", mapped to `Ok(None)`.
+    async fn radarr_resolve(
+        &self,
+        media_type: TmdbMediaType,
+        provider_id: &str,
+    ) -> MuseResult<Option<ProviderMetadata>> {
+        if media_type == TmdbMediaType::Tv {
+            // api.radarr.video is a TMDb-*movie* proxy; series are Skyhook's job.
+            return Ok(None);
+        }
+
+        let path = if provider_id.starts_with("tt") {
+            format!("/movie/imdb/{provider_id}")
+        } else {
+            format!("/movie/{provider_id}")
+        };
+
+        match self.get::<RadarrMovie>(&path, &[]).await {
+            Ok(movie) => Ok(Some(radarr_proxy_to_provider_metadata(movie))),
+            Err(MuseError::Upstream { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Free-text movie search via the Radarr proxy: `GET /search?q={term}`.
+    /// Returns full records (the proxy embeds the same shape as
+    /// `/movie/{id}`), mapped to `ProviderMetadata`. Movie-only — a `Series`
+    /// kind yields an empty list.
+    async fn radarr_search(
+        &self,
+        query: &str,
+        media_type: TmdbMediaType,
+    ) -> MuseResult<Vec<ProviderMetadata>> {
+        if media_type == TmdbMediaType::Tv {
+            return Ok(Vec::new());
+        }
+        let movies: Vec<RadarrMovie> = self.get("/search", &[("q", query)]).await?;
+        Ok(movies
+            .into_iter()
+            .map(radarr_proxy_to_provider_metadata)
+            .collect())
+    }
 }
 
 /// Maps the crate-wide, provider-agnostic [`MetadataKind`] to TMDb's own
@@ -264,7 +421,10 @@ fn details_to_provider_metadata(details: TmdbDetails, tmdb_id: &str) -> Provider
         provider_ids.insert("imdb".to_string(), imdb_id);
     }
 
-    let first_aired = details.release_date.clone().or_else(|| details.first_air_date.clone());
+    let first_aired = details
+        .release_date
+        .clone()
+        .or_else(|| details.first_air_date.clone());
     let year = first_aired
         .as_deref()
         .filter(|d| d.len() >= 4)
@@ -274,10 +434,17 @@ fn details_to_provider_metadata(details: TmdbDetails, tmdb_id: &str) -> Provider
         provider_ids,
         title: details.title.or(details.name),
         overview: details.overview.filter(|s| !s.is_empty()),
-        genres: details.genres.into_iter().map(|g| g.name).filter(|n| !n.is_empty()).collect(),
+        genres: details
+            .genres
+            .into_iter()
+            .map(|g| g.name)
+            .filter(|n| !n.is_empty())
+            .collect(),
         images: ProviderImages {
             poster_url: details.poster_path.map(|p| format!("{IMAGE_BASE_URL}{p}")),
-            backdrop_url: details.backdrop_path.map(|p| format!("{IMAGE_BASE_URL}{p}")),
+            backdrop_url: details
+                .backdrop_path
+                .map(|p| format!("{IMAGE_BASE_URL}{p}")),
         },
         rating: details.vote_average,
         first_aired,
@@ -290,6 +457,145 @@ fn details_to_provider_metadata(details: TmdbDetails, tmdb_id: &str) -> Provider
         keywords: Vec::new(),
         // MUSEL-C2 field: TMDb runtime isn't fetched in this v1 mapping.
         runtime_minutes: None,
+    }
+}
+
+// --- AMETA-2: Radarr public-proxy (api.radarr.video) response shapes -------
+//
+// The proxy JSON differs from TMDb's own: `genres` is a plain string array
+// (not `[{id,name}]`), art comes back as an `images[]` array tagged by
+// `coverType` (not `poster_path`/`backdrop_path` relative paths, and already
+// as absolute `remoteUrl`s), and `runtime`/`year` are inline. Permissive
+// (`Option`/`#[serde(default)]`) like `TmdbTitle`, since the proxy omits
+// fields per title.
+
+/// One entry of a Radarr-proxy `images[]` array, e.g.
+/// `{"coverType":"poster","url":"/...","remoteUrl":"https://image.tmdb.org/..."}`.
+#[derive(Debug, Clone, Deserialize)]
+struct RadarrImage {
+    #[serde(rename = "coverType", default)]
+    cover_type: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(rename = "remoteUrl", default)]
+    remote_url: Option<String>,
+}
+
+impl RadarrImage {
+    /// Prefer the absolute `remoteUrl` (the TMDb CDN URL); fall back to the
+    /// proxy-relative `url` if that's all the record carries.
+    fn best_url(&self) -> Option<String> {
+        self.remote_url.clone().or_else(|| self.url.clone())
+    }
+}
+
+/// Tolerant Radarr `ratings` shape. Newer proxies nest per-source
+/// (`{"tmdb":{"value":8.2},"imdb":{"value":8.7}}`); older/flat responses may
+/// send `{"value":8.2}` directly. Either yields a single best-effort rating.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RadarrRatings {
+    #[serde(default)]
+    tmdb: Option<RadarrRatingValue>,
+    #[serde(default)]
+    imdb: Option<RadarrRatingValue>,
+    #[serde(default)]
+    value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RadarrRatingValue {
+    #[serde(default)]
+    value: Option<f64>,
+}
+
+impl RadarrRatings {
+    fn best(&self) -> Option<f64> {
+        self.tmdb
+            .as_ref()
+            .and_then(|r| r.value)
+            .or_else(|| self.imdb.as_ref().and_then(|r| r.value))
+            .or(self.value)
+    }
+}
+
+/// A Radarr-proxy movie record (`GET /movie/{tmdbId}` /
+/// `GET /movie/imdb/{imdbId}` / `GET /search` element).
+#[derive(Debug, Clone, Deserialize)]
+struct RadarrMovie {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    year: Option<i32>,
+    /// Runtime in minutes — fills `ProviderMetadata::runtime_minutes`
+    /// (MUSEL-C2), which the real-API v1 mapping leaves `None`.
+    #[serde(default)]
+    runtime: Option<i32>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    images: Vec<RadarrImage>,
+    #[serde(default)]
+    ratings: Option<RadarrRatings>,
+    #[serde(rename = "imdbId", default)]
+    imdb_id: Option<String>,
+    /// TMDb id as a JSON number on the proxy — captured as a string for
+    /// `provider_ids` parity with the rest of the crate.
+    #[serde(rename = "tmdbId", default)]
+    tmdb_id: Option<i64>,
+    /// The proxy also echoes `inCinemas`/`physicalRelease`; `inCinemas` is
+    /// the closest analogue to TMDb's `release_date` for `first_aired`.
+    #[serde(rename = "inCinemas", default)]
+    in_cinemas: Option<String>,
+}
+
+/// Maps a Radarr-proxy [`RadarrMovie`] into the crate-wide
+/// [`ProviderMetadata`] (AMETA-2). Poster ← `images[coverType=="poster"]`,
+/// backdrop ← `images[coverType=="fanart"]`, genres pass through as-is
+/// (already strings), and `runtime` fills `runtime_minutes`.
+fn radarr_proxy_to_provider_metadata(movie: RadarrMovie) -> ProviderMetadata {
+    let mut provider_ids = std::collections::HashMap::new();
+    if let Some(tmdb_id) = movie.tmdb_id {
+        provider_ids.insert("tmdb".to_string(), tmdb_id.to_string());
+    }
+    if let Some(imdb_id) = movie.imdb_id.filter(|s| !s.is_empty()) {
+        provider_ids.insert("imdb".to_string(), imdb_id);
+    }
+
+    let find_image = |want: &str| -> Option<String> {
+        movie
+            .images
+            .iter()
+            .find(|img| img.cover_type.as_deref() == Some(want))
+            .and_then(RadarrImage::best_url)
+    };
+
+    let first_aired = movie.in_cinemas.clone().filter(|s| !s.is_empty());
+    let year = movie.year.or_else(|| {
+        first_aired
+            .as_deref()
+            .filter(|d| d.len() >= 4)
+            .and_then(|d| d[0..4].parse::<i32>().ok())
+    });
+
+    ProviderMetadata {
+        provider_ids,
+        title: movie.title.filter(|s| !s.is_empty()),
+        overview: movie.overview.filter(|s| !s.is_empty()),
+        genres: movie.genres.into_iter().filter(|g| !g.is_empty()).collect(),
+        images: ProviderImages {
+            poster_url: find_image("poster"),
+            backdrop_url: find_image("fanart"),
+        },
+        rating: movie.ratings.and_then(|r| r.best()),
+        first_aired,
+        year,
+        network: None,
+        keywords: Vec::new(),
+        // MUSEL-C2: the proxy carries runtime — populate it (real-API v1
+        // mapping still leaves this None).
+        runtime_minutes: movie.runtime.filter(|m| *m > 0),
     }
 }
 
@@ -307,6 +613,11 @@ impl MetadataProvider for TmdbClient {
         provider_id: &str,
     ) -> MuseResult<Option<ProviderMetadata>> {
         let media_type = to_tmdb_media_type(kind);
+
+        // AMETA-2: key-less proxy mode uses the Radarr-proxy shapes/endpoints.
+        if self.mode == TmdbMode::RadarrProxy {
+            return self.radarr_resolve(media_type, provider_id).await;
+        }
 
         if provider_id.starts_with("tt") {
             return self.resolve_by_imdb_id(media_type, provider_id).await;
@@ -327,6 +638,11 @@ impl MetadataProvider for TmdbClient {
     /// that lands on one of these via `resolve_and_merge`'s fallback path
     /// gets a lowest-confidence title/year/rating match, not a full record.
     async fn search(&self, query: &str, kind: MetadataKind) -> MuseResult<Vec<ProviderMetadata>> {
+        // AMETA-2: proxy mode searches api.radarr.video (movie-only).
+        if self.mode == TmdbMode::RadarrProxy {
+            return self.radarr_search(query, to_tmdb_media_type(kind)).await;
+        }
+
         let want = match kind {
             MetadataKind::Movie => "movie",
             MetadataKind::Series => "tv",
@@ -488,7 +804,9 @@ mod tests {
         });
 
         let client = client_for(&server);
-        let result = client.trending(TmdbMediaType::Movie, TrendingWindow::Day).await;
+        let result = client
+            .trending(TmdbMediaType::Movie, TrendingWindow::Day)
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -508,26 +826,223 @@ mod tests {
         });
 
         let client = client_for(&server);
-        let result = client.trending(TmdbMediaType::Movie, TrendingWindow::Day).await;
+        let result = client
+            .trending(TmdbMediaType::Movie, TrendingWindow::Day)
+            .await;
 
         assert!(result.is_err());
     }
 
     #[test]
-    fn from_config_returns_none_when_unconfigured() {
+    fn from_config_returns_none_when_keyless_disabled_and_no_key() {
+        // AMETA-1: with the key-less switch explicitly off and no raw key,
+        // the client is unavailable — the old graceful-degrade posture.
         let config = Config {
+            metadata_keyless: false,
             ..Default::default()
         };
         assert!(TmdbClient::from_config(&config).is_none());
     }
 
     #[test]
-    fn from_config_builds_client_when_configured() {
+    fn from_config_builds_real_api_client_when_key_set() {
+        // Raw TMDB_API_KEY always wins → real-API mode, even with keyless on.
         let config = Config {
             tmdb_api_key: Some("abc123".to_string()),
+            metadata_keyless: true,
             ..Default::default()
         };
-        assert!(TmdbClient::from_config(&config).is_some());
+        let client = TmdbClient::from_config(&config).expect("key ⇒ Some");
+        assert!(
+            !client.is_proxy_mode(),
+            "a raw key must select real-API mode"
+        );
+    }
+
+    #[test]
+    fn from_config_builds_keyless_proxy_when_no_key() {
+        // AMETA-1: the headline behavior — no key + keyless default true ⇒
+        // Some(proxy-mode) instead of None, pointed at the Radarr proxy.
+        let config = Config {
+            metadata_keyless: true,
+            ..Default::default()
+        };
+        let client = TmdbClient::from_config(&config).expect("keyless ⇒ Some");
+        assert!(
+            client.is_proxy_mode(),
+            "no key must select Radarr-proxy mode"
+        );
+        assert_eq!(client.base_url, DEFAULT_RADARR_PROXY_URL);
+    }
+
+    #[test]
+    fn from_config_honors_proxy_base_url_override() {
+        let config = Config {
+            metadata_keyless: true,
+            tmdb_metadata_base_url: Some("http://radarr-proxy.test.invalid/v1".to_string()),
+            ..Default::default()
+        };
+        let client = TmdbClient::from_config(&config).expect("keyless ⇒ Some");
+        assert!(client.is_proxy_mode());
+        assert_eq!(client.base_url, "http://radarr-proxy.test.invalid/v1");
+    }
+
+    // --- AMETA-2: Radarr key-less proxy mode --------------------------------
+
+    fn proxy_client_for(server: &MockServer) -> TmdbClient {
+        TmdbClient::new_proxy(server.base_url()).expect("proxy client should construct")
+    }
+
+    #[tokio::test]
+    async fn proxy_resolve_by_id_parses_radarr_movie_shape() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/movie/603");
+            // NOTE: no api_key query param asserted — proxy mode is key-less.
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{
+                        "title": "The Matrix",
+                        "overview": "A hacker discovers reality is a simulation.",
+                        "year": 1999,
+                        "runtime": 136,
+                        "genres": ["Action", "Science Fiction"],
+                        "images": [
+                            {"coverType": "poster", "url": "/p.jpg", "remoteUrl": "https://image.tmdb.org/t/p/original/p.jpg"},
+                            {"coverType": "fanart", "remoteUrl": "https://image.tmdb.org/t/p/original/b.jpg"}
+                        ],
+                        "ratings": {"tmdb": {"value": 8.2}},
+                        "imdbId": "tt0133093",
+                        "tmdbId": 603,
+                        "inCinemas": "1999-03-30"
+                    }"#,
+                );
+        });
+
+        let client = proxy_client_for(&server);
+        let result = MetadataProvider::resolve_by_id(&client, MetadataKind::Movie, "603")
+            .await
+            .expect("resolve should not error")
+            .expect("603 should resolve");
+
+        mock.assert();
+        assert_eq!(result.title.as_deref(), Some("The Matrix"));
+        assert_eq!(result.year, Some(1999));
+        assert_eq!(result.runtime_minutes, Some(136));
+        assert_eq!(
+            result.genres,
+            vec!["Action".to_string(), "Science Fiction".to_string()]
+        );
+        assert_eq!(result.provider_ids.get("tmdb"), Some(&"603".to_string()));
+        assert_eq!(
+            result.provider_ids.get("imdb"),
+            Some(&"tt0133093".to_string())
+        );
+        assert_eq!(
+            result.images.poster_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/p.jpg")
+        );
+        assert_eq!(
+            result.images.backdrop_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/b.jpg")
+        );
+        assert_eq!(result.rating, Some(8.2));
+    }
+
+    #[tokio::test]
+    async fn proxy_resolve_bridges_imdb_id_via_movie_imdb_path() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/movie/imdb/tt0133093");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"title": "The Matrix", "tmdbId": 603, "imdbId": "tt0133093"}"#);
+        });
+
+        let client = proxy_client_for(&server);
+        let result = MetadataProvider::resolve_by_id(&client, MetadataKind::Movie, "tt0133093")
+            .await
+            .expect("resolve should not error")
+            .expect("imdb bridge should resolve");
+
+        mock.assert();
+        assert_eq!(result.title.as_deref(), Some("The Matrix"));
+        assert_eq!(result.provider_ids.get("tmdb"), Some(&"603".to_string()));
+    }
+
+    #[tokio::test]
+    async fn proxy_resolve_series_kind_is_none_movie_only_proxy() {
+        // api.radarr.video is movie-only; a Series lookup no-ops to None
+        // (series go through the Skyhook path) — and makes no HTTP call.
+        let server = MockServer::start();
+        let client = proxy_client_for(&server);
+        let result = MetadataProvider::resolve_by_id(&client, MetadataKind::Series, "121361")
+            .await
+            .expect("series-on-movie-proxy should not error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_resolve_returns_none_for_404() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/movie/999999");
+            then.status(404).body("not found");
+        });
+
+        let client = proxy_client_for(&server);
+        let result = MetadataProvider::resolve_by_id(&client, MetadataKind::Movie, "999999")
+            .await
+            .expect("a 404 should not be an error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_search_parses_movie_hits() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/search").query_param("q", "matrix");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"[{"title": "The Matrix", "tmdbId": 603, "genres": ["Action"]}]"#);
+        });
+
+        let client = proxy_client_for(&server);
+        let hits = MetadataProvider::search(&client, "matrix", MetadataKind::Movie)
+            .await
+            .expect("search should parse");
+
+        mock.assert();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("The Matrix"));
+        assert_eq!(hits[0].provider_ids.get("tmdb"), Some(&"603".to_string()));
+    }
+
+    #[tokio::test]
+    async fn proxy_trending_and_watch_providers_degrade_to_empty_not_error() {
+        // AMETA-2 caveat: the proxy has no /trending or /watch/providers, so
+        // these degrade to empty WITHOUT hitting the network or erroring.
+        let server = MockServer::start();
+        let client = proxy_client_for(&server);
+
+        let trending = client
+            .trending(TmdbMediaType::Movie, TrendingWindow::Day)
+            .await
+            .expect("trending must degrade, not error");
+        assert!(trending.is_empty());
+
+        let popular = client
+            .popular(TmdbMediaType::Movie, None)
+            .await
+            .expect("popular must degrade, not error");
+        assert!(popular.is_empty());
+
+        let providers = client
+            .watch_providers(TmdbMediaType::Movie, "603")
+            .await
+            .expect("watch_providers must degrade, not error");
+        assert!(providers.is_empty());
     }
 
     // --- MUSEL-A2: MetadataProvider adapter ---------------------------
@@ -565,10 +1080,19 @@ mod tests {
         mock.assert();
         assert_eq!(result.title, Some("The Matrix".to_string()));
         assert_eq!(result.year, Some(1999));
-        assert_eq!(result.genres, vec!["Action".to_string(), "Science Fiction".to_string()]);
+        assert_eq!(
+            result.genres,
+            vec!["Action".to_string(), "Science Fiction".to_string()]
+        );
         assert_eq!(result.provider_ids.get("tmdb"), Some(&"603".to_string()));
-        assert_eq!(result.provider_ids.get("imdb"), Some(&"tt0133093".to_string()));
-        assert_eq!(result.images.poster_url, Some(format!("{IMAGE_BASE_URL}/poster.jpg")));
+        assert_eq!(
+            result.provider_ids.get("imdb"),
+            Some(&"tt0133093".to_string())
+        );
+        assert_eq!(
+            result.images.poster_url,
+            Some(format!("{IMAGE_BASE_URL}/poster.jpg"))
+        );
     }
 
     #[tokio::test]
@@ -597,7 +1121,9 @@ mod tests {
                 .query_param("external_source", "imdb_id");
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"movie_results": [{"id": 603, "title": "The Matrix"}], "tv_results": []}"#);
+                .body(
+                    r#"{"movie_results": [{"id": 603, "title": "The Matrix"}], "tv_results": []}"#,
+                );
         });
         let details_mock = server.mock(|when, then| {
             when.method(GET).path("/movie/603");
@@ -662,6 +1188,9 @@ mod tests {
         mock.assert();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, Some("Arrival".to_string()));
-        assert_eq!(results[0].provider_ids.get("tmdb"), Some(&"329865".to_string()));
+        assert_eq!(
+            results[0].provider_ids.get("tmdb"),
+            Some(&"329865".to_string())
+        );
     }
 }

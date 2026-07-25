@@ -62,6 +62,14 @@ pub struct Config {
     pub prowlarr_url: Option<String>,
     pub prowlarr_api_key: Option<String>,
     pub tmdb_api_key: Option<String>,
+    /// AMETA-1 (key-less metadata): base URL of the Radarr public TMDb
+    /// metadata proxy (`MUSE_TMDB_METADATA_URL`, default
+    /// `https://api.radarr.video/v1`). This is what `TmdbClient` points at
+    /// in proxy mode — the same key-less proxy Radarr itself uses so a user
+    /// never has to register a TMDb API key. Not secret-shaped (a public
+    /// host, no auth); overridable purely as a test/on-prem seam. Only used
+    /// when `tmdb_api_key` is unset and `metadata_keyless` is true.
+    pub tmdb_metadata_base_url: Option<String>,
     pub ollama_url: Option<String>,
     pub chord_url: Option<String>,
     /// S125: base URL of Chord's standardized `/v1/embeddings` endpoint
@@ -108,6 +116,26 @@ pub struct Config {
     /// exists so a test/on-prem proxy can point the client elsewhere, same
     /// seam `Config::trakt_base_url` provides for Trakt.
     pub tvdb_base_url: Option<String>,
+
+    /// AMETA-1 (key-less metadata): base URL of the Sonarr Skyhook public
+    /// TVDB metadata proxy (`MUSE_SKYHOOK_URL`, default
+    /// `https://skyhook.sonarr.tv/v1/tvdb`). `TvdbClient` points at this in
+    /// Skyhook (key-less) mode — the unauthenticated proxy Sonarr itself uses
+    /// so a user never registers a TheTVDB API key (and there's no `/login`
+    /// bearer dance). Not secret-shaped (a public host, no auth); overridable
+    /// as a test/on-prem seam. Only used when `tvdb_api_key` is unset and
+    /// `metadata_keyless` is true.
+    pub skyhook_base_url: Option<String>,
+
+    /// AMETA-1 (key-less metadata): master switch (`MUSE_METADATA_KEYLESS`,
+    /// default **true**). When true and no raw provider key is set, the
+    /// metadata clients build in key-less *proxy* mode (Radarr/Skyhook
+    /// public proxies) instead of returning `None` — so a fresh deploy gets
+    /// posters/genres/overview/runtime enrichment with ZERO operator key
+    /// setup. Set to `0`/`false` to restore the old "no key ⇒ no provider"
+    /// behavior. A raw `TMDB_API_KEY`/`MUSE_TVDB_API_KEY` always takes
+    /// precedence over the proxy regardless of this flag.
+    pub metadata_keyless: bool,
 
     /// MUSE-14: fleet SearXNG instance base URL, used for forum/critic
     /// sentiment + "does it get good" enrichment queries. `None` disables
@@ -540,6 +568,7 @@ impl Config {
             prowlarr_url: env_opt("PROWLARR_URL"),
             prowlarr_api_key: env_opt("PROWLARR_API_KEY"),
             tmdb_api_key: env_opt("TMDB_API_KEY"),
+            tmdb_metadata_base_url: env_opt("MUSE_TMDB_METADATA_URL"),
             ollama_url: env_opt("MUSE_OLLAMA_URL"),
             chord_url: env_opt("CHORD_URL"),
             chord_embeddings_url: env_opt("CHORD_EMBEDDINGS_URL"),
@@ -547,6 +576,10 @@ impl Config {
             tvdb_api_key: env_opt("MUSE_TVDB_API_KEY").map(QbitPassword::from),
             tvdb_pin: env_opt("MUSE_TVDB_PIN").map(QbitPassword::from),
             tvdb_base_url: env_opt("MUSE_TVDB_BASE_URL"),
+            skyhook_base_url: env_opt("MUSE_SKYHOOK_URL"),
+            metadata_keyless: env_opt("MUSE_METADATA_KEYLESS")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true),
             searxng_url: env_opt("MUSE_SEARXNG_URL"),
             news_url: env_opt("MUSE_NEWS_URL"),
             news_api_key: env_opt("MUSE_NEWS_API_KEY"),
@@ -723,6 +756,7 @@ impl Default for Config {
             prowlarr_url: None,
             prowlarr_api_key: None,
             tmdb_api_key: None,
+            tmdb_metadata_base_url: None,
             ollama_url: None,
             chord_url: None,
             chord_embeddings_url: None,
@@ -730,6 +764,8 @@ impl Default for Config {
             tvdb_api_key: None,
             tvdb_pin: None,
             tvdb_base_url: None,
+            skyhook_base_url: None,
+            metadata_keyless: true,
             arr_instances_json: None,
             qbit_url: None,
             qbit_user: None,
@@ -860,11 +896,14 @@ mod tests {
             "PROWLARR_URL",
             "PROWLARR_API_KEY",
             "TMDB_API_KEY",
+            "MUSE_TMDB_METADATA_URL",
             "MUSE_OLLAMA_URL",
             "CHORD_URL",
             "MUSE_TVDB_API_KEY",
             "MUSE_TVDB_PIN",
             "MUSE_TVDB_BASE_URL",
+            "MUSE_SKYHOOK_URL",
+            "MUSE_METADATA_KEYLESS",
             "MUSE_SEARXNG_URL",
             "MUSE_NEWS_URL",
             "MUSE_NEWS_API_KEY",
@@ -925,6 +964,13 @@ mod tests {
         assert!(cfg.tvdb_api_key.is_none());
         assert!(cfg.tvdb_pin.is_none());
         assert!(cfg.tvdb_base_url.is_none());
+        // AMETA-1: key-less proxy mode is the default; the proxy base URLs
+        // are unset (each client applies its public-proxy default) but the
+        // master switch defaults to true so a fresh deploy gets key-less
+        // metadata with zero operator env.
+        assert!(cfg.tmdb_metadata_base_url.is_none());
+        assert!(cfg.skyhook_base_url.is_none());
+        assert!(cfg.metadata_keyless);
         assert!(cfg.arr_instances_json.is_none());
         assert!(cfg
             .arr_instances()

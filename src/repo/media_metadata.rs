@@ -165,13 +165,29 @@ pub async fn find_by_tvdb_id(pool: &PgPool, kind: MediaKind, tvdb_id: &str) -> M
 /// history row's `imdb://tt…` GUID against an already-cataloged (arr-ingested)
 /// row. `imdb_id` is stored verbatim (`tt…`), so this is an exact match on the
 /// same string form the GUID parser yields.
+///
+/// **Resolves ONLY when the match is unambiguous** (same rule as
+/// [`find_by_title_year`]): unlike `tmdb_id`/`tvdb_id`, `imdb_id` is NOT unique
+/// in `media_metadata` (duplicate/inconsistent IMDb records happen), and imdb
+/// is the last-resort GUID priority — so this fetches up to two candidates and
+/// returns `Some` only when exactly one exists; zero or more-than-one → `None`
+/// (leave the session unresolved rather than cross-link to an arbitrary
+/// same-kind row).
 pub async fn find_by_imdb_id(pool: &PgPool, kind: MediaKind, imdb_id: &str) -> MuseResult<Option<i64>> {
-    sqlx::query_scalar::<_, i64>("SELECT id FROM media_metadata WHERE kind = $1 AND imdb_id = $2")
-        .bind(kind)
-        .bind(imdb_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(MuseError::Database)
+    let candidates: Vec<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM media_metadata WHERE kind = $1 AND imdb_id = $2 LIMIT 2",
+    )
+    .bind(kind)
+    .bind(imdb_id)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)?;
+
+    // Exactly one → unambiguous resolution; zero or ambiguous (≥2) → None.
+    match candidates.as_slice() {
+        [only] => Ok(Some(*only)),
+        _ => Ok(None),
+    }
 }
 
 /// Best-effort resolve a parsed release (title + optional year) to an
@@ -833,6 +849,103 @@ mod tests {
                 .expect("query"),
             None,
             "the year-absent branch must also refuse an ambiguous match"
+        );
+    }
+
+    /// FINAL FIX (live-DB, gated): `find_by_imdb_id` resolves ONLY when the
+    /// imdb match is unambiguous. `imdb_id` is not unique in `media_metadata`,
+    /// so a unique imdb returns that id, but two same-kind rows sharing the
+    /// exact `imdb_id` return `None` (never a blind cross-link).
+    #[tokio::test]
+    async fn find_by_imdb_id_resolves_only_when_unambiguous() {
+        let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!(
+                "MUSE_TEST_DATABASE_URL not set — skipping find_by_imdb_id_resolves_only_when_unambiguous"
+            );
+            return;
+        };
+
+        use sqlx::postgres::PgPoolOptions;
+        use uuid::Uuid;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // Unique imdb_id -> resolves to exactly that row.
+        let unique_imdb = format!("tt-fiximdb-unique-{suffix}");
+        let unique = upsert_by_tmdb(
+            &pool,
+            &NewMediaMetadata {
+                kind: MediaKind::Movie,
+                tmdb_id: Some(format!("fiximdb-unique-{suffix}")),
+                tvdb_id: None,
+                imdb_id: Some(unique_imdb.clone()),
+                provider_ids: serde_json::json!({}),
+                title: format!("FIXIMDB Unique {suffix}"),
+                sort_title: None,
+                original_title: None,
+                original_language: None,
+                status: None,
+                overview: None,
+                studio: None,
+                network: None,
+                runtime_minutes: None,
+                year: Some(1995),
+                images: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("seed unique imdb");
+
+        assert_eq!(
+            find_by_imdb_id(&pool, MediaKind::Movie, &unique_imdb)
+                .await
+                .expect("query"),
+            Some(unique.id),
+            "a unique imdb_id must resolve"
+        );
+
+        // Two DIFFERENT same-kind rows sharing the SAME imdb_id -> ambiguous ->
+        // None. (imdb_id is non-unique, so keyed on distinct tmdb_ids.)
+        let dup_imdb = format!("tt-fiximdb-dup-{suffix}");
+        for n in 0..2 {
+            upsert_by_tmdb(
+                &pool,
+                &NewMediaMetadata {
+                    kind: MediaKind::Movie,
+                    tmdb_id: Some(format!("fiximdb-dup-{n}-{suffix}")),
+                    tvdb_id: None,
+                    imdb_id: Some(dup_imdb.clone()),
+                    provider_ids: serde_json::json!({}),
+                    title: format!("FIXIMDB Dup {n} {suffix}"),
+                    sort_title: None,
+                    original_title: None,
+                    original_language: None,
+                    status: None,
+                    overview: None,
+                    studio: None,
+                    network: None,
+                    runtime_minutes: None,
+                    year: Some(1986),
+                    images: serde_json::json!([]),
+                },
+            )
+            .await
+            .expect("seed dup imdb");
+        }
+
+        assert_eq!(
+            find_by_imdb_id(&pool, MediaKind::Movie, &dup_imdb)
+                .await
+                .expect("query"),
+            None,
+            "an ambiguous imdb_id (2 same-kind rows) must NOT be resolved — correctness over coverage"
         );
     }
 }

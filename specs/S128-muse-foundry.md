@@ -699,9 +699,16 @@ same-mount `rename(2)`.
        VMAF over `verify_vmaf_samples` (default **3**) 10-second segments at
        even offsets, harmonic mean ≥ `verify_vmaf_floor` (default **93**);
      - **full-read integrity** — the output is decoded end-to-end with
-       `ffmpeg -v error -i <staged-output> -f null -` (the `-i` is not optional
-       — an earlier draft omitted it, which would decode nothing) and must
-       emit zero decode errors. This is
+       `ffmpeg -v error -i <staged-output> -map 0:v -map 0:a -f null -`.
+       Two flags here are load-bearing and both were wrong in earlier drafts:
+       the `-i` (omitted once, which would decode nothing), and the explicit
+       `-map`s. Without them ffmpeg applies **default stream selection** and
+       decodes only the default video and audio stream — a corrupt *second*
+       audio track or secondary video stream would sail through a check the
+       spec calls end-to-end. Every decodable planned stream is mapped.
+       Subtitle and attachment streams are not decodable to `null` and are
+       verified separately by presence and codec in the stream-set check
+       above. Must emit zero decode errors. This is
        the bitstream check; the VMAF sample is a quality check. Both required.
      Any failure → source untouched, job `Failed`, output retained for
      inspection.
@@ -788,9 +795,14 @@ same-mount `rename(2)`.
 
   ## TEST PLAN
   - Sandbox end-to-end on `src-readonly/Andromeda.103…avi`: transcodes,
-    verifies and swaps; the recycle-bin entry and the installed file share an
-    inode with, respectively, the original and the encoder output (assert by
-    `st_ino`); a re-probe confirms `h264`
+    verifies and swaps; a re-probe of the installed file confirms `h264`.
+    Assert inode identity **only where it can hold**: the recycle-bin entry
+    shares an inode with the pre-swap original (it is a `link(2)`). The
+    installed file does **not** share an inode with the encoder output — rail 3
+    puts `work_dir` on another filesystem, so destination staging is a copy —
+    and asserting otherwise would be an impossible test that pushes an
+    implementer toward a same-device work dir or an invalid cross-device link.
+    The staged copy is verified by **sha256** against the work-dir output
   - Hardlinked file (`st_nlink > 1`) is `Blocked`; asserted byte-identical
     (sha256) and `st_mtime`-unchanged afterwards
   - Insufficient headroom is `Blocked` before any encode starts (assert the
@@ -809,7 +821,9 @@ same-mount `rename(2)`.
     An earlier draft asserted "reachable from the recycle bin" at every point,
     which is false immediately after staging. Retry after each abort converges
     to the same final state
-  - Full-read integrity check rejects a deliberately corrupted output
+  - Full-read integrity check rejects a deliberately corrupted output,
+    **including corruption confined to a non-default second audio track** —
+    the regression test for default stream selection
   - **Cross-device staging**: with `work_dir` on a different filesystem from
     the target (the real deployment shape), the swap succeeds — this is the
     regression test for the `EXDEV` bug in draft 2, and it must fail if any

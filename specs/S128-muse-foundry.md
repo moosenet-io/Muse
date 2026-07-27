@@ -734,7 +734,8 @@ same-mount `rename(2)`.
      d. Delete the work-dir output (scratch only; the installed file is the
         staged copy, and the old content lives in the recycle bin).
 
-     **Revalidate the source immediately before (b) and (c).** The check in
+     **Revalidate the source around (b) and (c) — and mind that (b) itself
+     changes the link count.** The check in
      step 1 happens before the encode, and staging plus the recycle link take
      real time on a large file — a concurrent *arr import could replace the
      source in that window, and the rename would silently overwrite it with a
@@ -747,11 +748,22 @@ same-mount `rename(2)`.
        do not catch a metadata-preserving replacement.
      - **size and mtime**, which catch an in-place modification of the same
        inode.
-     - **`st_nlink`**, rechecked here and not only at step 1: a hardlink can be
+     - **`st_nlink`**, rechecked and not only at step 1: a hardlink can be
        created *during* the encode (an import, or cross-seed) and leaves size,
        mtime and inode all unchanged. Replacing a now-multi-linked file would
-       break the seed the link-count guard exists to protect. `st_nlink > 1` at
-       this point aborts, exactly as it does at step 1.
+       break the seed the link-count guard exists to protect.
+       **Where this check goes is load-bearing, and an earlier draft got it
+       wrong.** It said "recheck `st_nlink > 1` before (b) and (c)" — but step
+       (b) *is* the recycle hardlink, which takes the count from 1 to 2 by
+       design, so the check before (c) would have aborted every correctly
+       staged swap. The count is therefore checked twice with *different*
+       expectations:
+       - **immediately before (b): expect exactly 1.** More than that is an
+         external link and aborts.
+       - **immediately before (c): expect exactly 2** — the original entry plus
+         the recycle link Foundry just created, and nothing else. Anything
+         higher means a third party linked the file during staging; abort and
+         leave the recycle link behind for the next run to reclaim.
      Any mismatch aborts the swap. The recycle link from (b) is harmless if
      left behind; the next run reclaims it by job id.
 
@@ -834,11 +846,16 @@ same-mount `rename(2)`.
         refused at startup, so this holds unconditionally)
   - [ ] The installed file is the destination-staged copy, and its sha256
         matches the work-dir output
-  - [ ] A source whose **inode**, size, mtime, or **link count** changed at any
-        point between planning and the final rename — including during staging
-        and recycle-linking — aborts the swap rather than overwriting newer
-        content or breaking a newly-created hardlink. Tested by injecting each
-        of the four mutations separately during the staging window
+  - [ ] A source whose **inode**, size or mtime changed at any point between
+        planning and the final rename aborts the swap rather than overwriting
+        newer content. Tested by injecting each mutation separately during the
+        staging window
+  - [ ] Link count is checked with the **correct expectation at each point** —
+        exactly 1 before the recycle link is created, exactly 2 after it — so
+        a normal swap is never self-blocked by its own recycle link, while an
+        externally-created link at either point still aborts. Tested both ways:
+        an ordinary swap completes, and an injected third-party hardlink during
+        staging aborts it
   - [ ] For **all three** crash-injection points (after staging, after the
         recycle link, after the rename), the target path still resolves to a
         file and the old content is still reachable; retrying converges to the

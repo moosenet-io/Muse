@@ -40,6 +40,12 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResolvedPath(PathBuf);
 
+// The raw-path accessors have no consumers yet: MUSEF-01 is deliberately the
+// foundation, built and reviewed before any code exists that could misuse it.
+// MUSEF-02 (probe) is the first reader and MUSEF-08 (verify-then-swap) the
+// first writer. Annotated rather than left as warning noise, and rather than
+// widening visibility just to silence it.
+#[allow(dead_code)]
 impl ResolvedPath {
     /// The underlying canonical path.
     ///
@@ -102,6 +108,8 @@ impl std::fmt::Display for ResolvedPath {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MutablePath(ResolvedPath);
 
+// Same as ResolvedPath above: no consumers until MUSEF-08.
+#[allow(dead_code)]
 impl MutablePath {
     /// The underlying canonical path. Foundry-internal, as for
     /// [`ResolvedPath::as_path`].

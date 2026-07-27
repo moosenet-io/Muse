@@ -1187,7 +1187,7 @@ same-mount `rename(2)`.
   - [ ] Secrets accessed via `SecretManager`, not env vars
   - [ ] No hardcoded infrastructure values in new/modified code
 
-### MUSEF-17: Candidate scoring and sync verification
+### MUSEF-17: Candidate scoring and match confidence
 - **Priority:** High · **Labels:** muse, foundry, subtitles · **Agent:** claude
 - **Estimate:** 5h · **Phase:** 4
 - **Description:** Pick the right subtitle and prove it is actually in sync
@@ -1199,19 +1199,39 @@ same-mount `rename(2)`.
   ## APPROACH
   1. Score candidates on: hash match (dominant), release-group match, duration
      match, uploader rating, download count, HI/forced correctness.
-  2. Verify sync structurally: parse the subtitle's first and last cue
-     timestamps and check they fall within the media duration with sane margins;
-     reject a candidate whose last cue exceeds the runtime or whose first cue
-     is implausibly late.
-  3. Enforce a minimum score threshold — below it, leave the item wanted rather
-     than write a bad subtitle. A wrong subtitle is worse than none.
+  2. **Two-tier confidence, because a structural check does not prove sync.**
+     An earlier draft called the cue-range test "sync verification"; it is not,
+     and the name overclaimed. Parsing first/last cue timestamps and checking
+     they fall inside the runtime only rejects the *grossly* wrong — a subtitle
+     for a different episode of the same series, or a different release of the
+     same film, passes it easily when runtimes are similar, and would then be
+     written and reported as verified. Since this spec says a wrong subtitle is
+     worse than none, the rule is:
+     - **`Verified`** — a **moviehash match** (the provider matched the exact
+       file, so timing is the release's own) *or* an exact release-group +
+       runtime match within `sync_runtime_tolerance_secs`. Only a `Verified`
+       candidate is written automatically.
+     - **`Plausible`** — passes the structural cue-range test but has no hash
+       or release match. **Not written automatically.** It is offered to the
+       operator/assistant as a suggestion, and the item stays wanted.
+     - **`Rejected`** — fails the structural test.
+     Real audio-to-subtitle alignment (the only thing that would promote a
+     `Plausible` candidate to `Verified` on its own merits) needs speech
+     detection over sampled segments; scoped as a follow-up rather than
+     pretended at here.
+  3. Enforce a minimum score threshold in addition to the tier — below it,
+     leave the item wanted rather than write a bad subtitle.
   4. Record the chosen candidate, its score, and every rejection reason.
 
   ## TEST PLAN
   - Hash match outranks a higher-rated non-hash candidate
-  - A candidate whose last cue exceeds runtime is rejected
+  - A candidate whose last cue exceeds runtime is `Rejected`
+  - A candidate that passes the cue-range test but has no hash or release match
+    is `Plausible` and is **not written** — the item stays wanted and the
+    candidate is surfaced as a suggestion
+  - A hash-matched candidate is `Verified` and is written
   - Below-threshold scoring leaves the item wanted
-  - Rejection reasons are recorded
+  - Rejection and non-promotion reasons are recorded
   - Verify no hardcoded infrastructure values in new/modified files
 
   ## EDGE CASES
@@ -1223,7 +1243,12 @@ same-mount `rename(2)`.
 
 - **Acceptance criteria:**
   - [ ] Hash matches dominate scoring
-  - [ ] Structural sync verification rejects out-of-range candidates
+  - [ ] The structural cue-range test rejects out-of-range candidates
+  - [ ] Only a `Verified` candidate (hash match, or release-group + runtime
+        match) is ever written automatically; a merely `Plausible` one is
+        surfaced as a suggestion and never written unattended
+  - [ ] Nothing is reported as sync-verified on the strength of the cue-range
+        test alone
   - [ ] Below-threshold results leave the item wanted rather than writing
   - [ ] Every rejection reason is recorded
   - [ ] No hardcoded infrastructure values in new/modified code
@@ -1716,18 +1741,22 @@ routine gate.
    runtime overlay under project `MUSE`; promoting it to the git-versioned
    baseline (`data/prefix_registry.toml`) opens a Terminus PR and should ride
    the normal pipeline. The provisional `MFDY` claim has been retired.
-5. **Real seed-awareness via the torrent client** — `st_nlink` is a floor, not
+5. **Audio-to-subtitle alignment** — the only way to promote a `Plausible`
+   subtitle candidate to `Verified` on its own merits (MUSEF-17). Needs speech
+   detection over sampled segments compared against cue timings. Until it
+   exists, unmatched candidates are suggestions, never automatic writes.
+6. **Real seed-awareness via the torrent client** — `st_nlink` is a floor, not
    an oracle (see the safety-model section). Asking qBittorrent for the set of
    paths it is actively seeding, and treating *those* as untouchable, is the
    only correct answer. Muse already has a qBittorrent adapter (`src/download/
    qbit.rs`, MUSEM-02) so the client call is cheap; the work is the policy and
    cache. Scoped as its own item once MUSEF-21 lands.
-6. **A real library backup is an operator prerequisite** — the Foundry recycle
+7. **A real library backup is an operator prerequisite** — the Foundry recycle
    bin is a fortnight-long undo window on the same filesystem, not a backup. It
    does not survive device loss and it expires. MUSEF-26's acceptance run
    states this as a precondition before the live-library gate is opened; it is
    deliberately not something this spec pretends to solve.
-7. **Correct the `moosenet-spec` skill's Plane project list** — it omits
+8. **Correct the `moosenet-spec` skill's Plane project list** — it omits
    `MUSE` (and `DOCS`/`INFRA2`/`CTX`/`FRG`/`TRIG`, which still exist in Plane).
    A spec author following the skill alone would misfile every Muse spec, as
    this one initially did. Worth a small skill edit.

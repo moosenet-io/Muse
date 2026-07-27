@@ -28,6 +28,18 @@
 //! [`paths::ResolvedPath`] rather than a `Path`, which makes "I forgot to
 //! validate this" a compile error instead of a code-review catch.
 //!
+//! ## What is deliberately NOT hidden: the logs
+//! Foundry logs its configured roots and any misconfiguration through
+//! `tracing`, and a crate-level subscriber can therefore see those paths. That
+//! is intentional and is not a leak to be closed: an operator diagnostic whose
+//! whole job is to say *which* path is misconfigured has to name it, and the
+//! log is the channel it is delivered on. Every service on this fleet logs its
+//! own configuration. The narrowing in this module is about **capability** —
+//! preventing outside code from obtaining a guard or a usable path — not about
+//! keeping the operator's own paths secret from the operator's own logs. (A
+//! reviewer raised this; recorded here so it reads as a decision rather than an
+//! oversight.)
+//!
 //! ## Capability gating (Module Contract §2)
 //! Foundry registers only when it is actually configured. With
 //! `MUSE_FOUNDRY_ALLOWED_ROOTS` unset — the default — [`Foundry::from_config`]

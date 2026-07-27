@@ -74,10 +74,42 @@ A fuller derived diagram, per-subsystem narrative, and the end-to-end request fl
 | `cultural` | The "what's hot / the talk" layer: trending ∩ library ∩ taste, cached and config-gated | [reference/cultural](docs/reference/cultural.md) |
 | `discord` | Discord bot core: allowlisted friends, default-private consent, brain-driven replies | [reference/discord](docs/reference/discord.md) |
 | `premiere` | Scheduled premiere events, RSVP, discussion threads, engagement-tiered request budgets | [reference/premiere](docs/reference/premiere.md) |
+| `foundry` | Media formatting: transcode fabric, subtitle matcher, library organizer — **default-off**, see below | [S128 spec](specs/S128-muse-foundry.md) |
 
 The full inventory — including `curation`, `taste_model`, `embed`, `recall`, `acquisition`,
 `decision`, `download`, `library`, `matching`, `watch_together`, `taste_review`, `web`,
 and the rest — is in the [reference index](docs/reference/index.md).
+
+## Foundry (media formatting)
+
+`foundry` is Muse's media-formatting subsystem (spec
+[S128](specs/S128-muse-foundry.md)): it probes library files, judges them
+against per-client direct-play profiles, and — in later phases — transcodes,
+matches subtitles, and organizes folder layout. It replaces two containers in
+the ARR suite that were deployed but never configured; see
+[docs/ARR-SUITE-GRAPH.md](docs/ARR-SUITE-GRAPH.md) for that survey.
+
+**Foundry is off unless you configure it, and read-only unless you also open
+the mutation gate.** Both defaults are deliberate: it is the first Muse
+subsystem that can delete or overwrite library files.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MUSE_FOUNDRY_ALLOWED_ROOTS` | *(unset)* | `:`-separated default-deny allowlist of roots Foundry may address. **Unset means Foundry does not register at all.** Every path is resolved (symlinks included) and must land inside one of these. |
+| `MUSE_FOUNDRY_ENABLE_MUTATION` | `false` | The kill-switch. While false, Foundry probes, plans and reports but cannot modify a byte. Parsed fail-closed: only `1`/`true`/`yes`/`on` open it. |
+| `MUSE_FOUNDRY_WORK_DIR` | *(unset)* | Scratch for transcode output before verify-and-swap. Should be on a **different filesystem** from any allowed root; Foundry warns at startup when it is not, or when it sits inside one. |
+| `MUSE_FOUNDRY_RETENTION_DAYS` | `14` | How long a superseded original stays in the Foundry recycle bin. This is an **undo window, not a backup** — it shares a filesystem with the library and it expires. |
+| `MUSE_FOUNDRY_FFPROBE_BIN` | `ffprobe` | Probe binary — a `PATH` name or an absolute path. |
+| `MUSE_FOUNDRY_HANDBRAKE_BIN` | `HandBrakeCLI` | Encoder binary — a `PATH` name or an absolute path. |
+
+A configured-but-unmounted root is dropped with a warning rather than failing
+startup, so an absent NFS mount degrades Foundry instead of taking down Muse.
+If *no* root resolves, Foundry stays unregistered.
+
+Nothing here is a secret, so all of it is plain configuration. Foundry's later
+credentials (a subtitle-provider key, a worker-node token) are secret-shaped
+and will be routed through the same redacting path as every other Muse
+credential.
 
 ## Quick start
 

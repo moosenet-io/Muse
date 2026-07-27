@@ -22,6 +22,7 @@ pub mod embed;
 #[cfg(test)]
 mod endpoint_tests;
 pub mod enrichment;
+pub mod foundry;
 mod error;
 #[cfg(test)]
 mod fixtures;

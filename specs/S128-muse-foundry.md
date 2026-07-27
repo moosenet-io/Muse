@@ -226,7 +226,9 @@ Concretely, within a mutation:
   *before* the target entry is replaced, so the old content survives the swap
   with a live reference.
 - **Junk removal** — linked into the recycle bin first; the original entry is
-  removed only once that link is confirmed to exist.
+  removed only once that link is confirmed to exist. For a junk *directory*
+  (which POSIX cannot hardlink), the structure is mirrored and every file
+  linked before any original entry is removed — see MUSEF-21 step 5.
 - **Multi-link file** — not touched at all, by any of the three mutating
   paths: not swapped (MUSEF-08), not moved or recycled as junk (MUSEF-21), and
   not replaced as a subtitle sidecar (MUSEF-18).
@@ -1614,7 +1616,24 @@ same-mount `rename(2)`.
      journal is the crash-consistency mechanism for every non-atomic step.
   5. Junk goes to the recycle bin, never `unlink` directly: it is *linked*
      into the recycle bin and its original entry removed only once that link
-     is confirmed to exist. **The `st_nlink > 1` guard from step 2 applies here
+     is confirmed to exist.
+     **Directories need a recursive form, because POSIX cannot hardlink a
+     directory.** MUSEF-20 classifies sample directories as junk, so the
+     file-only protocol above was unimplementable for them — an implementer
+     would have had to leave them alone or invent a copy/delete fallback that
+     breaks the content-preservation invariant. For a junk *directory*:
+     a. recreate the directory structure (empty) under the recycle bin —
+        `mkdir`, which creates nothing that needs preserving;
+     b. `link(2)` every *file* in it, depth-first, into the mirrored structure,
+        confirming each link before proceeding — files are what carry content,
+        and each is individually preserved exactly as in the file case;
+     c. only once **every** file is confirmed linked, remove the original
+        entries bottom-up (`unlink` files, then `rmdir` the now-empty dirs).
+     Journaled per entry like every other operation, so an interrupt leaves
+     some files linked in both places — recoverable and idempotent on retry —
+     and never a file with zero references. A directory containing any file
+     with `st_nlink > 1` aborts the whole directory untouched, per the
+     multi-link guard. **The `st_nlink > 1` guard from step 2 applies here
      too** — a multi-link file is never touched by *either* path. An earlier
      draft applied the guard only to `Move`, which left the junk path able to
      remove an entry the safety model said was untouchable; a `.nfo` or sample
@@ -1634,6 +1653,12 @@ same-mount `rename(2)`.
   - Cross-mount move verifies sha256 before unlinking the source; an injected
     checksum mismatch aborts with the source intact
   - Junk lands in the recycle bin, not deleted
+  - A junk **directory** (a scene sample dir) is mirrored into the recycle bin
+    with every file hardlinked before any original entry is removed; an
+    interrupt part-way leaves every file reachable from at least one path, and
+    retry converges
+  - A junk directory containing a file with `st_nlink > 1` is aborted entirely
+    and left untouched
   - Verify no hardcoded infrastructure values in new/modified files
 
   ## EDGE CASES
@@ -1721,11 +1746,18 @@ same-mount `rename(2)`.
      - **Subtitles:** `foundry_sub_status`, `foundry_sub_search`, `foundry_sub_fetch`
      - **Organize:** `foundry_organize_plan`, `foundry_organize_apply`
      - **Audit:** `foundry_audit`
-  2. **Mutating tools are guarded.** `foundry_job_submit` against a non-sandbox
-     root, `foundry_organize_apply`, and `foundry_policy_set` route through the
-     registry's guarded-tool approval gate (the same posture as `pg_ddl` and
-     `ansible`), requiring a per-occurrence operator approval. Read-only tools
-     are ungated.
+  2. **Mutating tools are guarded.** The guarded set is every tool that can
+     reach a mutating path: `foundry_job_submit` against a non-sandbox root,
+     `foundry_organize_apply`, `foundry_policy_set`, **and `foundry_sub_fetch`**
+     — which an earlier draft omitted. That omission was a real hole:
+     `foundry_sub_fetch` invokes the MUSEF-18 sidecar writer, so with server
+     mutation enabled the assistant could have written subtitle files into a
+     live library with no per-occurrence approval, while every other write path
+     required one. All four route through the registry's guarded-tool approval
+     gate (the same posture as `pg_ddl` and `ansible`). Read-only tools —
+     including `foundry_sub_search`, which only queries providers — are ungated.
+     The rule for a future tool: if it can cause a byte to change on disk, it is
+     guarded, regardless of how small the change is.
   3. Muse credentials via `SecretManager::get()`; no Foundry token is ever
      returned by a tool or written to a log.
   4. Every tool returns structured JSON with the human-readable reasons from the
@@ -1733,7 +1765,8 @@ same-mount `rename(2)`.
 
   ## TEST PLAN
   - Each tool's request/response parsing via `httpmock`
-  - Mutating tools refuse without approval; read-only tools do not require it
+  - Each of the four mutating tools refuses without approval — `sub_fetch`
+    explicitly among them; read-only tools do not require it
   - `foundry_organize_apply` cannot be invoked without a plan ID
   - No token or path secret appears in any tool response
   - Verify secrets accessed via `SecretManager`, not `std::env::var`
@@ -1747,7 +1780,9 @@ same-mount `rename(2)`.
 
 - **Acceptance criteria:**
   - [ ] All listed `foundry_*` tools are registered and callable
-  - [ ] Mutating tools are behind the guarded-tool approval gate
+  - [ ] Every tool that can change a byte on disk is behind the guarded-tool
+        approval gate — `job_submit`, `organize_apply`, `policy_set` **and
+        `sub_fetch`**
   - [ ] Read-only tools require no approval
   - [ ] All calls to Muse go through this module, not a direct API client
   - [ ] No new script or process reads Muse's token directly

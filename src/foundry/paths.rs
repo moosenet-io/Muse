@@ -271,9 +271,18 @@ impl PathGuard {
         self.roots.is_empty()
     }
 
-    /// The canonical allowed roots, for diagnostics and the status endpoint.
-    pub fn roots(&self) -> &[PathBuf] {
+    /// The canonical allowed roots. **Foundry-internal** — these are raw
+    /// `PathBuf`s, and a caller who has them can append a child and call
+    /// `std::fs` directly, bypassing confinement entirely. Outside Foundry use
+    /// [`crate::foundry::Foundry::root_descriptions`], which yields display
+    /// strings that cannot be used to open a file.
+    pub(in crate::foundry) fn roots(&self) -> &[PathBuf] {
         &self.roots
+    }
+
+    /// How many roots are allowed. Safe to expose: a count is not a path.
+    pub fn root_count(&self) -> usize {
+        self.roots.len()
     }
 
     /// Whether the mutation gate is open.

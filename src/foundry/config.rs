@@ -33,22 +33,28 @@ const DEFAULT_FFPROBE_BIN: &str = "ffprobe";
 const DEFAULT_HANDBRAKE_BIN: &str = "HandBrakeCLI";
 
 /// Typed Foundry configuration.
+///
+/// The path fields are `pub(in crate::foundry)`: they are raw `PathBuf`s, and
+/// handing them to outside code would let a caller append a child and call
+/// `std::fs` directly, bypassing the guard. Outside Foundry, use the
+/// capability-free diagnostics on [`super::Foundry`]
+/// (`root_descriptions`, `root_count`, `mutation_enabled`, `retention_days`).
 #[derive(Debug, Clone)]
 pub struct FoundryConfig {
     /// Default-deny allowlist of roots Foundry may address. Empty ⇒ inert.
-    pub allowed_roots: Vec<PathBuf>,
+    pub(in crate::foundry) allowed_roots: Vec<PathBuf>,
     /// Scratch directory for transcode output, before verification and swap.
     /// Should be on a **different device** from any allowed root (rail 3);
     /// [`FoundryConfig::warnings`] reports it when it is not.
-    pub work_dir: Option<PathBuf>,
+    pub(in crate::foundry) work_dir: Option<PathBuf>,
     /// The mutation kill-switch. Default false.
-    pub enable_mutation: bool,
+    pub(in crate::foundry) enable_mutation: bool,
     /// How long a superseded original is retained in the Foundry recycle bin.
-    pub retention_days: u32,
+    pub(in crate::foundry) retention_days: u32,
     /// `ffprobe` binary (name on `PATH`, or an absolute path).
-    pub ffprobe_bin: String,
+    pub(in crate::foundry) ffprobe_bin: String,
     /// `HandBrakeCLI` binary (name on `PATH`, or an absolute path).
-    pub handbrake_bin: String,
+    pub(in crate::foundry) handbrake_bin: String,
 }
 
 impl FoundryConfig {

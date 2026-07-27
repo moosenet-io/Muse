@@ -116,14 +116,55 @@ impl Foundry {
         Some(Self { config, guard })
     }
 
-    /// The typed configuration.
-    pub fn config(&self) -> &FoundryConfig {
+    /// The typed configuration. **Foundry-internal.**
+    ///
+    /// `FoundryConfig` carries raw `PathBuf`s, so a public accessor would hand
+    /// out the configured roots to any caller — who could append a child and
+    /// call `std::fs` directly, bypassing both confinement and the gate. That
+    /// is the same leak the narrowed path accessors closed, one level up
+    /// (S128 MUSEF-01 review, round 6).
+    pub(in crate::foundry) fn config(&self) -> &FoundryConfig {
         &self.config
     }
 
     /// The path guard every Foundry operation resolves through.
-    pub fn guard(&self) -> &PathGuard {
+    /// **Foundry-internal**, and this is the load-bearing one: a `&PathGuard`
+    /// *is* the capability. Handing it out publicly would let outside code
+    /// call `resolve_for_mutation` directly, which defeats the entire
+    /// MutablePath design. Narrowing the leaf accessors while leaving this
+    /// public achieved nothing — both reviewers caught it.
+    pub(in crate::foundry) fn guard(&self) -> &PathGuard {
         &self.guard
+    }
+
+    // --- Public, capability-free diagnostics -------------------------------
+    // Everything a status endpoint or log line legitimately needs, without
+    // leaking a path or a capability.
+
+    /// How many roots the guard allows. Useful for status; leaks nothing.
+    pub fn root_count(&self) -> usize {
+        self.guard.root_count()
+    }
+
+    /// Whether the mutation gate is open.
+    pub fn mutation_enabled(&self) -> bool {
+        self.guard.mutation_enabled()
+    }
+
+    /// Configured recycle-bin retention, in days.
+    pub fn retention_days(&self) -> u32 {
+        self.config.retention_days
+    }
+
+    /// The allowed roots as **display strings**, for a status surface or an
+    /// operator-facing log. A `String` cannot be used to open a file without
+    /// re-resolving it through the guard, so this leaks no capability.
+    pub fn root_descriptions(&self) -> Vec<String> {
+        self.guard
+            .roots()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect()
     }
 }
 

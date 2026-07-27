@@ -90,7 +90,7 @@ impl FoundryConfig {
     /// Takes `&Config` rather than reading the environment directly, so
     /// `config.rs` stays the crate's single env-reading door (see its module
     /// docs) and Foundry stays testable without touching process state.
-    pub fn from_config(cfg: &crate::config::Config) -> Self {
+    pub(in crate::foundry) fn from_config(cfg: &crate::config::Config) -> Self {
         Self {
             allowed_roots: parse_roots(cfg.foundry_allowed_roots.as_deref()),
             work_dir: cfg
@@ -160,12 +160,18 @@ impl FoundryConfig {
     /// its surface (Module Contract §2). Note this is the *pre*-canonicalization
     /// check; [`PathGuard::is_inert`] is the authoritative post-resolution one,
     /// since a configured-but-unmounted root also yields an inert guard.
-    pub fn is_unconfigured(&self) -> bool {
+    pub(in crate::foundry) fn is_unconfigured(&self) -> bool {
         self.allowed_roots.is_empty()
     }
 
     /// Configuration problems that are **fatal once the mutation gate is
     /// open**.
+    ///
+    /// Foundry-internal. These strings deliberately name the offending paths —
+    /// an operator diagnostic that says "your work dir is misconfigured"
+    /// without saying *which* one is useless — so the disclosure is contained
+    /// by restricting the caller rather than by redacting the message. The one
+    /// consumer is [`super::Foundry::from_config`], which logs them.
     ///
     /// The distinction matters and is load-bearing (it was a real
     /// contradiction in an early draft of the S128 spec: MUSEF-01 warned where
@@ -176,7 +182,7 @@ impl FoundryConfig {
     /// startup refusal. Warn when it cannot bite, refuse when it can.
     ///
     /// Empty ⇒ safe to start.
-    pub fn fatal_errors(&self) -> Vec<String> {
+    pub(in crate::foundry) fn fatal_errors(&self) -> Vec<String> {
         if !self.enable_mutation {
             return Vec::new();
         }
@@ -202,7 +208,7 @@ impl FoundryConfig {
     /// Non-fatal configuration problems worth surfacing at startup and on the
     /// status endpoint. Returning them (rather than logging inline) keeps this
     /// type pure and lets the status surface show the operator the same list.
-    pub fn warnings(&self) -> Vec<String> {
+    pub(in crate::foundry) fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
 
         // When mutation is enabled these are reported by `fatal_errors`

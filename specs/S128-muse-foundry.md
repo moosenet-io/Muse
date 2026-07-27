@@ -152,9 +152,18 @@ Four subsystems under `src/foundry/`, one policy engine, one queue.
 
 Five rails, each independently sufficient to prevent catastrophe:
 
-1. **Default-deny root allowlist.** Every path operation resolves through
-   `MUSE_FOUNDRY_ALLOWED_ROOTS`; a path outside it is a hard error. Default is
-   the sandbox root only.
+1. **Default-deny root allowlist.** Every path operation resolves through the
+   guard; a path outside every allowed root is a hard error. Default is the
+   sandbox root only. The allowlist is the union of two *distinct* kinds of
+   root, and the distinction matters (it was missing in an earlier draft, which
+   left the server with no authority to resolve its own staging paths):
+   - **library roots** (`MUSE_FOUNDRY_ALLOWED_ROOTS`) — the media Foundry may
+     read and, when the gate is open, modify;
+   - **the work root** (`MUSE_FOUNDRY_WORK_DIR`) — Foundry's own scratch and
+     staging area, which it must also be able to address.
+   Rail 3 constrains their *relationship* (the work root must be outside every
+   library root and on a different filesystem); it does not remove the work
+   root from the allowlist. A path is confined if it lies under either kind.
 2. **Mutation kill-switch.** `MUSE_FOUNDRY_ENABLE_MUTATION` defaults false.
    With it false, Forge/Archivist produce plans and never touch a byte.
 3. **Never in-place.** Output goes to the work dir on a different device; the
@@ -272,7 +281,9 @@ same-mount `rename(2)`.
   - `README.md` — Foundry section (new module, user-facing)
 
   ## APPROACH
-  1. Add `FoundryConfig` with `allowed_roots: Vec<PathBuf>`, `work_dir`,
+  1. Add `FoundryConfig` with `allowed_roots: Vec<PathBuf>` (library roots),
+     `work_dir` (the work root — included in the guard's allowlist, since
+     Foundry must be able to address its own staging area; see rail 1),
      `sandbox_root`, `enable_mutation: bool` (default false),
      `retention_days`, `ffmpeg_bin`, `handbrake_bin`. Read every value through
      `crate::config` helpers — never a scattered `std::env::var`.
@@ -329,6 +340,9 @@ same-mount `rename(2)`.
   - [ ] Both `resolve` (existing) and `resolve_new` (prospective) exist, so no
         later item needs to bypass the guard to address a file it will create
   - [ ] Traversal, symlink-escape, and outside-root paths are all rejected
+  - [ ] A path under the **work root** resolves successfully, so the server can
+        address its own staging area — while a work root inside a library root
+        is still refused by rail 3
   - [ ] `enable_mutation=false` blocks every mutating entry point
   - [ ] A rail-3-violating layout (`work_dir` on the same device as, or inside,
         an allowed root) is a warning while mutation is disabled and a startup
@@ -985,7 +999,11 @@ same-mount `rename(2)`.
   ## APPROACH
   1. `POST /foundry/nodes/register` with a `NodeCapabilities` payload: encoders
      available, hwaccel devices, logical cores, RAM, cache dir size, reachable
-     library roots (a node that cannot see a path must never be given its jobs).
+     library roots (a node that cannot see a path must never be given its
+     jobs), **and its own local mount point for the shared staging area**
+     (`staging_root`). The last one is not optional: the shared mount can be
+     mounted at a different path on the server than on the node, so the server
+     must never hand a node its own absolute staging path.
   2. Authenticate with `MUSE_FOUNDRY_NODE_TOKEN` via `SecretManager::get()`,
      constant-time compared. Node identity is the token plus a node-supplied
      stable ID; re-registration updates rather than duplicates.
@@ -997,6 +1015,8 @@ same-mount `rename(2)`.
 
   ## TEST PLAN
   - Registration with a valid token succeeds; invalid token rejected
+  - A node that advertises no `staging_root` is registered but never leased a
+    transcode job
   - Re-registration updates the existing node row
   - Missed heartbeats mark the node offline and expire its leases
   - A node not advertising a root is never offered jobs under that root
@@ -1010,7 +1030,8 @@ same-mount `rename(2)`.
 
 - **Acceptance criteria:**
   - [ ] Nodes authenticate with a constant-time token comparison
-  - [ ] Capabilities including reachable roots are recorded and updated
+  - [ ] Capabilities including reachable library roots **and `staging_root`**
+        are recorded and updated
   - [ ] Offline nodes have their leases expired
   - [ ] A node is never offered work for a root it cannot see
   - [ ] Secrets accessed via `SecretManager`, not env vars
@@ -1037,19 +1058,26 @@ same-mount `rename(2)`.
      is not addressable by the server, and accepting one would hand an
      unvalidated path straight past the `PathGuard` confinement model — the
      exact bypass MUSEF-01 exists to prevent. Instead:
-     - The **lease** (issued by the server) carries the staging destination:
-       a server-owned directory under `MUSE_FOUNDRY_WORK_DIR`, on a mount both
-       the server and that node can reach, plus the job-relative filename to
-       write. The node chooses nothing about placement.
+     - The **lease** (issued by the server) carries a **job-relative staging
+       name only** — e.g. `staging/<job_id>/<name>.mkv` — never an absolute
+       path. Each side joins that relative name to *its own* mount point for
+       the shared staging area: the node to the `staging_root` it advertised at
+       registration (MUSEF-11), the server to its `MUSE_FOUNDRY_WORK_DIR`. This
+       is what makes the protocol correct when the same share is mounted at
+       different paths on the two hosts, and it means the server never hands
+       out a path that is only meaningful to itself. The node chooses nothing
+       about placement.
      - The node writes its output there and calls
        `POST /foundry/jobs/{id}/complete` with **only** the sha256 and the
        output probe — never a path.
-     - The server resolves the staging path **itself**, from the job row it
-       issued, through `PathGuard`, verifies the sha256, and then runs the
-       MUSEF-08 verify-and-swap. A node never swaps a library file itself.
-     - A node with no shared mount to the staging destination is simply not
-       eligible for that job (MUSEF-11 already records reachable roots per
-       node, and MUSEF-14's hard constraints already filter on them). An
+     - The server resolves the staging path **itself** — joining the
+       job-relative name from the job row it issued to its own work root, then
+       through `PathGuard`, which allowlists the work root precisely so this
+       resolution has an authority (rail 1). It verifies the sha256 and then
+       runs the MUSEF-08 verify-and-swap. A node never swaps a library file.
+     - A node that advertised no `staging_root` is not eligible for any
+       transcode job — MUSEF-14's hard constraints filter on it exactly as they
+       do on encoder and reachable-root capability. An
        authenticated upload endpoint is the alternative for a node with no
        shared storage at all; scoped as a follow-up rather than built here,
        since every node on this fleet has the mount.
@@ -1138,7 +1166,9 @@ same-mount `rename(2)`.
   - `src/foundry/fabric/scheduler.rs`
 
   ## APPROACH
-  1. Filter by hard constraints (encoder, hwaccel, reachable root, free cache).
+  1. Filter by hard constraints (encoder, hwaccel, reachable library root,
+     **advertised `staging_root`**, free cache). A node with no staging root
+     cannot return output the server can resolve, so it is never eligible.
   2. Rank by: job priority, then locality, then node idleness.
   3. Weighted round-robin across libraries so a 5,000-file backlog in one
      library does not starve a 10-file backlog in another.

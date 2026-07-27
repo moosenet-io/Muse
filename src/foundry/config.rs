@@ -97,7 +97,30 @@ impl FoundryConfig {
         if !self.fatal_errors().is_empty() {
             return None;
         }
-        Some(PathGuard::new(&self.allowed_roots, self.enable_mutation))
+        Some(PathGuard::new(self.guard_roots(), self.enable_mutation))
+    }
+
+    /// Every root the guard allows: the **library roots** plus the **work
+    /// root**.
+    ///
+    /// Including `work_dir` is not a loosening — it is required for the guard
+    /// to be usable at all, and its absence was a real gap (S128 round-13
+    /// review). Foundry must address its own scratch and staging area:
+    /// MUSEF-08 stages an encode there, and MUSEF-12 has the server resolve a
+    /// distributed worker's output there. With only the library roots
+    /// allowlisted there is no authority for those paths, which would force
+    /// the very guard bypass this type exists to prevent.
+    ///
+    /// Rail 3 constrains the *relationship* between the two — the work root
+    /// must sit outside every library root, on a different filesystem, and
+    /// `rail3_problems` enforces that — but it does not remove the work root
+    /// from the set of addressable paths.
+    pub(crate) fn guard_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.allowed_roots.clone();
+        if let Some(work) = &self.work_dir {
+            roots.push(work.clone());
+        }
+        roots
     }
 
     /// True when no roots are configured at all — Foundry must not register
@@ -548,6 +571,38 @@ mod tests {
     fn projected_path_is_identity_for_an_existing_canonical_path() {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         assert_eq!(projected_path(&base), Some(base.clone()));
+    }
+
+    #[test]
+    fn the_work_root_is_addressable_but_still_outside_the_library() {
+        // Both halves matter. The guard must allow the work root (otherwise
+        // MUSEF-08 cannot stage and MUSEF-12 cannot resolve worker output),
+        // while rail 3 still requires it to live outside every library root.
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let lib = base.join("muse-fnd-lib-addr");
+        let work = base.join("muse-fnd-work-addr");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut c = cfg_with(None, false);
+        c.allowed_roots = vec![lib.clone()];
+        c.work_dir = Some(work.clone());
+
+        let roots = c.guard_roots();
+        assert!(roots.contains(&lib), "library root must be allowed");
+        assert!(roots.contains(&work), "work root must be allowed");
+
+        // And a real path under the work root resolves through the guard.
+        let g = c.guard().expect("valid read-only config yields a guard");
+        let staged = work.join("job-1.tmp");
+        std::fs::write(&staged, b"x").unwrap();
+        assert!(
+            g.resolve(&staged).is_ok(),
+            "the server must be able to address its own staging area"
+        );
+
+        let _ = std::fs::remove_dir_all(&lib);
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

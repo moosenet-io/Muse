@@ -105,8 +105,23 @@ impl FoundryConfig {
         if !self.enable_mutation {
             return Vec::new();
         }
+        let mut out = Vec::new();
+
+        // Mutation with nowhere to stage is not a warning — there is no safe
+        // way to honour rail 3, so the gate must not open (S128 MUSEF-01
+        // review: this previously only warned, and Foundry registered anyway).
+        if self.work_dir.is_none() {
+            out.push(
+                "MUSE_FOUNDRY_ENABLE_MUTATION is set but MUSE_FOUNDRY_WORK_DIR is not — \
+                 there is no location outside the library to stage output, so the \
+                 never-in-place rail cannot be honoured"
+                    .to_string(),
+            );
+        }
+
         // Every rail-3 problem is fatal once mutation is possible.
-        self.rail3_problems()
+        out.extend(self.rail3_problems());
+        out
     }
 
     /// Non-fatal configuration problems worth surfacing at startup and on the
@@ -115,16 +130,11 @@ impl FoundryConfig {
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
 
-        if self.enable_mutation && self.work_dir.is_none() {
-            out.push(
-                "MUSE_FOUNDRY_ENABLE_MUTATION is set but MUSE_FOUNDRY_WORK_DIR is not — \
-                 Foundry has nowhere to stage output outside the library, which defeats \
-                 the never-in-place rail"
-                    .to_string(),
-            );
+        // When mutation is enabled these are reported by `fatal_errors`
+        // instead, and reporting them twice would be noise.
+        if !self.enable_mutation {
+            out.extend(self.rail3_problems());
         }
-
-        out.extend(self.rail3_problems());
 
         if self.retention_days == 0 {
             out.push(
@@ -148,24 +158,55 @@ impl FoundryConfig {
             return out;
         };
 
-        if let Some(dev) = device_of(work) {
-            for root in &self.allowed_roots {
-                if device_of(root) == Some(dev) {
-                    out.push(format!(
-                        "MUSE_FOUNDRY_WORK_DIR ({}) is on the same filesystem as the \
-                         allowed root {} — a failed swap could consume the library's \
-                         own free space; put the work dir on a different device",
-                        work.display(),
-                        root.display()
-                    ));
+        // A scratch dir very often does not exist yet at startup. Statting it
+        // directly would return None and silently skip the whole check (S128
+        // MUSEF-01 review), so resolve the nearest EXISTING ancestor instead —
+        // whatever filesystem that sits on is the one the work dir will be
+        // created on. Canonicalizing also means the containment test below
+        // compares real paths, not lexical ones, so a symlinked work dir
+        // cannot evade it.
+        let work_anchor = nearest_existing_ancestor(work);
+
+        match work_anchor.as_deref().and_then(device_of) {
+            Some(work_dev) => {
+                for root in &self.allowed_roots {
+                    let root_anchor = nearest_existing_ancestor(root);
+                    if root_anchor.as_deref().and_then(device_of) == Some(work_dev) {
+                        out.push(format!(
+                            "MUSE_FOUNDRY_WORK_DIR ({}) is on the same filesystem as the \
+                             allowed root {} — a failed swap could consume the library's \
+                             own free space; put the work dir on a different device",
+                            work.display(),
+                            root.display()
+                        ));
+                    }
                 }
+            }
+            None => {
+                // Fail closed: if we cannot determine the device at all, we
+                // cannot assert rail 3 holds, and this list is consulted as
+                // fatal_errors() when mutation is enabled.
+                out.push(format!(
+                    "MUSE_FOUNDRY_WORK_DIR ({}) has no resolvable existing ancestor, so \
+                     its filesystem cannot be determined and the never-in-place rail \
+                     cannot be verified",
+                    work.display()
+                ));
             }
         }
 
         // A work dir *inside* an allowed root is worse than same-device: the
-        // library scan would see Foundry's own scratch output.
+        // library scan would see Foundry's own scratch output. Compare
+        // canonicalized anchors so a symlinked or `..`-laden work dir cannot
+        // evade the check lexically.
         for root in &self.allowed_roots {
-            if work.starts_with(root) {
+            let inside = match (&work_anchor, nearest_existing_ancestor(root)) {
+                (Some(w), Some(r)) => w.starts_with(&r),
+                // Fall back to the lexical comparison only when canonical
+                // paths are unavailable; better a false positive than a miss.
+                _ => work.starts_with(root),
+            };
+            if inside {
                 out.push(format!(
                     "MUSE_FOUNDRY_WORK_DIR ({}) is inside the allowed root {} — \
                      scratch output would appear in the library",
@@ -201,6 +242,25 @@ fn non_empty_or(v: Option<&str>, default: &str) -> String {
 fn device_of(p: &std::path::Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(p).ok().map(|m| m.dev())
+}
+
+/// The canonicalized nearest existing ancestor of `p` (possibly `p` itself).
+///
+/// A configured scratch or library directory may not exist yet at startup.
+/// Statting it directly yields `None` and silently skips every filesystem
+/// check that depends on it; walking up to the first existing ancestor gives
+/// the filesystem the path *will* be created on, which is the thing rail 3
+/// actually cares about. Canonicalizing on the way out means callers compare
+/// real paths rather than lexical ones.
+fn nearest_existing_ancestor(p: &std::path::Path) -> Option<PathBuf> {
+    let mut cur = Some(p);
+    while let Some(c) = cur {
+        if let Ok(canon) = std::fs::canonicalize(c) {
+            return Some(canon);
+        }
+        cur = c.parent();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -241,16 +301,6 @@ mod tests {
     fn no_roots_means_unconfigured() {
         assert!(cfg_with(None, false).is_unconfigured());
         assert!(!cfg_with(Some("/srv/a"), false).is_unconfigured());
-    }
-
-    #[test]
-    fn mutation_without_a_work_dir_warns() {
-        let c = cfg_with(Some("/srv/a"), true);
-        assert!(
-            c.warnings().iter().any(|w| w.contains("MUSE_FOUNDRY_WORK_DIR is not")),
-            "expected a missing-work-dir warning, got {:?}",
-            c.warnings()
-        );
     }
 
     #[test]
@@ -303,13 +353,71 @@ mod tests {
     }
 
     #[test]
-    fn a_sound_layout_is_never_fatal() {
+    fn a_work_dir_outside_every_root_does_not_trip_the_containment_check() {
+        // Isolates containment from the device comparison: this asserts only
+        // that a work dir which is not inside any root produces no
+        // "inside the allowed root" diagnostic. It deliberately does NOT
+        // assert fatal_errors() is empty — whether the two land on the same
+        // filesystem depends on the host's mount topology, and the
+        // same-filesystem check is exercised separately.
         let mut c = cfg_with(Some("/srv/media"), true);
         c.work_dir = Some(PathBuf::from("/var/tmp/muse-foundry-work"));
-        // Neither path exists in the test env, so the device comparison is a
-        // no-op; what matters is that containment does not fire and nothing
-        // is reported fatal.
-        assert!(c.fatal_errors().is_empty(), "got {:?}", c.fatal_errors());
+        assert!(
+            !c.fatal_errors().iter().any(|e| e.contains("is inside the allowed root")),
+            "got {:?}",
+            c.fatal_errors()
+        );
+    }
+
+    #[test]
+    fn mutation_without_a_work_dir_is_fatal_not_merely_a_warning() {
+        // There is no safe way to honour rail 3 with nowhere to stage, so the
+        // gate must not open at all (S128 MUSEF-01 review).
+        let c = cfg_with(Some("/srv/a"), true);
+        assert!(
+            c.fatal_errors().iter().any(|e| e.contains("MUSE_FOUNDRY_WORK_DIR is not")),
+            "expected a fatal error, got {:?}",
+            c.fatal_errors()
+        );
+    }
+
+    #[test]
+    fn a_nonexistent_work_dir_still_gets_its_filesystem_checked() {
+        // The scratch dir usually does not exist yet at startup. Statting it
+        // directly returns None and would silently skip the whole rail-3
+        // check; the nearest-existing-ancestor walk is what prevents that.
+        let base = std::env::temp_dir();
+        let mut c = cfg_with(None, true);
+        c.allowed_roots = vec![base.clone()];
+        c.work_dir = Some(base.join("muse-foundry-not-created-yet").join("deep"));
+
+        let fatal = c.fatal_errors();
+        assert!(
+            fatal.iter().any(|e| e.contains("same filesystem") || e.contains("inside the allowed root")),
+            "a nonexistent work dir under the root must still be caught, got {fatal:?}"
+        );
+    }
+
+    #[test]
+    fn an_undeterminable_work_dir_filesystem_fails_closed() {
+        // If we cannot resolve any existing ancestor we cannot assert rail 3,
+        // so this must be reported rather than silently passing.
+        let mut c = cfg_with(Some("/srv/a"), true);
+        c.work_dir = Some(PathBuf::from("/nonexistent-root-xyzzy/work"));
+        let fatal = c.fatal_errors();
+        assert!(
+            !fatal.is_empty(),
+            "an unresolvable work dir must not silently pass"
+        );
+    }
+
+    #[test]
+    fn warnings_do_not_duplicate_fatal_errors() {
+        let c = cfg_with(Some("/srv/a"), true);
+        assert!(
+            !c.warnings().iter().any(|w| w.contains("MUSE_FOUNDRY_WORK_DIR is not")),
+            "the missing-work-dir message belongs to fatal_errors when mutating"
+        );
     }
 
     #[test]

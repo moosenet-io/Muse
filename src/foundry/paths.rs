@@ -66,6 +66,51 @@ impl std::fmt::Display for ResolvedPath {
     }
 }
 
+/// A [`ResolvedPath`] that has *also* passed the mutation gate.
+///
+/// The point of a separate type (S128 MUSEF-01 review): `ResolvedPath` alone
+/// proves only "this path is inside the allowlist" — it says nothing about
+/// whether mutation is permitted, and `as_path()` would happily hand it to
+/// `std::fs::remove_file`. Later Foundry items that modify, move or delete
+/// take a `MutablePath`, which can only be obtained through
+/// [`PathGuard::resolve_for_mutation`] / [`PathGuard::resolve_new_for_mutation`]
+/// — both of which call [`PathGuard::require_mutation`] first.
+///
+/// So the gate is enforced by the *type* a function accepts, exactly as
+/// confinement is, rather than by remembering to call a checker. A read-only
+/// operation keeps taking `ResolvedPath` and is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MutablePath(ResolvedPath);
+
+impl MutablePath {
+    /// The underlying canonical path.
+    pub fn as_path(&self) -> &Path {
+        self.0.as_path()
+    }
+
+    /// Consume into the owned canonical [`PathBuf`].
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0.into_path_buf()
+    }
+
+    /// Downgrade to a plain [`ResolvedPath`] for a read-only call.
+    pub fn as_resolved(&self) -> &ResolvedPath {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for MutablePath {
+    fn as_ref(&self) -> &Path {
+        self.0.as_path()
+    }
+}
+
+impl std::fmt::Display for MutablePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Why a path was refused, or why a mutation was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
@@ -137,12 +182,18 @@ pub struct PathGuard {
 impl PathGuard {
     /// Build a guard from raw configured roots.
     ///
+    /// `pub(crate)` deliberately: a guard is a *capability*, and code that can
+    /// mint its own with arbitrary roots and `enable_mutation: true` has
+    /// bypassed the configuration entirely. Foundry code takes the one real
+    /// guard from [`crate::foundry::Foundry::guard`]; only
+    /// [`crate::foundry::FoundryConfig::guard`] constructs it.
+    ///
     /// Each root is canonicalized; roots that do not exist or cannot be
     /// resolved are dropped with a warning. If *every* root drops out, the
     /// guard is still constructed but refuses all paths with
     /// [`PathError::NoAllowedRoots`] — callers that want "Foundry is not
     /// configured at all" semantics should check [`PathGuard::is_inert`].
-    pub fn new<I, P>(roots: I, enable_mutation: bool) -> Self
+    pub(crate) fn new<I, P>(roots: I, enable_mutation: bool) -> Self
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
@@ -257,7 +308,56 @@ impl PathGuard {
         // Prove the parent is confined *before* appending, then append a single
         // plain component so the result cannot escape it.
         let confined_parent = self.confine(parent, canonical_parent)?;
-        Ok(ResolvedPath(confined_parent.0.join(name)))
+        let candidate = confined_parent.0.join(name);
+
+        // CRITICAL (S128 MUSEF-01 review, found independently by two
+        // reviewers): a confined parent is NOT sufficient on its own.
+        // `resolve_new` is also used to address a file that may already exist
+        // (replacing a subtitle sidecar, overwriting a stale staged temp), and
+        // if that existing final component is a SYMLINK pointing outside the
+        // allowlist, returning the unresolved `candidate` hands the caller a
+        // path that escapes the moment anything writes through it. The parent
+        // check cannot see this, because the escape lives in the leaf.
+        //
+        // So: if the final component exists at all, fall through to the full
+        // existing-path resolution, which canonicalizes (following the
+        // symlink) and re-confines. Use `symlink_metadata` so a dangling or
+        // escaping symlink is still detected as "exists" — `metadata` follows
+        // the link and would report NotFound for a dangling one, letting it
+        // slip through as a fresh path.
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => self.resolve(&candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Genuinely new: the parent is confined and the leaf is a
+                // plain name, so the result cannot escape.
+                Ok(ResolvedPath(candidate))
+            }
+            Err(e) => Err(PathError::Io {
+                path: candidate,
+                message: e.to_string(),
+            }),
+        }
+    }
+
+    /// Resolve an existing path **and** pass the mutation gate.
+    ///
+    /// The only way to obtain a [`MutablePath`] for an existing file. Gate
+    /// first, then resolve: a caller with the gate closed learns that before
+    /// any filesystem work happens, and cannot distinguish which paths exist.
+    pub fn resolve_for_mutation(&self, path: impl AsRef<Path>) -> Result<MutablePath, PathError> {
+        self.require_mutation()?;
+        Ok(MutablePath(self.resolve(path)?))
+    }
+
+    /// Resolve a prospective path **and** pass the mutation gate.
+    ///
+    /// The only way to obtain a [`MutablePath`] for a file to be created.
+    pub fn resolve_new_for_mutation(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<MutablePath, PathError> {
+        self.require_mutation()?;
+        Ok(MutablePath(self.resolve_new(path)?))
     }
 
     /// Cheap structural checks shared by both resolve paths.
@@ -500,6 +600,110 @@ mod tests {
         assert!(matches!(
             g.resolve_new(root.join("no-such-dir").join("out.mkv")),
             Err(PathError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_new_rejects_an_existing_leaf_symlink_that_escapes() {
+        // THE regression test for the S128 MUSEF-01 review finding. The parent
+        // is legitimately inside the root, so the parent-confinement check
+        // passes; the escape is entirely in the leaf. Returning the unresolved
+        // candidate here would hand the caller a path that escapes the instant
+        // anything writes through it.
+        let tmp = Tmp::new("new-leaf-symlink");
+        let root = tmp.path().join("lib");
+        let other = tmp.path().join("elsewhere");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let outside = other.join("victim.srt");
+        fs::write(&outside, b"x").unwrap();
+
+        let link = root.join("subtitle.srt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let g = guard_for(&root, false);
+        assert!(
+            matches!(g.resolve_new(&link), Err(PathError::OutsideAllowedRoots { .. })),
+            "an existing leaf symlink pointing outside must be refused"
+        );
+    }
+
+    #[test]
+    fn resolve_new_rejects_a_dangling_leaf_symlink_that_escapes() {
+        // `metadata` follows the link and reports NotFound for a dangling one,
+        // which would let it through as a "fresh" path; `symlink_metadata` is
+        // what makes this case detectable.
+        let tmp = Tmp::new("new-dangling");
+        let root = tmp.path().join("lib");
+        let other = tmp.path().join("elsewhere");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
+
+        let link = root.join("subtitle.srt");
+        std::os::unix::fs::symlink(other.join("does-not-exist.srt"), &link).unwrap();
+
+        let g = guard_for(&root, false);
+        assert!(
+            g.resolve_new(&link).is_err(),
+            "a dangling leaf symlink pointing outside must not resolve as a fresh path"
+        );
+    }
+
+    #[test]
+    fn resolve_new_accepts_an_existing_leaf_that_stays_inside() {
+        // Replacing an existing sidecar is a legitimate use of resolve_new.
+        let tmp = Tmp::new("new-existing-ok");
+        let root = tmp.path().join("lib");
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("subtitle.srt");
+        fs::write(&existing, b"x").unwrap();
+
+        let g = guard_for(&root, false);
+        let r = g.resolve_new(&existing).expect("existing leaf inside the root is fine");
+        assert_eq!(r.as_path(), existing.as_path());
+    }
+
+    #[test]
+    fn a_mutable_path_cannot_be_obtained_while_the_gate_is_closed() {
+        let tmp = Tmp::new("cap");
+        let root = tmp.path().join("lib");
+        fs::create_dir_all(&root).unwrap();
+        let f = root.join("a.mkv");
+        fs::write(&f, b"x").unwrap();
+
+        let closed = guard_for(&root, false);
+        assert!(matches!(
+            closed.resolve_for_mutation(&f),
+            Err(PathError::MutationDisabled)
+        ));
+        assert!(matches!(
+            closed.resolve_new_for_mutation(root.join("new.mkv")),
+            Err(PathError::MutationDisabled)
+        ));
+        // ...but a read-only resolve still works, which is the point.
+        assert!(closed.resolve(&f).is_ok());
+
+        let open = guard_for(&root, true);
+        assert!(open.resolve_for_mutation(&f).is_ok());
+        assert!(open.resolve_new_for_mutation(root.join("new.mkv")).is_ok());
+    }
+
+    #[test]
+    fn a_mutable_path_still_cannot_escape_the_allowlist() {
+        // The gate and the confinement are independent: opening the gate must
+        // not weaken containment.
+        let tmp = Tmp::new("cap-escape");
+        let root = tmp.path().join("lib");
+        let other = tmp.path().join("elsewhere");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let outside = other.join("x.mkv");
+        fs::write(&outside, b"x").unwrap();
+
+        let open = guard_for(&root, true);
+        assert!(matches!(
+            open.resolve_for_mutation(&outside),
+            Err(PathError::OutsideAllowedRoots { .. })
         ));
     }
 

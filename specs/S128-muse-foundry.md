@@ -161,16 +161,19 @@ Five rails, each independently sufficient to prevent catastrophe:
      read and, when the gate is open, modify;
    - **the work root** (`MUSE_FOUNDRY_WORK_DIR`) — Foundry's own scratch and
      staging area, which it must also be able to address;
-   - **the recycle root** (`MUSE_FOUNDRY_RECYCLE_DIR`) — where superseded
-     originals are retained. This was missing from an earlier draft entirely:
+   - **the recycle roots** (`MUSE_FOUNDRY_RECYCLE_DIRS`) — where superseded
+     originals are retained. **One per library root**, because they must each
+     share a filesystem with the root they serve. This was missing from an earlier draft entirely:
      MUSEF-08, MUSEF-18 and MUSEF-21 all require a recycle bin and all require
      the retention step to be a `link(2)`, but no item defined where it lives
      or gave it allowlist authority, leaving an implementer with no sanctioned
      location. It is **per library root** and **on that root's own
      filesystem** — that is what makes `link(2)` possible — and it defaults to
      `<library-root>/.foundry-recycle` when unset. A recycle root on a
-     different filesystem from its library root is a startup error (MUSEF-08
-     step 4b), not a runtime copy fallback.
+     different filesystem from *its own* library root is a startup error
+     (MUSEF-08 step 4b), not a runtime copy fallback. With several library
+     roots on different filesystems, each gets its own recycle root — sharing
+     one across filesystems is exactly the case that would force a copy.
    Rail 3 constrains their *relationship* (the work root must be outside every
    library root and on a different filesystem); it does not remove the work
    root from the allowlist. A path is confined if it lies under either kind.
@@ -294,9 +297,16 @@ same-mount `rename(2)`.
   1. Add `FoundryConfig` with `allowed_roots: Vec<PathBuf>` (library roots),
      `work_dir` (the work root — included in the guard's allowlist, since
      Foundry must be able to address its own staging area; see rail 1),
-     `recycle_dir` (the recycle root, defaulting per library root to
-     `<root>/.foundry-recycle`, also in the allowlist, and validated to be on
-     the same filesystem as its library root so retention is always a link),
+     `recycle_dirs: BTreeMap<PathBuf, PathBuf>` — a **per-library-root** map,
+     not a single path (an earlier draft declared the requirement as per-root
+     but typed the config as one `recycle_dir`, which cannot represent two
+     library roots on different filesystems; an implementer would have had to
+     either reject valid configurations or share one bin and reintroduce the
+     copy/unlink fallback the invariant forbids). Each entry is validated to be
+     on the same filesystem as its own library root, and each is in the
+     allowlist. Unset entries default to `<that-root>/.foundry-recycle`.
+     `MUSE_FOUNDRY_RECYCLE_DIRS` overrides individual pairs as
+     `<library-root>=<recycle-dir>`, colon-separated,
      `sandbox_root`, `enable_mutation: bool` (default false),
      `retention_days`, `ffmpeg_bin`, `handbrake_bin`. Read every value through
      `crate::config` helpers — never a scattered `std::env::var`.
@@ -357,8 +367,11 @@ same-mount `rename(2)`.
         address its own staging area — while a work root inside a library root
         is still refused by rail 3
   - [ ] A path under a **recycle root** resolves successfully, and a recycle
-        root on a different filesystem from its library root is refused at
+        root on a different filesystem from its own library root is refused at
         startup — so the retention `link(2)` can never silently become a copy
+  - [ ] With two library roots on **different filesystems**, each resolves to
+        its own recycle root and both are valid — the configuration the
+        singular-`recycle_dir` shape could not represent
   - [ ] The recycle root is excluded from library scans and compliance reports,
         so Foundry never re-processes its own retained originals
   - [ ] `enable_mutation=false` blocks every mutating entry point

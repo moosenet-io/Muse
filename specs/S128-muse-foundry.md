@@ -820,6 +820,17 @@ same-mount `rename(2)`.
        do not catch a metadata-preserving replacement.
      - **size and mtime**, which catch an in-place modification of the same
        inode.
+     - **a content digest**, which catches what the three above cannot: an
+       *in-place* modification that restores inode, size and mtime. The encode
+       already reads the whole source, so the digest is computed on that pass
+       at effectively no extra I/O. Re-verifying it in full before the swap
+       would mean a second full read, so the pre-swap check is a **sampled**
+       digest — first and last 8 MiB plus 8 MiB at the midpoint, which is what
+       an *arr re-import or a repack changes — and the full digest is recorded
+       on the job row for the audit trail. This closes the same-inode content
+       race, which the documented TOCTOU limitation does *not* cover: TOCTOU is
+       about the interval between check and use, whereas this is about a change
+       that leaves no metadata trace at all.
      - **`st_nlink`**, rechecked and not only at step 1: a hardlink can be
        created *during* the encode (an import, or cross-seed) and leaves size,
        mtime and inode all unchanged. Replacing a now-multi-linked file would
@@ -927,10 +938,11 @@ same-mount `rename(2)`.
         refused at startup, so this holds unconditionally)
   - [ ] The installed file is the destination-staged copy, and its sha256
         matches the work-dir output
-  - [ ] A source whose **inode**, size or mtime changed at any point between
-        planning and the final rename aborts the swap rather than overwriting
-        newer content. Tested by injecting each mutation separately during the
-        staging window
+  - [ ] A source whose **inode**, size, mtime **or sampled content digest**
+        changed at any point between planning and the final rename aborts the
+        swap rather than overwriting newer content. Tested by injecting each
+        mutation separately during the staging window — including an in-place
+        edit that **restores** size and mtime, which only the digest catches
   - [ ] Link count is checked with the **correct expectation at each point** —
         exactly 1 before the recycle link is created, exactly 2 after it — so
         a normal swap is never self-blocked by its own recycle link, while an
@@ -1360,12 +1372,18 @@ same-mount `rename(2)`.
      same film, passes it easily when runtimes are similar, and would then be
      written and reported as verified. Since this spec says a wrong subtitle is
      worse than none, the rule is:
-     - **`Verified`** — a **moviehash match** (the provider matched the exact
-       file, so timing is the release's own) *or* an exact release-group +
-       runtime match within `sync_runtime_tolerance_secs`. Only a `Verified`
-       candidate is written automatically.
-     - **`Plausible`** — passes the structural cue-range test but has no hash
-       or release match. **Not written automatically.** It is offered to the
+     - **`Verified`** — a **moviehash match only**. The provider matched the
+       exact file, so the timing is that release's own; nothing weaker
+       establishes synchronization. An earlier draft also admitted an exact
+       release-group + runtime match here, which does *not* hold: different
+       cuts and different subtitle releases can share a group and a runtime
+       while carrying timing offsets or different edits, so that rule could
+       install a mistimed subtitle unattended — against this item's own
+       "a wrong subtitle is worse than none". Only `Verified` is written
+       automatically.
+     - **`Plausible`** — passes the structural cue-range test, and may also
+       have a release-group and runtime match, but has **no hash match**.
+       **Not written automatically.** It is offered to the
        operator/assistant as a suggestion, and the item stays wanted.
      - **`Rejected`** — fails the structural test.
      Real audio-to-subtitle alignment (the only thing that would promote a
@@ -1379,9 +1397,9 @@ same-mount `rename(2)`.
   ## TEST PLAN
   - Hash match outranks a higher-rated non-hash candidate
   - A candidate whose last cue exceeds runtime is `Rejected`
-  - A candidate that passes the cue-range test but has no hash or release match
-    is `Plausible` and is **not written** — the item stays wanted and the
-    candidate is surfaced as a suggestion
+  - A candidate with an exact release-group and runtime match but **no hash
+    match** is `Plausible`, not `Verified`, and is **not written** — the
+    regression test for the rule that only a hash licenses an unattended write
   - A hash-matched candidate is `Verified` and is written
   - Below-threshold scoring leaves the item wanted
   - Rejection and non-promotion reasons are recorded
@@ -1397,9 +1415,10 @@ same-mount `rename(2)`.
 - **Acceptance criteria:**
   - [ ] Hash matches dominate scoring
   - [ ] The structural cue-range test rejects out-of-range candidates
-  - [ ] Only a `Verified` candidate (hash match, or release-group + runtime
-        match) is ever written automatically; a merely `Plausible` one is
-        surfaced as a suggestion and never written unattended
+  - [ ] Only a hash-matched (`Verified`) candidate is ever written
+        automatically; a `Plausible` one — **including one with an exact
+        release-group and runtime match** — is surfaced as a suggestion and
+        never written unattended
   - [ ] Nothing is reported as sync-verified on the strength of the cue-range
         test alone
   - [ ] Below-threshold results leave the item wanted rather than writing

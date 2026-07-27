@@ -89,6 +89,26 @@ impl FoundryConfig {
         self.allowed_roots.is_empty()
     }
 
+    /// Configuration problems that are **fatal once the mutation gate is
+    /// open**.
+    ///
+    /// The distinction matters and is load-bearing (it was a real
+    /// contradiction in an early draft of the S128 spec: MUSEF-01 warned where
+    /// MUSEF-08 said "required"). A `work_dir` on the same filesystem as the
+    /// library breaks safety rail 3 — but only if anything is ever actually
+    /// staged there. While `enable_mutation` is false the setting is inert, so
+    /// it is a warning; the moment mutation is enabled the same layout is a
+    /// startup refusal. Warn when it cannot bite, refuse when it can.
+    ///
+    /// Empty ⇒ safe to start.
+    pub fn fatal_errors(&self) -> Vec<String> {
+        if !self.enable_mutation {
+            return Vec::new();
+        }
+        // Every rail-3 problem is fatal once mutation is possible.
+        self.rail3_problems()
+    }
+
     /// Non-fatal configuration problems worth surfacing at startup and on the
     /// status endpoint. Returning them (rather than logging inline) keeps this
     /// type pure and lets the status surface show the operator the same list.
@@ -104,33 +124,7 @@ impl FoundryConfig {
             );
         }
 
-        if let Some(work) = &self.work_dir {
-            if let Some(dev) = device_of(work) {
-                for root in &self.allowed_roots {
-                    if device_of(root) == Some(dev) {
-                        out.push(format!(
-                            "MUSE_FOUNDRY_WORK_DIR ({}) is on the same filesystem as the \
-                             allowed root {} — a failed swap could consume the library's \
-                             own free space; put the work dir on a different device",
-                            work.display(),
-                            root.display()
-                        ));
-                    }
-                }
-            }
-            // A work dir *inside* an allowed root is worse than same-device: it
-            // means the library scan would see Foundry's own scratch output.
-            for root in &self.allowed_roots {
-                if work.starts_with(root) {
-                    out.push(format!(
-                        "MUSE_FOUNDRY_WORK_DIR ({}) is inside the allowed root {} — \
-                         scratch output would appear in the library",
-                        work.display(),
-                        root.display()
-                    ));
-                }
-            }
-        }
+        out.extend(self.rail3_problems());
 
         if self.retention_days == 0 {
             out.push(
@@ -138,6 +132,47 @@ impl FoundryConfig {
                  unrecoverable immediately after a swap"
                     .to_string(),
             );
+        }
+
+        out
+    }
+
+    /// Layout problems that violate safety rail 3 ("never in-place": staged
+    /// output must live on a different filesystem from the library).
+    ///
+    /// Reported as warnings while mutation is closed and as fatal errors once
+    /// it is open — see [`FoundryConfig::fatal_errors`].
+    fn rail3_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(work) = &self.work_dir else {
+            return out;
+        };
+
+        if let Some(dev) = device_of(work) {
+            for root in &self.allowed_roots {
+                if device_of(root) == Some(dev) {
+                    out.push(format!(
+                        "MUSE_FOUNDRY_WORK_DIR ({}) is on the same filesystem as the \
+                         allowed root {} — a failed swap could consume the library's \
+                         own free space; put the work dir on a different device",
+                        work.display(),
+                        root.display()
+                    ));
+                }
+            }
+        }
+
+        // A work dir *inside* an allowed root is worse than same-device: the
+        // library scan would see Foundry's own scratch output.
+        for root in &self.allowed_roots {
+            if work.starts_with(root) {
+                out.push(format!(
+                    "MUSE_FOUNDRY_WORK_DIR ({}) is inside the allowed root {} — \
+                     scratch output would appear in the library",
+                    work.display(),
+                    root.display()
+                ));
+            }
         }
 
         out
@@ -240,6 +275,41 @@ mod tests {
             "got {:?}",
             c.warnings()
         );
+    }
+
+    #[test]
+    fn a_rail3_violation_warns_while_mutation_is_closed_but_is_fatal_once_open() {
+        // The whole point: warn when it cannot bite, refuse when it can.
+        let mut c = cfg_with(Some("/srv/media"), false);
+        c.work_dir = Some(PathBuf::from("/srv/media/.foundry-work"));
+
+        assert!(
+            c.fatal_errors().is_empty(),
+            "inert while mutation is closed, got {:?}",
+            c.fatal_errors()
+        );
+        assert!(
+            c.warnings().iter().any(|w| w.contains("is inside the allowed root")),
+            "should still warn, got {:?}",
+            c.warnings()
+        );
+
+        c.enable_mutation = true;
+        assert!(
+            c.fatal_errors().iter().any(|w| w.contains("is inside the allowed root")),
+            "must be fatal once mutation is open, got {:?}",
+            c.fatal_errors()
+        );
+    }
+
+    #[test]
+    fn a_sound_layout_is_never_fatal() {
+        let mut c = cfg_with(Some("/srv/media"), true);
+        c.work_dir = Some(PathBuf::from("/var/tmp/muse-foundry-work"));
+        // Neither path exists in the test env, so the device comparison is a
+        // no-op; what matters is that containment does not fire and nothing
+        // is reported fatal.
+        assert!(c.fatal_errors().is_empty(), "got {:?}", c.fatal_errors());
     }
 
     #[test]

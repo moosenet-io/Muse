@@ -81,6 +81,24 @@ impl Foundry {
             return None;
         }
 
+        // Fatal errors are the rail-3 violations that only bite once the
+        // mutation gate is open (see FoundryConfig::fatal_errors). Refusing to
+        // register is the right response: a Foundry that can mutate but stages
+        // output onto the library's own filesystem is more dangerous than no
+        // Foundry at all, so it must not come up half-configured.
+        let fatal = config.fatal_errors();
+        if !fatal.is_empty() {
+            for e in &fatal {
+                tracing::error!(error = %e, "foundry: fatal configuration error");
+            }
+            tracing::error!(
+                "foundry: mutation is enabled but the layout violates safety rail 3 \
+                 — refusing to register. Fix the configuration, or unset \
+                 MUSE_FOUNDRY_ENABLE_MUTATION to run read-only."
+            );
+            return None;
+        }
+
         for w in config.warnings() {
             tracing::warn!(warning = %w, "foundry: configuration warning");
         }
@@ -118,6 +136,9 @@ mod tests {
         if config.is_unconfigured() {
             return None;
         }
+        if !config.fatal_errors().is_empty() {
+            return None;
+        }
         let guard = config.guard();
         if guard.is_inert() {
             return None;
@@ -146,6 +167,27 @@ mod tests {
         let missing = std::env::temp_dir().join("muse-foundry-definitely-not-mounted");
         let _ = std::fs::remove_dir_all(&missing);
         assert!(foundry_from(cfg(vec![missing])).is_none());
+    }
+
+    #[test]
+    fn a_rail3_violation_refuses_to_register_once_mutation_is_enabled() {
+        // A Foundry that can mutate but stages onto the library's own
+        // filesystem is more dangerous than no Foundry, so it must not come up.
+        let root = std::env::temp_dir();
+        let mut c = cfg(vec![root.clone()]);
+        c.work_dir = Some(root.join("foundry-work-inside"));
+
+        c.enable_mutation = false;
+        assert!(
+            foundry_from(c.clone()).is_some(),
+            "read-only Foundry with an inert work_dir still registers"
+        );
+
+        c.enable_mutation = true;
+        assert!(
+            foundry_from(c).is_none(),
+            "the same layout must refuse to register once mutation is enabled"
+        );
     }
 
     #[test]

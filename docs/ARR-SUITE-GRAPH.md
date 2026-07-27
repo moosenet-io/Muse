@@ -169,10 +169,16 @@ lossless-audio files whose direct-play status is client-dependent.
 | Modern TV | mkv | `hevc` Main | aac-lc 2.0 | ass (embedded) | client-dependent; ASS burns on some |
 | Modern film | mkv | h264 High 1080p | ac3 5.1 | subrip | direct-plays everywhere |
 
-**Finding E — mislabeled audio language.** The `wmv3` sample tags its English
-audio as `swe`. Jellyfin/Emby language selection trusts this tag, so the track
-is unselectable by an English-preferring profile. Metadata repair is a
-first-class Foundry function, not an afterthought.
+**Finding E — a language tag worth a second look, not an automatic rewrite.**
+The `wmv3` sample tags its audio `swe`. That *may* be wrong — the series is an
+English dub — and if it is, Jellyfin/Emby language selection trusts the tag and
+the track becomes unselectable by an English-preferring profile. But `swe` is a
+valid ISO 639-2 code and nothing in the probe establishes what the audio
+actually is. An earlier version of this note called it "mislabeled" and
+concluded metadata repair should be a first-class Foundry function; that
+overstated the evidence. Foundry reports a tag as *suspected*-wrong only with a
+corroborating source (release name, a sibling track, an `und` tag) and never
+rewrites one automatically — see `specs/S128-muse-foundry.md` MUSEF-15.
 
 ---
 

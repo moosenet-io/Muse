@@ -160,7 +160,17 @@ Five rails, each independently sufficient to prevent catastrophe:
    - **library roots** (`MUSE_FOUNDRY_ALLOWED_ROOTS`) — the media Foundry may
      read and, when the gate is open, modify;
    - **the work root** (`MUSE_FOUNDRY_WORK_DIR`) — Foundry's own scratch and
-     staging area, which it must also be able to address.
+     staging area, which it must also be able to address;
+   - **the recycle root** (`MUSE_FOUNDRY_RECYCLE_DIR`) — where superseded
+     originals are retained. This was missing from an earlier draft entirely:
+     MUSEF-08, MUSEF-18 and MUSEF-21 all require a recycle bin and all require
+     the retention step to be a `link(2)`, but no item defined where it lives
+     or gave it allowlist authority, leaving an implementer with no sanctioned
+     location. It is **per library root** and **on that root's own
+     filesystem** — that is what makes `link(2)` possible — and it defaults to
+     `<library-root>/.foundry-recycle` when unset. A recycle root on a
+     different filesystem from its library root is a startup error (MUSEF-08
+     step 4b), not a runtime copy fallback.
    Rail 3 constrains their *relationship* (the work root must be outside every
    library root and on a different filesystem); it does not remove the work
    root from the allowlist. A path is confined if it lies under either kind.
@@ -284,6 +294,9 @@ same-mount `rename(2)`.
   1. Add `FoundryConfig` with `allowed_roots: Vec<PathBuf>` (library roots),
      `work_dir` (the work root — included in the guard's allowlist, since
      Foundry must be able to address its own staging area; see rail 1),
+     `recycle_dir` (the recycle root, defaulting per library root to
+     `<root>/.foundry-recycle`, also in the allowlist, and validated to be on
+     the same filesystem as its library root so retention is always a link),
      `sandbox_root`, `enable_mutation: bool` (default false),
      `retention_days`, `ffmpeg_bin`, `handbrake_bin`. Read every value through
      `crate::config` helpers — never a scattered `std::env::var`.
@@ -343,6 +356,11 @@ same-mount `rename(2)`.
   - [ ] A path under the **work root** resolves successfully, so the server can
         address its own staging area — while a work root inside a library root
         is still refused by rail 3
+  - [ ] A path under a **recycle root** resolves successfully, and a recycle
+        root on a different filesystem from its library root is refused at
+        startup — so the retention `link(2)` can never silently become a copy
+  - [ ] The recycle root is excluded from library scans and compliance reports,
+        so Foundry never re-processes its own retained originals
   - [ ] `enable_mutation=false` blocks every mutating entry point
   - [ ] A rail-3-violating layout (`work_dir` on the same device as, or inside,
         an allowed root) is a warning while mutation is disabled and a startup
@@ -380,7 +398,19 @@ same-mount `rename(2)`.
      `is_lossless_audio`, `is_image_subtitle` (pgs/vobsub/dvbsub),
      `is_text_subtitle` (subrip/ass/ssa/mov_text), `effective_bitrate`.
   4. Normalize language tags to ISO 639-2/B, preserving the raw tag alongside
-     the normalized one so a *mislabeled* tag stays visible (see MUSEF-05).
+     the normalized one.
+     **Never infer that a tag is wrong from the tag alone, and never rewrite
+     one automatically.** An earlier draft called the `swe` tag on the surveyed
+     `wmv3` sample "implausible" and treated metadata repair as a first-class
+     Foundry function. `swe` is a perfectly valid ISO 639-2 code, and nothing
+     in the probe establishes what language the audio actually *is* — acting on
+     that assumption would rewrite legitimate Swedish tracks as English and
+     corrupt exactly the metadata playback-language selection depends on.
+     A tag may only be reported as **suspected-wrong**, never as wrong, and
+     only with a stated evidence source: the release name or a sibling track's
+     tag disagreeing, an `und`/empty tag, or an operator assertion. Any actual
+     rewrite is an approval-gated operation carrying that evidence, never an
+     automatic repair.
   5. Capture fixtures from the six sandbox samples and parse them in tests —
      no media files in the repo, only the ffprobe JSON.
 
@@ -558,8 +588,10 @@ same-mount `rename(2)`.
      `(path, size, mtime)` so a re-report is cheap on an unchanged library.
   3. Aggregate: counts by verdict, by container, by codec, top offenders by
      estimated reclaimable bytes, and a **metadata-defects** section — files
-     whose audio/subtitle language tags are absent or implausible (the wmv
-     sample's English audio tagged `swe`).
+     whose audio/subtitle language tags are absent, or which disagree with
+     corroborating evidence such as the release name. Report only — see
+     MUSEF-15 on why a valid-but-unexpected tag is never treated as proof of
+     mislabeling.
   4. Expose read-only endpoints behind the existing `src/http/auth.rs` layer.
   5. Emit `media.formatting.report_completed` on the context bus.
 
@@ -1224,7 +1256,9 @@ same-mount `rename(2)`.
   ## TEST PLAN
   - Inventory over the sandbox finds the embedded ASS and subrip streams
   - Sidecar patterns including `.forced.` and `.sdh.` are classified correctly
-  - An implausible language tag is flagged, not silently trusted
+  - A tag that disagrees with corroborating evidence is reported as
+    *suspected*-wrong with that evidence named; a valid-but-unexpected tag with
+    no corroborating evidence is left alone and never rewritten
   - The wanted queue reflects desired-minus-present
   - Verify no hardcoded infrastructure values in new/modified files
 
@@ -1237,7 +1271,10 @@ same-mount `rename(2)`.
 - **Acceptance criteria:**
   - [ ] Embedded and sidecar subtitles are both inventoried
   - [ ] Forced, SDH and HI variants are distinguished
-  - [ ] Implausible language tags are flagged rather than trusted
+  - [ ] A language tag is never rewritten automatically; a suspected-wrong tag
+        is reported with its evidence source and any repair is approval-gated
+  - [ ] A valid-but-unexpected tag with no corroborating evidence is left
+        untouched — the regression guard against rewriting real Swedish audio
   - [ ] A wanted queue is produced from a per-library language profile
   - [ ] No hardcoded infrastructure values in new/modified code
 

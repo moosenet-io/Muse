@@ -726,7 +726,12 @@ same-mount `rename(2)`.
   ## EDGE CASES
   - Source modified during the encode (mtime/size change) — abort the swap
   - Recycle bin full or unwritable — refuse the swap, do not delete
-  - Cross-device recycle — copy, verify checksum, then unlink; never rename
+  - Cross-device recycle bin — **impossible by construction**: the recycle
+    bin is required at startup to share a filesystem with its allowed root
+    (step 4b), so the retention step is always `link(2)`. A misconfigured
+    recycle bin is a startup error, never a runtime copy fallback. (An
+    earlier draft listed a copy-then-unlink fallback here; it contradicted
+    the startup rule and is removed.)
   - Output larger than source — refuse unless the plan carried an override
   - Concurrent job targeting the same path — the queue's dedup plus a per-path
     lock make this impossible; assert it rather than handling it
@@ -1144,7 +1149,11 @@ same-mount `rename(2)`.
 
   ## APPROACH
   1. Write `<base>.<lang>[.forced][.sdh].srt` next to the media file, through
-     `PathGuard` and behind the mutation gate, atomically (temp + rename).
+     `PathGuard` and behind the mutation gate, atomically: the temp file is a
+     **sibling of the target** (`<target>.tmp`), so it is on the target's own
+     filesystem and the `rename(2)` is a genuine same-mount atomic replace —
+     never a temp in the work dir, which would be cross-device (the EXDEV trap
+     MUSEF-08 documents).
   2. Normalize encoding to UTF-8, converting known legacy encodings; never
      write a file whose encoding cannot be determined.
   3. Worker: poll the wanted queue on an interval, respecting an adaptive
@@ -1161,14 +1170,24 @@ same-mount `rename(2)`.
 
   ## EDGE CASES
   - Existing sidecar at the target name — replaced only if the new score is
-    higher; the old one goes to the recycle bin
+    higher, and via the same **link-before-replace** protocol MUSEF-08 uses, so
+    the content-preservation invariant holds on this path too: (1) `link(2)`
+    the existing sidecar into the recycle bin — which shares a filesystem with
+    the allowed root by the same startup requirement, so this is always a link,
+    never a copy; (2) write the new sidecar to a sibling
+    `<base>.<lang>.srt.tmp` on that same filesystem; (3) `rename(2)` it over
+    the target. The old sidecar is never unreferenced, and the target path
+    never lacks a file
   - Read-only media directory — the item is blocked with a clear reason
   - Media file renamed between search and write — re-resolve or abandon
 
 - **Acceptance criteria:**
   - [ ] Sidecars are named correctly for plain, forced and SDH variants
   - [ ] Output is always UTF-8; undeterminable encodings are refused
-  - [ ] Writes are atomic and pass through the mutation gate
+  - [ ] Writes are atomic (same-filesystem sibling temp + `rename(2)`) and pass
+        through the mutation gate
+  - [ ] Replacing an existing sidecar links it into the recycle bin *before*
+        the replacement lands, so the old content is never unreferenced
   - [ ] Replacing an existing sidecar retains the old one
   - [ ] No hardcoded infrastructure values in new/modified code
 

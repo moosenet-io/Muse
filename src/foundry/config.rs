@@ -40,6 +40,11 @@ const DEFAULT_HANDBRAKE_BIN: &str = "HandBrakeCLI";
 /// capability-free diagnostics on [`super::Foundry`]
 /// (`root_descriptions`, `root_count`, `mutation_enabled`, `retention_days`).
 #[derive(Debug, Clone)]
+// `ffprobe_bin`/`handbrake_bin` have no consumer until MUSEF-02 (probe) and
+// MUSEF-06 (encoder backends) respectively. Configured here because they belong
+// with the rest of the Foundry config, not deferred to the item that first
+// reads them.
+#[allow(dead_code)]
 pub struct FoundryConfig {
     /// Default-deny allowlist of roots Foundry may address. Empty ⇒ inert.
     pub(in crate::foundry) allowed_roots: Vec<PathBuf>,

@@ -116,6 +116,11 @@ impl Foundry {
         Some(Self { config, guard })
     }
 
+    // Not yet consumed: MUSEF-02 (probe) is the first caller of `guard()`, and
+    // MUSEF-08 the first of `config()`. Same reasoning as the accessors in
+    // paths.rs — this item is deliberately the foundation, reviewed before any
+    // consumer exists. Annotated rather than widened to silence a warning.
+    #[allow(dead_code)]
     /// The typed configuration. **Foundry-internal.**
     ///
     /// `FoundryConfig` carries raw `PathBuf`s, so a public accessor would hand
@@ -133,6 +138,7 @@ impl Foundry {
     /// call `resolve_for_mutation` directly, which defeats the entire
     /// MutablePath design. Narrowing the leaf accessors while leaving this
     /// public achieved nothing — both reviewers caught it.
+    #[allow(dead_code)]
     pub(in crate::foundry) fn guard(&self) -> &PathGuard {
         &self.guard
     }

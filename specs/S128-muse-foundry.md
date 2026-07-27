@@ -205,8 +205,9 @@ Concretely, within a mutation:
   with a live reference.
 - **Junk removal** — linked into the recycle bin first; the original entry is
   removed only once that link is confirmed to exist.
-- **Multi-link file** — not touched at all, by any path: not moved, not
-  replaced, not recycled as junk.
+- **Multi-link file** — not touched at all, by any of the three mutating
+  paths: not swapped (MUSEF-08), not moved or recycled as junk (MUSEF-21), and
+  not replaced as a subtitle sidecar (MUSEF-18).
 
 So Foundry may remove a directory entry it did not create; no mutation may
 leave content unreachable. That is testable (assert reachability at every
@@ -275,10 +276,21 @@ same-mount `rename(2)`.
      `sandbox_root`, `enable_mutation: bool` (default false),
      `retention_days`, `ffmpeg_bin`, `handbrake_bin`. Read every value through
      `crate::config` helpers — never a scattered `std::env::var`.
-  2. Implement `PathGuard::resolve(&self, p: &Path) -> Result<ResolvedPath>`:
-     canonicalize, reject symlink escape, reject any path not under an allowed
-     root. `ResolvedPath` is the only type later items accept — make the unsafe
-     path unrepresentable rather than checked-by-convention.
+  2. Implement **two** resolution entry points. Both are required: later phases
+     must address files that do not exist yet (a staged temp file, a new
+     sidecar, an organizer move target), and without a sanctioned way to do
+     that an implementer would either bypass the guard or weaken it ad hoc —
+     which would defeat the whole rail.
+     - `PathGuard::resolve(&self, p) -> Result<ResolvedPath>` — for an
+       **existing** path: canonicalize (resolving symlinks and `..`), then
+       reject anything not under an allowed root.
+     - `PathGuard::resolve_new(&self, p) -> Result<ResolvedPath>` — for a
+       **prospective** path: canonicalize and confine the **parent**, then
+       append the final component. The final component must be a plain name;
+       a `..` or nested path there would step back out of the parent just
+       proven safe. `resolve_new` creates nothing.
+     `ResolvedPath` is the only type later items accept — make the unsafe path
+     unrepresentable rather than checked-by-convention.
   3. Add `PathGuard::require_mutation()` returning `Err` when
      `enable_mutation` is false, so a mutating call site cannot forget the gate.
   4. Register Foundry as capability-gated: an empty `allowed_roots` yields
@@ -289,6 +301,10 @@ same-mount `rename(2)`.
   ## TEST PLAN
   - `cargo test -p muse foundry::paths` — resolve inside root succeeds;
     outside root, `..` traversal, and symlink-to-outside all rejected
+  - `resolve_new` accepts a nonexistent child of an allowed parent and creates
+    nothing; rejects a target whose parent escapes, and a missing parent
+  - a sibling root sharing a name prefix (`/…/lib-evil` vs root `/…/lib`) is
+    rejected — the component-wise check, not a string prefix
   - Mutation gate returns `Err` when `enable_mutation` is false
   - Empty `allowed_roots` yields an unregistered surface
   - Verify no hardcoded IPs, hostnames, or org names in new/modified files
@@ -310,6 +326,8 @@ same-mount `rename(2)`.
 
 - **Acceptance criteria:**
   - [ ] `ResolvedPath` cannot be constructed except through `PathGuard`
+  - [ ] Both `resolve` (existing) and `resolve_new` (prospective) exist, so no
+        later item needs to bypass the guard to address a file it will create
   - [ ] Traversal, symlink-escape, and outside-root paths are all rejected
   - [ ] `enable_mutation=false` blocks every mutating entry point
   - [ ] A rail-3-violating layout (`work_dir` on the same device as, or inside,
@@ -681,7 +699,9 @@ same-mount `rename(2)`.
        VMAF over `verify_vmaf_samples` (default **3**) 10-second segments at
        even offsets, harmonic mean ≥ `verify_vmaf_floor` (default **93**);
      - **full-read integrity** — the output is decoded end-to-end with
-       `ffmpeg -v error -f null -` and must emit zero decode errors. This is
+       `ffmpeg -v error -i <staged-output> -f null -` (the `-i` is not optional
+       — an earlier draft omitted it, which would decode nothing) and must
+       emit zero decode errors. This is
        the bitstream check; the VMAF sample is a quality check. Both required.
      Any failure → source untouched, job `Failed`, output retained for
      inspection.
@@ -1202,8 +1222,15 @@ same-mount `rename(2)`.
   - Verify no hardcoded infrastructure values in new/modified files
 
   ## EDGE CASES
-  - Existing sidecar at the target name — replaced only if the new score is
-    higher, and via the same **link-before-replace** protocol MUSEF-08 uses, so
+  - Existing sidecar with `st_nlink > 1` — **blocked and left untouched**, like
+    every other multi-link file (MUSEF-08, MUSEF-21). A subtitle sidecar can
+    absolutely be part of a seeded torrent's payload, and replacing it removes
+    the torrent-known path. This is the third and last mutating path the guard
+    has to cover; the safety model says "not touched by *any* path" and this
+    is what makes that true rather than aspirational
+  - Existing single-link sidecar at the target name — replaced only if the new
+    score is higher, and via the same **link-before-replace** protocol
+    MUSEF-08 uses, so
     the content-preservation invariant holds on this path too: (1) `link(2)`
     the existing sidecar into the recycle bin — which shares a filesystem with
     the allowed root by the same startup requirement, so this is always a link,
@@ -1221,6 +1248,8 @@ same-mount `rename(2)`.
         through the mutation gate
   - [ ] Replacing an existing sidecar links it into the recycle bin *before*
         the replacement lands, so the old content is never unreferenced
+  - [ ] An existing sidecar with `st_nlink > 1` is blocked and left untouched —
+        not relinked, not replaced, not recycled
   - [ ] Replacing an existing sidecar retains the old one
   - [ ] No hardcoded infrastructure values in new/modified code
 

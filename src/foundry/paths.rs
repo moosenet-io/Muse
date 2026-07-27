@@ -42,26 +42,46 @@ pub struct ResolvedPath(PathBuf);
 
 impl ResolvedPath {
     /// The underlying canonical path.
-    pub fn as_path(&self) -> &Path {
+    ///
+    /// Restricted to the `foundry` module. A reviewer observed that a public
+    /// accessor makes the type boundary porous: any caller could take the path
+    /// out of a read-only `ResolvedPath` and hand it to `std::fs::write` while
+    /// the mutation gate was closed. Narrowing the accessor means nothing
+    /// *outside* Foundry can extract a raw path at all.
+    ///
+    /// **What this does and does not guarantee, stated plainly.** Inside
+    /// Foundry the boundary is a strong convention, not a sandbox: Rust cannot
+    /// stop a module that holds a `&Path` from calling `std::fs::remove_file`
+    /// on it, and read operations legitimately need the path (ffprobe, ffmpeg,
+    /// `File::open`). So the guarantee is: *outside* Foundry, no raw path;
+    /// *inside* Foundry, a function that takes [`MutablePath`] documents and
+    /// type-checks its intent to mutate, and any `fs` mutation reached from a
+    /// plain `ResolvedPath` is a reviewable defect. Making that unrepresentable
+    /// would need every filesystem call to route through a Foundry IO façade
+    /// that only accepts `MutablePath` — a worthwhile design, scoped as a
+    /// follow-up rather than claimed here.
+    pub(in crate::foundry) fn as_path(&self) -> &Path {
         &self.0
     }
 
-    /// Consume into the owned canonical [`PathBuf`].
-    pub fn into_path_buf(self) -> PathBuf {
+    /// Consume into the owned canonical [`PathBuf`]. Foundry-internal, for the
+    /// same reason as [`ResolvedPath::as_path`].
+    pub(in crate::foundry) fn into_path_buf(self) -> PathBuf {
         self.0
     }
-}
 
-impl AsRef<Path> for ResolvedPath {
-    fn as_ref(&self) -> &Path {
-        &self.0
+    /// A lossy display form, safe to hand to logs and error messages outside
+    /// Foundry — it cannot be used to open a file.
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.0.display()
     }
 }
 
 impl std::fmt::Display for ResolvedPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `Path`'s Display-via-`display()` is lossy for non-UTF8, which is
-        // correct for a human-facing message; the stored path stays exact.
+        // Lossy for non-UTF8, which is correct for a human-facing message; the
+        // stored path stays exact. Display leaks no capability — a formatted
+        // string cannot be used to open a file without re-resolving it.
         write!(f, "{}", self.0.display())
     }
 }
@@ -83,25 +103,25 @@ impl std::fmt::Display for ResolvedPath {
 pub struct MutablePath(ResolvedPath);
 
 impl MutablePath {
-    /// The underlying canonical path.
-    pub fn as_path(&self) -> &Path {
+    /// The underlying canonical path. Foundry-internal, as for
+    /// [`ResolvedPath::as_path`].
+    pub(in crate::foundry) fn as_path(&self) -> &Path {
         self.0.as_path()
     }
 
     /// Consume into the owned canonical [`PathBuf`].
-    pub fn into_path_buf(self) -> PathBuf {
+    pub(in crate::foundry) fn into_path_buf(self) -> PathBuf {
         self.0.into_path_buf()
     }
 
     /// Downgrade to a plain [`ResolvedPath`] for a read-only call.
-    pub fn as_resolved(&self) -> &ResolvedPath {
+    pub(in crate::foundry) fn as_resolved(&self) -> &ResolvedPath {
         &self.0
     }
-}
 
-impl AsRef<Path> for MutablePath {
-    fn as_ref(&self) -> &Path {
-        self.0.as_path()
+    /// A lossy display form, safe outside Foundry.
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.0.display()
     }
 }
 
@@ -182,18 +202,21 @@ pub struct PathGuard {
 impl PathGuard {
     /// Build a guard from raw configured roots.
     ///
-    /// `pub(crate)` deliberately: a guard is a *capability*, and code that can
-    /// mint its own with arbitrary roots and `enable_mutation: true` has
-    /// bypassed the configuration entirely. Foundry code takes the one real
-    /// guard from [`crate::foundry::Foundry::guard`]; only
-    /// [`crate::foundry::FoundryConfig::guard`] constructs it.
+    /// `pub(in crate::foundry)` deliberately, and narrowed twice under review.
+    /// A guard is a *capability*: code that can mint its own with arbitrary
+    /// roots and `enable_mutation: true` has bypassed the configuration
+    /// entirely. `pub(crate)` was not enough — any current or future module
+    /// anywhere in the crate could still call it — so construction is now
+    /// restricted to the `foundry` module itself, where
+    /// [`crate::foundry::FoundryConfig::guard`] is the only caller and applies
+    /// the full validation first.
     ///
     /// Each root is canonicalized; roots that do not exist or cannot be
     /// resolved are dropped with a warning. If *every* root drops out, the
     /// guard is still constructed but refuses all paths with
     /// [`PathError::NoAllowedRoots`] — callers that want "Foundry is not
     /// configured at all" semantics should check [`PathGuard::is_inert`].
-    pub(crate) fn new<I, P>(roots: I, enable_mutation: bool) -> Self
+    pub(in crate::foundry) fn new<I, P>(roots: I, enable_mutation: bool) -> Self
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,

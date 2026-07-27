@@ -1246,8 +1246,15 @@ same-mount `rename(2)`.
   1. Embedded streams come from the MUSEF-02 probe. Sidecars are discovered by
      the conventional patterns (`<base>.<lang>.srt`, `.forced.`, `.hi.`,
      `.sdh.`, plus the `.ass` files present in the anime libraries).
-  2. Normalize language to ISO 639-2/B, retaining the raw tag. Flag implausible
-     tags — the wmv sample's English audio marked `swe` is the canonical case.
+  2. Normalize language to ISO 639-2/B, retaining the raw tag. Flag a tag only
+     when **corroborating evidence** disagrees with it (MUSEF-02's rule, which
+     this item must not contradict — an earlier draft here called the surveyed
+     `wmv3` sample's `swe` tag "the canonical case" of a mislabeled tag, which
+     is exactly the unevidenced judgement MUSEF-02 forbids). `swe` is a valid
+     ISO 639-2 code; the sample is *worth surfacing* because the release name
+     says English dub — that release name **is** the evidence, and it is what
+     licenses the flag, not the tag looking unexpected. With no such evidence,
+     an unexpected tag is left alone.
   3. Record desired-vs-present per title from a per-library language profile,
      producing a **wanted queue**.
   4. Distinguish forced/SDH/HI variants — they are not interchangeable, and

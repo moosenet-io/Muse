@@ -39,11 +39,16 @@ const DEFAULT_HANDBRAKE_BIN: &str = "HandBrakeCLI";
 /// `std::fs` directly, bypassing the guard. Outside Foundry, use the
 /// capability-free diagnostics on [`super::Foundry`]
 /// (`root_descriptions`, `root_count`, `mutation_enabled`, `retention_days`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 // `ffprobe_bin`/`handbrake_bin` have no consumer until MUSEF-02 (probe) and
 // MUSEF-06 (encoder backends) respectively. Configured here because they belong
 // with the rest of the Foundry config, not deferred to the item that first
 // reads them.
+//
+// NOTE the missing `Debug` derive — it is deliberate. A reviewer pointed out
+// that private fields do not stop disclosure through `{:?}`: a derived Debug
+// would have printed every configured path to anyone who could format the
+// value. The hand-written impl below prints shapes and counts, never paths.
 #[allow(dead_code)]
 pub struct FoundryConfig {
     /// Default-deny allowlist of roots Foundry may address. Empty ⇒ inert.
@@ -60,6 +65,23 @@ pub struct FoundryConfig {
     pub(in crate::foundry) ffprobe_bin: String,
     /// `HandBrakeCLI` binary (name on `PATH`, or an absolute path).
     pub(in crate::foundry) handbrake_bin: String,
+}
+
+impl std::fmt::Debug for FoundryConfig {
+    /// Deliberately path-free.
+    ///
+    /// A derived `Debug` discloses every configured `PathBuf` to any caller
+    /// that can format the value, which makes the field visibility narrowing
+    /// pointless. This prints only shape: how many roots, whether the optional
+    /// paths are set, and the non-path settings.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FoundryConfig")
+            .field("allowed_roots", &self.allowed_roots.len())
+            .field("work_dir", &self.work_dir.is_some())
+            .field("enable_mutation", &self.enable_mutation)
+            .field("retention_days", &self.retention_days)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FoundryConfig {
@@ -104,7 +126,7 @@ impl FoundryConfig {
     ///    configuration that would have been refused at registration. The
     ///    validation lives with the capability rather than only at the call
     ///    site that happens to remember it.
-    pub(crate) fn guard(&self) -> Option<PathGuard> {
+    pub(in crate::foundry) fn guard(&self) -> Option<PathGuard> {
         if !self.fatal_errors().is_empty() {
             return None;
         }
@@ -126,7 +148,7 @@ impl FoundryConfig {
     /// must sit outside every library root, on a different filesystem, and
     /// `rail3_problems` enforces that — but it does not remove the work root
     /// from the set of addressable paths.
-    pub(crate) fn guard_roots(&self) -> Vec<PathBuf> {
+    pub(in crate::foundry) fn guard_roots(&self) -> Vec<PathBuf> {
         let mut roots = self.allowed_roots.clone();
         if let Some(work) = &self.work_dir {
             roots.push(work.clone());

@@ -44,7 +44,9 @@ pub use paths::{PathError, PathGuard, ResolvedPath};
 ///
 /// Obtained from [`Foundry::from_config`], which returns `None` when Foundry is
 /// not configured — so holding this type is itself proof the subsystem is live.
-#[derive(Debug, Clone)]
+// No `Debug` derive: it would print the contained FoundryConfig and PathGuard,
+// disclosing every configured path regardless of field visibility.
+#[derive(Clone)]
 pub struct Foundry {
     config: FoundryConfig,
     guard: PathGuard,
@@ -162,15 +164,15 @@ impl Foundry {
         self.config.retention_days
     }
 
-    /// The allowed roots as **display strings**, for a status surface or an
-    /// operator-facing log. A `String` cannot be used to open a file without
-    /// re-resolving it through the guard, so this leaks no capability.
-    pub fn root_descriptions(&self) -> Vec<String> {
-        self.guard
-            .roots()
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect()
+}
+
+impl std::fmt::Debug for Foundry {
+    /// Path-free, for the same reason as [`FoundryConfig`]'s impl.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Foundry")
+            .field("roots", &self.guard.root_count())
+            .field("mutation_enabled", &self.guard.mutation_enabled())
+            .finish_non_exhaustive()
     }
 }
 

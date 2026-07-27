@@ -734,6 +734,15 @@ same-mount `rename(2)`.
      d. Delete the work-dir output (scratch only; the installed file is the
         staged copy, and the old content lives in the recycle bin).
 
+     **Revalidate the source immediately before (c).** The size/mtime check in
+     step 1 happens before the encode, and staging plus the recycle link take
+     real time on a large file — a concurrent *arr import could replace the
+     source in that window, and the rename would silently overwrite it with a
+     transcode of the *old* content. So re-stat the source right before the
+     rename and abort the swap if size or mtime moved since the plan was made.
+     The recycle link from (b) is harmless if left behind; the next run
+     reclaims it by job id.
+
      At no instant does the target path lack a file (it holds the original
      until (c), the replacement after). At no instant is the old content
      unreachable (target until (b), recycle-bin link thereafter). A crash at
@@ -775,7 +784,9 @@ same-mount `rename(2)`.
   - Verify no hardcoded infrastructure values in new/modified files
 
   ## EDGE CASES
-  - Source modified during the encode (mtime/size change) — abort the swap
+  - Source modified during the encode **or during staging/linking** (mtime or
+    size change) — abort the swap; the final re-stat immediately before the
+    rename is what closes the second window
   - Recycle bin full or unwritable — refuse the swap, do not delete
   - Cross-device recycle bin — **impossible by construction**: the recycle
     bin is required at startup to share a filesystem with its allowed root
@@ -800,7 +811,9 @@ same-mount `rename(2)`.
         refused at startup, so this holds unconditionally)
   - [ ] The installed file is the destination-staged copy, and its sha256
         matches the work-dir output
-  - [ ] A source whose mtime or size changed mid-encode aborts the swap
+  - [ ] A source whose mtime or size changed at any point between planning and
+        the final rename — including during staging and recycle-linking —
+        aborts the swap rather than overwriting the newer content
   - [ ] For **all three** crash-injection points (after staging, after the
         recycle link, after the rename), the target path still resolves to a
         file and the old content is still reachable; retrying converges to the

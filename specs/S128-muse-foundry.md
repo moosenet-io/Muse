@@ -734,14 +734,37 @@ same-mount `rename(2)`.
      d. Delete the work-dir output (scratch only; the installed file is the
         staged copy, and the old content lives in the recycle bin).
 
-     **Revalidate the source immediately before (c).** The size/mtime check in
+     **Revalidate the source immediately before (b) and (c).** The check in
      step 1 happens before the encode, and staging plus the recycle link take
      real time on a large file — a concurrent *arr import could replace the
      source in that window, and the rename would silently overwrite it with a
-     transcode of the *old* content. So re-stat the source right before the
-     rename and abort the swap if size or mtime moved since the plan was made.
-     The recycle link from (b) is harmless if left behind; the next run
-     reclaims it by job id.
+     transcode of the *old* content. Three properties are re-verified, and each
+     catches something the others miss:
+     - **inode identity.** Hold an open file descriptor on the source from
+       plan time and `fstat` it; compare against a fresh `stat` of the path. An
+       *arr import that *replaces* the file produces a **new inode**, which is
+       detectable even when size and mtime happen to match — size/mtime alone
+       do not catch a metadata-preserving replacement.
+     - **size and mtime**, which catch an in-place modification of the same
+       inode.
+     - **`st_nlink`**, rechecked here and not only at step 1: a hardlink can be
+       created *during* the encode (an import, or cross-seed) and leaves size,
+       mtime and inode all unchanged. Replacing a now-multi-linked file would
+       break the seed the link-count guard exists to protect. `st_nlink > 1` at
+       this point aborts, exactly as it does at step 1.
+     Any mismatch aborts the swap. The recycle link from (b) is harmless if
+     left behind; the next run reclaims it by job id.
+
+     **Residual race, stated plainly.** None of this makes the swap atomic with
+     respect to a concurrent writer. A replacement landing between the final
+     check and the `rename(2)` is still possible, and closing it properly needs
+     either coordination with the *arr instances (which Foundry does not
+     control) or kernel-level exchange primitives. That is the same TOCTOU
+     class the safety model already scopes out, and the compensating control is
+     the live-library gate: while `MUSE_FOUNDRY_ALLOWED_ROOTS` points at the
+     sandbox there is no concurrent writer at all. Narrowing the window from
+     "the whole encode" to "the instruction after the check" is the real
+     improvement here; eliminating it is tracked as a follow-up, not claimed.
 
      At no instant does the target path lack a file (it holds the original
      until (c), the replacement after). At no instant is the old content
@@ -811,9 +834,11 @@ same-mount `rename(2)`.
         refused at startup, so this holds unconditionally)
   - [ ] The installed file is the destination-staged copy, and its sha256
         matches the work-dir output
-  - [ ] A source whose mtime or size changed at any point between planning and
-        the final rename — including during staging and recycle-linking —
-        aborts the swap rather than overwriting the newer content
+  - [ ] A source whose **inode**, size, mtime, or **link count** changed at any
+        point between planning and the final rename — including during staging
+        and recycle-linking — aborts the swap rather than overwriting newer
+        content or breaking a newly-created hardlink. Tested by injecting each
+        of the four mutations separately during the staging window
   - [ ] For **all three** crash-injection points (after staging, after the
         recycle link, after the rename), the target path still resolves to a
         file and the old content is still reachable; retrying converges to the

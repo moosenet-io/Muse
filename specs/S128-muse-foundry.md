@@ -699,10 +699,16 @@ same-mount `rename(2)`.
        VMAF over `verify_vmaf_samples` (default **3**) 10-second segments at
        even offsets, harmonic mean ≥ `verify_vmaf_floor` (default **93**);
      - **full-read integrity** — the output is decoded end-to-end with
-       `ffmpeg -v error -i <staged-output> -map 0:v -map 0:a -f null -`.
-       Two flags here are load-bearing and both were wrong in earlier drafts:
-       the `-i` (omitted once, which would decode nothing), and the explicit
-       `-map`s. Without them ffmpeg applies **default stream selection** and
+       `ffmpeg -v error -i <staged-output> -map 0:v? -map 0:a? -f null -`.
+       The `?` suffixes are required, not cosmetic: MUSEF-02 explicitly treats
+       a file with no video stream as valid (audio-only is a real case in this
+       library), and an unconditional `-map 0:v` makes ffmpeg **fail** when
+       that stream type is absent — rejecting a perfectly good output. Optional
+       maps still select *every* stream of each type that is present.
+       Three details here are load-bearing and each was wrong in an earlier
+       draft: the `-i` (omitted once, which would decode nothing), the explicit
+       `-map`s, and their `?` suffixes. Without the maps ffmpeg applies
+       **default stream selection** and
        decodes only the default video and audio stream — a corrupt *second*
        audio track or secondary video stream would sail through a check the
        spec calls end-to-end. Every decodable planned stream is mapped.
@@ -824,6 +830,8 @@ same-mount `rename(2)`.
   - Full-read integrity check rejects a deliberately corrupted output,
     **including corruption confined to a non-default second audio track** —
     the regression test for default stream selection
+  - The integrity check **passes** on a valid audio-only output — the
+    regression test for the optional `?` map suffixes
   - **Cross-device staging**: with `work_dir` on a different filesystem from
     the target (the real deployment shape), the swap succeeds — this is the
     regression test for the `EXDEV` bug in draft 2, and it must fail if any
@@ -1022,15 +1030,39 @@ same-mount `rename(2)`.
      actually run (encoder + hwaccel + reachable root), atomically leased.
   2. `POST /foundry/jobs/{id}/progress` with the common `Progress` structure;
      progress also renews the lease, so a working node never loses its job.
-  3. `POST /foundry/jobs/{id}/complete` with the output location and probe, or
-     `/fail` with a reason. The server performs verification and swap
-     (MUSEF-08) — a node never swaps a library file itself.
+  3. **Output transfer — the server never trusts a node-supplied path.** This
+     was an unspecified gap in an earlier draft, which had the node report "an
+     output location" for the server to verify and swap. That does not work:
+     `muse-node` runs anywhere with its own local cache, so a node-local path
+     is not addressable by the server, and accepting one would hand an
+     unvalidated path straight past the `PathGuard` confinement model — the
+     exact bypass MUSEF-01 exists to prevent. Instead:
+     - The **lease** (issued by the server) carries the staging destination:
+       a server-owned directory under `MUSE_FOUNDRY_WORK_DIR`, on a mount both
+       the server and that node can reach, plus the job-relative filename to
+       write. The node chooses nothing about placement.
+     - The node writes its output there and calls
+       `POST /foundry/jobs/{id}/complete` with **only** the sha256 and the
+       output probe — never a path.
+     - The server resolves the staging path **itself**, from the job row it
+       issued, through `PathGuard`, verifies the sha256, and then runs the
+       MUSEF-08 verify-and-swap. A node never swaps a library file itself.
+     - A node with no shared mount to the staging destination is simply not
+       eligible for that job (MUSEF-11 already records reachable roots per
+       node, and MUSEF-14's hard constraints already filter on them). An
+       authenticated upload endpoint is the alternative for a node with no
+       shared storage at all; scoped as a follow-up rather than built here,
+       since every node on this fleet has the mount.
   4. Bounded lease count per node from its advertised concurrency.
 
   ## TEST PLAN
-  - Lease returns only capability-matching jobs
+  - Lease returns only capability-matching jobs, and carries the
+    server-chosen staging destination
   - Progress renews the lease; silence expires it
   - Completion hands off to server-side verify+swap
+  - **A completion payload containing a path is rejected** — the server
+    resolves the staging path from its own job row, never from the node
+  - A node that cannot reach the staging destination is never offered the job
   - Per-node concurrency cap is enforced
   - Verify no hardcoded infrastructure values in new/modified files
 
@@ -1044,6 +1076,9 @@ same-mount `rename(2)`.
   - [ ] Nodes only receive jobs they can run
   - [ ] Progress renews leases; silence expires them
   - [ ] Nodes never perform the library-file swap themselves
+  - [ ] The server resolves the staging path from its own job row; a
+        node-supplied path is never accepted, so a node cannot reach outside
+        the confinement model
   - [ ] A completion against an expired lease is rejected
   - [ ] No hardcoded infrastructure values in new/modified code
 

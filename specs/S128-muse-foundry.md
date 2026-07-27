@@ -52,6 +52,26 @@ spec_id: S128-muse-foundry
 - Baseline tests: current Muse `cargo test --workspace` count
 - Baseline verify: current `docs/behavior-spec.md` score
 
+### Two review findings deliberately NOT actioned
+
+Recorded here so a later panel sees these were decided, not missed (both were
+raised in the S128 spec review):
+
+1. **"`Moose`/`Claude` are S1 personal-identifier violations."** Held. S1's
+   prohibition targets *infrastructure values and credentials* — IPs,
+   hostnames, emails, API keys, absolute user paths — none of which appear
+   here. The author-attribution convention `Author: <operator> (Moose) + Claude
+   (design)` is the established, already-merged, PII-gate-passed form used by
+   every existing spec in this repo (`S96-muse-foundation.md`,
+   `S119-muse-media-management.md`) and by the build skill's own worked
+   examples. Changing it here alone would create an inconsistency, not
+   compliance. One reviewer of two agreed it is not a violation.
+2. **"The documents are future-dated (2026-07-27 vs 2026-07-26)."** Dismissed
+   on evidence: the authoritative fleet clock (`time_now`) returns
+   `2026-07-27T02:36:38Z`, matching both the dev box and the surveyed ARR
+   host. The reviewing environment's clock was behind. Per the build skill,
+   `time_now` is the arbiter for date-gated decisions, not the harness date.
+
 **Plane project (verified live 2026-07-27):** Muse has its own project,
 **`MUSE`** (54 existing items across the MUSEM / MUSEL / MUSEX / EMB-MUSE
 sprints). The `moosenet-spec` skill's project list — `HARM`/`LUM`/`CHRD`/
@@ -146,9 +166,39 @@ Five rails, each independently sufficient to prevent catastrophe:
    failure = keep the original, mark the job failed. Thresholds are policy
    values with defaults stated in MUSEF-08, not adjectives.
 5. **Link-count guard.** `st_nlink > 1` means the file has another directory
-   entry somewhere — very often a torrent hardlink. Foundry never removes a
-   link it did not create. See the correction below for why this is a guard,
-   not a seeding oracle.
+   entry somewhere — very often a torrent hardlink. Such a file is never
+   touched. See the correction below for why this is a guard, not a seeding
+   oracle.
+
+### The content-preservation invariant (the one that actually matters)
+
+An earlier draft stated rail 5 as *"Foundry never removes a link it did not
+create."* Two reviewers correctly pointed out that this is impossible for an
+organizer: **a move is, definitionally, the removal of a source directory
+entry**, and same-mount `rename(2)` removes it as an intrinsic part of the
+operation. The criterion contradicted the feature.
+
+The honest invariant, which every mutating item is written against and tested
+for, is about *content*, not *entries*:
+
+> **Foundry never removes the last remaining reference to content.**
+
+Concretely:
+- **Same-mount move** — `rename(2)` removes the source entry and creates the
+  target entry in one atomic step. The content is never unreferenced.
+- **Cross-mount move** — copy to the target, verify sha256 at the destination,
+  and only then remove the source entry. Between those steps the content has
+  two references; it never has zero.
+- **Replace (MUSEF-08)** — the original is hardlinked into the recycle bin
+  *before* the target entry is replaced, so the old content survives the swap
+  with a live reference.
+- **Junk removal** — linked into the recycle bin first; the original entry is
+  removed only once that link is confirmed to exist.
+- **Multi-link file** — not touched at all, by either path.
+
+So Foundry may remove a directory entry it did not create; it may never make
+content unreachable. That is testable (assert reachability at every injected
+abort point) in a way the original phrasing was not.
 
 ### Three things this model deliberately does *not* claim
 
@@ -593,8 +643,10 @@ same-mount `rename(2)`.
   ## APPROACH
   1. Pre-flight: `PathGuard::require_mutation()`; `st_nlink > 1` → `Blocked`
      (a link Foundry did not create — see the link-count guard note above);
-     free space on the destination device < estimate × safety factor →
-     `Blocked`; destination device differs from work device → required.
+     free space on the **destination** device < estimate × safety factor →
+     `Blocked` (the staged copy in step 4a lands there, not only the final
+     file); `work_dir` on a different device from the target → required;
+     recycle bin on the **same** device as the target → required.
   2. Encode to `work_dir/<job_id>/<name>.tmp` via MUSEF-06.
   3. Verify, with **numeric thresholds from policy, not adjectives**:
      - container parses and the output re-probes cleanly;
@@ -610,24 +662,40 @@ same-mount `rename(2)`.
        the bitstream check; the VMAF sample is a quality check. Both required.
      Any failure → source untouched, job `Failed`, output retained for
      inspection.
-  4. Swap — **link-first, then atomic replace**. The earlier draft of this item
-     moved the source to the recycle bin and *then* installed the output, which
-     leaves a real window where the target path has no file at all. That
-     contradicted this item's own "never neither" criterion (caught in the S128
-     spec review). Corrected ordering:
-     a. **Hardlink** the source into the recycle bin (`link(2)`, same mount) —
-        this *adds* a directory entry, it does not remove the original, so
-        after this step the content has two paths and is recoverable.
-        Cross-mount recycle bin → copy + verify checksum instead, and only
-        then proceed.
-     b. `rename(2)` the verified output **over** the target path — atomic
-        within the mount, and it replaces the old entry in one step.
-     c. The original content is now referenced only by the recycle-bin entry,
-        which is exactly the retention we want. Nothing is ever unlinked by
-        this path.
-     At no instant does the target path lack a file, and at no instant is the
-     original content unreachable. A crash between (a) and (b) leaves the
-     original in place plus a recycle entry — safe and idempotent on retry.
+  4. Swap — **stage to the destination mount, link, then atomic replace.**
+     This ordering went through two review rounds; both earlier drafts were
+     wrong in instructive ways, recorded here so it is not "simplified" back:
+     - *Draft 1* moved the source to the recycle bin and then installed the
+       output, leaving a real window where the target path had no file —
+       contradicting this item's own "never neither" criterion.
+     - *Draft 2* fixed the ordering but called for `rename(2)` of the work-dir
+       output over the target. **That cannot work:** rail 3 requires `work_dir`
+       to be on a *different device* from the library, and cross-device
+       `rename(2)` fails with `EXDEV`. An atomic rename is only available
+       within one filesystem.
+
+     Correct ordering — note every atomic step is same-mount by construction:
+     a. **Stage onto the destination filesystem.** Copy the verified work-dir
+        output to a sibling temp file next to the target,
+        `<target_dir>/.foundry-<job_id>.tmp`, and verify its sha256 matches the
+        work-dir output. This is the cross-device copy, done *before* anything
+        in the library is disturbed; a failure here costs only scratch space.
+     b. **Hardlink** the source into the recycle bin (`link(2)`) — adds an
+        entry, removes nothing, so the old content now has two references.
+        The recycle bin is **required by config to be on the same filesystem as
+        the allowed root** precisely so this is a link and never a copy; a
+        recycle bin on another device is a startup configuration error, not a
+        runtime fallback.
+     c. `rename(2)` the staged temp file over the target — same mount, atomic,
+        replaces the old entry in one step.
+     d. Delete the work-dir output (scratch only; the installed file is the
+        staged copy, and the old content lives in the recycle bin).
+
+     At no instant does the target path lack a file (it holds the original
+     until (c), the replacement after). At no instant is the old content
+     unreachable (target until (b), recycle-bin link thereafter). A crash at
+     any point leaves a stale `.foundry-*.tmp` at worst, which the next run
+     reclaims by job id.
   5. Record source and output probes, VMAF score, decode-error count, byte
      delta and every decision on the job row.
 
@@ -647,6 +715,12 @@ same-mount `rename(2)`.
     the target path exists, and the original content is reachable from the
     recycle bin. Retry after each abort converges to the same final state
   - Full-read integrity check rejects a deliberately corrupted output
+  - **Cross-device staging**: with `work_dir` on a different filesystem from
+    the target (the real deployment shape), the swap succeeds — this is the
+    regression test for the `EXDEV` bug in draft 2, and it must fail if any
+    implementation renames directly from `work_dir`
+  - A recycle bin configured on a different device from an allowed root is
+    refused at startup, not worked around at runtime
   - Verify no hardcoded infrastructure values in new/modified files
 
   ## EDGE CASES
@@ -665,12 +739,18 @@ same-mount `rename(2)`.
         sha256 with an unchanged mtime afterwards
   - [ ] Headroom is checked before the encoder is invoked
   - [ ] After a completed swap, the original content is reachable from the
-        recycle bin and shares an inode with the pre-swap source
+        recycle bin and that entry shares an inode with the pre-swap source
+        (it is a `link(2)`, never a copy — a cross-device recycle bin is
+        refused at startup, so this holds unconditionally)
+  - [ ] The installed file is the destination-staged copy, and its sha256
+        matches the work-dir output
   - [ ] A source whose mtime or size changed mid-encode aborts the swap
-  - [ ] For **both** crash-injection points (after the recycle link, after the
-        rename), the target path still resolves to a file and the original is
-        still recoverable; retrying converges to the same state
-  - [ ] Foundry never unlinks a path it did not create
+  - [ ] For **all three** crash-injection points (after staging, after the
+        recycle link, after the rename), the target path still resolves to a
+        file and the old content is still reachable; retrying converges to the
+        same state
+  - [ ] The content-preservation invariant holds: no step leaves the old
+        content with zero references
   - [ ] No hardcoded infrastructure values in new/modified code
   - [ ] All existing tests still pass
 
@@ -1216,10 +1296,12 @@ same-mount `rename(2)`.
   4. Journal every operation **before** performing it (intent record), and mark
      it complete after, so an interrupted apply is resumable and auditable. The
      journal is the crash-consistency mechanism for every non-atomic step.
-  5. Junk goes to the recycle bin, never `unlink` directly. As in MUSEF-08,
-     Foundry never removes a directory entry it did not create — junk is
-     *linked* into the recycle bin and then its original entry removed only
-     when the link is confirmed.
+  5. Junk goes to the recycle bin, never `unlink` directly: it is *linked*
+     into the recycle bin and its original entry removed only once that link
+     is confirmed to exist. This satisfies the content-preservation invariant
+     (the content always has ≥1 reference), which is the correct criterion —
+     not the stricter "never removes an entry it did not create", which no
+     organizer can satisfy since a move *is* an entry removal.
 
   ## TEST PLAN
   - Sandbox apply over the staging scene release produces the target layout
@@ -1244,7 +1326,8 @@ same-mount `rename(2)`.
   - [ ] Apply requires an approved, still-valid plan and the mutation gate
   - [ ] A file with `st_nlink > 1` is blocked and left completely untouched —
         same inode, same link count, same path (no relink-and-unlink)
-  - [ ] Cross-mount moves verify sha256 before unlinking the source
+  - [ ] Cross-mount moves verify the destination sha256 before removing the
+        source entry, so the content always has ≥1 reference
   - [ ] Every operation is journaled before it is performed, and an interrupted
         apply resumes with every file reachable at its old or new path
   - [ ] Junk goes to the recycle bin, never a direct unlink

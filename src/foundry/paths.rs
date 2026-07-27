@@ -76,21 +76,24 @@ impl ResolvedPath {
         self.0
     }
 
-    /// A lossy display form, safe to hand to logs and error messages outside
-    /// Foundry — it cannot be used to open a file.
-    pub fn display(&self) -> std::path::Display<'_> {
+    /// A lossy display form for logs and error messages.
+    ///
+    /// Foundry-internal like the rest. A reviewer noted that a display string
+    /// still round-trips into a `Path`, so calling it "safe outside Foundry"
+    /// was wrong — the disclosure is real even if the capability is not. In
+    /// practice no `ResolvedPath` can be obtained outside the module anyway,
+    /// so this is belt-and-braces, but it removes the argument entirely.
+    pub(in crate::foundry) fn display(&self) -> std::path::Display<'_> {
         self.0.display()
     }
 }
 
-impl std::fmt::Display for ResolvedPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Lossy for non-UTF8, which is correct for a human-facing message; the
-        // stored path stays exact. Display leaks no capability — a formatted
-        // string cannot be used to open a file without re-resolving it.
-        write!(f, "{}", self.0.display())
-    }
-}
+// NOTE: no `Display` impl for `ResolvedPath` or `MutablePath`, deliberately.
+// A trait impl is public wherever the type is, so `format!("{}", p)` would have
+// disclosed the canonical path to any holder regardless of how narrow the
+// inherent accessors are. Foundry-internal code formats paths via the
+// `pub(in crate::foundry) display()` above; outside code has no instance to
+// format in the first place, and now no way to render one if it did.
 
 /// A [`ResolvedPath`] that has *also* passed the mutation gate.
 ///
@@ -127,15 +130,9 @@ impl MutablePath {
         &self.0
     }
 
-    /// A lossy display form, safe outside Foundry.
-    pub fn display(&self) -> std::path::Display<'_> {
+    /// A lossy display form. Foundry-internal, as for [`ResolvedPath::display`].
+    pub(in crate::foundry) fn display(&self) -> std::path::Display<'_> {
         self.0.display()
-    }
-}
-
-impl std::fmt::Display for MutablePath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 

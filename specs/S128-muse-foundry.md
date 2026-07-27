@@ -10,7 +10,7 @@ spec_id: S128-muse-foundry
 - **Session:** S128
 - **Date:** 2026-07-27
 - **Module version:** Muse (post-S125, main `d5f176e`)
-- **Estimated total:** ~118h autonomous agent work across 6 phases
+- **Estimated total:** ~136h autonomous agent work across 6 phases
 - **North-Star layer:** module
 - **Module-Contract:** meets §4 clauses 1–7 (see "Module Contract compliance")
 - **Context:** MUSE already owns the *acquisition* and *curation* halves of the
@@ -137,14 +137,53 @@ Five rails, each independently sufficient to prevent catastrophe:
    the sandbox root only.
 2. **Mutation kill-switch.** `MUSE_FOUNDRY_ENABLE_MUTATION` defaults false.
    With it false, Forge/Archivist produce plans and never touch a byte.
-3. **Never in-place.** Output goes to the work dir on a different device;
-   the original is replaced only after verification, and retained in a Foundry
-   recycle bin for `MUSE_FOUNDRY_RETENTION_DAYS`.
+3. **Never in-place.** Output goes to the work dir on a different device; the
+   original is replaced only after verification, and a **second link to the
+   original is placed in the Foundry recycle bin before the swap** (see the
+   swap ordering below), retained for `MUSE_FOUNDRY_RETENTION_DAYS`.
 4. **Verify-before-swap.** Duration within tolerance, expected stream count and
    types present, container parses, optional VMAF sample above floor. Any
-   failure = keep the original, mark the job failed.
-5. **Hardlink/seed guard.** `st_nlink > 1` means an active torrent hardlink;
-   the file is skipped with an explicit reason unless the plan is copy-on-write.
+   failure = keep the original, mark the job failed. Thresholds are policy
+   values with defaults stated in MUSEF-08, not adjectives.
+5. **Link-count guard.** `st_nlink > 1` means the file has another directory
+   entry somewhere — very often a torrent hardlink. Foundry never removes a
+   link it did not create. See the correction below for why this is a guard,
+   not a seeding oracle.
+
+### Three things this model deliberately does *not* claim
+
+Stated plainly so a later reader does not over-trust the rails (all three were
+raised by the S128 spec review and are accepted as scoping, not as fixes):
+
+- **`st_nlink` is not a seeding oracle.** `st_nlink == 1` does **not** prove a
+  file is unseeded — a torrent whose content lives at that single path is
+  actively seeded with one link. And `st_nlink > 1` does not prove the *other*
+  link is a torrent. Worse, relinking-then-unlinking does **not** rescue a
+  seeded file: qBittorrent tracks content by **path**, not inode, so removing
+  the path it knows breaks the torrent even though the inode survives. Foundry
+  therefore treats `st_nlink > 1` as a **refuse-to-touch signal**, never as a
+  problem to route around, and never unlinks a source path it did not create.
+  Genuine seed-awareness requires asking the torrent client which paths it is
+  seeding; that is scoped as a follow-up (see Known follow-ups), not faked here.
+- **The recycle bin is an undo window, not a backup.** It shares a filesystem
+  with the library, it expires, and it does not survive device loss. It exists
+  so a bad transcode is reversible for a fortnight. **A real backup of the
+  library is an operator prerequisite, outside this spec.** No item claims
+  otherwise, and MUSEF-26's acceptance run states it as a precondition.
+- **TOCTOU is out of the threat model.** Path validation resolves symlinks then
+  checks confinement, which defeats `..` traversal and symlink escape — our own
+  bugs and operator misconfiguration. It does **not** defeat an attacker who
+  can swap a directory for a symlink between the check and the open. Closing
+  that needs descriptor-relative, no-follow I/O throughout. On a single-tenant
+  home fleet with no hostile local user, that cost is not justified; the
+  decision is recorded in `src/foundry/paths.rs`'s module docs so it is a
+  choice rather than an oversight.
+
+**Atomicity is scoped to a single mount.** `rename(2)` is atomic within one
+filesystem. Across devices there is no atomic primitive, so Foundry does
+copy → verify checksum → unlink, and the window is covered by the journal
+(MUSEF-21) rather than by an atomicity claim. Any item saying "atomic" means
+same-mount `rename(2)`.
 
 ---
 
@@ -552,27 +591,62 @@ Five rails, each independently sufficient to prevent catastrophe:
   - `src/foundry/forge/execute.rs`, `verify.rs`, `swap.rs`, `recycle.rs`
 
   ## APPROACH
-  1. Pre-flight: `PathGuard::require_mutation()`; `st_nlink > 1` → `Blocked`;
+  1. Pre-flight: `PathGuard::require_mutation()`; `st_nlink > 1` → `Blocked`
+     (a link Foundry did not create — see the link-count guard note above);
      free space on the destination device < estimate × safety factor →
      `Blocked`; destination device differs from work device → required.
   2. Encode to `work_dir/<job_id>/<name>.tmp` via MUSEF-06.
-  3. Verify: re-probe the output; duration within tolerance of the source;
-     expected streams present with expected codecs; container parses; optional
-     VMAF over N sampled segments above the policy floor. Any failure → keep
-     the source untouched, mark `Failed`, retain the output for inspection.
-  4. Swap: move the source into the Foundry recycle bin (same device where
-     possible, copy+verify+unlink across devices), then move the verified
-     output into place. Ordering guarantees a crash never leaves *no* file.
-  5. Record source and output probes, VMAF score, byte delta and every decision
-     on the job row.
+  3. Verify, with **numeric thresholds from policy, not adjectives**:
+     - container parses and the output re-probes cleanly;
+     - `|duration_out − duration_in|` ≤ `verify_duration_tolerance_secs`
+       (default **1.0 s**) *and* ≤ 0.5% of source duration;
+     - every stream the plan said `Copy` or `Transcode` is present, with the
+       planned codec and channel count; no planned-`Drop` stream survives;
+     - when `verify_vmax_enabled` (default **on** for a video re-encode):
+       VMAF over `verify_vmaf_samples` (default **3**) 10-second segments at
+       even offsets, harmonic mean ≥ `verify_vmaf_floor` (default **93**);
+     - **full-read integrity** — the output is decoded end-to-end with
+       `ffmpeg -v error -f null -` and must emit zero decode errors. This is
+       the bitstream check; the VMAF sample is a quality check. Both required.
+     Any failure → source untouched, job `Failed`, output retained for
+     inspection.
+  4. Swap — **link-first, then atomic replace**. The earlier draft of this item
+     moved the source to the recycle bin and *then* installed the output, which
+     leaves a real window where the target path has no file at all. That
+     contradicted this item's own "never neither" criterion (caught in the S128
+     spec review). Corrected ordering:
+     a. **Hardlink** the source into the recycle bin (`link(2)`, same mount) —
+        this *adds* a directory entry, it does not remove the original, so
+        after this step the content has two paths and is recoverable.
+        Cross-mount recycle bin → copy + verify checksum instead, and only
+        then proceed.
+     b. `rename(2)` the verified output **over** the target path — atomic
+        within the mount, and it replaces the old entry in one step.
+     c. The original content is now referenced only by the recycle-bin entry,
+        which is exactly the retention we want. Nothing is ever unlinked by
+        this path.
+     At no instant does the target path lack a file, and at no instant is the
+     original content unreachable. A crash between (a) and (b) leaves the
+     original in place plus a recycle entry — safe and idempotent on retry.
+  5. Record source and output probes, VMAF score, decode-error count, byte
+     delta and every decision on the job row.
 
   ## TEST PLAN
-  - Sandbox end-to-end: the avi sample transcodes, verifies and swaps; the
-    recycle bin holds the original; a re-probe confirms the new codec
-  - Hardlinked file (`st_nlink > 1`) is `Blocked`, never touched
-  - Insufficient headroom is `Blocked` before any encode starts
-  - Injected verification failure leaves the source byte-identical
-  - Simulated crash between recycle and install leaves a recoverable state
+  - Sandbox end-to-end on `src-readonly/Andromeda.103…avi`: transcodes,
+    verifies and swaps; the recycle-bin entry and the installed file share an
+    inode with, respectively, the original and the encoder output (assert by
+    `st_ino`); a re-probe confirms `h264`
+  - Hardlinked file (`st_nlink > 1`) is `Blocked`; asserted byte-identical
+    (sha256) and `st_mtime`-unchanged afterwards
+  - Insufficient headroom is `Blocked` before any encode starts (assert the
+    encoder was never invoked)
+  - Injected verification failure (a truncated output fixture) leaves the
+    source byte-identical by sha256
+  - **Crash-injection matrix** — the swap is driven through a seam that can
+    abort after step (a) and after step (b). After *each* abort point, assert:
+    the target path exists, and the original content is reachable from the
+    recycle bin. Retry after each abort converges to the same final state
+  - Full-read integrity check rejects a deliberately corrupted output
   - Verify no hardcoded infrastructure values in new/modified files
 
   ## EDGE CASES
@@ -584,13 +658,19 @@ Five rails, each independently sufficient to prevent catastrophe:
     lock make this impossible; assert it rather than handling it
 
 - **Acceptance criteria:**
-  - [ ] No swap occurs unless verification passes in full
-  - [ ] Hardlinked files are blocked and never modified
-  - [ ] Headroom is checked before any encode begins
-  - [ ] The original is always recoverable from the recycle bin after a swap
-  - [ ] A source modified mid-encode aborts the swap
-  - [ ] A crash at any point leaves either the original or the verified output
-        in place, never neither
+  - [ ] No swap occurs unless every verification check above passes: container
+        parse, duration within 1.0 s and 0.5%, planned streams present, zero
+        decode errors on a full read, and VMAF ≥ 93 when enabled
+  - [ ] A file with `st_nlink > 1` is `Blocked`, and is byte-identical by
+        sha256 with an unchanged mtime afterwards
+  - [ ] Headroom is checked before the encoder is invoked
+  - [ ] After a completed swap, the original content is reachable from the
+        recycle bin and shares an inode with the pre-swap source
+  - [ ] A source whose mtime or size changed mid-encode aborts the swap
+  - [ ] For **both** crash-injection points (after the recycle link, after the
+        rename), the target path still resolves to a file and the original is
+        still recoverable; retrying converges to the same state
+  - [ ] Foundry never unlinks a path it did not create
   - [ ] No hardcoded infrastructure values in new/modified code
   - [ ] All existing tests still pass
 
@@ -1116,22 +1196,41 @@ Five rails, each independently sufficient to prevent catastrophe:
   ## APPROACH
   1. Require an explicit approved plan ID plus the mutation gate. A plan whose
      content hash no longer matches the library is refused.
-  2. For each `Move`: if `st_nlink > 1`, the file is hardlinked (an active
-     torrent) — create a new hardlink at the target and unlink the source, which
-     preserves the seeding inode; if that fails (cross-device), mark `Blocked`
-     rather than copying and breaking the seed.
-  3. Same-device moves are `rename(2)` — atomic. Cross-device is
-     copy → verify checksum → unlink.
-  4. Journal every operation before performing it, so an interrupted apply is
-     resumable and auditable.
-  5. Junk goes to the recycle bin, never `unlink` directly.
+  2. For each `Move` where `st_nlink > 1`: **`Blocked`, full stop.** The
+     earlier draft proposed relinking at the target and unlinking the source,
+     "which preserves the seeding inode." That is wrong, and the S128 spec
+     review caught it: qBittorrent (and every other client on this fleet)
+     tracks content by **path**, not inode. Removing the path the client knows
+     breaks the torrent whether or not the inode survives. There is no
+     inode-level trick that makes an unlink safe. So a multi-link file is
+     reported with its link count and left alone; resolving it is an operator
+     decision (stop seeding, or exclude the path from the layout policy).
+     Note the converse, stated in the safety-model section: `st_nlink == 1`
+     does **not** prove a file is unseeded, so this guard is a floor, not a
+     guarantee. True seed-safety needs the torrent client's own path list —
+     scoped as a follow-up, not faked here.
+  3. Same-mount moves are `rename(2)` — atomic within that filesystem, and the
+     only place this spec uses the word. Cross-mount is
+     copy → verify sha256 → unlink-source, which is *not* atomic and is covered
+     by the journal below rather than by an atomicity claim.
+  4. Journal every operation **before** performing it (intent record), and mark
+     it complete after, so an interrupted apply is resumable and auditable. The
+     journal is the crash-consistency mechanism for every non-atomic step.
+  5. Junk goes to the recycle bin, never `unlink` directly. As in MUSEF-08,
+     Foundry never removes a directory entry it did not create — junk is
+     *linked* into the recycle bin and then its original entry removed only
+     when the link is confirmed.
 
   ## TEST PLAN
   - Sandbox apply over the staging scene release produces the target layout
-  - A hardlinked file is relinked, and the source inode is preserved
-    (verified by inode number and link count)
-  - Cross-device hardlinked move is blocked, not copied
-  - Interrupted apply resumes from the journal with no lost files
+  - A file with `st_nlink > 1` is `Blocked`; asserted afterwards to have the
+    same `st_ino`, same `st_nlink`, and an unchanged path (no relink, no
+    unlink) — this test is the regression guard for the corrected step 2
+  - Interrupted apply resumes from the journal with no lost files: for each
+    injected abort point, every planned source is reachable at either its old
+    or its new path, never neither
+  - Cross-mount move verifies sha256 before unlinking the source; an injected
+    checksum mismatch aborts with the source intact
   - Junk lands in the recycle bin, not deleted
   - Verify no hardcoded infrastructure values in new/modified files
 
@@ -1143,9 +1242,11 @@ Five rails, each independently sufficient to prevent catastrophe:
 
 - **Acceptance criteria:**
   - [ ] Apply requires an approved, still-valid plan and the mutation gate
-  - [ ] Hardlinked (seeding) files preserve their inode or are blocked
-  - [ ] Cross-device moves verify a checksum before unlinking the source
-  - [ ] Every operation is journaled and an interrupted apply is resumable
+  - [ ] A file with `st_nlink > 1` is blocked and left completely untouched —
+        same inode, same link count, same path (no relink-and-unlink)
+  - [ ] Cross-mount moves verify sha256 before unlinking the source
+  - [ ] Every operation is journaled before it is performed, and an interrupted
+        apply resumes with every file reachable at its old or new path
   - [ ] Junk goes to the recycle bin, never a direct unlink
   - [ ] No hardcoded infrastructure values in new/modified code
   - [ ] All existing tests still pass
@@ -1381,6 +1482,17 @@ sandbox for all six phases. Extending it to a real library is a deliberate
 operator action taken after the MUSEF-26 acceptance run passes — not a step in
 any item here. `tdarr` and `bazarr` are decommissioned only after that.
 
+Three preconditions must hold before that gate opens, and MUSEF-26's checklist
+asserts each of them rather than assuming it:
+1. **A real backup of the library exists and a restore has been drilled.** The
+   recycle bin is an undo window, not a backup (see the safety model). This is
+   an operator prerequisite, outside this spec's scope.
+2. **The crash-injection matrices for MUSEF-08 and MUSEF-21 pass**, since they
+   are what make an interrupted mutation recoverable.
+3. **Seeding is understood for the target root** — either nothing in it is
+   seeded, or the follow-up seed-awareness item has landed. `st_nlink` alone
+   is not sufficient evidence.
+
 **Review posture.** MUSEF-08 and MUSEF-21 are the two items that can destroy
 irreplaceable data. Both get the widest available review panel and adversarial
 rounds, per the concurrent-pipeline gate discipline. Everything else takes the
@@ -1397,7 +1509,18 @@ routine gate.
    runtime overlay under project `MUSE`; promoting it to the git-versioned
    baseline (`data/prefix_registry.toml`) opens a Terminus PR and should ride
    the normal pipeline. The provisional `MFDY` claim has been retired.
-5. **Correct the `moosenet-spec` skill's Plane project list** — it omits
+5. **Real seed-awareness via the torrent client** — `st_nlink` is a floor, not
+   an oracle (see the safety-model section). Asking qBittorrent for the set of
+   paths it is actively seeding, and treating *those* as untouchable, is the
+   only correct answer. Muse already has a qBittorrent adapter (`src/download/
+   qbit.rs`, MUSEM-02) so the client call is cheap; the work is the policy and
+   cache. Scoped as its own item once MUSEF-21 lands.
+6. **A real library backup is an operator prerequisite** — the Foundry recycle
+   bin is a fortnight-long undo window on the same filesystem, not a backup. It
+   does not survive device loss and it expires. MUSEF-26's acceptance run
+   states this as a precondition before the live-library gate is opened; it is
+   deliberately not something this spec pretends to solve.
+7. **Correct the `moosenet-spec` skill's Plane project list** — it omits
    `MUSE` (and `DOCS`/`INFRA2`/`CTX`/`FRG`/`TRIG`, which still exist in Plane).
    A spec author following the skill alone would misfile every Muse spec, as
    this one initially did. Worth a small skill edit.

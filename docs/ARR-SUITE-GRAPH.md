@@ -202,8 +202,13 @@ because neither is configured.
    and `whisparr` set `copyUsingHardlinks: true`, and the downloads volume is
    a separate device from the library — so a hardlink may or may not exist
    depending on instance and path. Replacing a hardlinked, actively-seeded
-   file breaks the torrent. Foundry MUST detect `st_nlink > 1` and refuse or
-   copy-on-write.
+   file breaks the torrent. Foundry MUST detect `st_nlink > 1` and **refuse —
+   block the file and leave it completely untouched.** Copy-on-write is *not*
+   an acceptable alternative: for an organizer it still removes the
+   torrent-known source path, and clients track content by path, not inode.
+   Note also the converse: `st_nlink == 1` does **not** prove a file is
+   unseeded, so this check is a floor, not a guarantee (see
+   `specs/S128-muse-foundry.md`, "The content-preservation invariant").
 2. **No recycle bin anywhere.** Every *arr instance has `recycleBin: ""`.
    There is no undo today. Foundry supplies its own retention.
 3. **Library is 84% full (27 TB used of 33 TB).** A transcode pass that writes

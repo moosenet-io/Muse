@@ -181,9 +181,20 @@ operation. The criterion contradicted the feature.
 The honest invariant, which every mutating item is written against and tested
 for, is about *content*, not *entries*:
 
-> **Foundry never removes the last remaining reference to content.**
+> **No Foundry mutation ever leaves content with zero references.**
 
-Concretely:
+Scope matters here, and the phrasing is deliberate. The invariant governs the
+*mutation transaction* — at no point during a swap, move, replace or junk
+removal does content become unreachable. It is **not** a promise that Foundry
+never eventually deletes anything: **recycle-bin retention expiry does, by
+design, remove the last Foundry reference to a superseded original**, once
+`MUSE_FOUNDRY_RETENTION_DAYS` have passed. That is the feature, not a
+violation — an undo window that never expires is just a second copy of the
+library. The two are distinguished by *when*: the invariant is instantaneous
+and transactional; expiry is deferred, policy-driven, and separately audited
+(MUSEF-25 records the expiry event so the deletion is never silent).
+
+Concretely, within a mutation:
 - **Same-mount move** — `rename(2)` removes the source entry and creates the
   target entry in one atomic step. The content is never unreferenced.
 - **Cross-mount move** — copy to the target, verify sha256 at the destination,
@@ -196,9 +207,10 @@ Concretely:
   removed only once that link is confirmed to exist.
 - **Multi-link file** — not touched at all, by either path.
 
-So Foundry may remove a directory entry it did not create; it may never make
-content unreachable. That is testable (assert reachability at every injected
-abort point) in a way the original phrasing was not.
+So Foundry may remove a directory entry it did not create; no mutation may
+leave content unreachable. That is testable (assert reachability at every
+injected abort point) in a way the original phrasing was not. Retention expiry
+is the one deliberate, deferred, audited exception described above.
 
 ### Three things this model deliberately does *not* claim
 
@@ -711,9 +723,17 @@ same-mount `rename(2)`.
   - Injected verification failure (a truncated output fixture) leaves the
     source byte-identical by sha256
   - **Crash-injection matrix** — the swap is driven through a seam that can
-    abort after step (a) and after step (b). After *each* abort point, assert:
-    the target path exists, and the original content is reachable from the
-    recycle bin. Retry after each abort converges to the same final state
+    abort after each of steps (a), (b) and (c). After *every* abort point,
+    assert the two invariant properties, which is deliberately **not** the same
+    assertion at each point:
+    - the target path resolves to a file — the *original* after (a) and (b),
+      the replacement after (c); and
+    - the original content has ≥1 reference — reachable at the **target path**
+      after (a) (the recycle link does not exist yet), and at the
+      **recycle-bin path** after (b) and (c).
+    An earlier draft asserted "reachable from the recycle bin" at every point,
+    which is false immediately after staging. Retry after each abort converges
+    to the same final state
   - Full-read integrity check rejects a deliberately corrupted output
   - **Cross-device staging**: with `work_dir` on a different filesystem from
     the target (the real deployment shape), the swap succeeds — this is the
@@ -754,8 +774,10 @@ same-mount `rename(2)`.
         recycle link, after the rename), the target path still resolves to a
         file and the old content is still reachable; retrying converges to the
         same state
-  - [ ] The content-preservation invariant holds: no step leaves the old
-        content with zero references
+  - [ ] The content-preservation invariant holds *within the mutation*: no
+        step leaves the old content with zero references (retention expiry,
+        which does eventually remove it, is out of this item's scope and is
+        audited separately in MUSEF-25)
   - [ ] No hardcoded infrastructure values in new/modified code
   - [ ] All existing tests still pass
 

@@ -165,12 +165,22 @@ impl FoundryConfig {
         // created on. Canonicalizing also means the containment test below
         // compares real paths, not lexical ones, so a symlinked work dir
         // cannot evade it.
-        let work_anchor = nearest_existing_ancestor(work);
+        // `projected_path`, not just the anchor: the anchor alone discards the
+        // unresolved components, which a `..` in the configured value can
+        // exploit to evade both checks below. See its doc comment.
+        let work_projected = projected_path(work);
+        let work_anchor = work_projected
+            .as_deref()
+            .and_then(nearest_existing_ancestor)
+            .or_else(|| nearest_existing_ancestor(work));
 
         match work_anchor.as_deref().and_then(device_of) {
             Some(work_dev) => {
                 for root in &self.allowed_roots {
-                    let root_anchor = nearest_existing_ancestor(root);
+                    let root_anchor = projected_path(root)
+                        .as_deref()
+                        .and_then(nearest_existing_ancestor)
+                        .or_else(|| nearest_existing_ancestor(root));
                     if root_anchor.as_deref().and_then(device_of) == Some(work_dev) {
                         out.push(format!(
                             "MUSE_FOUNDRY_WORK_DIR ({}) is on the same filesystem as the \
@@ -200,10 +210,13 @@ impl FoundryConfig {
         // canonicalized anchors so a symlinked or `..`-laden work dir cannot
         // evade the check lexically.
         for root in &self.allowed_roots {
-            let inside = match (&work_anchor, nearest_existing_ancestor(root)) {
-                (Some(w), Some(r)) => w.starts_with(&r),
-                // Fall back to the lexical comparison only when canonical
-                // paths are unavailable; better a false positive than a miss.
+            let root_projected = projected_path(root);
+            let inside = match (&work_projected, &root_projected) {
+                // Compare the paths each value will actually denote, so a
+                // `..`-laden or partially-missing work dir cannot evade this.
+                (Some(w), Some(r)) => w.starts_with(r),
+                // Fall back to the lexical comparison only when projection is
+                // impossible; better a false positive than a miss.
                 _ => work.starts_with(root),
             };
             if inside {
@@ -261,6 +274,59 @@ fn nearest_existing_ancestor(p: &std::path::Path) -> Option<PathBuf> {
         cur = c.parent();
     }
     None
+}
+
+/// The path `p` will resolve to once its missing directories exist.
+///
+/// Walking to the nearest existing ancestor is not enough on its own, and the
+/// gap was a real hole (found by the S128 MUSEF-01 review): the walk
+/// **discards the unresolved components**, so for a root `/mnt/media` on one
+/// device and a `work_dir` of `/mnt/not-created/../media/.work`, the anchor
+/// comes back as `/mnt` — a different device, and not inside `/mnt/media`. Both
+/// rail-3 checks pass. Then `not-created` gets created, the path resolves to
+/// `/mnt/media/.work`, and the work dir is inside the library on the library's
+/// own filesystem, exactly what rail 3 forbids.
+///
+/// So the unresolved remainder is **replayed** onto the canonical anchor, with
+/// `..` applied lexically (safe here: the anchor is already canonical, so there
+/// are no symlinks left in it to be confused by) and `.` dropped. The result is
+/// the path the configured value will actually denote.
+fn projected_path(p: &std::path::Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    // Find the deepest existing ancestor and remember how far down it was, so
+    // the remaining components can be replayed onto its canonical form.
+    let mut prefix_len = p.components().count();
+    let mut anchor = None;
+    let mut cur = Some(p);
+    while let Some(c) = cur {
+        if let Ok(canon) = std::fs::canonicalize(c) {
+            anchor = Some(canon);
+            prefix_len = c.components().count();
+            break;
+        }
+        cur = c.parent();
+        if cur.is_some() {
+            continue;
+        }
+    }
+
+    let mut out = anchor?;
+    for comp in p.components().skip(prefix_len) {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Lexical pop is sound: `out` starts canonical and every
+                // component appended below is a plain name.
+                out.pop();
+            }
+            Component::Normal(name) => out.push(name),
+            // A rooted/prefix component cannot appear after the first, and the
+            // caller only ever passes absolute paths.
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -418,6 +484,51 @@ mod tests {
             !c.warnings().iter().any(|w| w.contains("MUSE_FOUNDRY_WORK_DIR is not")),
             "the missing-work-dir message belongs to fatal_errors when mutating"
         );
+    }
+
+    #[test]
+    fn a_parent_dir_component_cannot_smuggle_the_work_dir_into_a_root() {
+        // THE regression test for the S128 MUSEF-01 review finding. Walking to
+        // the nearest existing ancestor discards the unresolved components, so
+        // `<tmp>/not-created/../lib/.work` anchored to `<tmp>` — outside the
+        // root and (potentially) a different device — and both rail-3 checks
+        // passed. Once `not-created` exists the path denotes `<tmp>/lib/.work`,
+        // inside the library. Replaying the remainder is what closes it.
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = base.join("muse-foundry-rail3-lib");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut c = cfg_with(None, true);
+        c.allowed_roots = vec![root.clone()];
+        c.work_dir = Some(
+            base.join("muse-foundry-not-created")
+                .join("..")
+                .join("muse-foundry-rail3-lib")
+                .join(".work"),
+        );
+
+        let fatal = c.fatal_errors();
+        assert!(
+            fatal.iter().any(|e| e.contains("is inside the allowed root")),
+            "a `..`-laden work dir that lands inside the root must be caught, got {fatal:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn projected_path_replays_the_unresolved_remainder() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        // `<base>/a/../b` must project to `<base>/b` even though neither
+        // `a` nor `b` exists.
+        let p = base.join("muse-fnd-a").join("..").join("muse-fnd-b");
+        assert_eq!(projected_path(&p), Some(base.join("muse-fnd-b")));
+    }
+
+    #[test]
+    fn projected_path_is_identity_for_an_existing_canonical_path() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert_eq!(projected_path(&base), Some(base.clone()));
     }
 
     #[test]

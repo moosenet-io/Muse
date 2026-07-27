@@ -205,7 +205,8 @@ Concretely, within a mutation:
   with a live reference.
 - **Junk removal** — linked into the recycle bin first; the original entry is
   removed only once that link is confirmed to exist.
-- **Multi-link file** — not touched at all, by either path.
+- **Multi-link file** — not touched at all, by any path: not moved, not
+  replaced, not recycled as junk.
 
 So Foundry may remove a directory entry it did not create; no mutation may
 leave content unreachable. That is testable (assert reachability at every
@@ -297,13 +298,23 @@ same-mount `rename(2)`.
   - A root that does not exist at startup — log and drop that root, do not panic
   - Symlink pointing outside an allowed root — rejected (do not follow)
   - Path with non-UTF8 bytes — handled via `OsStr`, not lossy conversion
-  - `work_dir` on the same device as an allowed root — warn (breaks rail 3)
+  - `work_dir` on the same device as an allowed root — **severity depends on
+    the mutation gate**, and the two items must agree (an earlier draft had
+    MUSEF-01 warn while MUSEF-08 called it required, which is a real
+    contradiction): with mutation *disabled* it is a warning, because nothing
+    will ever be staged and the setting is inert; with mutation *enabled* it is
+    a **startup refusal**, because it breaks rail 3. Same for a `work_dir`
+    inside an allowed root, and for a recycle bin on a different device from
+    its root (MUSEF-08 step 4b)
   - Relative path input — resolved against nothing; rejected outright
 
 - **Acceptance criteria:**
   - [ ] `ResolvedPath` cannot be constructed except through `PathGuard`
   - [ ] Traversal, symlink-escape, and outside-root paths are all rejected
   - [ ] `enable_mutation=false` blocks every mutating entry point
+  - [ ] A rail-3-violating layout (`work_dir` on the same device as, or inside,
+        an allowed root) is a warning while mutation is disabled and a startup
+        refusal once it is enabled — never silently accepted when it matters
   - [ ] Empty `allowed_roots` leaves the Foundry surface unregistered
   - [ ] No hardcoded infrastructure values in new/modified code
   - [ ] README updated to document the Foundry module and its config
@@ -1339,7 +1350,11 @@ same-mount `rename(2)`.
      journal is the crash-consistency mechanism for every non-atomic step.
   5. Junk goes to the recycle bin, never `unlink` directly: it is *linked*
      into the recycle bin and its original entry removed only once that link
-     is confirmed to exist. This satisfies the content-preservation invariant
+     is confirmed to exist. **The `st_nlink > 1` guard from step 2 applies here
+     too** — a multi-link file is never touched by *either* path. An earlier
+     draft applied the guard only to `Move`, which left the junk path able to
+     remove an entry the safety model said was untouchable; a `.nfo` or sample
+     file can perfectly well be part of a seeded torrent's payload. This satisfies the content-preservation invariant
      (the content always has ≥1 reference), which is the correct criterion —
      not the stricter "never removes an entry it did not create", which no
      organizer can satisfy since a move *is* an entry removal.
@@ -1365,8 +1380,9 @@ same-mount `rename(2)`.
 
 - **Acceptance criteria:**
   - [ ] Apply requires an approved, still-valid plan and the mutation gate
-  - [ ] A file with `st_nlink > 1` is blocked and left completely untouched —
-        same inode, same link count, same path (no relink-and-unlink)
+  - [ ] A file with `st_nlink > 1` is blocked and left completely untouched by
+        **both** the move path and the junk path — same inode, same link count,
+        same path (no relink-and-unlink, no recycle)
   - [ ] Cross-mount moves verify the destination sha256 before removing the
         source entry, so the content always has ≥1 reference
   - [ ] Every operation is journaled before it is performed, and an interrupted

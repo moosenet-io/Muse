@@ -178,21 +178,50 @@ first-class Foundry function, not an afterthought.
 
 ## 4. Coverage arithmetic — what "strangler figged" actually means
 
-Distinct media-pipeline apps: **16**.
+**Counting rule (stated because the first draft of this section was wrong):**
+one row per *distinct application*, not per running container. The five Radarr
+containers are one app; the three Sonarr containers are one app. Non-media
+containers (§1, "Non-media") are excluded. Plex and qBittorrent are excluded
+because they are not ARR-suite apps — they are the playback server and the
+download client the suite drives. That rule yields **16** apps: 5
+acquisition/indexing + 4 media managers + 2 transcode/subtitle + 5
+presentation/request/analytics.
 
-| Already MUSE-covered | Absorbed by Foundry | Remaining external |
+| # | App | Post-Foundry status |
 |---|---|---|
-| <media-service>, tautulli, tunarr, plex, prowlarr *(read)* | **tdarr, bazarr, unpackerr, recyclarr,** *arr rename/organize | prowlarr *(indexing)*, flaresolverr, autobrr, cross-seed, qBittorrent |
+| 1 | `tdarr` | **Replaced** by Foundry (Forge + Fabric) |
+| 2 | `bazarr` | **Replaced** by Foundry (Lexicon) |
+| 3 | `recyclarr` | **Replaced** by Foundry's policy engine |
+| 4 | `<media-service>` | Already MUSE (MUSEM acquisition, S119) |
+| 5 | `tautulli` | Already MUSE (`src/tautulli`) |
+| 6 | `tunarr` | Already MUSE (`src/tuner`, MUSE-28/29) |
+| 7 | `radarr` ×5 | **Split** — organize/rename → Foundry; acquisition stays |
+| 8 | `sonarr` ×3 | **Split** — organize/rename → Foundry; acquisition stays |
+| 9 | `prowlarr` | External. Muse consumes its reports read-only; indexing stays |
+| 10 | `flaresolverr` | External (prowlarr's captcha solver) |
+| 11 | `autobrr` | External (IRC/RSS announce filtering) |
+| 12 | `cross-seed` | External (currently crash-looping) |
+| 13 | `unpackerr` | External — genuine archive extraction is a documented follow-up, **not** in this spec |
+| 14 | `notifiarr` | External to Muse; notification belongs to the assistant layer |
+| 15 | `lidarr` | Out of scope (music); currently inert |
+| 16 | `whisparr` | Out of scope; currently inert |
 
-Post-Foundry, MUSE functionally covers **12 of 16** media-pipeline apps
-(**75%**), leaving the indexer/tracker/torrent-client layer deliberately
-external — that layer is protocol plumbing with no assistant-facing surface
-and no reason to absorb.
+**Honest totals: 6 of 16 fully replaced or already owned, plus 2 more
+partially absorbed — so 8 of 16 (50%) are touched at all, and 37.5% are fully
+superseded.**
+
+An earlier draft of this section claimed "12 of 16 (75%)". That was wrong and
+is corrected here: it double-counted `prowlarr` in two columns, counted `plex`
+and `qBittorrent` which are not ARR-suite apps, and listed `unpackerr` as
+absorbed when the spec explicitly defers extraction. The real figure is lower,
+and the difference matters for planning — Foundry replaces the *formatting*
+layer decisively, but the acquisition and indexing layers survive largely
+intact and were never a target.
 
 The *arr instances are not decommissioned by Foundry: their acquisition half
 (monitoring, indexer search, grabbing) stays; only their organize/rename half
-is superseded. Decommissioning `tdarr` and `bazarr` outright is safe today
-because neither is configured.
+is superseded. Decommissioning `tdarr`, `bazarr` and `recyclarr` outright is
+safe today because none of the three is configured.
 
 ---
 

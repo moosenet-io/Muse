@@ -71,30 +71,33 @@ impl Foundry {
             return None;
         }
 
-        let guard = config.guard();
-        if guard.is_inert() {
-            tracing::warn!(
-                configured = config.allowed_roots.len(),
-                "foundry: allowed roots are configured but none could be resolved \
-                 (unmounted library?) — Foundry is not registered"
-            );
-            return None;
-        }
-
         // Fatal errors are the rail-3 violations that only bite once the
         // mutation gate is open (see FoundryConfig::fatal_errors). Refusing to
         // register is the right response: a Foundry that can mutate but stages
         // output onto the library's own filesystem is more dangerous than no
-        // Foundry at all, so it must not come up half-configured.
+        // Foundry at all, so it must not come up half-configured. Reported
+        // here for the operator; `config.guard()` independently refuses to
+        // mint a guard in this state, so the check is not the only line of
+        // defence.
         let fatal = config.fatal_errors();
         if !fatal.is_empty() {
             for e in &fatal {
                 tracing::error!(error = %e, "foundry: fatal configuration error");
             }
             tracing::error!(
-                "foundry: mutation is enabled but the layout violates safety rail 3 \
-                 — refusing to register. Fix the configuration, or unset \
+                "foundry: the layout violates safety rail 3 while mutation is \
+                 enabled — refusing to register. Fix the configuration, or unset \
                  MUSE_FOUNDRY_ENABLE_MUTATION to run read-only."
+            );
+            return None;
+        }
+
+        let guard = config.guard()?;
+        if guard.is_inert() {
+            tracing::warn!(
+                configured = config.allowed_roots.len(),
+                "foundry: allowed roots are configured but none could be resolved \
+                 (unmounted library?) — Foundry is not registered"
             );
             return None;
         }
@@ -136,10 +139,7 @@ mod tests {
         if config.is_unconfigured() {
             return None;
         }
-        if !config.fatal_errors().is_empty() {
-            return None;
-        }
-        let guard = config.guard();
+        let guard = config.guard()?;
         if guard.is_inert() {
             return None;
         }
@@ -187,6 +187,22 @@ mod tests {
         assert!(
             foundry_from(c).is_none(),
             "the same layout must refuse to register once mutation is enabled"
+        );
+    }
+
+    #[test]
+    fn a_config_that_would_be_refused_cannot_mint_a_guard_at_all() {
+        // The capability boundary, not just the registration path: even code
+        // that skips Foundry::from_config must not be able to obtain a
+        // mutation-capable guard for a configuration that registration would
+        // have rejected (S128 MUSEF-01 review).
+        let root = std::env::temp_dir();
+        let mut c = cfg(vec![root]);
+        c.enable_mutation = true; // ...with no work_dir at all
+        assert!(!c.fatal_errors().is_empty(), "precondition: this config is invalid");
+        assert!(
+            c.guard().is_none(),
+            "an invalid mutating config must not yield a guard"
         );
     }
 

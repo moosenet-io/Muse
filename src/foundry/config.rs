@@ -77,8 +77,27 @@ impl FoundryConfig {
     }
 
     /// Build the [`PathGuard`] every Foundry operation resolves paths through.
-    pub fn guard(&self) -> PathGuard {
-        PathGuard::new(&self.allowed_roots, self.enable_mutation)
+    ///
+    /// Two protections, both added after the S128 MUSEF-01 review pointed out
+    /// that a public `guard()` on a struct with public fields let any caller
+    /// assemble `FoundryConfig { enable_mutation: true, allowed_roots: vec![…] }`
+    /// and mint an operational guard — bypassing [`super::Foundry::from_config`]
+    /// and every validation in it, including the fatal rail-3 checks. That
+    /// contradicted this module's own claim that only a *registered* Foundry
+    /// yields a guard.
+    ///
+    /// 1. `pub(crate)`, so nothing outside the crate can call it at all.
+    /// 2. **Fail-closed on its own validation**: it returns `None` when
+    ///    [`FoundryConfig::fatal_errors`] is non-empty, so even in-crate code
+    ///    that skips `from_config` cannot obtain a mutation-capable guard for a
+    ///    configuration that would have been refused at registration. The
+    ///    validation lives with the capability rather than only at the call
+    ///    site that happens to remember it.
+    pub(crate) fn guard(&self) -> Option<PathGuard> {
+        if !self.fatal_errors().is_empty() {
+            return None;
+        }
+        Some(PathGuard::new(&self.allowed_roots, self.enable_mutation))
     }
 
     /// True when no roots are configured at all — Foundry must not register

@@ -275,6 +275,31 @@ pub struct Config {
     /// var.
     pub library_root: Option<String>,
 
+    // --- MUSEF-01: Foundry (media formatting) ---
+    // All non-secret behavioral settings. Foundry's later credentials
+    // (OPENSUBTITLES_API_KEY in MUSEF-16, MUSE_FOUNDRY_NODE_TOKEN in
+    // MUSEF-11) are secret-shaped and will be wrapped in the crate's
+    // redacting password type, not added here as bare String.
+    /// Default-deny allowlist of roots Foundry may address, `:`-separated.
+    /// Unset/empty (the default) means Foundry does not register at all —
+    /// an operator who configures nothing gets no Foundry, not a Foundry
+    /// pointed at their library.
+    pub foundry_allowed_roots: Option<String>,
+    /// Scratch dir for transcode output, staged before verify-and-swap.
+    /// Should live on a different device from any allowed root.
+    pub foundry_work_dir: Option<String>,
+    /// The mutation kill-switch. **Defaults false**: with it closed Foundry
+    /// probes, plans and reports but cannot modify a byte.
+    pub foundry_enable_mutation: bool,
+    /// Retention for superseded originals in the Foundry recycle bin.
+    /// `None` lets `foundry::config` apply its own default rather than this
+    /// module authoring one.
+    pub foundry_retention_days: Option<u32>,
+    /// `ffprobe` binary (a `PATH` name or an absolute path).
+    pub foundry_ffprobe_bin: Option<String>,
+    /// `HandBrakeCLI` binary (a `PATH` name or an absolute path).
+    pub foundry_handbrake_bin: Option<String>,
+
     /// MUSE-12: how often the proactive-content generator worker wakes up
     /// to run all five generators for every account
     /// (`MUSE_PROACTIVE_TICK_INTERVAL_SECS`). Purely a wake cadence, not a
@@ -616,6 +641,14 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_string()),
             library_root: env_opt("MUSE_LIBRARY_ROOT").filter(|v| !v.trim().is_empty()),
 
+            foundry_allowed_roots: env_opt("MUSE_FOUNDRY_ALLOWED_ROOTS"),
+            foundry_work_dir: env_opt("MUSE_FOUNDRY_WORK_DIR"),
+            foundry_enable_mutation: env_bool("MUSE_FOUNDRY_ENABLE_MUTATION", false),
+            foundry_retention_days: env_opt("MUSE_FOUNDRY_RETENTION_DAYS")
+                .and_then(|v| v.parse::<u32>().ok()),
+            foundry_ffprobe_bin: env_opt("MUSE_FOUNDRY_FFPROBE_BIN"),
+            foundry_handbrake_bin: env_opt("MUSE_FOUNDRY_HANDBRAKE_BIN"),
+
             proactive_tick_interval_secs: env_u64("MUSE_PROACTIVE_TICK_INTERVAL_SECS", 3600),
 
             maintenance_tick_secs: env_u64("MUSE_MAINTENANCE_TICK_SECS", 1800),
@@ -788,6 +821,16 @@ impl Default for Config {
             ffmpeg_path: DEFAULT_FFMPEG_PATH.to_string(),
             media_root: DEFAULT_MEDIA_ROOT.to_string(),
             library_root: None,
+
+            // Foundry defaults are the SAFE values: unconfigured (so it does
+            // not register) and mutation closed. A test that wants Foundry
+            // opts in explicitly.
+            foundry_allowed_roots: None,
+            foundry_work_dir: None,
+            foundry_enable_mutation: false,
+            foundry_retention_days: None,
+            foundry_ffprobe_bin: None,
+            foundry_handbrake_bin: None,
             proactive_tick_interval_secs: 3600,
             maintenance_tick_secs: 1800,
             trending_tick_secs: 86400,
@@ -849,6 +892,20 @@ fn env_int_list(key: &str, default: &[i32]) -> Vec<i32> {
             }
         }
         _ => default.to_vec(),
+    }
+}
+
+/// Parse a boolean-ish env var. Accepts `1`/`true`/`yes`/`on`
+/// (case-insensitive) as true and everything else as false, so a typo fails
+/// **closed** — which matters because the only current caller is Foundry's
+/// mutation kill-switch, where a misread must never open the gate.
+fn env_bool(key: &str, default: bool) -> bool {
+    match env_opt(key) {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        None => default,
     }
 }
 

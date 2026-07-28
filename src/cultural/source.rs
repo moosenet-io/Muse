@@ -124,8 +124,31 @@ impl TmdbTrendSource {
     /// `TmdbClient::from_config`). Returns `None` when TMDb isn't
     /// configured — same graceful degrade as every other optional
     /// integration in this crate.
+    ///
+    /// **Also `None` in key-less proxy mode**, which is the subtle case.
+    /// `TmdbClient::from_config` returns a client when `metadata_keyless` is
+    /// set (the default) even with no API key — that client talks to the
+    /// Radarr metadata proxy, which is genuinely useful for *enrichment*. But
+    /// the proxy has no `/trending` endpoint, so `TmdbClient::trending`
+    /// deliberately degrades to an empty vec in that mode (AMETA-2). Building
+    /// a `TmdbTrendSource` on top of it therefore yields a trend source that
+    /// can never, under any circumstances, return a trend.
+    ///
+    /// A source that is silently always-empty is worse than an absent one: an
+    /// absent source lets the caller fall back to a working one (Trakt), while
+    /// an always-empty source looks available and quietly contributes nothing.
+    /// So proxy mode yields `None` here, even though the same client is still
+    /// the right thing for metadata enrichment elsewhere.
     pub fn from_config(config: &Config) -> Option<Self> {
-        TmdbClient::from_config(config).map(Self::new)
+        let client = TmdbClient::from_config(config)?;
+        if client.is_proxy_mode() {
+            tracing::debug!(
+                "cultural: TMDb client is in key-less proxy mode, which has no \
+                 /trending endpoint — not registering a TMDb trend source"
+            );
+            return None;
+        }
+        Some(Self::new(client))
     }
 }
 
@@ -498,7 +521,51 @@ mod tests {
 
     #[test]
     fn tmdb_trend_source_from_config_returns_none_when_unconfigured() {
+        // A default Config has no TMDB_API_KEY. Note this passes for a reason
+        // that changed under it: `metadata_keyless` defaults true, so
+        // `TmdbClient::from_config` DOES hand back a (proxy-mode) client here.
+        // What makes this None is the proxy-mode check in
+        // `TmdbTrendSource::from_config` — see the regression test below.
         let config = Config::default();
+        assert!(TmdbTrendSource::from_config(&config).is_none());
+    }
+
+    #[test]
+    fn tmdb_trend_source_is_none_in_keyless_proxy_mode_even_though_the_client_builds() {
+        // The regression this fixes. The AMETA key-less metadata proxy made
+        // `TmdbClient::from_config` return Some without an API key, which
+        // silently turned this into an always-empty trend source (the proxy
+        // has no /trending endpoint, so `trending()` returns an empty vec by
+        // design). The test above had asserted None since before AMETA and
+        // began failing on main; relaxing it would have locked in the bad
+        // behaviour, so the source is gated on proxy mode instead.
+        let config = Config {
+            tmdb_api_key: None,
+            metadata_keyless: true,
+            ..Default::default()
+        };
+
+        // The client itself is available and useful — for enrichment.
+        let client = crate::trending::client::TmdbClient::from_config(&config)
+            .expect("key-less proxy client should still build for enrichment");
+        assert!(client.is_proxy_mode(), "precondition: this is proxy mode");
+
+        // ...but it must not be offered as a TREND source.
+        assert!(
+            TmdbTrendSource::from_config(&config).is_none(),
+            "a trend source that can never return a trend must not be registered"
+        );
+    }
+
+    #[test]
+    fn tmdb_trend_source_is_none_when_keyless_is_disabled_and_no_key_is_set() {
+        // The third precedence branch: no key and keyless off means the client
+        // itself is None, so the trend source is too.
+        let config = Config {
+            tmdb_api_key: None,
+            metadata_keyless: false,
+            ..Default::default()
+        };
         assert!(TmdbTrendSource::from_config(&config).is_none());
     }
 

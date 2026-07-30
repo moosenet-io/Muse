@@ -239,9 +239,15 @@ pub struct OnDeckRow {
     pub started_at: DateTime<Utc>,
 }
 
-pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<Vec<OnDeckRow>> {
-    sqlx::query_as::<_, OnDeckRow>(
-        r#"
+/// The on-deck query, hoisted to a `const` so the `percent_complete < 1`
+/// bound is INSPECTABLE by a test that runs in the default gate. A previous
+/// attempt to pin that bound asserted `!(1.0 < 1.0)` in Rust, which both
+/// reviewers correctly called a tautology: it would have kept passing if the
+/// SQL changed to `<= 1`. String-asserting SQL is not elegant, but the bound
+/// is a product decision (see the comment inside) and something has to fail
+/// when it silently moves. The behavioural proof lives in the `db_gated`
+/// test below, which needs `MUSE_TEST_DATABASE_URL`.
+pub(crate) const ON_DECK_SQL: &str = r#"
         SELECT * FROM (
             SELECT DISTINCT ON (ps.media_item_id)
                 ps.media_item_id,
@@ -270,20 +276,23 @@ pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<V
               -- persisted. A reviewer raised `<= 1` for that state-update
               -- race; admitting it would put fully-watched titles on the
               -- shelf, which is the worse outcome. The exclusion is pinned by
-              -- `progress_pct_excludes_a_fully_watched_fraction`.
+              -- `tests::on_deck_sql_bounds_progress_strictly_below_one` and
+              -- its `db_gated` behavioural sibling.
               AND ps.percent_complete > 0
               AND ps.percent_complete < 1
             ORDER BY ps.media_item_id, ps.started_at DESC
         ) newest
         ORDER BY newest.started_at DESC
         LIMIT $2
-        "#,
-    )
-    .bind(account_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(MuseError::Database)
+        "#;
+
+pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<Vec<OnDeckRow>> {
+    sqlx::query_as::<_, OnDeckRow>(ON_DECK_SQL)
+        .bind(account_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(MuseError::Database)
 }
 
 pub async fn library_counts(pool: &PgPool) -> MuseResult<LibraryCounts> {
@@ -305,4 +314,118 @@ pub async fn library_counts(pool: &PgPool) -> MuseResult<LibraryCounts> {
     .fetch_one(pool)
     .await
     .map_err(MuseError::Database)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MUSE #87: pins the on-deck progress bound. Both reviewers rejected the
+    /// previous attempt (`assert!(!(1.0 < 1.0))`) as a tautology that would
+    /// survive a change to `<= 1`. This inspects the actual SQL, so moving the
+    /// bound fails the build's test gate rather than silently putting
+    /// fully-watched titles on a "continue watching" shelf.
+    ///
+    /// Asserting on SQL text is a blunt instrument; it is used here only
+    /// because the bound is a deliberate product decision and this is the one
+    /// check that runs WITHOUT a database. The behavioural proof is
+    /// `db_gated::on_deck_excludes_a_fully_watched_unfinished_session`.
+    #[test]
+    fn on_deck_sql_bounds_progress_strictly_below_one() {
+        assert!(
+            ON_DECK_SQL.contains("ps.percent_complete < 1"),
+            "the on-deck bound must stay strictly below 1 (a 0..1 fraction)"
+        );
+        assert!(
+            !ON_DECK_SQL.contains("ps.percent_complete <= 1"),
+            "`<= 1` would admit fully-watched sessions onto the continue-watching shelf"
+        );
+        // The old percentage-scale bound must not come back.
+        assert!(
+            !ON_DECK_SQL.contains("percent_complete < 100"),
+            "`< 100` is a no-op on a 0..1 fraction — that was the MUSE #87 bug"
+        );
+    }
+
+    #[cfg(test)]
+    mod db_gated {
+        use super::*;
+
+        async fn test_pool_or_skip(test_name: &str) -> Option<PgPool> {
+            let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+                eprintln!(
+                    "MUSE_TEST_DATABASE_URL not set — skipping {test_name} \
+                     (expected in the default test run; this harness does not \
+                     require a live DB)"
+                );
+                return None;
+            };
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await
+                .expect("connect to MUSE_TEST_DATABASE_URL");
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("migrations should apply cleanly");
+            Some(pool)
+        }
+
+        /// The behavioural half of `on_deck_sql_bounds_progress_strictly_below_one`:
+        /// an UNFINISHED session at exactly `1.0` must not be on deck, which is
+        /// the state-update race a reviewer raised when asking for `<= 1`.
+        #[tokio::test]
+        async fn on_deck_excludes_a_fully_watched_unfinished_session() {
+            let Some(pool) = test_pool_or_skip(
+                "on_deck_excludes_a_fully_watched_unfinished_session",
+            )
+            .await
+            else {
+                return;
+            };
+
+            let (account_id,): (i64,) = sqlx::query_as(
+                "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
+                 VALUES ('muse87-fixture', 'MUSE87 Fixture', true, false) RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("seed account");
+
+            // Two sessions on the same account: one mid-watch, one at exactly
+            // 1.0 but still flagged unfinished.
+            for (key, pct) in [("muse87-partial", 0.40_f32), ("muse87-complete", 1.0_f32)] {
+                sqlx::query(
+                    "INSERT INTO play_sessions \
+                       (account_id, session_key, started_at, percent_complete, \
+                        is_finished, is_abandoned) \
+                     VALUES ($1, $2, now(), $3, false, false)",
+                )
+                .bind(account_id)
+                .bind(key)
+                .bind(pct)
+                .execute(&pool)
+                .await
+                .expect("seed session");
+            }
+
+            let rows = on_deck(&pool, account_id, 50).await.expect("on_deck query");
+            assert!(
+                rows.iter().all(|r| r.percent_complete.unwrap_or(0.0) < 1.0),
+                "a fully-watched unfinished session must never be on deck"
+            );
+
+            sqlx::query("DELETE FROM play_sessions WHERE account_id = $1")
+                .bind(account_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(account_id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+    }
 }

@@ -122,6 +122,14 @@ async fn resolve_account_id_fallible(
         .map(|a| a.id))
 }
 
+/// Convert a stored 0..1 watch fraction to the 0..100 percentage the
+/// Constellation hook's `MuseOnDeckItem.progress_pct` declares, rounded to one
+/// decimal so the JSON stays compact.
+fn progress_pct(fraction: Option<f32>) -> f32 {
+    let pct = fraction.unwrap_or(0.0) * 100.0;
+    (pct * 10.0).round() / 10.0
+}
+
 fn kind_str(kind: MediaKind) -> &'static str {
     match kind {
         MediaKind::Movie => "movie",
@@ -1149,11 +1157,14 @@ pub async fn get_on_deck(
                 id: r.media_item_id.to_string(),
                 title: r.title,
                 kind: kind_str(r.kind),
-                // The repo filters `percent_complete` to a non-null 0<x<100,
-                // so the fallback is unreachable; it is a `0.0` rather than
-                // an `unwrap()` so a future filter change can never panic a
-                // dashboard request.
-                progress_pct: r.percent_complete.unwrap_or(0.0),
+                // MUSE #87: scale to a PERCENTAGE. `percent_complete` is a
+                // fraction in 0..1 despite the column name, so passing it
+                // through unscaled made every progress bar read ~0 (a live
+                // 48%-watched film reported `progress_pct: 0.48`). The repo
+                // filters to a non-null 0<x<1, so the `0.0` fallback is
+                // unreachable; it is not an `unwrap()` so a future filter
+                // change can never panic a dashboard request.
+                progress_pct: progress_pct(r.percent_complete),
                 // `/art/media_item/{id}` — deliberately keyed on the SAME id
                 // this item reports, so a client can build the art URL from
                 // `id` alone. (`poster_url()`'s `/art/media_metadata/{id}`
@@ -1336,6 +1347,19 @@ mod tests {
         .unwrap();
         assert!(json.as_object().unwrap().contains_key("last_ingest_at"));
         assert!(json["last_ingest_at"].is_null());
+    }
+
+    /// MUSE #87 regression: `play_sessions.percent_complete` is a FRACTION in
+    /// 0..1 despite its name, so a passthrough reported a 48%-watched film as
+    /// `progress_pct: 0.48` and every progress bar rendered as ~empty. Live
+    /// data confirms the scale (finished sessions avg 0.991, max 1.000).
+    #[test]
+    fn progress_pct_scales_the_stored_fraction_to_a_percentage() {
+        assert_eq!(progress_pct(Some(0.48)), 48.0);
+        assert_eq!(progress_pct(Some(0.851)), 85.1);
+        assert_eq!(progress_pct(Some(1.0)), 100.0);
+        // Unreachable given the repo filter, but must not panic or NaN.
+        assert_eq!(progress_pct(None), 0.0);
     }
 
     #[test]

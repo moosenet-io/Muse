@@ -231,6 +231,10 @@ pub struct OnDeckRow {
     pub media_metadata_id: i64,
     pub kind: MediaKind,
     pub title: String,
+    /// A FRACTION in 0..1 (see the filter in [`on_deck`]) — callers that need
+    /// a percentage must scale by 100. Named as the column is named rather
+    /// than renamed to `progress_fraction`, so it stays greppable against the
+    /// schema.
     pub percent_complete: Option<f32>,
     pub started_at: DateTime<Utc>,
 }
@@ -253,8 +257,13 @@ pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<V
               AND ps.is_finished = false
               AND ps.is_abandoned = false
               AND ps.percent_complete IS NOT NULL
+              -- MUSE #87: `percent_complete` is a FRACTION in 0..1, not a
+              -- percentage. Verified against live data: finished sessions
+              -- average 0.991 (max 1.000), unfinished top out at 0.850, and
+              -- zero rows exceed 1. The previous `< 100` bound was a no-op on
+              -- this scale.
               AND ps.percent_complete > 0
-              AND ps.percent_complete < 100
+              AND ps.percent_complete < 1
             ORDER BY ps.media_item_id, ps.started_at DESC
         ) newest
         ORDER BY newest.started_at DESC

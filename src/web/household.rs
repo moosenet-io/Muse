@@ -179,7 +179,7 @@ fn together_pct(together: i64, sessions: i64) -> f64 {
 ///
 /// Unblocking this is a pipeline/backfill job (compute embeddings → derive
 /// personas → project to 2-D), not a handler change, which is why it is not
-/// bolted on here. Tracked as MUSE #87.
+/// bolted on here. Tracked as MUSE #88.
 pub async fn taste_clusters_get_handler() -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -190,7 +190,7 @@ pub async fn taste_clusters_get_handler() -> (StatusCode, Json<Value>) {
                        centroids to cluster and no model to attribute. Returning an empty \
                        clusters list would falsely assert that this household has no taste \
                        clusters.",
-            "tracked_as": "MUSE #87",
+            "tracked_as": "MUSE #88",
         })),
     )
 }
@@ -258,7 +258,7 @@ mod tests {
     async fn taste_clusters_returns_501_rather_than_a_falsely_empty_cluster_list() {
         let (status, Json(body)) = taste_clusters_get_handler().await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["tracked_as"], "MUSE #87");
+        assert_eq!(body["tracked_as"], "MUSE #88");
         assert!(
             body.get("clusters").is_none(),
             "must not look like a successful empty payload"

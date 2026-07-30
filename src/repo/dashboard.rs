@@ -231,13 +231,23 @@ pub struct OnDeckRow {
     pub media_metadata_id: i64,
     pub kind: MediaKind,
     pub title: String,
+    /// A FRACTION in 0..1 (see the filter in [`on_deck`]) — callers that need
+    /// a percentage must scale by 100. Named as the column is named rather
+    /// than renamed to `progress_fraction`, so it stays greppable against the
+    /// schema.
     pub percent_complete: Option<f32>,
     pub started_at: DateTime<Utc>,
 }
 
-pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<Vec<OnDeckRow>> {
-    sqlx::query_as::<_, OnDeckRow>(
-        r#"
+/// The on-deck query, hoisted to a `const` so the `percent_complete < 1`
+/// bound is INSPECTABLE by a test that runs in the default gate. A previous
+/// attempt to pin that bound asserted `!(1.0 < 1.0)` in Rust, which both
+/// reviewers correctly called a tautology: it would have kept passing if the
+/// SQL changed to `<= 1`. String-asserting SQL is not elegant, but the bound
+/// is a product decision (see the comment inside) and something has to fail
+/// when it silently moves. The behavioural proof lives in the `db_gated`
+/// test below, which needs `MUSE_TEST_DATABASE_URL`.
+pub(crate) const ON_DECK_SQL: &str = r#"
         SELECT * FROM (
             SELECT DISTINCT ON (ps.media_item_id)
                 ps.media_item_id,
@@ -253,19 +263,36 @@ pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<V
               AND ps.is_finished = false
               AND ps.is_abandoned = false
               AND ps.percent_complete IS NOT NULL
+              -- MUSE #87: `percent_complete` is a FRACTION in 0..1, not a
+              -- percentage. Verified against live data: finished sessions
+              -- average 0.991 (max 1.000), unfinished top out at 0.850, and
+              -- zero rows exceed 1. The previous `< 100` bound was a no-op on
+              -- this scale.
+              --
+              -- `< 1` (not `<= 1`) is deliberate, and it is a PRODUCT choice
+              -- rather than an accident of the data: a session watched to
+              -- exactly 100% does not belong on a "continue watching" shelf,
+              -- even in the window where `is_finished` has not yet been
+              -- persisted. A reviewer raised `<= 1` for that state-update
+              -- race; admitting it would put fully-watched titles on the
+              -- shelf, which is the worse outcome. The exclusion is pinned by
+              -- `tests::on_deck_sql_bounds_progress_strictly_below_one` and
+              -- its `db_gated` behavioural sibling.
               AND ps.percent_complete > 0
-              AND ps.percent_complete < 100
+              AND ps.percent_complete < 1
             ORDER BY ps.media_item_id, ps.started_at DESC
         ) newest
         ORDER BY newest.started_at DESC
         LIMIT $2
-        "#,
-    )
-    .bind(account_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(MuseError::Database)
+        "#;
+
+pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<Vec<OnDeckRow>> {
+    sqlx::query_as::<_, OnDeckRow>(ON_DECK_SQL)
+        .bind(account_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(MuseError::Database)
 }
 
 pub async fn library_counts(pool: &PgPool) -> MuseResult<LibraryCounts> {
@@ -287,4 +314,243 @@ pub async fn library_counts(pool: &PgPool) -> MuseResult<LibraryCounts> {
     .fetch_one(pool)
     .await
     .map_err(MuseError::Database)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MUSE #87: pins the on-deck progress bound. Both reviewers rejected the
+    /// previous attempt (`assert!(!(1.0 < 1.0))`) as a tautology that would
+    /// survive a change to `<= 1`. This inspects the actual SQL, so moving the
+    /// bound fails the build's test gate rather than silently putting
+    /// fully-watched titles on a "continue watching" shelf.
+    ///
+    /// Asserting on SQL text is a blunt instrument; it is used here only
+    /// because the bound is a deliberate product decision and this is the one
+    /// check that runs WITHOUT a database. The behavioural proof is
+    /// `db_gated::on_deck_excludes_a_fully_watched_unfinished_session`.
+    #[test]
+    fn on_deck_sql_bounds_progress_strictly_below_one() {
+        assert!(
+            ON_DECK_SQL.contains("ps.percent_complete < 1"),
+            "the on-deck bound must stay strictly below 1 (a 0..1 fraction)"
+        );
+        assert!(
+            !ON_DECK_SQL.contains("ps.percent_complete <= 1"),
+            "`<= 1` would admit fully-watched sessions onto the continue-watching shelf"
+        );
+        // The old percentage-scale bound must not come back.
+        assert!(
+            !ON_DECK_SQL.contains("percent_complete < 100"),
+            "`< 100` is a no-op on a 0..1 fraction — that was the MUSE #87 bug"
+        );
+    }
+
+    #[cfg(test)]
+    mod db_gated {
+        use super::*;
+
+        async fn test_pool_or_skip(test_name: &str) -> Option<PgPool> {
+            let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+                eprintln!(
+                    "MUSE_TEST_DATABASE_URL not set — skipping {test_name} \
+                     (expected in the default test run; this harness does not \
+                     require a live DB)"
+                );
+                return None;
+            };
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await
+                .expect("connect to MUSE_TEST_DATABASE_URL");
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("migrations should apply cleanly");
+            Some(pool)
+        }
+
+        /// The behavioural half of `on_deck_sql_bounds_progress_strictly_below_one`:
+        /// an UNFINISHED session at exactly `1.0` must not be on deck, which is
+        /// the state-update race a reviewer raised when asking for `<= 1`.
+        ///
+        /// The fixtures are fully joinable — library -> media_metadata ->
+        /// media_item -> play_session. An earlier version seeded sessions with
+        /// a NULL `media_item_id`, so `on_deck`'s INNER JOINs dropped BOTH rows
+        /// and the assertion passed on an empty set even with a `<= 1` bound.
+        /// Both reviewers caught that; hence the POSITIVE assertion below (the
+        /// partial fixture must be PRESENT) which is what makes the negative one
+        /// meaningful.
+        #[tokio::test]
+        async fn on_deck_excludes_a_fully_watched_unfinished_session() {
+            use crate::models::media_item::NewMediaItem;
+            use crate::models::media_metadata::{MediaKind, NewMediaMetadata};
+
+            let Some(pool) = test_pool_or_skip(
+                "on_deck_excludes_a_fully_watched_unfinished_session",
+            )
+            .await
+            else {
+                return;
+            };
+
+            // The account is seeded FIRST and its `bigserial` id becomes the
+            // suffix for every other fixture key. A reviewer rightly rejected
+            // `std::process::id()`: PIDs recycle, so two runs against the same
+            // database could collide on `media_metadata.tmdb_id` (the natural
+            // key `upsert_by_tmdb` keys on) or on `media_items (library_id,
+            // media_metadata_id)`. A sequence value never repeats.
+            //
+            // `accounts.username` needs no nonce — the table's only unique
+            // constraints are on `id` and `plex_account_id`, neither of which
+            // this fixture sets by hand.
+            let (account_id,): (i64,) = sqlx::query_as(
+                "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
+                 VALUES ('muse87-fixture', 'MUSE87 Fixture', true, false) RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("seed account");
+            let suffix = account_id;
+
+            let library = crate::repo::library::create(
+                &pool,
+                &crate::models::library::NewLibrary {
+                    name: format!("muse87-lib-{suffix}"),
+                    kind: crate::models::library::LibraryKind::Movie,
+                    root_folder: "/media/muse87-test".to_string(),
+                    source_arr_name: None,
+                    source_arr_url: None,
+                },
+            )
+            .await
+            .expect("create library");
+
+            // Two joinable titles: one mid-watch, one at exactly 1.0 that is
+            // still flagged unfinished.
+            let mut partial_item_id = 0_i64;
+            let mut complete_item_id = 0_i64;
+            for (label, pct) in [("partial", 0.40_f32), ("complete", 1.0_f32)] {
+                let metadata = crate::repo::media_metadata::upsert_by_tmdb(
+                    &pool,
+                    &NewMediaMetadata {
+                        kind: MediaKind::Movie,
+                        tmdb_id: Some(format!("muse87-{label}-{suffix}")),
+                        tvdb_id: None,
+                        imdb_id: None,
+                        provider_ids: serde_json::json!({}),
+                        title: format!("MUSE87 {label} {suffix}"),
+                        sort_title: None,
+                        original_title: None,
+                        original_language: None,
+                        status: None,
+                        overview: None,
+                        studio: None,
+                        network: None,
+                        runtime_minutes: Some(100),
+                        year: Some(2020),
+                        images: serde_json::json!({}),
+                    },
+                )
+                .await
+                .expect("upsert media_metadata");
+
+                let item = crate::repo::media_item::upsert(
+                    &pool,
+                    &NewMediaItem {
+                        library_id: library.id,
+                        media_metadata_id: metadata.id,
+                        path: format!("/media/muse87-test/{label}-{suffix}.mkv"),
+                        monitored: true,
+                        quality_profile_id: None,
+                        minimum_availability: None,
+                        plex_rating_key: Some(format!("muse87-rk-{label}-{suffix}")),
+                        added_at: None,
+                    },
+                )
+                .await
+                .expect("upsert media_item");
+
+                if label == "partial" {
+                    partial_item_id = item.id;
+                } else {
+                    complete_item_id = item.id;
+                }
+
+                sqlx::query(
+                    "INSERT INTO play_sessions \
+                       (account_id, media_item_id, session_key, started_at, \
+                        percent_complete, is_finished, is_abandoned) \
+                     VALUES ($1, $2, $3, now(), $4, false, false)",
+                )
+                .bind(account_id)
+                .bind(item.id)
+                .bind(format!("muse87-session-{label}-{suffix}"))
+                .bind(pct)
+                .execute(&pool)
+                .await
+                .expect("seed session");
+            }
+
+            let rows = on_deck(&pool, account_id, 50).await.expect("on_deck query");
+            let ids: Vec<i64> = rows.iter().map(|r| r.media_item_id).collect();
+
+            // TEARDOWN BEFORE ASSERTIONS. A reviewer noted that cleanup placed
+            // after the asserts leaks every seeded row whenever an assertion
+            // fires — precisely when the database is most likely to be
+            // re-examined by hand. The results are already captured in `ids`,
+            // so nothing is lost by tearing down first.
+            //
+            // FK-safe order. Cleanup failures are surfaced with `expect`, not
+            // swallowed with `.ok()`: a teardown that silently fails leaves the
+            // next run to trip over this run's rows.
+            for (label, sql, bind) in [
+                (
+                    "play_sessions",
+                    "DELETE FROM play_sessions WHERE account_id = $1",
+                    account_id,
+                ),
+                ("accounts", "DELETE FROM accounts WHERE id = $1", account_id),
+                (
+                    "media_items",
+                    "DELETE FROM media_items WHERE library_id = $1",
+                    library.id,
+                ),
+            ] {
+                sqlx::query(sql)
+                    .bind(bind)
+                    .execute(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("teardown {label} failed: {e}"));
+            }
+            sqlx::query("DELETE FROM media_metadata WHERE tmdb_id = ANY($1)")
+                .bind(vec![
+                    format!("muse87-partial-{suffix}"),
+                    format!("muse87-complete-{suffix}"),
+                ])
+                .execute(&pool)
+                .await
+                .expect("teardown media_metadata failed");
+            sqlx::query("DELETE FROM libraries WHERE id = $1")
+                .bind(library.id)
+                .execute(&pool)
+                .await
+                .expect("teardown libraries failed");
+
+            // POSITIVE first: without this the negative assertion below could
+            // pass on an empty result set, which is exactly how an earlier
+            // version of this test fooled itself.
+            assert!(
+                ids.contains(&partial_item_id),
+                "the 40%-watched fixture must be on deck — otherwise this test \
+                 proves nothing about the bound (rows: {ids:?})"
+            );
+            assert!(
+                !ids.contains(&complete_item_id),
+                "a fully-watched (1.0) unfinished session must NOT be on deck"
+            );
+        }
+    }
 }

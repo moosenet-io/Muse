@@ -94,6 +94,34 @@ async fn resolve_account_id(state: &AppState, requested: Option<i64>) -> Option<
         .map(|a| a.id)
 }
 
+/// Fallible sibling of [`resolve_account_id`] for handlers that must not turn
+/// a database failure into a valid-looking empty body.
+///
+/// `resolve_account_id` folds a failed `repo::account::list` into `None` via
+/// `unwrap_or_default`, which makes "the accounts query broke" indistinguishable
+/// from "no accounts exist". For the fail-open MWEBX-05 screens that is the
+/// intended posture; for the MUSE #84 dashboard endpoints it is not — the
+/// Constellation hook renders any 2xx as data, so the two cases must be
+/// distinguishable. `Ok(None)` here means the query SUCCEEDED and found no
+/// accounts (a true absence); an `Err` propagates.
+///
+/// (Both round-2 reviewers caught this: the first fix propagated errors from
+/// the on-deck query itself but left this resolver's swallowed error in place.)
+async fn resolve_account_id_fallible(
+    state: &AppState,
+    requested: Option<i64>,
+) -> MuseResult<Option<i64>> {
+    if let Some(id) = requested {
+        return Ok(Some(id));
+    }
+    let accounts = repo::account::list(&state.pool).await?;
+    Ok(accounts
+        .iter()
+        .find(|a| a.is_primary)
+        .or_else(|| accounts.first())
+        .map(|a| a.id))
+}
+
 fn kind_str(kind: MediaKind) -> &'static str {
     match kind {
         MediaKind::Movie => "movie",
@@ -1104,9 +1132,13 @@ pub async fn get_on_deck(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AccountQuery>,
 ) -> MuseResult<Json<MuseOnDeckResponse>> {
-    let Some(account_id) = resolve_account_id(&state, q.account_id).await else {
-        // A genuinely-true empty: no accounts exist, so there is no queue.
-        // Distinct from a query failure, which propagates below.
+    // `resolve_account_id_fallible`, NOT `resolve_account_id`: the latter
+    // folds a failed accounts query into `None`, which would land in the
+    // empty-list branch below and re-create the exact false-2xx this endpoint
+    // was fixed to avoid.
+    let Some(account_id) = resolve_account_id_fallible(&state, q.account_id).await? else {
+        // A genuinely-true empty: the query succeeded and there are no
+        // accounts, so there is no queue.
         return Ok(Json(MuseOnDeckResponse { items: Vec::new() }));
     };
     let rows = repo::dashboard::on_deck(&state.pool, account_id, ON_DECK_LIMIT).await?;

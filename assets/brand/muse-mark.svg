@@ -1,0 +1,31 @@
+<svg width="420" height="420" viewBox="0 0 420 420" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Muse mark</title>
+<desc>Constellation-lyre mark for Muse: star-nodes connected by thin lines in violet on deep indigo.</desc>
+<rect x="60" y="30" width="300" height="360" rx="28" fill="#1a1636" stroke="#534AB7" stroke-width="1.5"/>
+<line x1="160" y1="120" x2="160" y2="300" stroke="#7F77DD" stroke-width="1.5" opacity="0.85"/>
+<line x1="260" y1="120" x2="260" y2="300" stroke="#7F77DD" stroke-width="1.5" opacity="0.85"/>
+<line x1="160" y1="120" x2="210" y2="95" stroke="#7F77DD" stroke-width="1.5" opacity="0.85"/>
+<line x1="260" y1="120" x2="210" y2="95" stroke="#7F77DD" stroke-width="1.5" opacity="0.85"/>
+<line x1="160" y1="300" x2="210" y2="325" stroke="#7F77DD" stroke-width="1.5" opacity="0.85"/>
+<line x1="260" y1="300" x2="210" y2="325" stroke="#7F77DD" stroke-width="1.5" opacity="0.85"/>
+<line x1="160" y1="165" x2="260" y2="165" stroke="#AFA9EC" stroke-width="1" opacity="0.55"/>
+<line x1="160" y1="210" x2="260" y2="210" stroke="#AFA9EC" stroke-width="1" opacity="0.55"/>
+<line x1="160" y1="255" x2="260" y2="255" stroke="#AFA9EC" stroke-width="1" opacity="0.55"/>
+<circle cx="210" cy="95" r="9" fill="#CECBF6"/>
+<circle cx="210" cy="95" r="16" fill="none" stroke="#AFA9EC" stroke-width="1" opacity="0.5"/>
+<circle cx="160" cy="120" r="6" fill="#AFA9EC"/>
+<circle cx="260" cy="120" r="6" fill="#AFA9EC"/>
+<circle cx="160" cy="165" r="4.5" fill="#7F77DD"/>
+<circle cx="260" cy="165" r="4.5" fill="#7F77DD"/>
+<circle cx="160" cy="210" r="4.5" fill="#7F77DD"/>
+<circle cx="260" cy="210" r="4.5" fill="#7F77DD"/>
+<circle cx="160" cy="255" r="4.5" fill="#7F77DD"/>
+<circle cx="260" cy="255" r="4.5" fill="#7F77DD"/>
+<circle cx="160" cy="300" r="6" fill="#AFA9EC"/>
+<circle cx="260" cy="300" r="6" fill="#AFA9EC"/>
+<circle cx="210" cy="325" r="7" fill="#CECBF6"/>
+<circle cx="115" cy="70" r="2" fill="#CECBF6" opacity="0.7"/>
+<circle cx="305" cy="80" r="2.5" fill="#CECBF6" opacity="0.6"/>
+<circle cx="300" cy="350" r="2" fill="#CECBF6" opacity="0.6"/>
+<circle cx="120" cy="345" r="2.5" fill="#CECBF6" opacity="0.7"/>
+</svg>

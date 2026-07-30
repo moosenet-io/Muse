@@ -1,0 +1,27 @@
+<svg width="680" height="200" viewBox="0 0 680 200" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Muse horizontal lockup</title>
+<desc>Muse constellation-lyre mark beside the muse wordmark and tagline on deep indigo.</desc>
+<rect x="40" y="30" width="120" height="140" rx="16" fill="#1a1636" stroke="#534AB7" stroke-width="1.2"/>
+<line x1="82" y1="70" x2="82" y2="130" stroke="#7F77DD" stroke-width="1.3"/>
+<line x1="118" y1="70" x2="118" y2="130" stroke="#7F77DD" stroke-width="1.3"/>
+<line x1="82" y1="70" x2="100" y2="60" stroke="#7F77DD" stroke-width="1.3"/>
+<line x1="118" y1="70" x2="100" y2="60" stroke="#7F77DD" stroke-width="1.3"/>
+<line x1="82" y1="130" x2="100" y2="140" stroke="#7F77DD" stroke-width="1.3"/>
+<line x1="118" y1="130" x2="100" y2="140" stroke="#7F77DD" stroke-width="1.3"/>
+<line x1="82" y1="90" x2="118" y2="90" stroke="#AFA9EC" stroke-width="0.8" opacity="0.55"/>
+<line x1="82" y1="110" x2="118" y2="110" stroke="#AFA9EC" stroke-width="0.8" opacity="0.55"/>
+<circle cx="100" cy="60" r="6" fill="#CECBF6"/>
+<circle cx="82" cy="70" r="4" fill="#AFA9EC"/>
+<circle cx="118" cy="70" r="4" fill="#AFA9EC"/>
+<circle cx="82" cy="90" r="3" fill="#7F77DD"/>
+<circle cx="118" cy="90" r="3" fill="#7F77DD"/>
+<circle cx="82" cy="110" r="3" fill="#7F77DD"/>
+<circle cx="118" cy="110" r="3" fill="#7F77DD"/>
+<circle cx="82" cy="130" r="4" fill="#AFA9EC"/>
+<circle cx="118" cy="130" r="4" fill="#AFA9EC"/>
+<circle cx="100" cy="140" r="5" fill="#CECBF6"/>
+<text x="195" y="108" font-family="Georgia, 'Times New Roman', serif" font-size="62" font-weight="400" fill="#EEEDFE" letter-spacing="2">muse</text>
+<text x="197" y="140" font-family="ui-monospace, 'Courier New', monospace" font-size="13" fill="#AFA9EC" letter-spacing="3">TASTE &#183; CURATION &#183; INTELLIGENCE</text>
+<circle cx="430" cy="55" r="2" fill="#CECBF6" opacity="0.6"/>
+<circle cx="620" cy="95" r="2.5" fill="#CECBF6" opacity="0.5"/>
+</svg>

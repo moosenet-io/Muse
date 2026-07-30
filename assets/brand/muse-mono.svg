@@ -1,0 +1,28 @@
+<svg width="200" height="220" viewBox="0 0 200 220" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Muse monochrome mark</title>
+<desc>Single-color violet Muse constellation-lyre mark on transparent background.</desc>
+<g stroke="#7F77DD" fill="#7F77DD">
+<line x1="70" y1="50" x2="70" y2="170" stroke-width="2"/>
+<line x1="130" y1="50" x2="130" y2="170" stroke-width="2"/>
+<line x1="70" y1="50" x2="100" y2="32" stroke-width="2"/>
+<line x1="130" y1="50" x2="100" y2="32" stroke-width="2"/>
+<line x1="70" y1="170" x2="100" y2="188" stroke-width="2"/>
+<line x1="130" y1="170" x2="100" y2="188" stroke-width="2"/>
+<line x1="70" y1="80" x2="130" y2="80" stroke-width="1.3"/>
+<line x1="70" y1="110" x2="130" y2="110" stroke-width="1.3"/>
+<line x1="70" y1="140" x2="130" y2="140" stroke-width="1.3"/>
+<circle cx="100" cy="32" r="8"/>
+<circle cx="70" cy="50" r="5.5"/>
+<circle cx="130" cy="50" r="5.5"/>
+<circle cx="70" cy="80" r="4"/>
+<circle cx="130" cy="80" r="4"/>
+<circle cx="70" cy="110" r="4"/>
+<circle cx="130" cy="110" r="4"/>
+<circle cx="70" cy="140" r="4"/>
+<circle cx="130" cy="140" r="4"/>
+<circle cx="70" cy="170" r="5.5"/>
+<circle cx="130" cy="170" r="5.5"/>
+<circle cx="100" cy="188" r="6.5"/>
+</g>
+<circle cx="100" cy="32" r="15" fill="none" stroke="#7F77DD" stroke-width="1.2" opacity="0.6"/>
+</svg>

@@ -109,10 +109,12 @@ pub async fn watch_history_get_handler(
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupDynamicsRow {
     pub participant: String,
-    /// Percentage of this participant's sessions that overlap in time with a
-    /// session on a DIFFERENT household account. This is a time-overlap
-    /// proxy, not a couch-presence fact — see `repo::household::group_dynamics`
-    /// for exactly what it catches and what it miscounts.
+    /// Percentage of this participant's sessions whose reconstructed span
+    /// overlaps a session on a DIFFERENT household account. An ESTIMATE, not a
+    /// couch-presence fact, and NOT a conservative floor — the error runs in
+    /// both directions. See `repo::household::group_dynamics` for exactly what
+    /// it catches and what it miscounts, and
+    /// [`WATCHED_TOGETHER_BASIS`] for the version that ships to clients.
     pub watched_together_pct: f64,
     /// Empty string when this participant's watched titles carry no genre
     /// rows at all. `MuseGroupDynamicsRow.favorite_genre` is a non-optional
@@ -123,9 +125,26 @@ pub struct GroupDynamicsRow {
     pub sessions: i64,
 }
 
+/// MUSE #89: the machine-visible honesty marker. A reviewer's point stands —
+/// documenting "this is a proxy" in a Rust doc comment does nothing for a
+/// client rendering `watched_together_pct` as a hard number, so the basis
+/// travels WITH the data.
+///
+/// `MuseGroupDynamics` declares only `rows`, and TypeScript interfaces are
+/// structural, so this extra key is additive and cannot break the existing
+/// hook. A UI that wants to caveat the column now has something to read
+/// instead of having to hard-code the caveat.
+const WATCHED_TOGETHER_BASIS: &str =
+    "estimate: overlap of reconstructed session spans (started_at + watched_ms + paused_ms) \
+     across different household accounts. Concurrency is not proof of co-viewing, and a span \
+     reconstructed from durations can both miss and manufacture overlap. Not a floor.";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupDynamicsResponse {
     pub rows: Vec<GroupDynamicsRow>,
+    /// Plain-language statement of how `watched_together_pct` was derived —
+    /// see [`WATCHED_TOGETHER_BASIS`].
+    pub watched_together_basis: &'static str,
 }
 
 /// `GET /api/graph/group-dynamics` — per-household-member session counts,
@@ -146,6 +165,7 @@ pub async fn group_dynamics_get_handler(
                 sessions: r.sessions,
             })
             .collect(),
+        watched_together_basis: WATCHED_TOGETHER_BASIS,
     }))
 }
 
@@ -217,6 +237,22 @@ mod tests {
         assert!(serde_json::to_string(&json!(pct)).is_ok());
     }
 
+    /// MUSE #89: the basis string must actually reach the client. A reviewer
+    /// objected that a doc comment cannot caveat a number a UI renders as
+    /// hard data, so this pins the marker's presence and that it does not
+    /// oversell the metric.
+    #[test]
+    fn group_dynamics_response_ships_the_estimate_basis_to_the_client() {
+        let json = serde_json::to_value(GroupDynamicsResponse {
+            rows: Vec::new(),
+            watched_together_basis: WATCHED_TOGETHER_BASIS,
+        })
+        .unwrap();
+        let basis = json["watched_together_basis"].as_str().expect("basis is a string");
+        assert!(basis.starts_with("estimate:"), "must lead with its own uncertainty");
+        assert!(basis.contains("Not a floor."), "the withdrawn floor claim must stay withdrawn");
+    }
+
     #[test]
     fn group_dynamics_row_matches_the_use_muse_contract() {
         let json = serde_json::to_value(GroupDynamicsResponse {
@@ -226,6 +262,7 @@ mod tests {
                 favorite_genre: "Science Fiction".to_string(),
                 sessions: 42,
             }],
+            watched_together_basis: WATCHED_TOGETHER_BASIS,
         })
         .unwrap();
         let row = &json["rows"][0];

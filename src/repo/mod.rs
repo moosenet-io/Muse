@@ -14,6 +14,7 @@ pub mod embedding;
 pub mod episode;
 pub mod external_enrichment;
 pub mod friend_opt_in;
+pub mod household;
 pub mod indexer;
 pub mod interstitial;
 pub mod library;

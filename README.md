@@ -1,8 +1,10 @@
-<h1 align="center">Muse</h1>
+<p align="center">
+  <img src="assets/brand/muse-lockup.svg" alt="Muse" width="420">
+</p>
 
 <p align="center"><em>The Lumina Constellation's media-management module: an AI-native curation & taste brain for a Plex library — acquisition, library scan, metadata, availability intelligence, taste modeling, and a pseudo-TV channel director, backed by Postgres + pgvector.</em></p>
 
-<p align="center">Rust · 1 binary (<code>muse</code>) · 216 modules · 3,317 KG nodes · 2,554 functions · 463 structs · 47 migrations · analyzed <code>34d8427</code></p>
+<p align="center">Rust · 1 binary (<code>muse</code>) · 223 modules · 3,577 KG nodes · 2,768 functions · 496 structs · 50 migrations · analyzed <code>b0112d9</code></p>
 
 <p align="center"><a href="docs/index.md">Docs</a> · <a href="docs/getting-started.md">Getting started</a> · <a href="docs/reference/index.md">Reference</a> · <a href="docs/architecture.md">Architecture</a> · <a href="docs/guides/index.md">Guides</a></p>
 

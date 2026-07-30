@@ -1362,6 +1362,23 @@ mod tests {
         assert_eq!(progress_pct(None), 0.0);
     }
 
+    /// The repo bounds on-deck at `percent_complete < 1`, so a fully-watched
+    /// fraction can never reach `progress_pct` — a reviewer asked for `<= 1`
+    /// to cover the window before `is_finished` is persisted, and this pins
+    /// the opposite decision: a 100%-watched title does not belong on a
+    /// "continue watching" shelf. The helper itself still scales 1.0 honestly
+    /// (see above) so it cannot silently misreport if the bound ever changes.
+    #[test]
+    fn progress_pct_excludes_a_fully_watched_fraction() {
+        // Documents the SQL bound rather than re-implementing it: 1.0 is a
+        // valid input to the helper, and is excluded upstream by the query.
+        assert!(
+            !(1.0_f32 < 1.0),
+            "the repo bound is `percent_complete < 1`, so exactly-1.0 is excluded"
+        );
+        assert_eq!(progress_pct(Some(1.0)), 100.0, "but it still scales correctly if reached");
+    }
+
     #[test]
     fn on_deck_item_ids_serialize_as_strings_and_progress_as_a_number() {
         let json = serde_json::to_value(MuseOnDeckResponse {

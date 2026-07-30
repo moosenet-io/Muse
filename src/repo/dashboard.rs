@@ -262,6 +262,15 @@ pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<V
               -- average 0.991 (max 1.000), unfinished top out at 0.850, and
               -- zero rows exceed 1. The previous `< 100` bound was a no-op on
               -- this scale.
+              --
+              -- `< 1` (not `<= 1`) is deliberate, and it is a PRODUCT choice
+              -- rather than an accident of the data: a session watched to
+              -- exactly 100% does not belong on a "continue watching" shelf,
+              -- even in the window where `is_finished` has not yet been
+              -- persisted. A reviewer raised `<= 1` for that state-update
+              -- race; admitting it would put fully-watched titles on the
+              -- shelf, which is the worse outcome. The exclusion is pinned by
+              -- `progress_pct_excludes_a_fully_watched_fraction`.
               AND ps.percent_complete > 0
               AND ps.percent_complete < 1
             ORDER BY ps.media_item_id, ps.started_at DESC

@@ -113,6 +113,29 @@ ALTER TABLE artwork_cache
     CHECK ((width = 0 AND master_content_hash IS NULL)
         OR (width > 0 AND master_content_hash IS NOT NULL));
 
+-- BACKFILL. Without this the whole feature is inert on existing data: every
+-- pre-existing master row would keep `content_hash = NULL`, so
+-- `master_content_hash()` returns None, the rendition-cache lookup is skipped,
+-- and EVERY ?w= request re-decodes and re-encodes a multi-megabyte master
+-- forever. The cache would look implemented and never hit. (Both reviewers
+-- caught this; it is the difference between shipping the feature and shipping
+-- its shape.)
+--
+-- `encode(sha256(bytes), 'hex')` is byte-identical to the Rust
+-- `artwork_render::content_hash` — verified against the live database, not
+-- assumed: both produce
+--   'poster-bytes' -> db4cd92bd09403b5e8535467a5099c222bbef177d68eaf8d21dc1db0a1ec1978
+-- `sha256()` is built into PostgreSQL 11+, so this needs no pgcrypto extension.
+--
+-- Scoped to master rows that actually have bytes, and idempotent via the
+-- `content_hash IS NULL` guard, so a re-run is a no-op. Muse runs migrations at
+-- startup, so this hashes the existing cache once on the deploy that lands it.
+UPDATE artwork_cache
+   SET content_hash = encode(sha256(bytes), 'hex')
+ WHERE width = 0
+   AND bytes IS NOT NULL
+   AND content_hash IS NULL;
+
 -- Renditions are matched by provenance, so that lookup needs an index.
 CREATE INDEX IF NOT EXISTS artwork_cache_master_hash_idx
     ON artwork_cache (entity_kind, entity_id, variant, master_content_hash)

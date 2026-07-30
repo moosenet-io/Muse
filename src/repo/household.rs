@@ -95,22 +95,43 @@ pub struct GroupDynamicsRow {
 /// `watched_together_pct` because that is the GUI's contract; this doc is the
 /// place the proxy is recorded, and `web::household`'s handler doc repeats it.
 ///
-/// A session's end is `stopped_at` when known, else
-/// `started_at + duration_ms`. When BOTH are absent the window collapses to
-/// zero length, and the `together` CTE excludes such sessions explicitly (see
-/// its positive-length guards) — they are counted in `sessions` but never in
-/// `together_sessions`. So a session whose end is unknown is never *claimed*
-/// as co-viewed, which makes `watched_together_pct` a floor rather than an
-/// exact figure on data with missing stop times.
+/// ## The window is `watched_ms`, not `stopped_at` (MUSE #89)
+/// A session's window is `started_at + watched_ms` — the actual time spent
+/// watching. It is deliberately NOT `stopped_at`, which on this data is a
+/// LAST-SEEN marker rather than a stop time:
+///
+/// ```text
+///                              stopped_at - started_at      watched_ms
+///   average                            15.33 h                0.57 h
+///   maximum                          2702    h (112 d)        5.24 h
+///   rows exceeding 6 h                134 of 1544             0
+///   rows NULL or zero                   0                     0
+/// ```
+///
+/// With ~15-hour windows essentially every session overlaps some other
+/// account's, so the original `stopped_at` form reported 84–100% co-viewing
+/// for every household member — a number that said nothing. Measured both
+/// ways over the live 1,544 rows:
+///
+/// ```text
+///   participant       sessions   stopped_at%   watched_ms%
+///   zooma41                938         99.0          16.0
+///   <operator>                 329         83.9          30.1
+///   glen.b88               161         98.8          35.4
+///   jordansharpe573         62        100.0          35.5
+/// ```
+///
+/// A session with no recorded watch time collapses to a zero-length window
+/// and is excluded by the positive-length guards below — counted in
+/// `sessions` but never in `together_sessions` — so `watched_together_pct`
+/// remains a floor rather than an exact figure.
 ///
 /// Two earlier versions of this comment were wrong and both were caught in
-/// review: the first claimed such a session "has a real window" (it does
-/// not), and the second claimed the strict `<` predicates alone excluded it
-/// (they do not — a zero-length window strictly inside another session
-/// satisfies both). Hence the explicit guards rather than a relied-upon
-/// side effect. On the current data set the distinction is moot — all 1,544
-/// `play_sessions` rows have a `stopped_at` — but the guarantee should hold
-/// for data that does not.
+/// review: the first claimed a session with no end "has a real window" (it
+/// does not), and the second claimed the strict `<` predicates alone excluded
+/// a zero-length one (they do not — a zero-length window strictly inside
+/// another session satisfies both). Hence the explicit guards rather than a
+/// relied-upon side effect.
 ///
 /// The fix was verified empirically against Postgres by replaying both
 /// predicates over synthetic rows: the unguarded version counted the
@@ -124,10 +145,10 @@ pub async fn group_dynamics(pool: &PgPool) -> MuseResult<Vec<GroupDynamicsRow>> 
                 ps.id,
                 ps.account_id,
                 ps.started_at,
-                COALESCE(
-                    ps.stopped_at,
-                    ps.started_at + make_interval(secs => COALESCE(ps.duration_ms, 0) / 1000.0)
-                ) AS ended_at
+                -- MUSE #89: the window is `watched_ms`, NOT `stopped_at`.
+                -- `stopped_at` behaves like a LAST-SEEN marker on this data,
+                -- not a stop time — see the doc comment above for the numbers.
+                ps.started_at + make_interval(secs => COALESCE(ps.watched_ms, 0) / 1000.0) AS ended_at
             FROM play_sessions ps
         ),
         together AS (

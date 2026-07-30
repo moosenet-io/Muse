@@ -16,10 +16,37 @@
 //! 3. No usable row, or fetch failed, or Plex isn't configured → serve a
 //!    tiny built-in placeholder image. Never a 404/500 for a missing cover —
 //!    a blank/placeholder tile is strictly better UX in an EPG grid.
+//!
+//! ## Renditions (`?w=`, MUSE #100)
+//! `?w=<ladder width>` serves an indexed, resized rendition instead of the
+//! master — the Plex/Jellyfin model: capture once, derive many. The master is
+//! still fetched/cached by the flow above (a rendition is derived FROM it, never
+//! instead of it), then resized, stored as its own `artwork_cache` row, and
+//! served with a strong-ish validator so the browser stops re-asking.
+//!
+//! Three properties are deliberate:
+//! - An **off-ladder width is a 400**, not a clamp — see
+//!   `artwork_render`'s module doc for why a free-form `?w=` is an
+//!   amplification vector.
+//! - Encoding runs under a **bounded semaphore** on a blocking thread. 240 grid
+//!   tiles arriving at once must not start 240 multi-megabyte decodes; they
+//!   queue. This is bounded concurrency, NOT per-key single-flight — two
+//!   requests racing the same missing rendition may both encode it. That is
+//!   acceptable because the bytes are a deterministic function of
+//!   (master, width, format) and the store is an idempotent upsert; the cost is
+//!   one wasted encode, not a corrupt cache.
+//! - A rendition failure **falls back to the master**, never to an error: a
+//!   too-small poster is better than a broken tile.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
+
+use crate::web::artwork_render::{
+    parse_width, render_jpeg, rendition_etag, RENDITION_CONTENT_TYPE, RENDITION_FORMAT,
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -39,22 +66,150 @@ const PLACEHOLDER_PNG: &[u8] = &[
 /// may request another via `?variant=`.
 const DEFAULT_VARIANT: &str = "poster";
 
+/// MUSE #100: how many rendition encodes may run at once. Image decode+encode is
+/// CPU-bound and a master can be ~2 MB, so this is the difference between a grid
+/// mount costing a few cores briefly and it costing the box. Excess requests
+/// WAIT (they do not fail) — the first mount of a cold library is slower than
+/// the second, which is the correct trade.
+const RENDITION_CONCURRENCY: usize = 4;
+
+static RENDITION_SEMAPHORE: std::sync::LazyLock<Semaphore> =
+    std::sync::LazyLock::new(|| Semaphore::new(RENDITION_CONCURRENCY));
+
 pub async fn art_handler(
     State(state): State<Arc<crate::http::AppState>>,
     Path((kind, id)): Path<(String, i64)>,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+    headers: axum::http::HeaderMap,
+) -> Response {
     let variant = params
         .get("variant")
         .map(String::as_str)
         .unwrap_or(DEFAULT_VARIANT);
 
-    match crate::repo::artwork_cache::get(&state.pool, &kind, id, variant).await {
+    // MUSE #100: validate the rendition width BEFORE any I/O. An off-ladder
+    // width is a client error and must not cost a database round-trip, let alone
+    // a decode.
+    let width = match parse_width(params.get("w").map(String::as_str)) {
+        Ok(w) => w,
+        Err(()) => return bad_width_response(),
+    };
+
+    // Serve an already-cached rendition without ever touching the master.
+    if let Some(w) = width {
+        match crate::repo::artwork_cache::get_rendition(
+            &state.pool,
+            &kind,
+            id,
+            variant,
+            w,
+            RENDITION_FORMAT,
+        )
+        .await
+        {
+            Ok(Some(row)) => {
+                if let Some(bytes) = row.bytes {
+                    let etag = row.etag.clone().unwrap_or_else(|| {
+                        rendition_etag(&format!("{kind}:{id}:{variant}"), w, RENDITION_FORMAT)
+                    });
+                    if if_none_match_matches(&headers, &etag) {
+                        return not_modified_response(&etag);
+                    }
+                    return rendition_response(bytes, &etag, true);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // A cache-lookup failure must not deny the image — fall through
+                // and serve/derive from the master.
+                tracing::warn!(error = %e, kind = %kind, id, w, "rendition lookup failed; deriving");
+            }
+        }
+    }
+
+    let master = resolve_master(&state, &kind, id, variant).await;
+
+    if let (Some(w), Some((ref bytes, _))) = (width, master.as_ref().map(|m| (m.0.clone(), m.1.clone()))) {
+        if let Some(resp) = derive_rendition(&state, &kind, id, variant, w, bytes, &headers).await {
+            return resp;
+        }
+        // Rendition failed — fall through to the master below rather than erroring.
+    }
+
+    match master {
+        Some((bytes, content_type)) => image_response(&content_type, bytes, true),
+        None => placeholder_response(),
+    }
+}
+
+/// MUSE #100: encode + store a rendition of `master_bytes`, returning the served
+/// response. `None` when the derivation failed, which the caller turns into
+/// "serve the master" — never an error page.
+async fn derive_rendition(
+    state: &crate::http::AppState,
+    kind: &str,
+    id: i64,
+    variant: &str,
+    width: i32,
+    master_bytes: &[u8],
+    headers: &axum::http::HeaderMap,
+) -> Option<Response> {
+    // Bounded concurrency: queue rather than fan out N decodes. A closed
+    // semaphore is unreachable (nothing closes it), but treat it as "no
+    // rendition" rather than unwrapping.
+    let _permit = RENDITION_SEMAPHORE.acquire().await.ok()?;
+
+    let owned = master_bytes.to_vec();
+    // CPU-bound: must not run on the async runtime.
+    let rendered = tokio::task::spawn_blocking(move || render_jpeg(&owned, width))
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "rendition task panicked"))
+        .ok()?
+        .map_err(|e| tracing::warn!(error = %e, kind, id, width, "rendition encode failed"))
+        .ok()?;
+
+    let etag = rendition_etag(&format!("{kind}:{id}:{variant}"), width, RENDITION_FORMAT);
+
+    if let Err(e) = crate::repo::artwork_cache::store_rendition(
+        &state.pool,
+        kind,
+        id,
+        variant,
+        width,
+        RENDITION_FORMAT,
+        RENDITION_CONTENT_TYPE,
+        &rendered,
+        Some(&etag),
+    )
+    .await
+    {
+        // Serving it uncached is strictly better than failing; the next request
+        // simply re-derives.
+        tracing::warn!(error = %e, kind, id, width, "failed to cache rendition; serving uncached");
+    }
+
+    if if_none_match_matches(headers, &etag) {
+        return Some(not_modified_response(&etag));
+    }
+    Some(rendition_response(rendered, &etag, false))
+}
+
+/// The pre-existing master-resolution flow, unchanged in behaviour and lifted
+/// into its own function so the rendition path can reuse it: cached bytes →
+/// Plex fetch → provider fallback. `None` means "serve the placeholder".
+async fn resolve_master(
+    state: &crate::http::AppState,
+    kind: &str,
+    id: i64,
+    variant: &str,
+) -> Option<(Vec<u8>, String)> {
+
+    match crate::repo::artwork_cache::get(&state.pool, kind, id, variant).await {
         Ok(Some(row)) => {
             if let (Some(bytes), Some(content_type)) =
                 (row.bytes.clone(), row.content_type.clone())
             {
-                return image_response(&content_type, bytes, true);
+                return Some((bytes, content_type));
             }
 
             if let Some(source_url) = row.source_url.clone() {
@@ -63,7 +218,7 @@ pub async fn art_handler(
                         Ok((bytes, content_type)) => {
                             if let Err(e) = crate::repo::artwork_cache::store_bytes(
                                 &state.pool,
-                                &kind,
+                                kind,
                                 id,
                                 variant,
                                 Some(&source_url),
@@ -80,7 +235,7 @@ pub async fn art_handler(
                                     "failed to cache fetched artwork; serving it uncached this time"
                                 );
                             }
-                            return image_response(&content_type, bytes, false);
+                            return Some((bytes, content_type));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -114,11 +269,7 @@ pub async fn art_handler(
     // URL from `media_metadata.images` and proxy it server-side (public
     // provider URL, no token), caching the bytes for next time. Any failure
     // degrades to the placeholder — never a 404/500.
-    if let Some(resp) = try_provider_artwork(&state, &kind, id, variant).await {
-        return resp;
-    }
-
-    placeholder_response()
+    try_provider_artwork(state, kind, id, variant).await
 }
 
 /// Extract the first image URL of `cover_type` from a `media_metadata.images`
@@ -150,7 +301,7 @@ async fn try_provider_artwork(
     kind: &str,
     id: i64,
     variant: &str,
-) -> Option<Response> {
+) -> Option<(Vec<u8>, String)> {
     // Resolve the entity to a `media_metadata` id (the images live there).
     let metadata_id = match kind {
         "media_metadata" => id,
@@ -210,7 +361,78 @@ async fn try_provider_artwork(
         tracing::warn!(error = %e, kind, id, "failed to cache provider artwork; serving it uncached this time");
     }
 
-    Some(image_response(&content_type, bytes, false))
+    Some((bytes, content_type))
+}
+
+/// MUSE #100 response helpers. A rendition is content-addressed by
+/// (master, width, format) and only changes when one of those changes, so it can
+/// carry a long `max-age` plus a validator and answer `304` — the grid was
+/// previously re-requesting every poster on every mount.
+fn rendition_response(bytes: Vec<u8>, etag: &str, cache_hit: bool) -> Response {
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(RENDITION_CONTENT_TYPE),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=604800, immutable"),
+    );
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        headers.insert(header::ETAG, v);
+    }
+    headers.insert(
+        header::HeaderName::from_static("x-muse-artwork-cache"),
+        HeaderValue::from_static(if cache_hit { "rendition-hit" } else { "rendition-miss" }),
+    );
+    resp
+}
+
+fn not_modified_response(etag: &str) -> Response {
+    let mut resp = StatusCode::NOT_MODIFIED.into_response();
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=604800, immutable"),
+    );
+    resp
+}
+
+/// An off-ladder `?w=` is a CLIENT error, answered as such rather than clamped.
+/// See `artwork_render`'s module doc: clamping would report success for a size
+/// the caller did not get, and a free-form width is an amplification vector.
+fn bad_width_response() -> Response {
+    let ladder = crate::web::artwork_render::RENDITION_WIDTHS
+        .iter()
+        .map(|w| w.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        StatusCode::BAD_REQUEST,
+        format!("unsupported ?w= — supported rendition widths are: {ladder} (omit ?w= for the original)\n"),
+    )
+        .into_response()
+}
+
+/// `If-None-Match` handling, read from the REQUEST HEADERS (not the query
+/// string). A conditional request whose validator list contains our ETag gets a
+/// `304`; `*` matches any existing representation per RFC 9110.
+fn if_none_match_matches(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|raw| {
+            raw.split(',').any(|candidate| {
+                let c = candidate.trim();
+                // Compare weak validators by their opaque part so `W/"x"` from us
+                // matches `W/"x"` echoed back, and tolerate a client that strips
+                // the weak prefix.
+                c == "*" || c == etag || c.trim_start_matches("W/") == etag.trim_start_matches("W/")
+            })
+        })
 }
 
 fn image_response(content_type: &str, bytes: Vec<u8>, cache_hit: bool) -> Response {
@@ -329,6 +551,7 @@ mod tests {
             State(state.clone()),
             Path((entity_kind.to_string(), entity_id)),
             Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
         )
         .await
         .into_response();
@@ -354,6 +577,7 @@ mod tests {
             State(state.clone()),
             Path((entity_kind.to_string(), entity_id)),
             Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
         )
         .await
         .into_response();
@@ -372,6 +596,7 @@ mod tests {
                 State(state.clone()),
                 Path((entity_kind.to_string(), entity_id)),
                 Query(HashMap::new()),
+                axum::http::HeaderMap::new(),
             )
             .await
             .into_response(),
@@ -430,6 +655,7 @@ mod tests {
             State(state),
             Path(("media_item".to_string(), 99_999_999_i64)),
             Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
         )
         .await
         .into_response();

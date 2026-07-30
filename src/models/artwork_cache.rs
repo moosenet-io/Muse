@@ -20,6 +20,11 @@ pub struct ArtworkCache {
     /// — a row can exist purely to record a `source_url` before any bytes
     /// have been fetched.
     pub bytes: Option<Vec<u8>>,
+    /// Rendition width in px. `0` is THE ORIGINAL master image (MUSE #100).
+    pub width: i32,
+    /// `"original"` for the master; the encoded container (`"jpeg"`, …) for a
+    /// derived rendition. See the column comment in `0109_artwork_renditions`.
+    pub format: String,
     pub etag: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,

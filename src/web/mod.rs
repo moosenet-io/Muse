@@ -11,6 +11,7 @@
 //! does not stand up its own HTTP server or app state.
 
 pub mod artwork;
+pub mod artwork_render;
 pub mod dashboard;
 pub mod graph;
 pub mod household;

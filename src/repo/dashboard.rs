@@ -396,18 +396,24 @@ mod tests {
                 return;
             };
 
-            // Unique per run so repeated runs cannot collide on the upserts'
-            // natural keys.
-            let suffix = std::process::id();
-
+            // The account is seeded FIRST and its `bigserial` id becomes the
+            // suffix for every other fixture key. A reviewer rightly rejected
+            // `std::process::id()`: PIDs recycle, so two runs against the same
+            // database could collide on `media_metadata.tmdb_id` (the natural
+            // key `upsert_by_tmdb` keys on) or on `media_items (library_id,
+            // media_metadata_id)`. A sequence value never repeats.
+            //
+            // `accounts.username` needs no nonce — the table's only unique
+            // constraints are on `id` and `plex_account_id`, neither of which
+            // this fixture sets by hand.
             let (account_id,): (i64,) = sqlx::query_as(
                 "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
-                 VALUES ($1, 'MUSE87 Fixture', true, false) RETURNING id",
+                 VALUES ('muse87-fixture', 'MUSE87 Fixture', true, false) RETURNING id",
             )
-            .bind(format!("muse87-fixture-{suffix}"))
             .fetch_one(&pool)
             .await
             .expect("seed account");
+            let suffix = account_id;
 
             let library = crate::repo::library::create(
                 &pool,
@@ -504,6 +510,11 @@ mod tests {
                 "a fully-watched (1.0) unfinished session must NOT be on deck"
             );
 
+            // Full teardown, FK-safe order. An earlier version deleted only
+            // the sessions and the account, leaving library/media_metadata/
+            // media_item rows to accumulate on every run — a reviewer caught
+            // that. `media_items` cascades from neither parent explicitly, so
+            // it is removed before its metadata and library.
             sqlx::query("DELETE FROM play_sessions WHERE account_id = $1")
                 .bind(account_id)
                 .execute(&pool)
@@ -511,6 +522,24 @@ mod tests {
                 .ok();
             sqlx::query("DELETE FROM accounts WHERE id = $1")
                 .bind(account_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM media_items WHERE library_id = $1")
+                .bind(library.id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM media_metadata WHERE tmdb_id = ANY($1)")
+                .bind(vec![
+                    format!("muse87-partial-{suffix}"),
+                    format!("muse87-complete-{suffix}"),
+                ])
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM libraries WHERE id = $1")
+                .bind(library.id)
                 .execute(&pool)
                 .await
                 .ok();

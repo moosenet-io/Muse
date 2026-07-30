@@ -123,11 +123,13 @@ pub fn rendition_etag(bytes: &[u8]) -> String {
 
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
-    // 16 hex chars (64 bits) is ample for cache validation and keeps the header
-    // small. Hand-rolled rather than pulling in a `hex` dependency for one line.
-    let mut out = String::with_capacity(18);
+    // The FULL digest. A truncated prefix is operationally fine for cache
+    // validation, but a reviewer rightly noted it weakens a strong validator for
+    // no real saving — 64 hex chars in a header costs nothing. Hand-rolled rather
+    // than pulling in a `hex` dependency for one line.
+    let mut out = String::with_capacity(66);
     out.push('"');
-    for b in &digest[..8] {
+    for b in digest.iter() {
         // Infallible: writing to a String cannot fail.
         let _ = write!(out, "{b:02x}");
     }

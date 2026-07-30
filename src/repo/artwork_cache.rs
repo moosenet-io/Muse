@@ -1,7 +1,7 @@
 //! Repo functions for `artwork_cache` (MUSE-27). Runtime sqlx only, per the
 //! MUSE-02 build constraint (the crate must build without a live database).
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::error::{MuseError, MuseResult};
@@ -85,6 +85,16 @@ pub async fn store_bytes(
     etag: Option<&str>,
 ) -> MuseResult<ArtworkCache> {
     let fetched_at = Utc::now();
+
+    // MUSE #100: the master upsert and the rendition purge are ONE TRANSACTION.
+    // As two separate pool operations there was a committed window in which the
+    // new master coexisted with old renditions, and a rendition hit (which does
+    // not read the master) would serve one — with a byte-accurate ETag, so the
+    // client's 304 was "correct" about the wrong image. Atomicity closes that
+    // window; the `master_generation` stamp closes the remaining lost-update race
+    // (see `store_rendition`).
+    let mut tx = pool.begin().await.map_err(MuseError::Database)?;
+
     let row = sqlx::query_as::<_, ArtworkCache>(
         r#"
         INSERT INTO artwork_cache (
@@ -92,10 +102,9 @@ pub async fn store_bytes(
             width, format
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'original')
-        -- MUSE #100: the inference target MUST be the new five-column unique
-        -- index; the old three-column constraint no longer exists, and a stale
-        -- ON CONFLICT list fails at RUNTIME (not compile time) with
-        -- "no unique or exclusion constraint matching the ON CONFLICT spec".
+        -- The inference target MUST be the new five-column unique index; a stale
+        -- ON CONFLICT list fails at RUNTIME with "no unique or exclusion
+        -- constraint matching the ON CONFLICT spec".
         ON CONFLICT (entity_kind, entity_id, variant, width, format)
         DO UPDATE SET
             source_url = COALESCE(EXCLUDED.source_url, artwork_cache.source_url),
@@ -115,28 +124,55 @@ pub async fn store_bytes(
     .bind(bytes)
     .bind(etag)
     .bind(fetched_at)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(MuseError::Database)?;
 
-    // MUSE #100 — THE INVALIDATION. Every derivative of this master is now
-    // stale, so it is deleted in the same call that replaced the master. Without
-    // this, a replaced poster would keep serving its OLD rendition indefinitely
-    // (the rendition lookup deliberately runs BEFORE the master read, and the
-    // response carries a long max-age), which is exactly the bug the review
-    // caught. Deleting rather than versioning keeps the cache key simple: a
-    // rendition either matches the current master or does not exist.
-    if let Err(e) = delete_renditions(pool, entity_kind, entity_id, variant).await {
-        // A failed purge must not fail the master write — the master is the
-        // valuable artifact. Log loudly: the consequence is a stale thumbnail,
-        // not a lost image.
-        tracing::warn!(
-            error = %e, entity_kind, entity_id, variant,
-            "failed to purge renditions after a master update; a stale rendition may be served"
-        );
-    }
+    // Every derivative of this master is now stale. In-transaction, so a failure
+    // ROLLS BACK the master write rather than being logged and swallowed — the
+    // previous version's "log and continue" guaranteed a stale-serving path.
+    sqlx::query(
+        "DELETE FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 AND width <> $4",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(ORIGINAL_WIDTH)
+    .execute(&mut *tx)
+    .await
+    .map_err(MuseError::Database)?;
 
+    tx.commit().await.map_err(MuseError::Database)?;
     Ok(row)
+}
+
+/// MUSE #100: the master's current generation — its `updated_at`. Selects ONLY
+/// that column on purpose: the whole point of the rendition fast path is to avoid
+/// moving a ~2 MB `bytea`, so the freshness check must stay a tiny indexed read.
+///
+/// `None` means there is no master row with bytes, in which case no rendition can
+/// be valid.
+pub async fn master_generation(
+    pool: &PgPool,
+    entity_kind: &str,
+    entity_id: i64,
+    variant: &str,
+) -> MuseResult<Option<DateTime<Utc>>> {
+    let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
+        "SELECT updated_at FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 \
+           AND width = $4 AND format = $5 AND bytes IS NOT NULL",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(ORIGINAL_WIDTH)
+    .bind(ORIGINAL_FORMAT)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(row.map(|r| r.0))
 }
 
 /// Delete every derived rendition of `(entity_kind, entity_id, variant)`,
@@ -174,17 +210,22 @@ pub async fn get_rendition(
     variant: &str,
     width: i32,
     format: &str,
+    master_generation: DateTime<Utc>,
 ) -> MuseResult<Option<ArtworkCache>> {
     sqlx::query_as::<_, ArtworkCache>(
+        // The `master_generation` predicate IS the freshness gate: a rendition
+        // derived from a superseded master does not match, so it can never be
+        // served — even if a purge was missed or lost a race with a slow encode.
         "SELECT * FROM artwork_cache \
          WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 \
-           AND width = $4 AND format = $5",
+           AND width = $4 AND format = $5 AND master_generation = $6",
     )
     .bind(entity_kind)
     .bind(entity_id)
     .bind(variant)
     .bind(width)
     .bind(format)
+    .bind(master_generation)
     .fetch_optional(pool)
     .await
     .map_err(MuseError::Database)
@@ -208,6 +249,7 @@ pub async fn store_rendition(
     content_type: &str,
     bytes: &[u8],
     etag: Option<&str>,
+    master_generation: DateTime<Utc>,
 ) -> MuseResult<ArtworkCache> {
     // Mirror the DB CHECK in code so a bad call fails with a clear message rather
     // than a constraint violation from three layers down.
@@ -221,15 +263,17 @@ pub async fn store_rendition(
     sqlx::query_as::<_, ArtworkCache>(
         r#"
         INSERT INTO artwork_cache (
-            entity_kind, entity_id, variant, width, format, content_type, bytes, etag, fetched_at
+            entity_kind, entity_id, variant, width, format, content_type, bytes, etag, fetched_at,
+            master_generation
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (entity_kind, entity_id, variant, width, format)
         DO UPDATE SET
             content_type = EXCLUDED.content_type,
             bytes = EXCLUDED.bytes,
             etag = EXCLUDED.etag,
             fetched_at = EXCLUDED.fetched_at,
+            master_generation = EXCLUDED.master_generation,
             updated_at = now()
         RETURNING *
         "#,
@@ -243,6 +287,7 @@ pub async fn store_rendition(
     .bind(bytes)
     .bind(etag)
     .bind(fetched_at)
+    .bind(master_generation)
     .fetch_one(pool)
     .await
     .map_err(MuseError::Database)

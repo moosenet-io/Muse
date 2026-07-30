@@ -16,7 +16,19 @@
 
 ALTER TABLE artwork_cache
     ADD COLUMN IF NOT EXISTS width  integer NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS format text    NOT NULL DEFAULT 'original';
+    ADD COLUMN IF NOT EXISTS format text    NOT NULL DEFAULT 'original',
+    -- The master generation a rendition was derived FROM (the master row's own
+    -- `updated_at` at derive time). NULL on the master row itself.
+    --
+    -- This is what makes staleness structurally impossible rather than merely
+    -- unlikely. Deleting renditions when the master changes is not sufficient on
+    -- its own: a request that read the OLD master, then spent a second encoding,
+    -- can COMMIT ITS RENDITION AFTER a concurrent master write has already
+    -- purged — and that row would then be served forever, because a rendition
+    -- hit does not read the master. Stamping the generation turns that lost race
+    -- into a harmless orphan: the next lookup asks for the CURRENT generation,
+    -- does not match, and re-derives.
+    ADD COLUMN IF NOT EXISTS master_generation timestamptz;
 
 COMMENT ON COLUMN artwork_cache.width IS
     'Rendition width in px; 0 = the original master image, never a derivative.';
@@ -83,7 +95,18 @@ ALTER TABLE artwork_cache
     ADD CONSTRAINT artwork_cache_original_sentinel
     CHECK ((width = 0 AND format = 'original') OR (width > 0 AND format <> 'original'));
 
--- Partial-free, total unique key over the rendition identity.
+-- A rendition must record its provenance; the master must not claim one.
+ALTER TABLE artwork_cache
+    DROP CONSTRAINT IF EXISTS artwork_cache_generation_sentinel;
+ALTER TABLE artwork_cache
+    ADD CONSTRAINT artwork_cache_generation_sentinel
+    CHECK ((width = 0 AND master_generation IS NULL)
+        OR (width > 0 AND master_generation IS NOT NULL));
+
+-- Partial-free, total unique key over the rendition identity. `master_generation`
+-- is deliberately NOT in the key: one row per (entity, variant, width, format),
+-- whose generation column says which master it belongs to. Keying on generation
+-- instead would accumulate a row per master revision forever.
 CREATE UNIQUE INDEX IF NOT EXISTS artwork_cache_rendition_key
     ON artwork_cache (entity_kind, entity_id, variant, width, format);
 

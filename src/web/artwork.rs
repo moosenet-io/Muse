@@ -104,8 +104,22 @@ pub async fn art_handler(
         return bad_variant_for_rendition_response(variant);
     }
 
-    // Serve an already-cached rendition without ever touching the master.
-    if let Some(w) = width {
+    // Serve an already-cached rendition without reading the master's BYTES. The
+    // master's generation is still consulted (a single indexed column read, no
+    // bytea) because that is what proves the rendition is not stale — see
+    // `repo::artwork_cache::get_rendition`.
+    let generation = if width.is_some() {
+        crate::repo::artwork_cache::master_generation(&state.pool, &kind, id, variant)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, kind = %kind, id, "master generation lookup failed; deriving");
+                None
+            })
+    } else {
+        None
+    };
+
+    if let (Some(w), Some(gen)) = (width, generation) {
         match crate::repo::artwork_cache::get_rendition(
             &state.pool,
             &kind,
@@ -113,6 +127,7 @@ pub async fn art_handler(
             variant,
             w,
             RENDITION_FORMAT,
+            gen,
         )
         .await
         {
@@ -141,7 +156,9 @@ pub async fn art_handler(
     let master = resolve_master(&state, &kind, id, variant).await;
 
     if let (Some(w), Some((ref bytes, _))) = (width, master.as_ref().map(|m| (m.0.clone(), m.1.clone()))) {
-        if let Some(resp) = derive_rendition(&state, &kind, id, variant, w, bytes, &headers).await {
+        if let Some(resp) =
+            derive_rendition(&state, &kind, id, variant, w, bytes, &headers, generation).await
+        {
             return resp;
         }
         // Rendition failed — fall through to the master below rather than erroring.
@@ -164,6 +181,7 @@ async fn derive_rendition(
     width: i32,
     master_bytes: &[u8],
     headers: &axum::http::HeaderMap,
+    generation: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<Response> {
     // Bounded concurrency: queue rather than fan out N decodes. A closed
     // semaphore is unreachable (nothing closes it), but treat it as "no
@@ -181,6 +199,22 @@ async fn derive_rendition(
 
     let etag = rendition_etag(&rendered);
 
+    // Re-read the generation if we did not have one (the master was only just
+    // fetched by `resolve_master`, so its row exists now). Without a generation
+    // the rendition cannot be stamped, and an unstamped rendition is one the
+    // CHECK constraint rejects — so it is served uncached rather than stored.
+    let generation = match generation {
+        Some(g) => Some(g),
+        None => crate::repo::artwork_cache::master_generation(&state.pool, kind, id, variant)
+            .await
+            .unwrap_or(None),
+    };
+
+    let Some(generation) = generation else {
+        tracing::debug!(kind, id, width, "no master generation; serving rendition uncached");
+        return Some(rendition_response(rendered, &etag, false));
+    };
+
     if let Err(e) = crate::repo::artwork_cache::store_rendition(
         &state.pool,
         kind,
@@ -191,6 +225,7 @@ async fn derive_rendition(
         RENDITION_CONTENT_TYPE,
         &rendered,
         Some(&etag),
+        generation,
     )
     .await
     {

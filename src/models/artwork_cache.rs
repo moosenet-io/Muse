@@ -25,6 +25,10 @@ pub struct ArtworkCache {
     /// `"original"` for the master; the encoded container (`"jpeg"`, …) for a
     /// derived rendition. See the column comment in `0109_artwork_renditions`.
     pub format: String,
+    /// For a rendition, the master's `updated_at` at derive time — its
+    /// provenance. `None` on the master row. A rendition whose generation does
+    /// not match the current master is stale and MUST NOT be served.
+    pub master_generation: Option<DateTime<Utc>>,
     pub etag: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,

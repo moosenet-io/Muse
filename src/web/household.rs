@@ -46,6 +46,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::error::MuseResult;
 use crate::http::AppState;
 use crate::repo;
 
@@ -72,18 +73,19 @@ pub struct HistoryQuery {
 pub async fn watch_history_get_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
-) -> Json<Value> {
+) -> MuseResult<Json<Value>> {
     let days = q
         .days
         .unwrap_or(DEFAULT_HISTORY_DAYS)
         .clamp(1, MAX_HISTORY_DAYS);
 
-    let buckets = repo::household::watch_history(&state.pool, days)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "watch_history_get: query failed; serving empty series");
-            Vec::new()
-        });
+    // Errors propagate: `useMuseSection` renders any 2xx body AS DATA, so a
+    // failed query becoming `{"series":[]}` would draw an empty chart that
+    // claims "nobody watched anything for 90 days". Same correction the
+    // sibling MUSE #84 endpoints took — flagged here by both reviewers,
+    // because this module was written before that fix landed and repeated the
+    // mistake.
+    let buckets = repo::household::watch_history(&state.pool, days).await?;
 
     // BTreeMap keeps the days in chronological order without a second sort;
     // the SQL already returns them ordered, but the pivot has to group anyway.
@@ -101,7 +103,7 @@ pub async fn watch_history_get_handler(
         })
         .collect();
 
-    Json(json!({ "series": series }))
+    Ok(Json(json!({ "series": series })))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,15 +132,11 @@ pub struct GroupDynamicsResponse {
 /// co-viewing overlap, and most-watched genre.
 pub async fn group_dynamics_get_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<GroupDynamicsResponse> {
-    let rows = repo::household::group_dynamics(&state.pool)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "group_dynamics_get: query failed; serving empty");
-            Vec::new()
-        });
+) -> MuseResult<Json<GroupDynamicsResponse>> {
+    // Errors propagate — see `watch_history_get_handler`.
+    let rows = repo::household::group_dynamics(&state.pool).await?;
 
-    Json(GroupDynamicsResponse {
+    Ok(Json(GroupDynamicsResponse {
         rows: rows
             .into_iter()
             .map(|r| GroupDynamicsRow {
@@ -148,7 +146,7 @@ pub async fn group_dynamics_get_handler(
                 sessions: r.sessions,
             })
             .collect(),
-    })
+    }))
 }
 
 /// Overlap share as a 0–100 percentage, rounded to one decimal.

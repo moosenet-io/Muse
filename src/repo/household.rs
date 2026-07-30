@@ -95,9 +95,15 @@ pub struct GroupDynamicsRow {
 /// `watched_together_pct` because that is the GUI's contract; this doc is the
 /// place the proxy is recorded, and `web::household`'s handler doc repeats it.
 ///
-/// A session's end is `stopped_at` when known, else `started_at + duration_ms`
-/// — a still-open session therefore has a real window rather than a
-/// zero-length one.
+/// A session's end is `stopped_at` when known, else
+/// `started_at + duration_ms`. When BOTH are absent the window collapses to
+/// zero length, and the strict `<` overlap predicate then excludes that
+/// session from `together` entirely — it is counted in `sessions` but never
+/// in `together_sessions`. That is the conservative direction (a session with
+/// no recorded end cannot be claimed as co-viewed), but it does mean
+/// `watched_together_pct` is a floor, not an exact figure, on data with
+/// missing stop times. (An earlier version of this comment claimed such a
+/// session "has a real window"; that was wrong, and a reviewer caught it.)
 pub async fn group_dynamics(pool: &PgPool) -> MuseResult<Vec<GroupDynamicsRow>> {
     sqlx::query_as::<_, GroupDynamicsRow>(
         r#"

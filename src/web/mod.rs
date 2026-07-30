@@ -54,6 +54,14 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/api/library/:id", get(dashboard::get_library_detail))
         .route("/api/discover", get(dashboard::get_discover))
         .route("/api/subsystems", get(dashboard::get_subsystems))
+        // MUSE #84: the Constellation web GUI's Muse dashboard cards. Only the
+        // two whole-library aggregates are public — `/stats` is four counts and
+        // a timestamp, `/gaps` is the same `wanted_titles` projection
+        // `/api/library` already returns here. Neither has a per-account
+        // component. `/on_deck` (viewing history) and `/premiere` stay on
+        // [`protected_routes`]; do not move them here.
+        .route("/stats", get(dashboard::get_stats))
+        .route("/gaps", get(dashboard::get_gaps))
 }
 
 /// Routes this module contributes that MUST be protected by
@@ -93,4 +101,9 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/api/indexers", get(dashboard::get_indexers))
         .route("/api/indexers/rss", get(dashboard::get_rss))
         .route("/api/rss", get(dashboard::get_rss))
+        // MUSE #84: per-account viewing history + premiere schedule. PROTECTED
+        // (CAP-SEC-03) — `/on_deck` is "who left what half-watched", which is
+        // exactly the per-account data this group exists to gate.
+        .route("/on_deck", get(dashboard::get_on_deck))
+        .route("/premiere", get(dashboard::get_premiere))
 }

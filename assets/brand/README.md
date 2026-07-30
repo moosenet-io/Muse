@@ -22,3 +22,34 @@ ramp, dots-and-lines constellation motif rendered as a lyre (celestial + muse).
   For pixel-identical rendering across machines, convert the wordmark to outlines,
   or swap in the repo's chosen brand fonts.
 - For PNG favicons, rasterize `muse-mark.svg` or `muse-mono.svg` at 512/192/32px.
+
+## Provenance & rights
+
+First-party project artwork: created for the Lumina Constellation by the project
+owner (moosenet) and supplied for this repository. Not third-party or
+externally-licensed material, so there is no upstream attribution requirement to
+carry.
+
+These files are mirrored to the public GitHub repo along with the rest of the
+tree. Note the usual distinction: the repository's MIT `LICENSE` covers the
+**code**, and permissive code licenses do not grant trademark or brand rights.
+Treat the mark and wordmark as project identity — reuse them to refer to Muse,
+not to brand something else. If different terms are wanted, state them here and
+they override this note.
+
+## Verified safe to publish (2026-07-30)
+
+Checked before the assets went to the public mirror, because SVG is an active
+format and README rendering differs between Gitea and GitHub:
+
+- **Inert.** Every element present is one of `svg g rect circle line text title
+  desc`; every attribute is geometry/style (`viewBox`, `fill`, `transform`,
+  `font-*`, `x`/`y`/`r`/`cx`/`cy`, `opacity`, `stroke*`, `text-anchor`,
+  `letter-spacing`, `role`, `xmlns`). No `<script>`, no `on*` event handlers, no
+  `javascript:`, no `<foreignObject>`, no `<iframe>`, no `<animate>`/`<set>`.
+- **Self-contained.** No external `href`/`xlink:href`/`url()` references, so
+  nothing tries to fetch a remote font or image — which would render broken under
+  GitHub's README CSP.
+- **No PII.** No IPs, hostnames, emails or internal identifiers.
+
+Re-run those checks if the pack is ever regenerated or edited.

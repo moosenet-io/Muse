@@ -118,23 +118,26 @@ pub fn render_jpeg(original: &[u8], width: i32) -> MuseResult<Vec<u8>> {
 /// `repo::artwork_cache::delete_renditions`. The byte-ETag and the purge are
 /// belt and braces: the purge stops a stale rendition existing, the ETag stops a
 /// stale one being revalidated as fresh.)
-pub fn rendition_etag(bytes: &[u8]) -> String {
+/// SHA-256 of `bytes`, hex, unquoted — the provenance/identity primitive.
+/// [`rendition_etag`] is this value wrapped as an HTTP entity-tag.
+pub fn content_hash(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
-    // The FULL digest. A truncated prefix is operationally fine for cache
-    // validation, but a reviewer rightly noted it weakens a strong validator for
-    // no real saving — 64 hex chars in a header costs nothing. Hand-rolled rather
-    // than pulling in a `hex` dependency for one line.
-    let mut out = String::with_capacity(66);
-    out.push('"');
+    let mut out = String::with_capacity(64);
     for b in digest.iter() {
         // Infallible: writing to a String cannot fail.
         let _ = write!(out, "{b:02x}");
     }
-    out.push('"');
     out
+}
+
+pub fn rendition_etag(bytes: &[u8]) -> String {
+    // The FULL digest. A truncated prefix is operationally fine for cache
+    // validation, but a reviewer rightly noted it weakens a strong validator for
+    // no real saving — 64 hex chars in a header costs nothing.
+    format!("\"{}\"", content_hash(bytes))
 }
 
 /// Variants this endpoint will serve. An ALLOWLIST because `variant` is part of
@@ -195,6 +198,15 @@ mod tests {
         assert_eq!(a, rendition_etag(b"rendition-bytes-A"), "and it must be stable");
         assert!(a.starts_with('"') && a.ends_with('"'), "strong validator, quoted");
         assert!(!a.starts_with("W/"), "not weak — it is computed from the representation");
+    }
+
+    #[test]
+    fn content_hash_is_the_full_sha256_and_the_etag_wraps_it() {
+        let h = content_hash(b"poster-bytes");
+        assert_eq!(h.len(), 64, "full SHA-256, not a truncated prefix");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(rendition_etag(b"poster-bytes"), format!("\"{h}\""));
+        assert_ne!(h, content_hash(b"poster-byteS"), "one bit changes the identity");
     }
 
     #[test]

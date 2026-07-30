@@ -17,18 +17,28 @@
 ALTER TABLE artwork_cache
     ADD COLUMN IF NOT EXISTS width  integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS format text    NOT NULL DEFAULT 'original',
-    -- The master generation a rendition was derived FROM (the master row's own
-    -- `updated_at` at derive time). NULL on the master row itself.
+    -- `content_hash` (master rows): SHA-256 of the master's own bytes.
+    -- `master_content_hash` (rendition rows): the content_hash of the master the
+    -- rendition was derived FROM.
     --
-    -- This is what makes staleness structurally impossible rather than merely
-    -- unlikely. Deleting renditions when the master changes is not sufficient on
-    -- its own: a request that read the OLD master, then spent a second encoding,
-    -- can COMMIT ITS RENDITION AFTER a concurrent master write has already
-    -- purged — and that row would then be served forever, because a rendition
-    -- hit does not read the master. Stamping the generation turns that lost race
-    -- into a harmless orphan: the next lookup asks for the CURRENT generation,
-    -- does not match, and re-derives.
-    ADD COLUMN IF NOT EXISTS master_generation timestamptz;
+    -- A rendition is served only when those match, which is what makes staleness
+    -- structurally impossible rather than merely unlikely. Purging renditions on
+    -- a master write is NOT sufficient alone: a request that read the old master
+    -- and spent a second encoding can COMMIT ITS RENDITION AFTER a concurrent
+    -- master write already purged, and that row would be served forever because a
+    -- rendition hit does not read the master bytes. Provenance turns that lost
+    -- race into an inert orphan — the next lookup asks for the CURRENT hash, does
+    -- not match, and re-derives.
+    --
+    -- CONTENT hash, not a timestamp: an earlier revision used the master's
+    -- `updated_at`, which is not a sound identity. Postgres `now()` is the
+    -- TRANSACTION-START time — constant across a transaction and equal for
+    -- multiple writes within one — and `timestamptz` has finite precision, so two
+    -- distinct master revisions can share a value and equality gating would then
+    -- accept a rendition of the older one. A hash of the bytes cannot collide
+    -- that way. (Both reviewers flagged this independently.)
+    ADD COLUMN IF NOT EXISTS content_hash        text,
+    ADD COLUMN IF NOT EXISTS master_content_hash text;
 
 COMMENT ON COLUMN artwork_cache.width IS
     'Rendition width in px; 0 = the original master image, never a derivative.';
@@ -100,8 +110,13 @@ ALTER TABLE artwork_cache
     DROP CONSTRAINT IF EXISTS artwork_cache_generation_sentinel;
 ALTER TABLE artwork_cache
     ADD CONSTRAINT artwork_cache_generation_sentinel
-    CHECK ((width = 0 AND master_generation IS NULL)
-        OR (width > 0 AND master_generation IS NOT NULL));
+    CHECK ((width = 0 AND master_content_hash IS NULL)
+        OR (width > 0 AND master_content_hash IS NOT NULL));
+
+-- Renditions are matched by provenance, so that lookup needs an index.
+CREATE INDEX IF NOT EXISTS artwork_cache_master_hash_idx
+    ON artwork_cache (entity_kind, entity_id, variant, master_content_hash)
+    WHERE width > 0;
 
 -- Partial-free, total unique key over the rendition identity. `master_generation`
 -- is deliberately NOT in the key: one row per (entity, variant, width, format),

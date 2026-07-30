@@ -45,7 +45,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::web::artwork_render::{
-    parse_width, render_jpeg, rendition_etag, variant_allowed, variant_renderable,
+    content_hash, parse_width, render_jpeg, rendition_etag, variant_allowed, variant_renderable,
     RENDITION_CONTENT_TYPE, RENDITION_FORMAT,
 };
 
@@ -108,18 +108,18 @@ pub async fn art_handler(
     // master's generation is still consulted (a single indexed column read, no
     // bytea) because that is what proves the rendition is not stale — see
     // `repo::artwork_cache::get_rendition`.
-    let generation = if width.is_some() {
-        crate::repo::artwork_cache::master_generation(&state.pool, &kind, id, variant)
+    let master_hash = if width.is_some() {
+        crate::repo::artwork_cache::master_content_hash(&state.pool, &kind, id, variant)
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, kind = %kind, id, "master generation lookup failed; deriving");
+                tracing::warn!(error = %e, kind = %kind, id, "master hash lookup failed; deriving");
                 None
             })
     } else {
         None
     };
 
-    if let (Some(w), Some(gen)) = (width, generation) {
+    if let (Some(w), Some(ref mh)) = (width, master_hash.as_ref()) {
         match crate::repo::artwork_cache::get_rendition(
             &state.pool,
             &kind,
@@ -127,7 +127,7 @@ pub async fn art_handler(
             variant,
             w,
             RENDITION_FORMAT,
-            gen,
+            mh,
         )
         .await
         {
@@ -155,10 +155,8 @@ pub async fn art_handler(
 
     let master = resolve_master(&state, &kind, id, variant).await;
 
-    if let (Some(w), Some((ref bytes, _))) = (width, master.as_ref().map(|m| (m.0.clone(), m.1.clone()))) {
-        if let Some(resp) =
-            derive_rendition(&state, &kind, id, variant, w, bytes, &headers, generation).await
-        {
+    if let (Some(w), Some((bytes, _))) = (width, master.as_ref()) {
+        if let Some(resp) = derive_rendition(&state, &kind, id, variant, w, bytes, &headers).await {
             return resp;
         }
         // Rendition failed — fall through to the master below rather than erroring.
@@ -181,12 +179,23 @@ async fn derive_rendition(
     width: i32,
     master_bytes: &[u8],
     headers: &axum::http::HeaderMap,
-    generation: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<Response> {
     // Bounded concurrency: queue rather than fan out N decodes. A closed
     // semaphore is unreachable (nothing closes it), but treat it as "no
     // rendition" rather than unwrapping.
     let _permit = RENDITION_SEMAPHORE.acquire().await.ok()?;
+
+    // Provenance is computed from the EXACT bytes being rendered, before the
+    // encode, not read back from the database afterwards.
+    //
+    // The earlier version read the master's generation AFTER encoding when it did
+    // not already have one, which codex correctly called a blocker: a request
+    // that encoded master M1 could, if M2 landed meanwhile, stamp its M1
+    // rendition with M2's identity — making stale bytes look current forever and
+    // producing a 304 that was wrong about which image the client held. Hashing
+    // the input makes mislabelling impossible: the stamp cannot describe bytes
+    // other than the ones it was computed from.
+    let provenance = content_hash(master_bytes);
 
     let owned = master_bytes.to_vec();
     // CPU-bound: must not run on the async runtime.
@@ -199,22 +208,6 @@ async fn derive_rendition(
 
     let etag = rendition_etag(&rendered);
 
-    // Re-read the generation if we did not have one (the master was only just
-    // fetched by `resolve_master`, so its row exists now). Without a generation
-    // the rendition cannot be stamped, and an unstamped rendition is one the
-    // CHECK constraint rejects — so it is served uncached rather than stored.
-    let generation = match generation {
-        Some(g) => Some(g),
-        None => crate::repo::artwork_cache::master_generation(&state.pool, kind, id, variant)
-            .await
-            .unwrap_or(None),
-    };
-
-    let Some(generation) = generation else {
-        tracing::debug!(kind, id, width, "no master generation; serving rendition uncached");
-        return Some(rendition_response(rendered, &etag, false));
-    };
-
     if let Err(e) = crate::repo::artwork_cache::store_rendition(
         &state.pool,
         kind,
@@ -225,7 +218,7 @@ async fn derive_rendition(
         RENDITION_CONTENT_TYPE,
         &rendered,
         Some(&etag),
-        generation,
+        &provenance,
     )
     .await
     {
@@ -421,15 +414,19 @@ fn rendition_response(bytes: Vec<u8>, etag: &str, cache_hit: bool) -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static(RENDITION_CONTENT_TYPE),
     );
-    // NOT `immutable`: a rendition is derived, and replacing the master changes
-    // it (the master write purges renditions — `delete_renditions`). `immutable`
-    // told browsers never to revalidate, which is how a replaced poster would
-    // have stayed visibly stale for a week. A day plus a byte-derived validator
-    // kills the per-mount re-request storm while keeping staleness bounded and
-    // recoverable on reload.
+    // `no-cache` means "you may store this, but revalidate before reuse" — NOT
+    // "don't cache". With the strong byte-derived ETag, a revalidation costs one
+    // conditional request and returns `304` with no body, so the per-mount
+    // BYTE-transfer storm is still eliminated.
+    //
+    // Any `max-age > 0` would let a browser keep showing a poster after the
+    // master changed, regardless of the database purge and the provenance gate —
+    // a reviewer's point, and correct: server-side invalidation cannot reach a
+    // copy already in a client's cache. Correctness beats saving a conditional
+    // GET on a LAN-served image.
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400"),
+        HeaderValue::from_static("no-cache"),
     );
     if let Ok(v) = HeaderValue::from_str(etag) {
         headers.insert(header::ETAG, v);
@@ -448,7 +445,7 @@ fn not_modified_response(etag: &str) -> Response {
     }
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400"),
+        HeaderValue::from_static("no-cache"),
     );
     resp
 }

@@ -9,7 +9,7 @@ ramp, dots-and-lines constellation motif rendered as a lyre (celestial + muse).
 | `muse-mark.svg` | Primary mark (420x420) — repo avatar, favicon source |
 | `muse-lockup.svg` | Horizontal lockup (680x200) — README header, docs |
 | `muse-mono.svg` | Monochrome, transparent (200x220) — stamps, small favicons, one-color contexts |
-| `muse-banner.svg` | Social/OpenGraph banner (680x356) — repo social preview |
+| `muse-banner.svg` | Social/OpenGraph banner (680x356) — **source** for the repo social preview (GitHub accepts PNG/JPG/GIF only, not SVG — use `png/muse-banner-1280.png`) |
 | `muse-icons.svg` | Sub-domain glyph set (680x250) — taste, curation, metadata, availability, recommend, channel director |
 
 ## Palette (Constellation family)
@@ -53,3 +53,21 @@ format and README rendering differs between Gitea and GitHub:
 - **No PII.** No IPs, hostnames, emails or internal identifiers.
 
 Re-run those checks if the pack is ever regenerated or edited.
+
+## Rasterized PNGs (`png/`)
+
+GitHub and Gitea both need raster images for the places that matter most, so the
+two files you actually upload are pre-rendered here:
+
+| File | Use |
+|------|-----|
+| `png/muse-mark-512.png` | Gitea repo avatar (and any 512px icon slot) |
+| `png/muse-mark-192.png` | PWA / apple-touch icon |
+| `png/muse-mark-32.png` | favicon |
+| `png/muse-banner-1280.png` | GitHub social preview (1280x670) |
+
+Rendered from the SVGs with headless chromium at deviceScaleFactor 1 and
+verified visually — the wordmark uses a system serif stack, so a raster made on
+a machine without a Georgia-class serif would substitute a different face. If
+you regenerate these, check the wordmark actually looks right rather than
+trusting the exit code.

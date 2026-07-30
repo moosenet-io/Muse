@@ -1037,27 +1037,24 @@ pub struct MuseStatsResponse {
 /// data `/api/library`'s `counts` block already serves publicly. Nothing here
 /// discloses who watched what.
 ///
-/// Fail-open to zeros on a query error, matching the rest of this module —
-/// but note this is the one place where that is a *lossy* choice, so the
-/// error is logged at `warn` with the cause rather than swallowed silently.
-pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<MuseStatsResponse> {
-    match repo::dashboard::constellation_stats(&state.pool).await {
-        Ok(s) => Json(MuseStatsResponse {
-            library_size: s.library_size,
-            active_channels: s.active_channels,
-            pending_items: s.pending_items,
-            last_ingest_at: s.last_ingest_at.map(|t| t.to_rfc3339()),
-        }),
-        Err(e) => {
-            tracing::warn!(error = %e, "get_stats: stats query failed; serving zeros");
-            Json(MuseStatsResponse {
-                library_size: 0,
-                active_channels: 0,
-                pending_items: 0,
-                last_ingest_at: None,
-            })
-        }
-    }
+/// ## Query errors propagate — this does NOT fail open
+/// The rest of this module fails open to an empty/zero `200`, a posture built
+/// for *seam* conditions (an unmounted library, an unconfigured provider) —
+/// cases where "nothing" is the true answer. A failed COUNT is not that. And
+/// because `useMuseSection` renders any 2xx body AS DATA, serving zeros here
+/// would put "0 items in library" on the operator's dashboard whenever a query
+/// transiently failed — the exact category of confident-but-false claim that
+/// `get_premiere`'s `501` exists to avoid. Returning the error lets the card
+/// degrade instead. (Raised by the MUSE #84 review panel: the fail-open paths
+/// contradicted the reasoning used to justify that `501`.)
+pub async fn get_stats(State(state): State<Arc<AppState>>) -> MuseResult<Json<MuseStatsResponse>> {
+    let s = repo::dashboard::constellation_stats(&state.pool).await?;
+    Ok(Json(MuseStatsResponse {
+        library_size: s.library_size,
+        active_channels: s.active_channels,
+        pending_items: s.pending_items,
+        last_ingest_at: s.last_ingest_at.map(|t| t.to_rfc3339()),
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1085,20 +1082,35 @@ pub struct MuseOnDeckResponse {
 /// Taste, Curation and On-Deck screens all agree about whose data an
 /// un-parameterised request means. A cold-start deployment with no accounts
 /// yields an empty list, which is honest: with no account there is no queue.
+///
+/// ## On `?account_id=` not being authorization-checked
+/// The MUSE #84 review panel flagged that a caller past the protected router
+/// can name any `account_id`. That is accurate, and it is a property of the
+/// auth model rather than of this handler: `http::auth::require_api_token`
+/// compares a single shared `MUSE_API_TOKEN` in constant time and establishes
+/// **no per-user identity at all**. There is exactly one principal — the
+/// operator — and they are already authorized for every household account
+/// (`/api/taste?account_id=N` and `/api/curation?account_id=N` have had the
+/// same shape since MWEBX-05). So there is no per-user boundary here to
+/// cross, and adding an `account_id`-vs-caller check would be theatre: there
+/// is no caller identity to compare against.
+///
+/// Introducing real per-account authorization means giving Muse per-user
+/// principals (sessions/JWT scoped to a `muse_account_id`) — a genuine auth
+/// change across every per-account endpoint, not something to bolt onto one
+/// dashboard read. Until then, the enforcement boundary is "holds the
+/// operator token", which is what the protected router expresses.
 pub async fn get_on_deck(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AccountQuery>,
-) -> Json<MuseOnDeckResponse> {
+) -> MuseResult<Json<MuseOnDeckResponse>> {
     let Some(account_id) = resolve_account_id(&state, q.account_id).await else {
-        return Json(MuseOnDeckResponse { items: Vec::new() });
+        // A genuinely-true empty: no accounts exist, so there is no queue.
+        // Distinct from a query failure, which propagates below.
+        return Ok(Json(MuseOnDeckResponse { items: Vec::new() }));
     };
-    let rows = repo::dashboard::on_deck(&state.pool, account_id, ON_DECK_LIMIT)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "get_on_deck: query failed; serving empty");
-            Vec::new()
-        });
-    Json(MuseOnDeckResponse {
+    let rows = repo::dashboard::on_deck(&state.pool, account_id, ON_DECK_LIMIT).await?;
+    Ok(Json(MuseOnDeckResponse {
         items: rows
             .into_iter()
             .map(|r| MuseOnDeckItem {
@@ -1118,7 +1130,7 @@ pub async fn get_on_deck(
                 poster_path: format!("/art/media_item/{}", r.media_item_id),
             })
             .collect(),
-    })
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1144,20 +1156,20 @@ pub struct MuseGapsResponse {
 /// `total` is the UNTRUNCATED count from `constellation_stats`, not
 /// `gaps.len()` — the list is capped at `GAPS_LIMIT`, and reporting the
 /// capped length as the total would silently under-report the backlog.
-pub async fn get_gaps(State(state): State<Arc<AppState>>) -> Json<MuseGapsResponse> {
-    let rows = repo::dashboard::wanted_titles(&state.pool, GAPS_LIMIT)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "get_gaps: wanted query failed; serving empty");
-            Vec::new()
-        });
+///
+/// Query errors propagate rather than failing open to an empty list, for the
+/// reason spelled out on `get_stats`: a 2xx empty body renders as "no gaps",
+/// which is a claim, not an absence of one.
+pub async fn get_gaps(State(state): State<Arc<AppState>>) -> MuseResult<Json<MuseGapsResponse>> {
+    let rows = repo::dashboard::wanted_titles(&state.pool, GAPS_LIMIT).await?;
+    // `total` comes from a second query; a failure there is still a failure —
+    // the previous fallback silently substituted the truncated visible length
+    // for the real backlog size, which is exactly the quiet-wrong-number
+    // problem an untruncated `total` exists to prevent.
     let total = repo::dashboard::constellation_stats(&state.pool)
-        .await
-        .map(|s| s.pending_items)
-        // Fall back to the visible length rather than 0 — under-reporting a
-        // known-nonempty list as "0 gaps" is the more misleading failure.
-        .unwrap_or(rows.len() as i64);
-    Json(MuseGapsResponse {
+        .await?
+        .pending_items;
+    Ok(Json(MuseGapsResponse {
         gaps: rows
             .into_iter()
             .map(|r| MuseGapItem {
@@ -1171,7 +1183,7 @@ pub async fn get_gaps(State(state): State<Arc<AppState>>) -> Json<MuseGapsRespon
             })
             .collect(),
         total,
-    })
+    }))
 }
 
 /// The shape `/premiere` will return once premiere events are persisted.
@@ -1333,6 +1345,29 @@ mod tests {
         assert!(json["gaps"][0]["id"].is_string(), "MuseGapItem.id is a string");
         assert_eq!(json["gaps"].as_array().unwrap().len(), 1);
         assert_eq!(json["total"], 412);
+    }
+
+    /// Regression guard for the MUSE #84 review's sharpest finding: the four
+    /// new handlers must not convert a query FAILURE into a valid-looking 2xx
+    /// body, because `useMuseSection` renders any 2xx as data. This is asserted
+    /// structurally (on the signatures) rather than by faking a broken pool:
+    /// a `MuseResult` return type cannot silently swallow a `sqlx` error, while
+    /// the previous `Json<T>` returns could and did.
+    #[test]
+    fn the_new_dashboard_handlers_cannot_swallow_a_query_error_into_a_2xx() {
+        // Compile-time proof: each handler's output is a fallible `MuseResult`,
+        // so the only way to a 2xx is a successful query. If someone
+        // reintroduces a `.unwrap_or_else(|_| empty)` fail-open, its return
+        // type stops being `MuseResult` and these bindings stop compiling.
+        fn assert_fallible<T, F: Fn(&AppState) -> T>(_: F) {}
+        let _ = assert_fallible::<_, _>(|_s: &AppState| {
+            // `get_stats`/`get_gaps` take only `State`; `get_on_deck` also
+            // takes `Query`. Referencing them as values is enough to pin the
+            // signature — calling them would need a live pool.
+            let _stats: fn(State<Arc<AppState>>) -> _ = get_stats;
+            let _gaps: fn(State<Arc<AppState>>) -> _ = get_gaps;
+            let _on_deck: fn(State<Arc<AppState>>, Query<AccountQuery>) -> _ = get_on_deck;
+        });
     }
 
     #[tokio::test]

@@ -497,8 +497,50 @@ mod tests {
             let rows = on_deck(&pool, account_id, 50).await.expect("on_deck query");
             let ids: Vec<i64> = rows.iter().map(|r| r.media_item_id).collect();
 
+            // TEARDOWN BEFORE ASSERTIONS. A reviewer noted that cleanup placed
+            // after the asserts leaks every seeded row whenever an assertion
+            // fires — precisely when the database is most likely to be
+            // re-examined by hand. The results are already captured in `ids`,
+            // so nothing is lost by tearing down first.
+            //
+            // FK-safe order. Cleanup failures are surfaced with `expect`, not
+            // swallowed with `.ok()`: a teardown that silently fails leaves the
+            // next run to trip over this run's rows.
+            for (label, sql, bind) in [
+                (
+                    "play_sessions",
+                    "DELETE FROM play_sessions WHERE account_id = $1",
+                    account_id,
+                ),
+                ("accounts", "DELETE FROM accounts WHERE id = $1", account_id),
+                (
+                    "media_items",
+                    "DELETE FROM media_items WHERE library_id = $1",
+                    library.id,
+                ),
+            ] {
+                sqlx::query(sql)
+                    .bind(bind)
+                    .execute(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("teardown {label} failed: {e}"));
+            }
+            sqlx::query("DELETE FROM media_metadata WHERE tmdb_id = ANY($1)")
+                .bind(vec![
+                    format!("muse87-partial-{suffix}"),
+                    format!("muse87-complete-{suffix}"),
+                ])
+                .execute(&pool)
+                .await
+                .expect("teardown media_metadata failed");
+            sqlx::query("DELETE FROM libraries WHERE id = $1")
+                .bind(library.id)
+                .execute(&pool)
+                .await
+                .expect("teardown libraries failed");
+
             // POSITIVE first: without this the negative assertion below could
-            // pass on an empty result set, which is exactly how the previous
+            // pass on an empty result set, which is exactly how an earlier
             // version of this test fooled itself.
             assert!(
                 ids.contains(&partial_item_id),
@@ -509,40 +551,6 @@ mod tests {
                 !ids.contains(&complete_item_id),
                 "a fully-watched (1.0) unfinished session must NOT be on deck"
             );
-
-            // Full teardown, FK-safe order. An earlier version deleted only
-            // the sessions and the account, leaving library/media_metadata/
-            // media_item rows to accumulate on every run — a reviewer caught
-            // that. `media_items` cascades from neither parent explicitly, so
-            // it is removed before its metadata and library.
-            sqlx::query("DELETE FROM play_sessions WHERE account_id = $1")
-                .bind(account_id)
-                .execute(&pool)
-                .await
-                .ok();
-            sqlx::query("DELETE FROM accounts WHERE id = $1")
-                .bind(account_id)
-                .execute(&pool)
-                .await
-                .ok();
-            sqlx::query("DELETE FROM media_items WHERE library_id = $1")
-                .bind(library.id)
-                .execute(&pool)
-                .await
-                .ok();
-            sqlx::query("DELETE FROM media_metadata WHERE tmdb_id = ANY($1)")
-                .bind(vec![
-                    format!("muse87-partial-{suffix}"),
-                    format!("muse87-complete-{suffix}"),
-                ])
-                .execute(&pool)
-                .await
-                .ok();
-            sqlx::query("DELETE FROM libraries WHERE id = $1")
-                .bind(library.id)
-                .execute(&pool)
-                .await
-                .ok();
         }
     }
 }

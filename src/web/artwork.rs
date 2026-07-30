@@ -45,7 +45,8 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::web::artwork_render::{
-    parse_width, render_jpeg, rendition_etag, RENDITION_CONTENT_TYPE, RENDITION_FORMAT,
+    parse_width, render_jpeg, rendition_etag, variant_allowed, variant_renderable,
+    RENDITION_CONTENT_TYPE, RENDITION_FORMAT,
 };
 
 use axum::{
@@ -87,13 +88,21 @@ pub async fn art_handler(
         .map(String::as_str)
         .unwrap_or(DEFAULT_VARIANT);
 
-    // MUSE #100: validate the rendition width BEFORE any I/O. An off-ladder
-    // width is a client error and must not cost a database round-trip, let alone
-    // a decode.
+    // MUSE #100: validate BEFORE any I/O. Both `variant` and `w` are part of the
+    // cache identity, so an unbounded value on either is an amplification vector
+    // — a rejected request must not cost a database round-trip, a provider
+    // lookup, or a decode.
+    if !variant_allowed(variant) {
+        return bad_variant_response();
+    }
     let width = match parse_width(params.get("w").map(String::as_str)) {
         Ok(w) => w,
         Err(()) => return bad_width_response(),
     };
+    // A `?w=` against a non-image variant is a client error, not a no-op.
+    if width.is_some() && !variant_renderable(variant) {
+        return bad_variant_for_rendition_response(variant);
+    }
 
     // Serve an already-cached rendition without ever touching the master.
     if let Some(w) = width {
@@ -109,9 +118,11 @@ pub async fn art_handler(
         {
             Ok(Some(row)) => {
                 if let Some(bytes) = row.bytes {
-                    let etag = row.etag.clone().unwrap_or_else(|| {
-                        rendition_etag(&format!("{kind}:{id}:{variant}"), w, RENDITION_FORMAT)
-                    });
+                    // Recompute from the BYTES rather than trusting the stored
+                    // column: a validator must describe the representation being
+                    // served, and hashing what we are about to send makes it
+                    // impossible for the two to disagree.
+                    let etag = rendition_etag(&bytes);
                     if if_none_match_matches(&headers, &etag) {
                         return not_modified_response(&etag);
                     }
@@ -168,7 +179,7 @@ async fn derive_rendition(
         .map_err(|e| tracing::warn!(error = %e, kind, id, width, "rendition encode failed"))
         .ok()?;
 
-    let etag = rendition_etag(&format!("{kind}:{id}:{variant}"), width, RENDITION_FORMAT);
+    let etag = rendition_etag(&rendered);
 
     if let Err(e) = crate::repo::artwork_cache::store_rendition(
         &state.pool,
@@ -375,9 +386,15 @@ fn rendition_response(bytes: Vec<u8>, etag: &str, cache_hit: bool) -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static(RENDITION_CONTENT_TYPE),
     );
+    // NOT `immutable`: a rendition is derived, and replacing the master changes
+    // it (the master write purges renditions — `delete_renditions`). `immutable`
+    // told browsers never to revalidate, which is how a replaced poster would
+    // have stayed visibly stale for a week. A day plus a byte-derived validator
+    // kills the per-mount re-request storm while keeping staleness bounded and
+    // recoverable on reload.
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=604800, immutable"),
+        HeaderValue::from_static("public, max-age=86400"),
     );
     if let Ok(v) = HeaderValue::from_str(etag) {
         headers.insert(header::ETAG, v);
@@ -396,7 +413,7 @@ fn not_modified_response(etag: &str) -> Response {
     }
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=604800, immutable"),
+        HeaderValue::from_static("public, max-age=86400"),
     );
     resp
 }
@@ -413,6 +430,26 @@ fn bad_width_response() -> Response {
     (
         StatusCode::BAD_REQUEST,
         format!("unsupported ?w= — supported rendition widths are: {ladder} (omit ?w= for the original)\n"),
+    )
+        .into_response()
+}
+
+fn bad_variant_response() -> Response {
+    let allowed = crate::web::artwork_render::ALLOWED_VARIANTS.join(", ");
+    (
+        StatusCode::BAD_REQUEST,
+        format!("unsupported ?variant= — supported variants are: {allowed}\n"),
+    )
+        .into_response()
+}
+
+fn bad_variant_for_rendition_response(variant: &str) -> Response {
+    let renderable = crate::web::artwork_render::RENDERABLE_VARIANTS.join(", ");
+    (
+        StatusCode::BAD_REQUEST,
+        format!(
+            "?w= is not valid for variant '{variant}' (not an image); renderable variants are: {renderable}\n"
+        ),
     )
         .into_response()
 }

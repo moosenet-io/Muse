@@ -28,11 +28,60 @@ COMMENT ON COLUMN artwork_cache.format IS
     'that switched from JPEG to PNG mint a SECOND "original" row, and a width=0 lookup would then '
     'return one of them arbitrarily.';
 
--- Swap the unique key. The old constraint name is Postgres'' default for a
--- table-level UNIQUE(...) on these columns; drop it defensively by name and
--- fall back to nothing if a deployment already renamed it.
+-- Swap the unique key. Dropping only Postgres'' DEFAULT constraint name would
+-- leave a renamed constraint — or a bare UNIQUE INDEX — in place, and that
+-- surviving 3-column uniqueness would REJECT every rendition insert while the
+-- new 5-column index looked correct. So discover it instead of guessing its
+-- name: drop any unique CONSTRAINT and any unique INDEX whose key is exactly
+-- (entity_kind, entity_id, variant).
+DO $$
+DECLARE
+    obj text;
+BEGIN
+    -- Unique/PK constraints on exactly those three columns.
+    FOR obj IN
+        SELECT c.conname
+        FROM pg_constraint c
+        WHERE c.conrelid = 'artwork_cache'::regclass
+          AND c.contype = 'u'
+          AND (
+                SELECT array_agg(a.attname::text ORDER BY a.attname)
+                FROM unnest(c.conkey) k
+                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k
+              ) = ARRAY['entity_id','entity_kind','variant']
+    LOOP
+        EXECUTE format('ALTER TABLE artwork_cache DROP CONSTRAINT %I', obj);
+        RAISE NOTICE 'dropped 3-column unique constraint %', obj;
+    END LOOP;
+
+    -- A bare unique index (no backing constraint) on the same three columns.
+    FOR obj IN
+        SELECT i.indexrelid::regclass::text
+        FROM pg_index i
+        WHERE i.indrelid = 'artwork_cache'::regclass
+          AND i.indisunique
+          AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)
+          AND (
+                SELECT array_agg(a.attname::text ORDER BY a.attname)
+                FROM unnest(i.indkey) k
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k
+              ) = ARRAY['entity_id','entity_kind','variant']
+    LOOP
+        EXECUTE format('DROP INDEX %s', obj);
+        RAISE NOTICE 'dropped 3-column unique index %', obj;
+    END LOOP;
+END $$;
+
+-- The sentinel relationship is an INVARIANT, so the database enforces it rather
+-- than trusting every caller: width = 0 if and only if format = 'original'.
+-- Without this, `store_rendition(width=0, format='jpeg')` would mint a row that
+-- is neither a valid master nor a valid rendition, and a width=0 master lookup
+-- would then be ambiguous.
 ALTER TABLE artwork_cache
-    DROP CONSTRAINT IF EXISTS artwork_cache_entity_kind_entity_id_variant_key;
+    DROP CONSTRAINT IF EXISTS artwork_cache_original_sentinel;
+ALTER TABLE artwork_cache
+    ADD CONSTRAINT artwork_cache_original_sentinel
+    CHECK ((width = 0 AND format = 'original') OR (width > 0 AND format <> 'original'));
 
 -- Partial-free, total unique key over the rendition identity.
 CREATE UNIQUE INDEX IF NOT EXISTS artwork_cache_rendition_key

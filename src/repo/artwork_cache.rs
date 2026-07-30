@@ -85,7 +85,7 @@ pub async fn store_bytes(
     etag: Option<&str>,
 ) -> MuseResult<ArtworkCache> {
     let fetched_at = Utc::now();
-    sqlx::query_as::<_, ArtworkCache>(
+    let row = sqlx::query_as::<_, ArtworkCache>(
         r#"
         INSERT INTO artwork_cache (
             entity_kind, entity_id, variant, source_url, content_type, bytes, etag, fetched_at,
@@ -117,7 +117,48 @@ pub async fn store_bytes(
     .bind(fetched_at)
     .fetch_one(pool)
     .await
-    .map_err(MuseError::Database)
+    .map_err(MuseError::Database)?;
+
+    // MUSE #100 — THE INVALIDATION. Every derivative of this master is now
+    // stale, so it is deleted in the same call that replaced the master. Without
+    // this, a replaced poster would keep serving its OLD rendition indefinitely
+    // (the rendition lookup deliberately runs BEFORE the master read, and the
+    // response carries a long max-age), which is exactly the bug the review
+    // caught. Deleting rather than versioning keeps the cache key simple: a
+    // rendition either matches the current master or does not exist.
+    if let Err(e) = delete_renditions(pool, entity_kind, entity_id, variant).await {
+        // A failed purge must not fail the master write — the master is the
+        // valuable artifact. Log loudly: the consequence is a stale thumbnail,
+        // not a lost image.
+        tracing::warn!(
+            error = %e, entity_kind, entity_id, variant,
+            "failed to purge renditions after a master update; a stale rendition may be served"
+        );
+    }
+
+    Ok(row)
+}
+
+/// Delete every derived rendition of `(entity_kind, entity_id, variant)`,
+/// leaving the original untouched. Called on any master write.
+pub async fn delete_renditions(
+    pool: &PgPool,
+    entity_kind: &str,
+    entity_id: i64,
+    variant: &str,
+) -> MuseResult<u64> {
+    let res = sqlx::query(
+        "DELETE FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 AND width <> $4",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(ORIGINAL_WIDTH)
+    .execute(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(res.rows_affected())
 }
 
 /// MUSE #100: fetch a cached RENDITION (a derived, resized encoding), if one exists.
@@ -168,6 +209,14 @@ pub async fn store_rendition(
     bytes: &[u8],
     etag: Option<&str>,
 ) -> MuseResult<ArtworkCache> {
+    // Mirror the DB CHECK in code so a bad call fails with a clear message rather
+    // than a constraint violation from three layers down.
+    if width <= ORIGINAL_WIDTH || format == ORIGINAL_FORMAT {
+        return Err(MuseError::Internal(anyhow::anyhow!(
+            "store_rendition refuses the original sentinel (width={width}, format={format}); \
+             use store_bytes for the master"
+        )));
+    }
     let fetched_at = Utc::now();
     sqlx::query_as::<_, ArtworkCache>(
         r#"

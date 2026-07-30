@@ -104,11 +104,59 @@ pub fn render_jpeg(original: &[u8], width: i32) -> MuseResult<Vec<u8>> {
     Ok(out)
 }
 
-/// A weak ETag for a rendition. Derived from the master's own identity plus the
-/// rendition key, so it changes exactly when the master or the rendition
-/// parameters change — which is the condition under which a client must refetch.
-pub fn rendition_etag(master_fingerprint: &str, width: i32, format: &str) -> String {
-    format!("W/\"{master_fingerprint}-{width}-{format}\"")
+/// A STRONG ETag derived from the rendition's own BYTES.
+///
+/// The first version of this took a `master_fingerprint` argument and the caller
+/// passed it `"{kind}:{id}:{variant}"` — the cache KEY, which never changes when
+/// the master image changes. Combined with a long `max-age`, that served a stale
+/// thumbnail forever and answered `304` to a client holding the old one. Both
+/// reviewers caught it. Hashing the bytes removes the possibility of that class
+/// of mistake entirely: the validator cannot disagree with the representation it
+/// validates, because it is computed FROM it.
+///
+/// (Rendition rows are also purged whenever the master is rewritten — see
+/// `repo::artwork_cache::delete_renditions`. The byte-ETag and the purge are
+/// belt and braces: the purge stops a stale rendition existing, the ETag stops a
+/// stale one being revalidated as fresh.)
+pub fn rendition_etag(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    // 16 hex chars (64 bits) is ample for cache validation and keeps the header
+    // small. Hand-rolled rather than pulling in a `hex` dependency for one line.
+    let mut out = String::with_capacity(18);
+    out.push('"');
+    for b in &digest[..8] {
+        // Infallible: writing to a String cannot fail.
+        let _ = write!(out, "{b:02x}");
+    }
+    out.push('"');
+    out
+}
+
+/// Variants this endpoint will serve. An ALLOWLIST because `variant` is part of
+/// the cache identity: an unbounded `?variant=` lets one client mint unlimited
+/// cache rows and provoke unlimited provider lookups, which is the same
+/// amplification problem the width ladder closes (a reviewer spotted that the
+/// width fix left this half open).
+///
+/// Contents are the variants actually in use — `poster`/`backdrop`/`nfo` exist in
+/// `artwork_cache` today and the code additionally writes `fanart`. Adding a new
+/// variant means adding it here on purpose.
+pub const ALLOWED_VARIANTS: [&str; 4] = ["poster", "backdrop", "fanart", "nfo"];
+
+/// Variants a RENDITION may be derived from. Narrower than [`ALLOWED_VARIANTS`]:
+/// `nfo` is not an image, so resizing it is meaningless and a `?w=` against it is
+/// a client error rather than a silently-ignored parameter.
+pub const RENDERABLE_VARIANTS: [&str; 3] = ["poster", "backdrop", "fanart"];
+
+pub fn variant_allowed(variant: &str) -> bool {
+    ALLOWED_VARIANTS.contains(&variant)
+}
+
+pub fn variant_renderable(variant: &str) -> bool {
+    RENDERABLE_VARIANTS.contains(&variant)
 }
 
 #[cfg(test)]
@@ -133,13 +181,36 @@ mod tests {
         }
     }
 
+    /// The regression that matters most: the validator must track the BYTES.
+    /// The original implementation derived it from the cache key, so it never
+    /// changed when the image did — serving a stale thumbnail behind a long
+    /// max-age and answering 304 to a client holding the old one.
     #[test]
-    fn etag_changes_with_every_component_of_the_rendition_key() {
-        let base = rendition_etag("abc", 160, "jpeg");
-        assert_ne!(base, rendition_etag("abd", 160, "jpeg"), "master change");
-        assert_ne!(base, rendition_etag("abc", 320, "jpeg"), "width change");
-        assert_ne!(base, rendition_etag("abc", 160, "webp"), "format change");
-        assert!(base.starts_with("W/\""), "weak validator");
+    fn etag_is_derived_from_the_bytes_not_the_cache_key() {
+        let a = rendition_etag(b"rendition-bytes-A");
+        let b = rendition_etag(b"rendition-bytes-B");
+        assert_ne!(a, b, "different bytes MUST produce different validators");
+        assert_eq!(a, rendition_etag(b"rendition-bytes-A"), "and it must be stable");
+        assert!(a.starts_with('"') && a.ends_with('"'), "strong validator, quoted");
+        assert!(!a.starts_with("W/"), "not weak — it is computed from the representation");
+    }
+
+    #[test]
+    fn variant_allowlist_bounds_the_cache_key() {
+        for ok in ALLOWED_VARIANTS {
+            assert!(variant_allowed(ok), "{ok} is in use and must be served");
+        }
+        // An unbounded ?variant= would let a client mint unlimited cache rows.
+        for bad in ["", "poster ", "POSTER", "../etc", "a".repeat(200).as_str(), "thumb"] {
+            assert!(!variant_allowed(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn nfo_is_servable_but_never_renderable() {
+        assert!(variant_allowed("nfo"), "existing nfo rows must still be readable");
+        assert!(!variant_renderable("nfo"), "an nfo is not an image; ?w= on it is a client error");
+        assert!(variant_renderable("poster"));
     }
 
     /// Renders a real (tiny) JPEG through the full decode→resize→encode path and

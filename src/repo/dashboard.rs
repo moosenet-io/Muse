@@ -375,8 +375,19 @@ mod tests {
         /// The behavioural half of `on_deck_sql_bounds_progress_strictly_below_one`:
         /// an UNFINISHED session at exactly `1.0` must not be on deck, which is
         /// the state-update race a reviewer raised when asking for `<= 1`.
+        ///
+        /// The fixtures are fully joinable — library -> media_metadata ->
+        /// media_item -> play_session. An earlier version seeded sessions with
+        /// a NULL `media_item_id`, so `on_deck`'s INNER JOINs dropped BOTH rows
+        /// and the assertion passed on an empty set even with a `<= 1` bound.
+        /// Both reviewers caught that; hence the POSITIVE assertion below (the
+        /// partial fixture must be PRESENT) which is what makes the negative one
+        /// meaningful.
         #[tokio::test]
         async fn on_deck_excludes_a_fully_watched_unfinished_session() {
+            use crate::models::media_item::NewMediaItem;
+            use crate::models::media_metadata::{MediaKind, NewMediaMetadata};
+
             let Some(pool) = test_pool_or_skip(
                 "on_deck_excludes_a_fully_watched_unfinished_session",
             )
@@ -385,25 +396,92 @@ mod tests {
                 return;
             };
 
+            // Unique per run so repeated runs cannot collide on the upserts'
+            // natural keys.
+            let suffix = std::process::id();
+
             let (account_id,): (i64,) = sqlx::query_as(
                 "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
-                 VALUES ('muse87-fixture', 'MUSE87 Fixture', true, false) RETURNING id",
+                 VALUES ($1, 'MUSE87 Fixture', true, false) RETURNING id",
             )
+            .bind(format!("muse87-fixture-{suffix}"))
             .fetch_one(&pool)
             .await
             .expect("seed account");
 
-            // Two sessions on the same account: one mid-watch, one at exactly
-            // 1.0 but still flagged unfinished.
-            for (key, pct) in [("muse87-partial", 0.40_f32), ("muse87-complete", 1.0_f32)] {
+            let library = crate::repo::library::create(
+                &pool,
+                &crate::models::library::NewLibrary {
+                    name: format!("muse87-lib-{suffix}"),
+                    kind: crate::models::library::LibraryKind::Movie,
+                    root_folder: "/media/muse87-test".to_string(),
+                    source_arr_name: None,
+                    source_arr_url: None,
+                },
+            )
+            .await
+            .expect("create library");
+
+            // Two joinable titles: one mid-watch, one at exactly 1.0 that is
+            // still flagged unfinished.
+            let mut partial_item_id = 0_i64;
+            let mut complete_item_id = 0_i64;
+            for (label, pct) in [("partial", 0.40_f32), ("complete", 1.0_f32)] {
+                let metadata = crate::repo::media_metadata::upsert_by_tmdb(
+                    &pool,
+                    &NewMediaMetadata {
+                        kind: MediaKind::Movie,
+                        tmdb_id: Some(format!("muse87-{label}-{suffix}")),
+                        tvdb_id: None,
+                        imdb_id: None,
+                        provider_ids: serde_json::json!({}),
+                        title: format!("MUSE87 {label} {suffix}"),
+                        sort_title: None,
+                        original_title: None,
+                        original_language: None,
+                        status: None,
+                        overview: None,
+                        studio: None,
+                        network: None,
+                        runtime_minutes: Some(100),
+                        year: Some(2020),
+                        images: serde_json::json!({}),
+                    },
+                )
+                .await
+                .expect("upsert media_metadata");
+
+                let item = crate::repo::media_item::upsert(
+                    &pool,
+                    &NewMediaItem {
+                        library_id: library.id,
+                        media_metadata_id: metadata.id,
+                        path: format!("/media/muse87-test/{label}-{suffix}.mkv"),
+                        monitored: true,
+                        quality_profile_id: None,
+                        minimum_availability: None,
+                        plex_rating_key: Some(format!("muse87-rk-{label}-{suffix}")),
+                        added_at: None,
+                    },
+                )
+                .await
+                .expect("upsert media_item");
+
+                if label == "partial" {
+                    partial_item_id = item.id;
+                } else {
+                    complete_item_id = item.id;
+                }
+
                 sqlx::query(
                     "INSERT INTO play_sessions \
-                       (account_id, session_key, started_at, percent_complete, \
-                        is_finished, is_abandoned) \
-                     VALUES ($1, $2, now(), $3, false, false)",
+                       (account_id, media_item_id, session_key, started_at, \
+                        percent_complete, is_finished, is_abandoned) \
+                     VALUES ($1, $2, $3, now(), $4, false, false)",
                 )
                 .bind(account_id)
-                .bind(key)
+                .bind(item.id)
+                .bind(format!("muse87-session-{label}-{suffix}"))
                 .bind(pct)
                 .execute(&pool)
                 .await
@@ -411,9 +489,19 @@ mod tests {
             }
 
             let rows = on_deck(&pool, account_id, 50).await.expect("on_deck query");
+            let ids: Vec<i64> = rows.iter().map(|r| r.media_item_id).collect();
+
+            // POSITIVE first: without this the negative assertion below could
+            // pass on an empty result set, which is exactly how the previous
+            // version of this test fooled itself.
             assert!(
-                rows.iter().all(|r| r.percent_complete.unwrap_or(0.0) < 1.0),
-                "a fully-watched unfinished session must never be on deck"
+                ids.contains(&partial_item_id),
+                "the 40%-watched fixture must be on deck — otherwise this test \
+                 proves nothing about the bound (rows: {ids:?})"
+            );
+            assert!(
+                !ids.contains(&complete_item_id),
+                "a fully-watched (1.0) unfinished session must NOT be on deck"
             );
 
             sqlx::query("DELETE FROM play_sessions WHERE account_id = $1")

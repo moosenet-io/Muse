@@ -95,13 +95,13 @@ pub struct GroupDynamicsRow {
 /// `watched_together_pct` because that is the GUI's contract; this doc is the
 /// place the proxy is recorded, and `web::household`'s handler doc repeats it.
 ///
-/// ## The window is `watched_ms`, not `stopped_at` (MUSE #89)
-/// A session's window is `started_at + watched_ms` — the actual time spent
-/// watching. It is deliberately NOT `stopped_at`, which on this data is a
-/// LAST-SEEN marker rather than a stop time:
+/// ## The span is watched + paused wall time, not `stopped_at` (MUSE #89)
+/// A session's span is `started_at + watched_ms + paused_ms`. It is
+/// deliberately NOT `stopped_at`, which on this data is a LAST-SEEN marker
+/// rather than a stop time:
 ///
 /// ```text
-///                              stopped_at - started_at      watched_ms
+///                              stopped_at - started_at    watched+paused
 ///   average                            15.33 h                0.57 h
 ///   maximum                          2702    h (112 d)        5.24 h
 ///   rows exceeding 6 h                134 of 1544             0
@@ -114,29 +114,38 @@ pub struct GroupDynamicsRow {
 /// ways over the live 1,544 rows:
 ///
 /// ```text
-///   participant       sessions   stopped_at%   watched_ms%
-///   zooma41                938         99.0          16.0
-///   <operator>                 329         83.9          30.1
-///   glen.b88               161         98.8          35.4
-///   jordansharpe573         62        100.0          35.5
+///   participant       sessions   stopped_at%   watched+paused%
+///   zooma41                938         99.0             16.0
+///   <operator>                 329         83.9             30.1
+///   glen.b88               161         98.8             35.4
+///   jordansharpe573         62        100.0             35.5
 /// ```
 ///
-/// A session with no recorded watch time collapses to a zero-length window
-/// and is excluded by the positive-length guards below — counted in
-/// `sessions` but never in `together_sessions` — so `watched_together_pct`
-/// remains a floor rather than an exact figure.
+/// `paused_ms` is included because `watched_ms` is the sum of PLAYING
+/// intervals only; using it alone compresses pauses out of the timeline. On
+/// the current data set that makes no difference — `paused_ms` is 0 on all
+/// 1,544 rows — but the arithmetic should be right regardless. (Reviewers
+/// raised this; the numbers above are unchanged by the addition.)
 ///
-/// Two earlier versions of this comment were wrong and both were caught in
-/// review: the first claimed a session with no end "has a real window" (it
-/// does not), and the second claimed the strict `<` predicates alone excluded
-/// a zero-length one (they do not — a zero-length window strictly inside
-/// another session satisfies both). Hence the explicit guards rather than a
-/// relied-upon side effect.
+/// ## This is an ESTIMATE, and it is not a floor
+/// Earlier versions of this doc claimed the percentage was a conservative
+/// floor. That claim was wrong and is withdrawn — it has now been wrong three
+/// times, so it is worth stating precisely what this can and cannot do:
 ///
-/// The fix was verified empirically against Postgres by replaying both
-/// predicates over synthetic rows: the unguarded version counted the
-/// zero-length session, the guarded one counts only the genuine overlap and
-/// still excludes adjacent-but-not-overlapping sessions.
+/// - Two accounts playing different things at the same time are counted as
+///   "together". Concurrency is not co-viewing.
+/// - A span reconstructed from durations is not the real timeline. If a
+///   session had gaps, overlap can be both MISSED (real co-viewing after a
+///   long gap) and MANUFACTURED (apparent overlap during one). So the error
+///   runs in both directions, not one.
+/// - Exact co-view inference would need the underlying play intervals.
+///   `play_events` exists but is EMPTY (0 rows) on this deployment, so that
+///   path is unavailable today.
+///
+/// A session with no recorded watched or paused time collapses to a
+/// zero-length span and is excluded by the positive-length guards below.
+/// Callers must present the result as an estimate; the endpoint ships a
+/// `basis` field saying so, rather than relying on this comment being read.
 pub async fn group_dynamics(pool: &PgPool) -> MuseResult<Vec<GroupDynamicsRow>> {
     sqlx::query_as::<_, GroupDynamicsRow>(
         r#"
@@ -145,10 +154,14 @@ pub async fn group_dynamics(pool: &PgPool) -> MuseResult<Vec<GroupDynamicsRow>> 
                 ps.id,
                 ps.account_id,
                 ps.started_at,
-                -- MUSE #89: the window is `watched_ms`, NOT `stopped_at`.
-                -- `stopped_at` behaves like a LAST-SEEN marker on this data,
-                -- not a stop time — see the doc comment above for the numbers.
-                ps.started_at + make_interval(secs => COALESCE(ps.watched_ms, 0) / 1000.0) AS ended_at
+                -- MUSE #89: the span is watched + paused wall time, NOT
+                -- `stopped_at` (a LAST-SEEN marker on this data — see the doc
+                -- comment above for the numbers). `watched_ms` alone is the sum
+                -- of PLAYING intervals, so adding `paused_ms` is what makes this
+                -- a wall-clock span rather than a compressed one.
+                ps.started_at + make_interval(
+                    secs => (COALESCE(ps.watched_ms, 0) + COALESCE(ps.paused_ms, 0)) / 1000.0
+                ) AS ended_at
             FROM play_sessions ps
         ),
         together AS (
@@ -157,8 +170,8 @@ pub async fn group_dynamics(pool: &PgPool) -> MuseResult<Vec<GroupDynamicsRow>> 
             JOIN s s2
               ON s2.account_id <> s1.account_id
              -- Both windows must have POSITIVE length. Without these two
-             -- guards a zero-length window (no `stopped_at` AND no
-             -- `duration_ms`) still satisfies the strict overlap predicates
+             -- guards a zero-length window (no recorded watched/paused time)
+             -- still satisfies the strict overlap predicates
              -- whenever its instant falls strictly inside the other session
              -- --   s1=[t,t] vs s2=[t-1,t+1]  =>  t < t+1 and t-1 < t  --
              -- so it WOULD be counted, while the otherwise-identical case

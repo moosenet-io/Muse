@@ -171,6 +171,103 @@ pub struct LibraryCounts {
     pub on_disk: i64,
 }
 
+/// MUSE #84: the four scalars the Constellation web GUI's Muse dashboard
+/// header binds to (`useMuseStats`). Deliberately a superset-free, ONE
+/// round-trip projection — the GUI polls this on every panel mount.
+///
+/// `pending_items` reuses `library_counts`' "wanted" definition verbatim
+/// (monitored, but no `media_files` row anywhere) rather than inventing a
+/// second notion of pending — two endpoints disagreeing about the same word
+/// is worse than either number.
+///
+/// `last_ingest_at` is derived from the newest `media_files` row, which is
+/// the only durable record of when the read-only scanner last wrote
+/// anything. It is NOT a scanner-run timestamp: a scan that found no new
+/// files does not advance it. Named `last_ingest_at` (not `last_scan_at`)
+/// for exactly that reason.
+#[derive(Debug, Clone, FromRow)]
+pub struct ConstellationStats {
+    pub library_size: i64,
+    pub active_channels: i64,
+    pub pending_items: i64,
+    pub last_ingest_at: Option<DateTime<Utc>>,
+}
+
+pub async fn constellation_stats(pool: &PgPool) -> MuseResult<ConstellationStats> {
+    sqlx::query_as::<_, ConstellationStats>(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::bigint FROM media_items) AS library_size,
+            (SELECT COUNT(*)::bigint FROM channels) AS active_channels,
+            (SELECT COUNT(*)::bigint
+               FROM monitored_items mo
+              WHERE mo.monitored = true
+                AND NOT EXISTS (
+                    SELECT 1 FROM media_items mi
+                    JOIN media_files mf ON mf.media_item_id = mi.id
+                    WHERE mi.media_metadata_id = mo.media_metadata_id
+                )) AS pending_items,
+            (SELECT MAX(created_at) FROM media_files) AS last_ingest_at
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// MUSE #84: continue-watching rows for `useMuseOnDeck`, straight off
+/// `play_sessions` — the same persisted Tautulli/Plex session data the taste
+/// model reads, NOT the in-memory curation ranker. This endpoint answers
+/// "what did someone leave part-way through", which is a fact on disk; it
+/// deliberately does no scoring, so it cannot go empty just because Chord is
+/// down.
+///
+/// `DISTINCT ON (media_item_id)` collapses a title's repeated sessions to
+/// its most recent one, so a show rewatched across five sittings occupies
+/// one card rather than five.
+#[derive(Debug, Clone, FromRow)]
+pub struct OnDeckRow {
+    pub media_item_id: i64,
+    pub media_metadata_id: i64,
+    pub kind: MediaKind,
+    pub title: String,
+    pub percent_complete: Option<f32>,
+    pub started_at: DateTime<Utc>,
+}
+
+pub async fn on_deck(pool: &PgPool, account_id: i64, limit: i64) -> MuseResult<Vec<OnDeckRow>> {
+    sqlx::query_as::<_, OnDeckRow>(
+        r#"
+        SELECT * FROM (
+            SELECT DISTINCT ON (ps.media_item_id)
+                ps.media_item_id,
+                mi.media_metadata_id,
+                md.kind,
+                md.title,
+                ps.percent_complete,
+                ps.started_at
+            FROM play_sessions ps
+            JOIN media_items mi ON mi.id = ps.media_item_id
+            JOIN media_metadata md ON md.id = mi.media_metadata_id
+            WHERE ps.account_id = $1
+              AND ps.is_finished = false
+              AND ps.is_abandoned = false
+              AND ps.percent_complete IS NOT NULL
+              AND ps.percent_complete > 0
+              AND ps.percent_complete < 100
+            ORDER BY ps.media_item_id, ps.started_at DESC
+        ) newest
+        ORDER BY newest.started_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(account_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
 pub async fn library_counts(pool: &PgPool) -> MuseResult<LibraryCounts> {
     sqlx::query_as::<_, LibraryCounts>(
         r#"

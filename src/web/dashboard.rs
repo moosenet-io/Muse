@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +52,13 @@ const DEFAULT_GRID_LIMIT: i64 = 120;
 const DEFAULT_TABLE_LIMIT: i64 = 500;
 const DEFAULT_DISCOVER_LIMIT: i64 = 40;
 const DEFAULT_CURATION_LIMIT: i64 = 30;
+/// MUSE #84: the Constellation dashboard's On-Deck and Gaps cards are
+/// fixed-height summary widgets, not browsable lists — a generous cap keeps
+/// one dashboard mount from pulling the whole backlog over the proxy. `/gaps`
+/// reports its untruncated `total` separately, so the cap is visible, never
+/// silent.
+const ON_DECK_LIMIT: i64 = 60;
+const GAPS_LIMIT: i64 = 60;
 /// TMDb trending is region-scoped; US is the neutral default when the caller
 /// doesn't pin one (matches the trending worker's own default posture).
 const DEFAULT_REGION: &str = "US";
@@ -997,6 +1005,232 @@ pub async fn trigger_library_scan(State(state): State<Arc<AppState>>) -> MuseRes
     })))
 }
 
+// ===========================================================================
+// Constellation web GUI dashboard (MUSE #84)
+// ===========================================================================
+//
+// The four endpoints `Terminus/constellation-web/src/hooks/useMuse.ts` binds
+// its Muse dashboard sections to. That hook file is the CONTRACT: every field
+// name and JSON type below is copied from its `MuseStats`/`MuseOnDeck`/
+// `MuseGaps`/`MusePremiere` interfaces, including the detail that every `id`
+// is a STRING there, not a number — hence the `.to_string()`s.
+//
+// ## Why these degrade differently from the rest of this module
+// `useMuseSection` treats a `404`/`501` as "not yet wired" and a `null` body
+// as the same thing, but renders any 2xx body AS DATA. So an honest empty
+// list is NOT interchangeable with an error here: returning `{"items":[]}`
+// asserts "nothing is on deck", which must only be said when that is true.
+// Each handler below therefore states which of the two it does and why.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MuseStatsResponse {
+    pub library_size: i64,
+    pub active_channels: i64,
+    pub pending_items: i64,
+    pub last_ingest_at: Option<String>,
+}
+
+/// `GET /stats` — the dashboard header scalars (`useMuseStats`).
+///
+/// PUBLIC (unauthenticated) by deliberate choice: these are four
+/// whole-library aggregates with no per-account component, the same class of
+/// data `/api/library`'s `counts` block already serves publicly. Nothing here
+/// discloses who watched what.
+///
+/// Fail-open to zeros on a query error, matching the rest of this module —
+/// but note this is the one place where that is a *lossy* choice, so the
+/// error is logged at `warn` with the cause rather than swallowed silently.
+pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<MuseStatsResponse> {
+    match repo::dashboard::constellation_stats(&state.pool).await {
+        Ok(s) => Json(MuseStatsResponse {
+            library_size: s.library_size,
+            active_channels: s.active_channels,
+            pending_items: s.pending_items,
+            last_ingest_at: s.last_ingest_at.map(|t| t.to_rfc3339()),
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "get_stats: stats query failed; serving zeros");
+            Json(MuseStatsResponse {
+                library_size: 0,
+                active_channels: 0,
+                pending_items: 0,
+                last_ingest_at: None,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MuseOnDeckItem {
+    pub id: String,
+    pub title: String,
+    pub kind: &'static str,
+    pub progress_pct: f32,
+    pub poster_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MuseOnDeckResponse {
+    pub items: Vec<MuseOnDeckItem>,
+}
+
+/// `GET /on_deck` — continue-watching (`useMuseOnDeck`).
+///
+/// PROTECTED: this is per-account viewing history (MUSEX-CAP-SEC-03), the
+/// exact data `/api/taste` and `/api/curation` are gated for. It must never
+/// move to the public router.
+///
+/// Account selection reuses this module's existing `resolve_account_id`
+/// convention (explicit `?account_id=` → primary → first → none), so the
+/// Taste, Curation and On-Deck screens all agree about whose data an
+/// un-parameterised request means. A cold-start deployment with no accounts
+/// yields an empty list, which is honest: with no account there is no queue.
+pub async fn get_on_deck(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<AccountQuery>,
+) -> Json<MuseOnDeckResponse> {
+    let Some(account_id) = resolve_account_id(&state, q.account_id).await else {
+        return Json(MuseOnDeckResponse { items: Vec::new() });
+    };
+    let rows = repo::dashboard::on_deck(&state.pool, account_id, ON_DECK_LIMIT)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "get_on_deck: query failed; serving empty");
+            Vec::new()
+        });
+    Json(MuseOnDeckResponse {
+        items: rows
+            .into_iter()
+            .map(|r| MuseOnDeckItem {
+                id: r.media_item_id.to_string(),
+                title: r.title,
+                kind: kind_str(r.kind),
+                // The repo filters `percent_complete` to a non-null 0<x<100,
+                // so the fallback is unreachable; it is a `0.0` rather than
+                // an `unwrap()` so a future filter change can never panic a
+                // dashboard request.
+                progress_pct: r.percent_complete.unwrap_or(0.0),
+                // `/art/media_item/{id}` — deliberately keyed on the SAME id
+                // this item reports, so a client can build the art URL from
+                // `id` alone. (`poster_url()`'s `/art/media_metadata/{id}`
+                // form is equally valid but keyed on a different id, which
+                // would silently invite an `id`/art-id mix-up.)
+                poster_path: format!("/art/media_item/{}", r.media_item_id),
+            })
+            .collect(),
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MuseGapItem {
+    pub id: String,
+    pub title: String,
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MuseGapsResponse {
+    pub gaps: Vec<MuseGapItem>,
+    pub total: i64,
+}
+
+/// `GET /gaps` — monitored-but-absent titles (`useMuseGaps`).
+///
+/// PUBLIC, for the same reason as `/stats`: "this title is monitored and has
+/// no file" is a property of the library, not of a person. It is the same
+/// `wanted_titles` projection `/api/library` already returns publicly.
+///
+/// `total` is the UNTRUNCATED count from `constellation_stats`, not
+/// `gaps.len()` — the list is capped at `GAPS_LIMIT`, and reporting the
+/// capped length as the total would silently under-report the backlog.
+pub async fn get_gaps(State(state): State<Arc<AppState>>) -> Json<MuseGapsResponse> {
+    let rows = repo::dashboard::wanted_titles(&state.pool, GAPS_LIMIT)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "get_gaps: wanted query failed; serving empty");
+            Vec::new()
+        });
+    let total = repo::dashboard::constellation_stats(&state.pool)
+        .await
+        .map(|s| s.pending_items)
+        // Fall back to the visible length rather than 0 — under-reporting a
+        // known-nonempty list as "0 gaps" is the more misleading failure.
+        .unwrap_or(rows.len() as i64);
+    Json(MuseGapsResponse {
+        gaps: rows
+            .into_iter()
+            .map(|r| MuseGapItem {
+                id: r.monitored_item_id.to_string(),
+                detail: match r.year {
+                    Some(y) => format!("{y} · monitored, no file on disk"),
+                    None => "monitored, no file on disk".to_string(),
+                },
+                title: r.title,
+                kind: kind_str(r.kind),
+            })
+            .collect(),
+        total,
+    })
+}
+
+/// The shape `/premiere` will return once premiere events are persisted.
+/// Retained (unconstructed) as the machine-checked record of the contract
+/// `useMusePremiere` expects, so MUSE #86 has a target rather than having to
+/// re-derive it from the hook file.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+pub struct MusePremiereItem {
+    pub id: String,
+    pub title: String,
+    pub release_date: String,
+    pub rsvp_count: i64,
+}
+
+/// See [`MusePremiereItem`] — retained as the MUSE #86 target shape.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+pub struct MusePremiereResponse {
+    pub items: Vec<MusePremiereItem>,
+}
+
+/// `GET /premiere` — scheduled premiere events (`useMusePremiere`).
+///
+/// ## This returns `501 Not Implemented`, and that is the honest answer
+/// `premiere::schedule::PremiereEvent` is an **in-memory** value. There is no
+/// premiere-events table and no RSVP table: migration
+/// `0101_premiere_discussion_threads.sql` persists discussion threads and
+/// posts ONLY, with no `scheduled_at` and no RSVP rows. So a scheduled
+/// premiere does not survive the process that scheduled it, and there is
+/// nothing durable to enumerate.
+///
+/// Returning `{"items":[]}` here would be a lie of exactly the kind the
+/// module doc warns about — `useMuseSection` renders a 2xx body as data, so
+/// an empty list would assert "no premieres are scheduled" when the truth is
+/// "premieres cannot be recorded yet". A `501` is the one status the hook
+/// already classifies as `not yet wired`, which is precisely the fact. The
+/// GUI renders its standard degraded card and no one is misled.
+///
+/// Wiring this for real needs a persistence layer (premiere events + RSVPs)
+/// — tracked separately as MUSE #86, deliberately NOT bolted on here.
+/// The `501` is returned directly rather than via `MuseError::NotImplemented`
+/// (a unit variant whose message is the fixed string "not implemented yet")
+/// so an operator running `curl` gets the actual reason, without widening a
+/// shared error enum for one endpoint.
+pub async fn get_premiere() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "premiere events are not persisted yet",
+            "detail": "PremiereEvent is in-memory only; there are no premiere-event or RSVP \
+                       tables (0101 persists discussion threads/posts only), so there is \
+                       nothing durable to list. Returning an empty list would falsely assert \
+                       that no premieres are scheduled.",
+            "tracked_as": "MUSE #86",
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1245,104 @@ mod tests {
     fn kind_str_maps_both_kinds() {
         assert_eq!(kind_str(MediaKind::Movie), "movie");
         assert_eq!(kind_str(MediaKind::Show), "show");
+    }
+
+    // ── MUSE #84: Constellation dashboard contract ──────────────────────────
+    //
+    // These pin the SERIALIZED KEY NAMES AND JSON TYPES against
+    // `Terminus/constellation-web/src/hooks/useMuse.ts`. This is not
+    // ceremony: a field-name or number-vs-string mismatch here does not fail
+    // any request — `useMuseSection` degrades only on a 404/501/null, so a
+    // 200 carrying the wrong keys renders as a populated-looking card with
+    // blank values. That silent-wrong-shape failure is exactly how the Muse
+    // panel came to show empty cards, so the shape is asserted, not assumed.
+
+    #[test]
+    fn stats_response_matches_the_use_muse_stats_interface() {
+        let json = serde_json::to_value(MuseStatsResponse {
+            library_size: 1892,
+            active_channels: 0,
+            pending_items: 3,
+            last_ingest_at: Some("2026-07-25T17:55:53+00:00".to_string()),
+        })
+        .unwrap();
+        // Exactly these four keys, no more (an extra key is harmless to the
+        // GUI but signals the contract drifted without the hook being updated).
+        let obj = json.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["active_channels", "last_ingest_at", "library_size", "pending_items"]
+        );
+        assert!(json["library_size"].is_i64(), "MuseStats.library_size is number");
+        assert!(json["last_ingest_at"].is_string());
+    }
+
+    #[test]
+    fn stats_last_ingest_at_is_null_not_absent_when_the_library_is_empty() {
+        // `MuseStats.last_ingest_at` is `string | null` — a MISSING key would
+        // deserialize as `undefined` in TS and print "undefined" in the card.
+        let json = serde_json::to_value(MuseStatsResponse {
+            library_size: 0,
+            active_channels: 0,
+            pending_items: 0,
+            last_ingest_at: None,
+        })
+        .unwrap();
+        assert!(json.as_object().unwrap().contains_key("last_ingest_at"));
+        assert!(json["last_ingest_at"].is_null());
+    }
+
+    #[test]
+    fn on_deck_item_ids_serialize_as_strings_and_progress_as_a_number() {
+        let json = serde_json::to_value(MuseOnDeckResponse {
+            items: vec![MuseOnDeckItem {
+                id: "77".to_string(),
+                title: "Example Feature Film".to_string(),
+                kind: "movie",
+                progress_pct: 41.5,
+                poster_path: "/art/media_item/77".to_string(),
+            }],
+        })
+        .unwrap();
+        let item = &json["items"][0];
+        // `MuseOnDeckItem.id: string` — a bare number here would break
+        // `museArtUrl(..., item.id)`'s encodeURIComponent contract.
+        assert!(item["id"].is_string(), "MuseOnDeckItem.id is a string");
+        assert!(item["progress_pct"].is_number());
+        // The art id in `poster_path` must be the SAME id the item reports,
+        // so a client can build the art URL from `id` alone.
+        assert_eq!(item["poster_path"], "/art/media_item/77");
+    }
+
+    #[test]
+    fn gaps_response_reports_the_untruncated_total_separately_from_the_list() {
+        let json = serde_json::to_value(MuseGapsResponse {
+            gaps: vec![MuseGapItem {
+                id: "5".to_string(),
+                title: "Example Series".to_string(),
+                kind: "show",
+                detail: "1999 · monitored, no file on disk".to_string(),
+            }],
+            // Deliberately larger than `gaps.len()`: the list is capped at
+            // GAPS_LIMIT and `total` must stay the real backlog size.
+            total: 412,
+        })
+        .unwrap();
+        assert!(json["gaps"][0]["id"].is_string(), "MuseGapItem.id is a string");
+        assert_eq!(json["gaps"].as_array().unwrap().len(), 1);
+        assert_eq!(json["total"], 412);
+    }
+
+    #[tokio::test]
+    async fn premiere_returns_501_so_the_gui_degrades_instead_of_showing_a_false_empty() {
+        let (status, Json(body)) = get_premiere().await;
+        // 501 is one of `useMuseSection`'s NOT_WIRED_STATUS values, so the card
+        // renders "not yet wired" rather than asserting "no premieres booked".
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["tracked_as"], "MUSE #86");
+        // Must NOT look like a successful empty payload.
+        assert!(body.get("items").is_none());
     }
 }

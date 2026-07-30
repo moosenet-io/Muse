@@ -13,6 +13,7 @@
 pub mod artwork;
 pub mod dashboard;
 pub mod graph;
+pub mod household;
 pub mod guide;
 pub mod settings;
 
@@ -76,9 +77,26 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         // MUSEX-17: graph-visualization endpoints — see `graph`'s module doc.
         .route("/api/graph/taste-map", post(graph::taste_map_handler))
-        .route("/api/graph/group-dynamics", post(graph::group_dynamics_handler))
-        .route("/api/graph/watch-history", post(graph::watch_history_handler))
-        .route("/api/graph/taste-clusters", post(graph::taste_clusters_handler))
+        // MUSE #85: GET and POST at these three paths serve DIFFERENT things,
+        // deliberately. POST is the unchanged MUSEX-17 client-fed KG viz over
+        // Discord friend identities; GET is the household account analytics
+        // the Constellation web GUI's `useMuse.ts` actually fetches (it sends
+        // a parameterless GET and expects `{rows:[...]}`/`{series:[...]}`).
+        // Adding a GET that reused the POST handlers would assemble an EMPTY
+        // GraphSourceInput and return an empty viz on every call — which the
+        // GUI renders AS DATA. See `crate::web::household`'s module doc.
+        .route(
+            "/api/graph/group-dynamics",
+            get(household::group_dynamics_get_handler).post(graph::group_dynamics_handler),
+        )
+        .route(
+            "/api/graph/watch-history",
+            get(household::watch_history_get_handler).post(graph::watch_history_handler),
+        )
+        .route(
+            "/api/graph/taste-clusters",
+            get(household::taste_clusters_get_handler).post(graph::taste_clusters_handler),
+        )
         // MUSEX-18: the Constellation GUI control + tuning panel surface —
         // see `settings`'s module doc.
         .route(

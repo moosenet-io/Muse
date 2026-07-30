@@ -1,0 +1,153 @@
+-- MUSE #100: index optimized poster renditions alongside the original, the way
+-- Plex/Jellyfin do — capture the provider's image ONCE, then derive and cache
+-- sized/encoded variants so a grid tile costs ~15KB instead of ~1.9MB while a
+-- detail view still gets a high-quality render.
+--
+-- The existing UNIQUE (entity_kind, entity_id, variant) is widened to include
+-- the rendition dimensions. `width = 0` means THE ORIGINAL (the master), which
+-- is why the column is NOT NULL with a 0 default rather than nullable: in
+-- Postgres a NULL in a unique key does not conflict with another NULL, so a
+-- nullable width would silently permit duplicate originals.
+--
+-- `format` is the encoded container of THIS row's bytes. Only 'jpeg' is
+-- produced today (the `image` crate's webp support is decode-only), but the
+-- column is part of the key from day one so adding WebP/AVIF later is a new
+-- row rather than a migration + cache wipe.
+
+ALTER TABLE artwork_cache
+    ADD COLUMN IF NOT EXISTS width  integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS format text    NOT NULL DEFAULT 'original',
+    -- `content_hash` (master rows): SHA-256 of the master's own bytes.
+    -- `master_content_hash` (rendition rows): the content_hash of the master the
+    -- rendition was derived FROM.
+    --
+    -- A rendition is served only when those match, which is what makes staleness
+    -- structurally impossible rather than merely unlikely. Purging renditions on
+    -- a master write is NOT sufficient alone: a request that read the old master
+    -- and spent a second encoding can COMMIT ITS RENDITION AFTER a concurrent
+    -- master write already purged, and that row would be served forever because a
+    -- rendition hit does not read the master bytes. Provenance turns that lost
+    -- race into an inert orphan — the next lookup asks for the CURRENT hash, does
+    -- not match, and re-derives.
+    --
+    -- CONTENT hash, not a timestamp: an earlier revision used the master's
+    -- `updated_at`, which is not a sound identity. Postgres `now()` is the
+    -- TRANSACTION-START time — constant across a transaction and equal for
+    -- multiple writes within one — and `timestamptz` has finite precision, so two
+    -- distinct master revisions can share a value and equality gating would then
+    -- accept a rendition of the older one. A hash of the bytes cannot collide
+    -- that way. (Both reviewers flagged this independently.)
+    ADD COLUMN IF NOT EXISTS content_hash        text,
+    ADD COLUMN IF NOT EXISTS master_content_hash text;
+
+COMMENT ON COLUMN artwork_cache.width IS
+    'Rendition width in px; 0 = the original master image, never a derivative.';
+COMMENT ON COLUMN artwork_cache.format IS
+    'For a rendition, the encoded container of its bytes (jpeg today; webp/avif reserved). '
+    'For the ORIGINAL (width = 0) it is always the literal ''original'' — NOT the master''s real '
+    'container — so exactly one original row can exist per (entity_kind, entity_id, variant) '
+    'whatever the provider served. Keying the original on its real container would let a provider '
+    'that switched from JPEG to PNG mint a SECOND "original" row, and a width=0 lookup would then '
+    'return one of them arbitrarily.';
+
+-- Swap the unique key. Dropping only Postgres'' DEFAULT constraint name would
+-- leave a renamed constraint — or a bare UNIQUE INDEX — in place, and that
+-- surviving 3-column uniqueness would REJECT every rendition insert while the
+-- new 5-column index looked correct. So discover it instead of guessing its
+-- name: drop any unique CONSTRAINT and any unique INDEX whose key is exactly
+-- (entity_kind, entity_id, variant).
+DO $$
+DECLARE
+    obj text;
+BEGIN
+    -- Unique/PK constraints on exactly those three columns.
+    FOR obj IN
+        SELECT c.conname
+        FROM pg_constraint c
+        WHERE c.conrelid = 'artwork_cache'::regclass
+          AND c.contype = 'u'
+          AND (
+                SELECT array_agg(a.attname::text ORDER BY a.attname)
+                FROM unnest(c.conkey) k
+                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k
+              ) = ARRAY['entity_id','entity_kind','variant']
+    LOOP
+        EXECUTE format('ALTER TABLE artwork_cache DROP CONSTRAINT %I', obj);
+        RAISE NOTICE 'dropped 3-column unique constraint %', obj;
+    END LOOP;
+
+    -- A bare unique index (no backing constraint) on the same three columns.
+    FOR obj IN
+        SELECT i.indexrelid::regclass::text
+        FROM pg_index i
+        WHERE i.indrelid = 'artwork_cache'::regclass
+          AND i.indisunique
+          AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)
+          AND (
+                SELECT array_agg(a.attname::text ORDER BY a.attname)
+                FROM unnest(i.indkey) k
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k
+              ) = ARRAY['entity_id','entity_kind','variant']
+    LOOP
+        EXECUTE format('DROP INDEX %s', obj);
+        RAISE NOTICE 'dropped 3-column unique index %', obj;
+    END LOOP;
+END $$;
+
+-- The sentinel relationship is an INVARIANT, so the database enforces it rather
+-- than trusting every caller: width = 0 if and only if format = 'original'.
+-- Without this, `store_rendition(width=0, format='jpeg')` would mint a row that
+-- is neither a valid master nor a valid rendition, and a width=0 master lookup
+-- would then be ambiguous.
+ALTER TABLE artwork_cache
+    DROP CONSTRAINT IF EXISTS artwork_cache_original_sentinel;
+ALTER TABLE artwork_cache
+    ADD CONSTRAINT artwork_cache_original_sentinel
+    CHECK ((width = 0 AND format = 'original') OR (width > 0 AND format <> 'original'));
+
+-- A rendition must record its provenance; the master must not claim one.
+ALTER TABLE artwork_cache
+    DROP CONSTRAINT IF EXISTS artwork_cache_generation_sentinel;
+ALTER TABLE artwork_cache
+    ADD CONSTRAINT artwork_cache_generation_sentinel
+    CHECK ((width = 0 AND master_content_hash IS NULL)
+        OR (width > 0 AND master_content_hash IS NOT NULL));
+
+-- BACKFILL. Without this the whole feature is inert on existing data: every
+-- pre-existing master row would keep `content_hash = NULL`, so
+-- `master_content_hash()` returns None, the rendition-cache lookup is skipped,
+-- and EVERY ?w= request re-decodes and re-encodes a multi-megabyte master
+-- forever. The cache would look implemented and never hit. (Both reviewers
+-- caught this; it is the difference between shipping the feature and shipping
+-- its shape.)
+--
+-- `encode(sha256(bytes), 'hex')` is byte-identical to the Rust
+-- `artwork_render::content_hash` — verified against the live database, not
+-- assumed: both produce
+--   'poster-bytes' -> db4cd92bd09403b5e8535467a5099c222bbef177d68eaf8d21dc1db0a1ec1978
+-- `sha256()` is built into PostgreSQL 11+, so this needs no pgcrypto extension.
+--
+-- Scoped to master rows that actually have bytes, and idempotent via the
+-- `content_hash IS NULL` guard, so a re-run is a no-op. Muse runs migrations at
+-- startup, so this hashes the existing cache once on the deploy that lands it.
+UPDATE artwork_cache
+   SET content_hash = encode(sha256(bytes), 'hex')
+ WHERE width = 0
+   AND bytes IS NOT NULL
+   AND content_hash IS NULL;
+
+-- Renditions are matched by provenance, so that lookup needs an index.
+CREATE INDEX IF NOT EXISTS artwork_cache_master_hash_idx
+    ON artwork_cache (entity_kind, entity_id, variant, master_content_hash)
+    WHERE width > 0;
+
+-- Partial-free, total unique key over the rendition identity. `master_generation`
+-- is deliberately NOT in the key: one row per (entity, variant, width, format),
+-- whose generation column says which master it belongs to. Keying on generation
+-- instead would accumulate a row per master revision forever.
+CREATE UNIQUE INDEX IF NOT EXISTS artwork_cache_rendition_key
+    ON artwork_cache (entity_kind, entity_id, variant, width, format);
+
+-- Lookups for "every rendition of this entity" (cache invalidation + GC).
+CREATE INDEX IF NOT EXISTS artwork_cache_entity_renditions_idx
+    ON artwork_cache (entity_kind, entity_id, variant);

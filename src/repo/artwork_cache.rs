@@ -7,7 +7,17 @@ use sqlx::PgPool;
 use crate::error::{MuseError, MuseResult};
 use crate::models::ArtworkCache;
 
-/// Fetch the cache row for `(entity_kind, entity_id, variant)`, if any.
+/// The `width` sentinel for the original master image, and the `format` the
+/// original row is always keyed on. See `0109_artwork_renditions.sql`.
+pub const ORIGINAL_WIDTH: i32 = 0;
+pub const ORIGINAL_FORMAT: &str = "original";
+
+/// Fetch the ORIGINAL cache row for `(entity_kind, entity_id, variant)`, if any.
+///
+/// MUSE #100: the `width`/`format` predicates are load-bearing, not decoration.
+/// Once renditions share this table, an unfiltered `SELECT *` would happily
+/// return a 160px derivative as "the artwork" — so every original lookup pins
+/// the sentinel.
 pub async fn get(
     pool: &PgPool,
     entity_kind: &str,
@@ -15,11 +25,15 @@ pub async fn get(
     variant: &str,
 ) -> MuseResult<Option<ArtworkCache>> {
     sqlx::query_as::<_, ArtworkCache>(
-        "SELECT * FROM artwork_cache WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3",
+        "SELECT * FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 \
+           AND width = $4 AND format = $5",
     )
     .bind(entity_kind)
     .bind(entity_id)
     .bind(variant)
+    .bind(ORIGINAL_WIDTH)
+    .bind(ORIGINAL_FORMAT)
     .fetch_optional(pool)
     .await
     .map_err(MuseError::Database)
@@ -38,9 +52,12 @@ pub async fn upsert_source(
 ) -> MuseResult<ArtworkCache> {
     sqlx::query_as::<_, ArtworkCache>(
         r#"
-        INSERT INTO artwork_cache (entity_kind, entity_id, variant, source_url)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (entity_kind, entity_id, variant)
+        INSERT INTO artwork_cache (entity_kind, entity_id, variant, source_url, width, format)
+        VALUES ($1, $2, $3, $4, 0, 'original')
+        -- MUSE #100: same runtime hazard as `store_bytes` — the inference list
+        -- must match the new five-column unique index. A source_url belongs to
+        -- the ORIGINAL row only; renditions are derived, never fetched.
+        ON CONFLICT (entity_kind, entity_id, variant, width, format)
         DO UPDATE SET source_url = EXCLUDED.source_url, updated_at = now()
         RETURNING *
         "#,
@@ -68,19 +85,34 @@ pub async fn store_bytes(
     etag: Option<&str>,
 ) -> MuseResult<ArtworkCache> {
     let fetched_at = Utc::now();
-    sqlx::query_as::<_, ArtworkCache>(
+
+    // MUSE #100: the master upsert and the rendition purge are ONE TRANSACTION.
+    // As two separate pool operations there was a committed window in which the
+    // new master coexisted with old renditions, and a rendition hit (which does
+    // not read the master) would serve one — with a byte-accurate ETag, so the
+    // client's 304 was "correct" about the wrong image. Atomicity closes that
+    // window; the `master_generation` stamp closes the remaining lost-update race
+    // (see `store_rendition`).
+    let mut tx = pool.begin().await.map_err(MuseError::Database)?;
+
+    let row = sqlx::query_as::<_, ArtworkCache>(
         r#"
         INSERT INTO artwork_cache (
-            entity_kind, entity_id, variant, source_url, content_type, bytes, etag, fetched_at
+            entity_kind, entity_id, variant, source_url, content_type, bytes, etag, fetched_at,
+            width, format, content_hash
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (entity_kind, entity_id, variant)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'original', $9)
+        -- The inference target MUST be the new five-column unique index; a stale
+        -- ON CONFLICT list fails at RUNTIME with "no unique or exclusion
+        -- constraint matching the ON CONFLICT spec".
+        ON CONFLICT (entity_kind, entity_id, variant, width, format)
         DO UPDATE SET
             source_url = COALESCE(EXCLUDED.source_url, artwork_cache.source_url),
             content_type = EXCLUDED.content_type,
             bytes = EXCLUDED.bytes,
             etag = EXCLUDED.etag,
             fetched_at = EXCLUDED.fetched_at,
+            content_hash = EXCLUDED.content_hash,
             updated_at = now()
         RETURNING *
         "#,
@@ -93,6 +125,174 @@ pub async fn store_bytes(
     .bind(bytes)
     .bind(etag)
     .bind(fetched_at)
+    // Computed here, from the bytes being stored, so the master's identity is
+    // always exactly a hash of its own content.
+    .bind(crate::web::artwork_render::content_hash(bytes))
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(MuseError::Database)?;
+
+    // Every derivative of this master is now stale. In-transaction, so a failure
+    // ROLLS BACK the master write rather than being logged and swallowed — the
+    // previous version's "log and continue" guaranteed a stale-serving path.
+    sqlx::query(
+        "DELETE FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 AND width <> $4",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(ORIGINAL_WIDTH)
+    .execute(&mut *tx)
+    .await
+    .map_err(MuseError::Database)?;
+
+    tx.commit().await.map_err(MuseError::Database)?;
+    Ok(row)
+}
+
+/// MUSE #100: the master's content hash — its identity. Selects ONLY that column
+/// on purpose: the whole point of the rendition fast path is to avoid moving a
+/// ~2 MB `bytea`, so the freshness check stays a tiny indexed read even though it
+/// is content-derived (the hash was computed once, at write time).
+///
+/// `None` means there is no master row with bytes, in which case no rendition can
+/// be valid.
+pub async fn master_content_hash(
+    pool: &PgPool,
+    entity_kind: &str,
+    entity_id: i64,
+    variant: &str,
+) -> MuseResult<Option<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT content_hash FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 \
+           AND width = $4 AND format = $5 AND bytes IS NOT NULL",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(ORIGINAL_WIDTH)
+    .bind(ORIGINAL_FORMAT)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(row.and_then(|r| r.0))
+}
+
+/// Delete every derived rendition of `(entity_kind, entity_id, variant)`,
+/// leaving the original untouched. Called on any master write.
+pub async fn delete_renditions(
+    pool: &PgPool,
+    entity_kind: &str,
+    entity_id: i64,
+    variant: &str,
+) -> MuseResult<u64> {
+    let res = sqlx::query(
+        "DELETE FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 AND width <> $4",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(ORIGINAL_WIDTH)
+    .execute(pool)
+    .await
+    .map_err(MuseError::Database)?;
+    Ok(res.rows_affected())
+}
+
+/// MUSE #100: fetch a cached RENDITION (a derived, resized encoding), if one exists.
+///
+/// Distinct from [`get`], which is pinned to the original master. A rendition is
+/// identified by `(entity_kind, entity_id, variant, width, format)` and always has
+/// bytes — a rendition row is only ever written after a successful encode, so
+/// unlike the original there is no "row exists but bytes are NULL" state to handle.
+pub async fn get_rendition(
+    pool: &PgPool,
+    entity_kind: &str,
+    entity_id: i64,
+    variant: &str,
+    width: i32,
+    format: &str,
+    master_content_hash: &str,
+) -> MuseResult<Option<ArtworkCache>> {
+    sqlx::query_as::<_, ArtworkCache>(
+        // The provenance predicate IS the freshness gate: a rendition derived
+        // from a superseded master does not match, so it can never be served —
+        // even if a purge was missed or lost a race with a slow encode.
+        "SELECT * FROM artwork_cache \
+         WHERE entity_kind = $1 AND entity_id = $2 AND variant = $3 \
+           AND width = $4 AND format = $5 AND master_content_hash = $6",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(width)
+    .bind(format)
+    .bind(master_content_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)
+}
+
+/// Store a freshly-encoded rendition. Idempotent: two requests that raced the
+/// same encode both succeed and the last write wins, which is safe because the
+/// bytes are a deterministic function of (master, width, format).
+///
+/// `source_url` is deliberately NOT set — a rendition has no upstream; it is
+/// derived from the original row. Leaving it NULL keeps "has an upstream to
+/// refetch from" meaningful.
+#[allow(clippy::too_many_arguments)]
+pub async fn store_rendition(
+    pool: &PgPool,
+    entity_kind: &str,
+    entity_id: i64,
+    variant: &str,
+    width: i32,
+    format: &str,
+    content_type: &str,
+    bytes: &[u8],
+    etag: Option<&str>,
+    master_content_hash: &str,
+) -> MuseResult<ArtworkCache> {
+    // Mirror the DB CHECK in code so a bad call fails with a clear message rather
+    // than a constraint violation from three layers down.
+    if width <= ORIGINAL_WIDTH || format == ORIGINAL_FORMAT {
+        return Err(MuseError::Internal(anyhow::anyhow!(
+            "store_rendition refuses the original sentinel (width={width}, format={format}); \
+             use store_bytes for the master"
+        )));
+    }
+    let fetched_at = Utc::now();
+    sqlx::query_as::<_, ArtworkCache>(
+        r#"
+        INSERT INTO artwork_cache (
+            entity_kind, entity_id, variant, width, format, content_type, bytes, etag, fetched_at,
+            master_content_hash
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (entity_kind, entity_id, variant, width, format)
+        DO UPDATE SET
+            content_type = EXCLUDED.content_type,
+            bytes = EXCLUDED.bytes,
+            etag = EXCLUDED.etag,
+            fetched_at = EXCLUDED.fetched_at,
+            master_content_hash = EXCLUDED.master_content_hash,
+            updated_at = now()
+        RETURNING *
+        "#,
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(variant)
+    .bind(width)
+    .bind(format)
+    .bind(content_type)
+    .bind(bytes)
+    .bind(etag)
+    .bind(fetched_at)
+    .bind(master_content_hash)
     .fetch_one(pool)
     .await
     .map_err(MuseError::Database)

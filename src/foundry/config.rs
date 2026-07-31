@@ -30,6 +30,7 @@ const DEFAULT_RETENTION_DAYS: u32 = 14;
 
 /// Default probe/encode binary names, resolved via `PATH`.
 const DEFAULT_FFPROBE_BIN: &str = "ffprobe";
+const DEFAULT_FFMPEG_BIN: &str = "ffmpeg";
 const DEFAULT_HANDBRAKE_BIN: &str = "HandBrakeCLI";
 
 /// Typed Foundry configuration.
@@ -40,10 +41,9 @@ const DEFAULT_HANDBRAKE_BIN: &str = "HandBrakeCLI";
 /// capability-free diagnostics on [`super::Foundry`]
 /// (`root_descriptions`, `root_count`, `mutation_enabled`, `retention_days`).
 #[derive(Clone)]
-// `ffprobe_bin`/`handbrake_bin` have no consumer until MUSEF-02 (probe) and
-// MUSEF-06 (encoder backends) respectively. Configured here because they belong
-// with the rest of the Foundry config, not deferred to the item that first
-// reads them.
+// MUSEF-02 is now the consumer of `ffprobe_bin` and `ffmpeg_bin`
+// (`crate::foundry::probe` / `crate::foundry::forge`). `handbrake_bin` is still
+// only *reported* — see its field doc.
 //
 // NOTE the missing `Debug` derive — it is deliberate. A reviewer pointed out
 // that private fields do not stop disclosure through `{:?}`: a derived Debug
@@ -63,7 +63,22 @@ pub struct FoundryConfig {
     pub(in crate::foundry) retention_days: u32,
     /// `ffprobe` binary (name on `PATH`, or an absolute path).
     pub(in crate::foundry) ffprobe_bin: String,
+    /// `ffmpeg` binary — the encoder Foundry actually drives (MUSEF-02).
+    ///
+    /// Sourced from the crate-wide `MUSE_FFMPEG_PATH` rather than a new
+    /// `MUSE_FOUNDRY_FFMPEG_BIN`, deliberately: `crate::streaming` already
+    /// invokes ffmpeg through that setting, and a second env var for the same
+    /// binary on the same host is a configuration trap — an operator who
+    /// pointed the streaming engine at a custom build would get the system
+    /// ffmpeg here without ever being told.
+    pub(in crate::foundry) ffmpeg_bin: String,
     /// `HandBrakeCLI` binary (name on `PATH`, or an absolute path).
+    ///
+    /// Detected and reported by [`crate::foundry::capability`], but not driven:
+    /// Foundry constructs its own ffmpeg argv (see
+    /// [`crate::foundry::plan::build_transcode_args`]) so that the exact
+    /// command is pure, reviewable and unit-tested, which a HandBrake preset
+    /// name would not be.
     pub(in crate::foundry) handbrake_bin: String,
 }
 
@@ -102,6 +117,7 @@ impl FoundryConfig {
             enable_mutation: cfg.foundry_enable_mutation,
             retention_days: cfg.foundry_retention_days.unwrap_or(DEFAULT_RETENTION_DAYS),
             ffprobe_bin: non_empty_or(cfg.foundry_ffprobe_bin.as_deref(), DEFAULT_FFPROBE_BIN),
+            ffmpeg_bin: non_empty_or(Some(cfg.ffmpeg_path.as_str()), DEFAULT_FFMPEG_BIN),
             handbrake_bin: non_empty_or(
                 cfg.foundry_handbrake_bin.as_deref(),
                 DEFAULT_HANDBRAKE_BIN,
@@ -440,6 +456,7 @@ mod tests {
             enable_mutation: mutation,
             retention_days: DEFAULT_RETENTION_DAYS,
             ffprobe_bin: DEFAULT_FFPROBE_BIN.to_string(),
+            ffmpeg_bin: DEFAULT_FFMPEG_BIN.to_string(),
             handbrake_bin: DEFAULT_HANDBRAKE_BIN.to_string(),
         }
     }
@@ -649,5 +666,16 @@ mod tests {
         assert_eq!(non_empty_or(None, DEFAULT_FFPROBE_BIN), "ffprobe");
         assert_eq!(non_empty_or(Some("  "), DEFAULT_HANDBRAKE_BIN), "HandBrakeCLI");
         assert_eq!(non_empty_or(Some("/opt/bin/ffprobe"), DEFAULT_FFPROBE_BIN), "/opt/bin/ffprobe");
+    }
+
+    #[test]
+    fn the_foundry_ffmpeg_binary_comes_from_the_crate_wide_setting() {
+        // MUSEF-02: deliberately NOT a second Foundry-specific env var. An
+        // operator who points `MUSE_FFMPEG_PATH` at a custom build must get
+        // that build here too, rather than silently getting the system ffmpeg.
+        let mut cfg = crate::config::Config::default();
+        cfg.ffmpeg_path = "/opt/ffmpeg-custom/bin/ffmpeg".to_string();
+        let fc = FoundryConfig::from_config(&cfg);
+        assert_eq!(fc.ffmpeg_bin, "/opt/ffmpeg-custom/bin/ffmpeg");
     }
 }

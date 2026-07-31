@@ -16,6 +16,7 @@ pub mod dashboard;
 pub mod graph;
 pub mod household;
 pub mod guide;
+pub mod search;
 pub mod settings;
 
 use std::sync::Arc;
@@ -55,6 +56,8 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/api/library/table", get(dashboard::get_library_table))
         .route("/api/library/:id", get(dashboard::get_library_detail))
         .route("/api/discover", get(dashboard::get_discover))
+        // MUSE #108: free-text metadata search across configured providers.
+        .route("/api/search", get(search::get_search))
         .route("/api/subsystems", get(dashboard::get_subsystems))
         // MUSE #84: the Constellation web GUI's Muse dashboard cards. Only the
         // two whole-library aggregates are public — `/stats` is four counts and

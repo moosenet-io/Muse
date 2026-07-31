@@ -705,6 +705,171 @@ mod tests {
         );
     }
 
+
+    /// REAL `7z l -slt` output, captured from p7zip 16.02 on the deployment host — not written
+    /// by hand. Hand-written fixtures are how MUSE #106 and #109 both survived a green suite:
+    /// the fixture agreed with the code and both disagreed with the tool.
+    const REAL_7Z_LISTING: &str = "
+7-Zip [64] 26.01 : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27
+p7zip Version 16.02 (locale=C.UTF-8,Utf16=on,HugeFiles=on,64 bits,8 CPUs Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz (906ED)  (LP))
+
+Scanning the drive for archives:
+1 file, 559 bytes (1 KiB)
+
+Listing archive: r.zip
+
+--
+Path = r.zip
+Type = zip
+Physical Size = 559
+
+----------
+Path = Movie.2024.mkv
+Folder = -
+Size = 3
+Packed Size = 3
+Modified = 2026-07-31 20:05:06.7603784
+Created = 
+Accessed = 
+Attributes =  -rw-r--r--
+Encrypted = -
+Comment = 
+CRC = ED6F7A7A
+Method = Store
+Characteristics = NTFS
+Host OS = Unix
+Version = 10
+Volume Index = 0
+Offset = 0
+
+Path = Setup.exe
+Folder = -
+Size = 4
+Packed Size = 4
+Modified = 2026-07-31 20:05:06.7603784
+Created = 
+Accessed = 
+Attributes =  -rw-r--r--
+Encrypted = -
+Comment = 
+CRC = 183A063E
+Method = Store
+Characteristics = NTFS
+Host OS = Unix
+Version = 10
+Volume Index = 0
+Offset = 47
+
+Path = sub
+Folder = +
+Size = 0
+Packed Size = 0
+Modified = 2026-07-31 20:05:06.7603784
+Created = 
+Accessed = 
+Attributes = D drwxr-xr-x
+Encrypted = -
+Comment = 
+CRC = 
+Method = Store
+Characteristics = NTFS
+Host OS = Unix
+Version = 20
+Volume Index = 0
+Offset = 90
+
+Path = sub/Movie.srt
+Folder = -
+Size = 2
+Packed Size = 2
+Modified = 2026-07-31 20:05:06.7603784
+Created = 
+Accessed = 
+Attributes =  -rw-r--r--
+Encrypted = -
+Comment = 
+CRC = A51ED1D4
+Method = Store
+Characteristics = NTFS
+Host OS = Unix
+Version = 10
+Volume Index = 0
+Offset = 124
+
+";
+
+    #[test]
+    fn the_sevenzip_parser_handles_REAL_output() {
+        let listing = parse_sevenzip_listing(REAL_7Z_LISTING);
+        assert!(listing.failure.is_none());
+
+        let names: Vec<&str> = listing.entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"Movie.2024.mkv"), "{names:?}");
+        assert!(names.contains(&"Setup.exe"), "{names:?}");
+        assert!(names.contains(&"sub/Movie.srt"), "nested file must be listed: {names:?}");
+        // The DIRECTORY stanza (`Folder = +`) must not appear as a file entry.
+        assert!(!names.contains(&"sub"), "a directory is not a file entry: {names:?}");
+        // Sizes come through.
+        let movie = listing.entries.iter().find(|(n, _)| n == "Movie.2024.mkv").unwrap();
+        assert_eq!(movie.1, 3);
+    }
+
+    #[test]
+    fn a_nonzero_7z_exit_is_unknown_never_an_empty_clean_listing() {
+        // The fail-closed branch. This was unreachable in tests because it sat inside the
+        // function that shells out, so a mutation turning a failed 7z into an empty listing
+        // survived — on a security gate, "the tool failed" is the branch that most needs a test.
+        for code in [Some(1), Some(2), Some(255), None] {
+            let listing = sevenzip_result("/usr/bin/7z", code, "Path = x\n----------\nPath = a.mkv\n");
+            assert!(listing.entries.is_empty(), "a failed run must yield no entries");
+            assert!(matches!(listing.failure, Some(ListingFailure::Unreadable(_))));
+            let v = inspect_listing("release.rar", &listing);
+            assert_eq!(v.severity, Severity::Suspicious, "and it must not be clean");
+            assert!(!v.is_importable());
+        }
+        // Exit 0 parses normally.
+        let ok = sevenzip_result("/usr/bin/7z", Some(0), REAL_7Z_LISTING);
+        assert!(!ok.entries.is_empty());
+        assert!(ok.failure.is_none());
+    }
+
+    #[test]
+    fn either_directory_signal_alone_is_enough() {
+        // Real 7z emits BOTH `Folder = +` and `Attributes = D ...`, so each masks the other and
+        // a mutation removing either survived a test using real output. They are defence in
+        // depth, and each is pinned on its own.
+        let folder_only = "Path = a\n----------\nPath = sub\nFolder = +\nSize = 0\n\n";
+        assert!(
+            parse_sevenzip_listing(folder_only).entries.is_empty(),
+            "`Folder = +` alone must mark a directory",
+        );
+        let attrs_only = "Path = a\n----------\nPath = sub\nSize = 0\nAttributes = D drwxr-xr-x\n\n";
+        assert!(
+            parse_sevenzip_listing(attrs_only).entries.is_empty(),
+            "a leading `D` in Attributes alone must mark a directory",
+        );
+        // And a plain file with neither signal is kept.
+        let file = "Path = a\n----------\nPath = Movie.mkv\nFolder = -\nSize = 9\nAttributes =  -rw-r--r--\n\n";
+        assert_eq!(parse_sevenzip_listing(file).entries.len(), 1);
+    }
+
+    #[test]
+    fn a_rar_listed_via_sevenzip_finds_the_executable_inside() {
+        // The blind spot this closes: RAR is the most common release format on public trackers
+        // and was previously reported uninspected. Judged by the same rules as everything else.
+        let v = inspect_listing("release.rar", &parse_sevenzip_listing(REAL_7Z_LISTING));
+        assert_eq!(v.severity, Severity::Dangerous);
+        assert!(v.findings.iter().any(|f| f.path.contains("Setup.exe")));
+    }
+
+    #[test]
+    fn sevenzip_output_that_is_empty_or_garbage_yields_no_entries_not_a_clean_pass() {
+        assert!(parse_sevenzip_listing("").entries.is_empty());
+        assert!(parse_sevenzip_listing("total nonsense\nwith no stanzas").entries.is_empty());
+        // And an archive with only its own header line yields nothing.
+        assert!(parse_sevenzip_listing("Path = only-the-archive.rar\n").entries.is_empty());
+    }
+
     #[test]
     fn magic_beats_the_extension_when_classifying_an_archive() {
         // Same principle as the main gate: the name is the part an adversary controls.
@@ -747,5 +912,189 @@ mod tests {
         let bytes = zip_with(&[("RARBG.lnk", b"x")]);
         let v = inspect_listing("r.zip", &list_zip(Cursor::new(bytes.clone()), bytes.len() as u64));
         assert_eq!(v.severity, Severity::Dangerous);
+    }
+}
+
+// ===========================================================================
+// External archive readers (RAR / 7z) — SAFE-03b
+// ===========================================================================
+
+/// Path to the 7-Zip binary, which reads BOTH `Rar` and `Rar5` as well as `7z`.
+///
+/// RAR is the most common release format on public trackers, and until this existed it was the
+/// gate's largest blind spot: reported honestly as uninspected, but uninspected all the same.
+/// `p7zip` covers it with one dependency instead of two, and — critically — `7z l` LISTS without
+/// extracting, which is the same posture the ZIP path takes and for the same reasons.
+pub const DEFAULT_SEVENZIP_BIN: &str = "/usr/bin/7z";
+
+/// List a RAR/7z archive by invoking `7z l -slt`.
+///
+/// ## Why shelling out is acceptable here, when it was avoided elsewhere
+///
+/// The ZIP path deliberately uses an in-process, memory-safe parser. There is no equivalent for
+/// RAR, and the alternatives were: leave the format uninspected (the status quo, and a real
+/// hole), or link a C decoder into the process. `unrar`'s C code has a history of CVEs, and a
+/// parser bug there is a bug INSIDE Muse. A separate short-lived process is the weaker coupling:
+/// a crash or a hang is contained, and it cannot corrupt this process's memory.
+///
+/// Still LISTING only. `7z l` reads the archive directory; it does not decompress member data,
+/// so a bomb has nothing to expand into and nothing is written anywhere.
+///
+/// Fail closed throughout: a missing binary, a non-zero exit, a timeout, or unparseable output
+/// all yield a listing FAILURE, never an empty-and-therefore-clean result.
+pub fn list_with_sevenzip(bin: &str, archive_path: &std::path::Path) -> ArchiveListing {
+    use std::process::Command;
+
+    let output = match Command::new(bin)
+        .arg("l")
+        .arg("-slt")
+        // Never prompt: a password-protected archive would otherwise block forever waiting on
+        // stdin that no one is attached to.
+        .arg("-p")
+        // `--` so an archive whose name begins with `-` cannot be read as a switch.
+        .arg("--")
+        .arg(archive_path)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return ArchiveListing::failed(ListingFailure::UnsupportedFormat(format!(
+                "{bin} could not be run ({e}); archive contents were NOT inspected"
+            )))
+        }
+    };
+
+    sevenzip_result(bin, output.status.code(), &String::from_utf8_lossy(&output.stdout))
+}
+
+/// Turn a 7z exit code + stdout into a listing.
+///
+/// Extracted so the FAIL-CLOSED path is testable without the binary present. It was previously
+/// inline in `list_with_sevenzip`, which needs a real `7z` to reach — so a mutation turning a
+/// non-zero exit into an empty-and-therefore-clean listing survived the suite. On a security
+/// gate, the branch that handles "the tool failed" is the one that most needs a test.
+pub fn sevenzip_result(bin: &str, exit_code: Option<i32>, stdout: &str) -> ArchiveListing {
+    if exit_code != Some(0) {
+        // Includes the encrypted-header case, where 7z cannot list without a password. An
+        // archive we could not read is UNKNOWN, never empty.
+        return ArchiveListing::failed(ListingFailure::Unreadable(format!(
+            "{bin} exited {}; contents unknown and NOT inspected",
+            exit_code.map(|c| c.to_string()).unwrap_or_else(|| "on a signal".to_string())
+        )));
+    }
+    parse_sevenzip_listing(stdout)
+}
+
+/// Parse `7z l -slt` output.
+///
+/// Separated from the invocation so it is testable without the binary present — the same
+/// pure/impure split the rest of this codebase uses.
+///
+/// The format is stanzas of `Key = Value` separated by blank lines, preceded by a header. The
+/// FIRST `Path =` is the archive itself and is skipped; a stanza with no `Size` is a directory.
+pub fn parse_sevenzip_listing(stdout: &str) -> ArchiveListing {
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    let mut traversal_attempts = Vec::new();
+    let mut omitted = 0usize;
+
+    let mut current_path: Option<String> = None;
+    let mut current_size: Option<u64> = None;
+    let mut is_dir = false;
+    // 7z prints an archive-level header (which itself contains `Path = <the archive>`), then a
+    // `----------` separator, then one stanza per member. Keying on the SEPARATOR rather than
+    // on "skip the first Path" — the latter looks equivalent and is not: it silently drops the
+    // first real member whenever the header is absent or differently shaped, which is exactly
+    // what happened the first time this was run against captured output. Members are only read
+    // after the separator.
+    let mut in_members = false;
+
+    let mut flush = |path: &mut Option<String>,
+                     size: &mut Option<u64>,
+                     is_dir: &mut bool,
+                     entries: &mut Vec<(String, u64)>,
+                     traversal: &mut Vec<String>,
+                     omitted: &mut usize| {
+        if let Some(p) = path.take() {
+            // Traversal is checked for EVERY stanza including directories — the same ordering
+            // fix the ZIP path needed, for the same reason: a directory entry that escapes the
+            // extraction root is exactly as hostile as a file one.
+            if is_traversal(&p) {
+                traversal.push(p.clone());
+            }
+            if !*is_dir {
+                if entries.len() >= MAX_ENTRIES {
+                    *omitted += 1;
+                } else {
+                    entries.push((p, size.take().unwrap_or(0)));
+                }
+            }
+        }
+        *size = None;
+        *is_dir = false;
+    };
+
+    for line in stdout.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            flush(
+                &mut current_path,
+                &mut current_size,
+                &mut is_dir,
+                &mut entries,
+                &mut traversal_attempts,
+                &mut omitted,
+            );
+            continue;
+        }
+        if line.starts_with("----------") {
+            in_members = true;
+            continue;
+        }
+        if !in_members {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Path = ") {
+            flush(
+                &mut current_path,
+                &mut current_size,
+                &mut is_dir,
+                &mut entries,
+                &mut traversal_attempts,
+                &mut omitted,
+            );
+            current_path = Some(v.chars().take(MAX_ENTRY_NAME_LEN).collect());
+        } else if let Some(v) = line.strip_prefix("Size = ") {
+            current_size = v.trim().parse::<u64>().ok();
+        } else if let Some(v) = line.strip_prefix("Folder = ") {
+            // `Folder = +` is 7z's EXPLICIT directory marker. Captured from real output:
+            // a directory stanza carries `Folder = +` and `Attributes = D drwxr-xr-x`, a file
+            // carries `Folder = -` and `Attributes =  -rw-r--r--`. Keying on `Folder` rather
+            // than hunting for a `D` in the attribute string, which is a substring match over a
+            // field whose format varies by host OS.
+            if v.trim() == "+" {
+                is_dir = true;
+            }
+        } else if let Some(v) = line.strip_prefix("Attributes = ") {
+            // Secondary signal, for output where `Folder` is absent. The leading `D` is the
+            // directory flag; the mode string that follows never contains an uppercase D.
+            if v.trim_start().starts_with('D') {
+                is_dir = true;
+            }
+        }
+    }
+    flush(
+        &mut current_path,
+        &mut current_size,
+        &mut is_dir,
+        &mut entries,
+        &mut traversal_attempts,
+        &mut omitted,
+    );
+
+    ArchiveListing {
+        entries,
+        omitted,
+        failure: None,
+        traversal_attempts,
     }
 }

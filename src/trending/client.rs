@@ -496,11 +496,15 @@ fn details_to_provider_metadata(details: TmdbDetails, tmdb_id: &str) -> Provider
 /// `{"coverType":"poster","url":"/...","remoteUrl":"https://image.tmdb.org/..."}`.
 #[derive(Debug, Clone, Deserialize)]
 struct RadarrImage {
-    #[serde(rename = "coverType", default)]
+    // MUSE #109: the live proxy answers PascalCase (`CoverType`, `Url`, `RemoteUrl`), not the
+    // camelCase these renames assumed. With `#[serde(default)]` on every field nothing
+    // errored — the record just came back entirely empty. Aliases keep the old spellings
+    // accepted so a differently-configured proxy is not broken by the fix.
+    #[serde(rename = "CoverType", alias = "coverType", default)]
     cover_type: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "Url", alias = "url", default)]
     url: Option<String>,
-    #[serde(rename = "remoteUrl", default)]
+    #[serde(rename = "RemoteUrl", alias = "remoteUrl", default)]
     remote_url: Option<String>,
 }
 
@@ -525,6 +529,51 @@ struct RadarrRatings {
     value: Option<f64>,
 }
 
+/// One entry of the live proxy's `Ratings` ARRAY: `{Count, Value, Origin, Type}`.
+///
+/// MUSE #109: the proxy does not return the `RadarrRatings` OBJECT this client modelled. It
+/// returns a list, and the object form is kept only because a differently-configured proxy
+/// may still answer it — see `RadarrRatingsField`.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RadarrRatingEntry {
+    #[serde(rename = "Value", alias = "value", default)]
+    value: Option<f64>,
+    /// `"Tmdb"`, `"Imdb"`, ... Chosen by ORIGIN rather than by position: the order of this
+    /// array is the upstream's business, and picking `[0]` would silently start reporting a
+    /// different site's score the day that order changes.
+    #[serde(rename = "Origin", alias = "origin", default)]
+    origin: Option<String>,
+}
+
+/// Accepts either shape the proxy might answer for `Ratings`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RadarrRatingsField {
+    List(Vec<RadarrRatingEntry>),
+    Object(RadarrRatings),
+}
+
+impl RadarrRatingsField {
+    fn best(&self) -> Option<f64> {
+        match self {
+            RadarrRatingsField::Object(o) => o.best(),
+            RadarrRatingsField::List(entries) => {
+                let by_origin = |want: &str| {
+                    entries
+                        .iter()
+                        .find(|e| e.origin.as_deref().is_some_and(|o| o.eq_ignore_ascii_case(want)))
+                        .and_then(|e| e.value)
+                };
+                // Same precedence the object form used: TMDb, then IMDb, then whatever is
+                // there — so the two shapes cannot disagree about which score is reported.
+                by_origin("tmdb")
+                    .or_else(|| by_origin("imdb"))
+                    .or_else(|| entries.iter().find_map(|e| e.value))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RadarrRatingValue {
     #[serde(default)]
@@ -545,31 +594,36 @@ impl RadarrRatings {
 /// `GET /movie/imdb/{imdbId}` / `GET /search` element).
 #[derive(Debug, Clone, Deserialize)]
 struct RadarrMovie {
-    #[serde(default)]
+    // MUSE #109: every one of these renames was wrong for the live proxy, which answers
+    // PascalCase. Because all of them carry `#[serde(default)]`, deserialization SUCCEEDED and
+    // produced a record with nothing in it — a search returned 20 results with null titles.
+    // The old camelCase spellings stay as aliases so a proxy that answers them still works.
+    #[serde(rename = "Title", alias = "title", default)]
     title: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "Overview", alias = "overview", default)]
     overview: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "Year", alias = "year", default)]
     year: Option<i32>,
     /// Runtime in minutes — fills `ProviderMetadata::runtime_minutes`
     /// (MUSEL-C2), which the real-API v1 mapping leaves `None`.
-    #[serde(default)]
+    #[serde(rename = "Runtime", alias = "runtime", default)]
     runtime: Option<i32>,
-    #[serde(default)]
+    #[serde(rename = "Genres", alias = "genres", default)]
     genres: Vec<String>,
-    #[serde(default)]
+    #[serde(rename = "Images", alias = "images", default)]
     images: Vec<RadarrImage>,
-    #[serde(default)]
-    ratings: Option<RadarrRatings>,
-    #[serde(rename = "imdbId", default)]
+    #[serde(rename = "Ratings", alias = "ratings", default)]
+    ratings: Option<RadarrRatingsField>,
+    #[serde(rename = "ImdbId", alias = "imdbId", default)]
     imdb_id: Option<String>,
     /// TMDb id as a JSON number on the proxy — captured as a string for
     /// `provider_ids` parity with the rest of the crate.
-    #[serde(rename = "tmdbId", default)]
+    #[serde(rename = "TmdbId", alias = "tmdbId", default)]
     tmdb_id: Option<i64>,
     /// The proxy also echoes `inCinemas`/`physicalRelease`; `inCinemas` is
     /// the closest analogue to TMDb's `release_date` for `first_aired`.
-    #[serde(rename = "inCinemas", default)]
+    // Live field is `InCinema`, SINGULAR. `inCinemas` (plural) is kept as an alias.
+    #[serde(rename = "InCinema", alias = "inCinemas", alias = "InCinemas", default)]
     in_cinemas: Option<String>,
 }
 
@@ -590,7 +644,14 @@ fn radarr_proxy_to_provider_metadata(movie: RadarrMovie) -> ProviderMetadata {
         movie
             .images
             .iter()
-            .find(|img| img.cover_type.as_deref() == Some(want))
+            // Case-INSENSITIVE: the live proxy capitalizes these ("Poster", "Fanart"), so an
+            // exact lowercase match found nothing and every title came back art-less even
+            // once the key names were fixed (MUSE #109).
+            .find(|img| {
+                img.cover_type
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(want))
+            })
             .and_then(RadarrImage::best_url)
     };
 
@@ -1040,6 +1101,82 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title.as_deref(), Some("The Matrix"));
         assert_eq!(hits[0].provider_ids.get("tmdb"), Some(&"603".to_string()));
+    }
+
+    #[test]
+    fn radarr_movie_parses_the_LIVE_pascal_case_shape() {
+        // MUSE #109. Captured verbatim from api.radarr.video/v1/search?q=martian and
+        // /v1/movie/286217 — both answer PascalCase, `CoverType` is capitalized, and `Ratings`
+        // is an ARRAY. The previous struct expected camelCase with an object `ratings`, and
+        // because every field carries #[serde(default)] it parsed "successfully" into a record
+        // with nothing in it: a live search returned 20 results with null titles.
+        //
+        // The existing tests mocked the camelCase shape the CODE expected, so test and code
+        // agreed with each other and both disagreed with the service — the same failure as
+        // MUSE #106. This pins the shape the server actually sends.
+        let body = serde_json::json!({
+            "TmdbId": 286217,
+            "ImdbId": "tt3659388",
+            "Title": "The Martian",
+            "Overview": "During a manned mission to Mars...",
+            "Runtime": 141,
+            "Year": 2015,
+            "InCinema": "2015-09-30",
+            "Genres": ["Science Fiction", "Drama"],
+            "Images": [{"CoverType": "Poster", "Url": "https://image.tmdb.org/t/p/original/p.jpg"}],
+            "Ratings": [{"Count": 21484, "Value": 7.705, "Origin": "Tmdb", "Type": "User"}]
+        });
+        let movie: RadarrMovie = serde_json::from_value(body).expect("live shape must parse");
+        let meta = radarr_proxy_to_provider_metadata(movie);
+
+        assert_eq!(meta.title.as_deref(), Some("The Martian"));
+        assert_eq!(meta.year, Some(2015));
+        assert_eq!(meta.runtime_minutes, Some(141));
+        assert_eq!(meta.provider_ids.get("tmdb").map(String::as_str), Some("286217"));
+        assert_eq!(meta.provider_ids.get("imdb").map(String::as_str), Some("tt3659388"));
+        assert_eq!(meta.genres, vec!["Science Fiction", "Drama"]);
+        assert_eq!(meta.first_aired.as_deref(), Some("2015-09-30"));
+        // Capitalized "Poster" must still match the lowercase lookup key.
+        assert!(meta.images.poster_url.is_some(), "capitalized CoverType must resolve art");
+        // Chosen by Origin == "Tmdb", not by array position.
+        assert_eq!(meta.rating, Some(7.705));
+    }
+
+    #[test]
+    fn radarr_movie_still_accepts_the_camel_case_shape() {
+        // The old spellings survive as aliases, so a differently-configured proxy that does
+        // answer camelCase with an object `ratings` is not broken by the fix.
+        let body = serde_json::json!({
+            "tmdbId": 603, "title": "The Matrix", "year": 1999,
+            "images": [{"coverType": "poster", "remoteUrl": "https://x/p.jpg"}],
+            "ratings": {"tmdb": {"value": 8.2}}
+        });
+        let movie: RadarrMovie = serde_json::from_value(body).expect("camelCase must still parse");
+        let meta = radarr_proxy_to_provider_metadata(movie);
+        assert_eq!(meta.title.as_deref(), Some("The Matrix"));
+        assert_eq!(meta.rating, Some(8.2));
+        assert!(meta.images.poster_url.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "hits api.radarr.video"]
+    async fn live_keyless_movie_search_returns_POPULATED_records() {
+        // The test I should have written in MUSE #108. That one asserted only
+        // `!hits.is_empty()` — which 20 entirely blank records satisfy perfectly, and blank is
+        // exactly what production was returning. Assert CONTENT, not count.
+        let client = TmdbClient::new_proxy(DEFAULT_RADARR_PROXY_URL).expect("proxy client");
+        let hits = MetadataProvider::search(&client, "the martian", MetadataKind::Movie)
+            .await
+            .expect("search should succeed");
+        assert!(!hits.is_empty(), "search returned nothing at all");
+
+        let named = hits.iter().filter(|h| h.title.is_some()).count();
+        assert_eq!(named, hits.len(), "every hit must carry a title, not merely exist");
+        assert!(
+            hits.iter().any(|h| h.provider_ids.contains_key("tmdb")),
+            "hits must carry a tmdb id or nothing downstream can resolve them",
+        );
+        assert!(hits.iter().any(|h| h.year.is_some()), "at least one hit must carry a year");
     }
 
     #[tokio::test]

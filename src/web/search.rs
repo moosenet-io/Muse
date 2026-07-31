@@ -147,15 +147,42 @@ fn id_pairs(meta: &ProviderMetadata) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Which of these titles Muse already holds, as the set of `(provider, id)` pairs that match
-/// a row in `media_metadata`, mapped to that row's id.
+/// `media_metadata.kind` is the DB enum `media_kind`, whose variants are `movie` and `show`.
+/// That is a DIFFERENT spelling from this endpoint's wire value (`movie`/`series`) and from
+/// `metadata::MediaKind`. Converted explicitly rather than by string reuse, so the two
+/// vocabularies cannot drift into each other.
+fn db_kind(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Movie => "movie",
+        MediaKind::Series => "show",
+    }
+}
+
+/// What Muse knows about a title it recognized.
+#[derive(Debug, Clone, Copy)]
+struct LibraryHit {
+    metadata_id: i64,
+    /// A `media_metadata` row alone does NOT mean the title is held: `/api/discover` writes
+    /// metadata rows for TRENDING titles precisely because they are *not* in the library
+    /// (`list_trending_not_in_library`). Ownership is a `media_items` row — the same join
+    /// `repo::dashboard`'s library query uses. Treating a catalog row as ownership would have
+    /// marked every discoverable title as already owned (codex).
+    owned: bool,
+}
+
+/// Which of these titles Muse already knows, keyed by `(provider, id, db_kind)`.
+///
+/// The KIND is part of the key deliberately. `media_metadata` is `UNIQUE (kind, tmdb_id)` and
+/// `UNIQUE (kind, tvdb_id)`, so the same provider id can legitimately exist as both a movie and
+/// a show. Keying on `(provider, id)` alone let one row overwrite the other in the map and
+/// could report a movie as owned on the strength of a series row, or vice versa (codex).
 ///
 /// One query for the whole result set rather than per-hit: a search returns tens of titles and
 /// a per-hit lookup would be tens of round trips on an interactive path.
 async fn resolve_in_library(
     state: &AppState,
     hits: &[(&'static str, MediaKind, ProviderMetadata)],
-) -> MuseResult<HashMap<(String, String), i64>> {
+) -> MuseResult<HashMap<(String, String, &'static str), LibraryHit>> {
     let mut tmdb_ids: HashSet<String> = HashSet::new();
     let mut tvdb_ids: HashSet<String> = HashSet::new();
     let mut imdb_ids: HashSet<String> = HashSet::new();
@@ -171,7 +198,7 @@ async fn resolve_in_library(
         }
     }
 
-    let mut found: HashMap<(String, String), i64> = HashMap::new();
+    let mut found: HashMap<(String, String, &'static str), LibraryHit> = HashMap::new();
     if tmdb_ids.is_empty() && tvdb_ids.is_empty() && imdb_ids.is_empty() {
         return Ok(found);
     }
@@ -180,33 +207,68 @@ async fn resolve_in_library(
     let tvdb: Vec<String> = tvdb_ids.into_iter().collect();
     let imdb: Vec<String> = imdb_ids.into_iter().collect();
 
-    // The three id columns are queried in one pass. `id::text` because the columns are typed
-    // per provider while the provider hands us strings.
-    let rows: Vec<(i64, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT id, tmdb_id::text, tvdb_id::text, imdb_id
-        FROM media_metadata
-        WHERE (tmdb_id::text = ANY($1)) OR (tvdb_id::text = ANY($2)) OR (imdb_id = ANY($3))
-        "#,
-    )
-    .bind(&tmdb)
-    .bind(&tvdb)
-    .bind(&imdb)
-    .fetch_all(&state.pool)
-    .await?;
+    // `tmdb_id`/`tvdb_id`/`imdb_id` are all `text` columns (migration 0005), so no casts are
+    // needed — an earlier version cast them anyway, which was noise that could have hidden a
+    // genuine type mismatch behind a silent coercion.
+    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, bool)> =
+        sqlx::query_as(
+            r#"
+            SELECT
+                mm.id,
+                mm.kind::text,
+                mm.tmdb_id,
+                mm.tvdb_id,
+                mm.imdb_id,
+                EXISTS (SELECT 1 FROM media_items mi WHERE mi.media_metadata_id = mm.id) AS owned
+            FROM media_metadata mm
+            WHERE mm.tmdb_id = ANY($1) OR mm.tvdb_id = ANY($2) OR mm.imdb_id = ANY($3)
+            "#,
+        )
+        .bind(&tmdb)
+        .bind(&tvdb)
+        .bind(&imdb)
+        .fetch_all(&state.pool)
+        .await?;
 
-    for (id, tmdb_id, tvdb_id, imdb_id) in rows {
-        if let Some(v) = tmdb_id {
-            found.insert(("tmdb".to_string(), v), id);
-        }
-        if let Some(v) = tvdb_id {
-            found.insert(("tvdb".to_string(), v), id);
-        }
-        if let Some(v) = imdb_id {
-            found.insert(("imdb".to_string(), v), id);
+    for (id, kind, tmdb_id, tvdb_id, imdb_id, owned) in rows {
+        // Leaked once per distinct kind string the DB can produce (two), not per row — the
+        // enum has exactly the two variants below and anything else is skipped rather than
+        // silently bucketed into one of them.
+        let kind_key: &'static str = match kind.as_str() {
+            "movie" => "movie",
+            "show" => "show",
+            other => {
+                tracing::warn!(kind = other, "MUSE #108: unknown media_kind; skipping row");
+                continue;
+            }
+        };
+        let hit = LibraryHit { metadata_id: id, owned };
+        for (provider, value) in [("tmdb", tmdb_id), ("tvdb", tvdb_id), ("imdb", imdb_id)] {
+            if let Some(v) = value {
+                found.insert((provider.to_string(), v, kind_key), hit);
+            }
         }
     }
     Ok(found)
+}
+
+/// Which requested kinds no provider searched SUCCESSFULLY.
+///
+/// Coverage is a property of the KIND, across all providers — not of a provider. The first
+/// implementation derived it from a provider-wide status, so a provider that searched movies
+/// fine and failed on series marked BOTH uncovered (codex, gpt56).
+///
+/// `outcomes` is one entry per (provider, kind) attempt. A kind with NO entry at all is
+/// uncovered: silence is not coverage — it means no configured provider could search it.
+pub(crate) fn uncovered_kinds(
+    outcomes: &[(&'static str, bool)],
+    requested: &[&'static str],
+) -> Vec<&'static str> {
+    requested
+        .iter()
+        .copied()
+        .filter(|k| !outcomes.iter().any(|(kind, ok)| kind == k && *ok))
+        .collect()
 }
 
 pub async fn get_search(
@@ -227,6 +289,10 @@ pub async fn get_search(
     let entries = providers(&state);
     let mut provider_reports: Vec<Value> = Vec::new();
     let mut hits: Vec<(&'static str, MediaKind, ProviderMetadata)> = Vec::new();
+    // Per (kind) success across ALL providers. Coverage is a property of the KIND, not of a
+    // provider: a provider that fails on series while succeeding on movies must not mark
+    // movies uncovered (codex, gpt56).
+    let mut outcomes: Vec<(&'static str, bool)> = Vec::new();
 
     for entry in &entries {
         // Only the kinds the caller asked for AND this provider can serve in its mode.
@@ -236,26 +302,69 @@ pub async fn get_search(
             .filter(|k| entry.searchable.contains(k))
             .collect();
 
-        let mut errors: Vec<String> = Vec::new();
-        let mut count = 0usize;
+        // One report per kind, because one status per provider cannot express "movies fine,
+        // series broken" — and that is the exact state a half-configured deployment is in.
+        let mut kind_reports: Vec<Value> = Vec::new();
 
         for kind in &to_search {
             match entry.client.search(&query, *kind).await {
                 Ok(found) => {
+                    let returned = found.len();
+                    // Detect truncation by what the provider ACTUALLY returned, before
+                    // discarding anything — `.take()` alone leaves the caller unable to tell
+                    // "exactly 40 results" from "40 of many" (gpt56).
+                    let truncated = returned > MAX_PER_PROVIDER;
+                    if truncated {
+                        tracing::info!(
+                            provider = entry.name, kind = kind_str(*kind), returned,
+                            limit = MAX_PER_PROVIDER,
+                            "MUSE #108: provider results truncated; reported to the caller"
+                        );
+                    }
                     for meta in found.into_iter().take(MAX_PER_PROVIDER) {
-                        count += 1;
                         hits.push((entry.name, *kind, meta));
                     }
+                    outcomes.push((kind_str(*kind), true));
+                    kind_reports.push(json!({
+                        "kind": kind_str(*kind),
+                        "status": "ok",
+                        "error": Value::Null,
+                        "result_count": returned.min(MAX_PER_PROVIDER),
+                        "truncated": truncated,
+                        "provider_returned": returned,
+                        "limit": MAX_PER_PROVIDER,
+                    }));
                 }
                 Err(e) => {
-                    // Recorded against this provider and reported; never folded into the
-                    // result list as an absence. See the module doc.
+                    // Recorded against this provider AND kind, and reported; never folded
+                    // into the result list as an absence. See the module doc.
                     tracing::warn!(provider = entry.name, kind = kind_str(*kind), error = %e,
                         "MUSE #108: provider search failed; reporting as error, not as empty");
-                    errors.push(format!("{}: {e}", kind_str(*kind)));
+                    outcomes.push((kind_str(*kind), false));
+                    kind_reports.push(json!({
+                        "kind": kind_str(*kind),
+                        "status": "error",
+                        "error": e.to_string(),
+                        "result_count": 0,
+                        "truncated": false,
+                        "provider_returned": Value::Null,
+                        "limit": MAX_PER_PROVIDER,
+                    }));
                 }
             }
         }
+
+        let any_error = kind_reports
+            .iter()
+            .any(|r| r.get("status").and_then(Value::as_str) == Some("error"));
+        let all_error = !kind_reports.is_empty()
+            && kind_reports
+                .iter()
+                .all(|r| r.get("status").and_then(Value::as_str) == Some("error"));
+        let total: u64 = kind_reports
+            .iter()
+            .filter_map(|r| r.get("result_count").and_then(Value::as_u64))
+            .sum();
 
         provider_reports.push(json!({
             "name": entry.name,
@@ -266,33 +375,39 @@ pub async fn get_search(
             // the caller's kinds and its own coverage. Empty means it was not consulted, which
             // is why it contributed nothing; that is not the same as finding nothing.
             "searched_kinds": to_search.iter().copied().map(kind_str).collect::<Vec<_>>(),
-            "status": if errors.is_empty() { "ok" } else { "error" },
-            "error": if errors.is_empty() { Value::Null } else { json!(errors.join("; ")) },
-            "result_count": count,
+            // Rolled up from the per-kind results, and PARTIAL is its own state: a provider
+            // that answered for one kind and failed for another is neither ok nor error, and
+            // flattening it to either would misdescribe half of what happened.
+            "status": if kind_reports.is_empty() {
+                "not_consulted"
+            } else if all_error {
+                "error"
+            } else if any_error {
+                "partial"
+            } else {
+                "ok"
+            },
+            "kinds": kind_reports,
+            "result_count": total,
         }));
     }
 
-    // Which requested kinds NO healthy provider covered. The caller needs this to know
+    // Which requested kinds NO provider searched successfully. The caller needs this to know
     // whether a short list is the honest answer or a hole: on a key-less deployment losing
     // one provider removes an entire media kind from the results.
-    let mut uncovered: Vec<&'static str> = Vec::new();
-    for kind in &kinds {
-        let covered = entries.iter().zip(provider_reports.iter()).any(|(e, r)| {
-            e.searchable.contains(kind) && r.get("status").and_then(Value::as_str) == Some("ok")
-        });
-        if !covered {
-            uncovered.push(kind_str(*kind));
-        }
-    }
+    let requested: Vec<&'static str> = kinds.iter().copied().map(kind_str).collect();
+    let uncovered = uncovered_kinds(&outcomes, &requested);
 
     let in_library = resolve_in_library(&state, &hits).await?;
 
     let results: Vec<Value> = hits
         .iter()
         .map(|(provider, kind, meta)| {
-            let library_id = id_pairs(meta)
+            // Matched on (provider, id, KIND) — see resolve_in_library on why the kind
+            // belongs in the key.
+            let known = id_pairs(meta)
                 .into_iter()
-                .find_map(|pair| in_library.get(&pair).copied());
+                .find_map(|(provider, id)| in_library.get(&(provider, id, db_kind(*kind))).copied());
             json!({
                 "provider": provider,
                 "kind": kind_str(*kind),
@@ -306,8 +421,13 @@ pub async fn get_search(
                 // are already in the library, so a search hit that is NOT owned has no Muse
                 // art url — the remote one is passed through as-is and may be null.
                 "poster_url": meta.images.poster_url.clone(),
-                "in_library": library_id.is_some(),
-                "media_metadata_id": library_id,
+                // `in_library` means Muse HOLDS this title (a media_items row), which is
+                // what the library query itself requires. A metadata row alone means only
+                // that Muse has seen the title — every trending title on /api/discover has
+                // one — so the two are reported separately rather than conflated.
+                "in_library": known.map(|k| k.owned).unwrap_or(false),
+                "in_catalog": known.is_some(),
+                "media_metadata_id": known.map(|k| k.metadata_id),
             })
         })
         .collect();
@@ -343,6 +463,55 @@ mod tests {
         // An unknown kind is a 400, NOT a silent fallback to "all". Quietly widening the
         // search would answer a question the caller did not ask and label it as theirs.
         assert!(requested_kinds(Some("anime")).is_err());
+    }
+
+    #[test]
+    fn db_kind_uses_the_db_vocabulary_not_the_wire_one() {
+        // media_kind is ('movie','show'); the wire says ('movie','series'). Conflating them
+        // would silently fail every series in_library match.
+        assert_eq!(db_kind(MediaKind::Series), "show");
+        assert_eq!(kind_str(MediaKind::Series), "series");
+        assert_eq!(db_kind(MediaKind::Movie), "movie");
+    }
+
+    /// Coverage is a property of the KIND, across all providers — not of a provider.
+    ///
+    /// The original implementation derived it from a provider-wide status, so a provider that
+    /// searched movies successfully and failed on series marked BOTH uncovered. On a key-less
+    /// deployment that is the difference between "your movie results are complete" and a
+    /// spurious warning that movie coverage is missing.
+    /// The PRODUCTION function, not a reimplementation of it. An earlier version of these
+    /// tests copied the logic into the test module, which would have passed happily while the
+    /// handler did something else entirely — the same class of false-green as a mock that
+    /// disagrees with its endpoint.
+    use super::uncovered_kinds as coverage;
+
+    #[test]
+    fn one_kind_failing_does_not_mark_the_other_uncovered() {
+        // tmdb ok on movie, tvdb error on series
+        assert_eq!(
+            coverage(&[("movie", true), ("series", false)], &["movie", "series"]),
+            vec!["series"],
+        );
+    }
+
+    #[test]
+    fn a_kind_is_covered_when_any_provider_succeeds_at_it() {
+        // Two providers both asked for series; one fails, one succeeds. Covered.
+        assert_eq!(
+            coverage(&[("series", false), ("series", true)], &["series"]),
+            Vec::<&str>::new(),
+        );
+    }
+
+    #[test]
+    fn a_kind_no_provider_could_search_is_uncovered() {
+        // Nothing reported an outcome for `series` at all — e.g. every configured provider is
+        // movie-only in its current mode. Silence is NOT coverage.
+        assert_eq!(
+            coverage(&[("movie", true)], &["movie", "series"]),
+            vec!["series"],
+        );
     }
 
     /// These hit the REAL upstreams. Ignored by default so the suite stays hermetic and

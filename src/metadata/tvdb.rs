@@ -387,11 +387,26 @@ impl TvdbClient {
         }
     }
 
-    /// `GET /search/en/{term}` — Skyhook series search (thin records).
+    /// `GET /search/en?term={term}` — Skyhook series search (thin records).
     /// Fail-open like [`Self::skyhook_show`]: transport/HTTP/parse failures
     /// degrade to an empty result set rather than erroring.
+    ///
+    /// MUSE #106: the term is a QUERY PARAMETER, not a path segment. This
+    /// built `/search/en/{term}`, which Skyhook answers with 404 — and
+    /// because this function fails open, every series search on a key-less
+    /// deployment returned an empty list with nothing logged above debug.
+    /// That is the whole of TVDB search whenever `MUSE_TVDB_API_KEY` is
+    /// unset, which is the default posture (see `TvdbMode::Skyhook`).
+    /// Probed live against `skyhook.sonarr.tv/v1/tvdb`:
+    ///   `/search/en/thrones`      -> 404
+    ///   `/search/en?term=thrones` -> 200 with results
+    ///   `/shows/en/121361`        -> 200 (resolve-by-id was never affected)
     async fn skyhook_search(&self, term: &str) -> MuseResult<Vec<ProviderMetadata>> {
-        let url = self.skyhook_url(&["search", "en", term])?;
+        let mut url = self.skyhook_url(&["search", "en"])?;
+        // `append_pair` percent-encodes, so a term with spaces or specials is
+        // carried correctly — the property the old path-segment form relied on
+        // `path_segments_mut` for.
+        url.query_pairs_mut().append_pair("term", term);
         let (status, bytes) = match self.skyhook_send(url).await {
             Ok(pair) => pair,
             Err(e) => {
@@ -1424,12 +1439,17 @@ mod tests {
 
     #[tokio::test]
     async fn skyhook_search_parses_hits() {
-        // Single-token term (no percent-encoding needed) keeps the path
-        // matcher unambiguous on the gate; the term is still routed through
-        // `Url::path_segments_mut`, which percent-encodes any spaces/specials.
+        // MUSE #106: this test previously mocked `/search/en/thrones` — the
+        // PATH-SEGMENT form — and passed, which is precisely why the bug
+        // survived: the test encoded the same wrong contract as the code, so
+        // the pair agreed with each other and disagreed with Skyhook. The
+        // mock now pins the query-parameter form the live service actually
+        // answers, so a regression to the path form fails here.
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(GET).path("/search/en/thrones");
+            when.method(GET)
+                .path("/search/en")
+                .query_param("term", "thrones");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!([
@@ -1519,6 +1539,30 @@ mod tests {
             .await
             .expect("5xx must degrade to Ok(None), not Err");
         assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn skyhook_search_encodes_a_multi_word_term() {
+        // The old path-segment form leaned on `path_segments_mut` for encoding.
+        // `append_pair` must carry the same property for terms with spaces.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/search/en")
+                .query_param("term", "game of thrones");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([]));
+        });
+
+        let client = skyhook_client_for(&server);
+        let hits = client
+            .search("game of thrones", MediaKind::Series)
+            .await
+            .expect("search should parse");
+
+        mock.assert();
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

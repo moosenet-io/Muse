@@ -367,6 +367,31 @@ pub struct DiscoverItem {
     pub backdrop_url: String,
 }
 
+/// Whether Discover can ever have anything to show, and if not, why.
+///
+/// Extracted as a pure function so it is testable: the decision previously sat inline in a
+/// handler that needs a database pool to reach, so no test executed it and a mutation restoring
+/// the old `tmdb.is_some()` behaviour survived the entire suite. The rule that decides whether
+/// a panel tells the operator the truth is exactly the rule that needs a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendingCapability {
+    /// A keyed TMDb client — trending can actually be fetched.
+    Available,
+    /// A key-less proxy client. Serves movie metadata, has NO trending endpoint, so no
+    /// snapshot can ever be ingested however long the worker runs.
+    MetadataProxyOnly,
+    /// No TMDb client at all.
+    NotConfigured,
+}
+
+pub fn trending_capability(client_present: bool, is_proxy_mode: bool) -> TrendingCapability {
+    match (client_present, is_proxy_mode) {
+        (false, _) => TrendingCapability::NotConfigured,
+        (true, true) => TrendingCapability::MetadataProxyOnly,
+        (true, false) => TrendingCapability::Available,
+    }
+}
+
 /// `GET /api/discover` — TMDb trending/popular titles not already in the
 /// library (read-only browse; the request/grab action stays gated in
 /// `crate::http::requests`). Seam-empty when TMDb isn't configured (no
@@ -398,9 +423,42 @@ pub async fn get_discover(
         })
         .collect();
 
+    // MUSE #111: `configured` used to be `state.tmdb.is_some()`, which conflated "a TMDb
+    // client exists" with "trending works". Those are different facts, and on this deployment
+    // they differ:
+    //
+    //   TMDB_API_KEY unset  ->  TmdbClient runs in key-less RadarrProxy mode
+    //   RadarrProxy mode    ->  `TmdbClient::trending()` returns Ok(vec![]) WITHOUT asking,
+    //                           because api.radarr.video has no /trending endpoint (404, probed)
+    //
+    // So the trending table is never populated and Discover is empty FOREVER — while the panel
+    // was told a trending provider was configured and had simply returned nothing. It then
+    // offered three possible causes, none of which was the real one. Reporting the capability
+    // honestly is the fix: the operator needs to know a TMDb API key is required, not go
+    // hunting for a worker that never had anything to do.
+    let capability = trending_capability(
+        state.tmdb.is_some(),
+        state.tmdb.as_ref().is_some_and(|c| c.is_proxy_mode()),
+    );
+    let trending_capable = capability == TrendingCapability::Available;
+    let metadata_only = capability == TrendingCapability::MetadataProxyOnly;
+
     Json(json!({
         "region": region,
-        "configured": state.tmdb.is_some(),
+        // Now means what the panel reads it as: trending can actually be fetched.
+        "configured": trending_capable,
+        // The narrower fact, so the UI can distinguish "nothing set up" from "set up for
+        // metadata but not for trending" — which need completely different operator actions.
+        "metadata_provider_only": metadata_only,
+        "reason": if trending_capable {
+            Value::Null
+        } else if metadata_only {
+            json!("TMDb is running in key-less proxy mode (no TMDB_API_KEY). That proxy serves \
+                   movie metadata only — it has no trending endpoint — so no trending snapshot \
+                   can ever be ingested. Set TMDB_API_KEY to enable Discover.")
+        } else {
+            json!("No TMDb client is configured, so trending cannot be fetched.")
+        },
         "items": items,
     }))
 }
@@ -1435,5 +1493,38 @@ mod tests {
         assert_eq!(body["tracked_as"], "MUSE #86");
         // Must NOT look like a successful empty payload.
         assert!(body.get("items").is_none());
+    }
+}
+
+#[cfg(test)]
+mod discover_capability_tests {
+    use super::{trending_capability, TrendingCapability};
+
+    #[test]
+    fn a_keyless_proxy_is_not_a_trending_provider() {
+        // MUSE #111, the whole bug: `configured: state.tmdb.is_some()` reported TRUE for a
+        // key-less proxy that structurally cannot fetch trending — api.radarr.video has no
+        // /trending endpoint (404, probed live), and TmdbClient::trending() returns empty
+        // WITHOUT asking. So Discover was permanently empty while telling the operator a
+        // trending provider was configured and had merely returned nothing, offering three
+        // candidate causes, none of which was the real one.
+        assert_eq!(
+            trending_capability(true, true),
+            TrendingCapability::MetadataProxyOnly,
+            "a metadata proxy must not be reported as a trending provider",
+        );
+    }
+
+    #[test]
+    fn a_keyed_client_can_do_trending() {
+        assert_eq!(trending_capability(true, false), TrendingCapability::Available);
+    }
+
+    #[test]
+    fn no_client_is_its_own_state() {
+        // Distinct from the proxy case because the operator action differs: one needs TMDb
+        // configuring at all, the other needs an API KEY adding to a working client.
+        assert_eq!(trending_capability(false, false), TrendingCapability::NotConfigured);
+        assert_eq!(trending_capability(false, true), TrendingCapability::NotConfigured);
     }
 }

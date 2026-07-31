@@ -746,6 +746,27 @@ mod tests {
         assert!(!v.is_importable());
     }
 
+    #[tokio::test]
+    async fn the_full_gate_reaches_the_llm_stage_and_records_it() {
+        // The claim that was still false: archive listing was wired in, the LLM stage was not
+        // reachable from any orchestration. A capability nothing calls is not a capability.
+        use std::io::Cursor;
+        let v = inspect_download_adjudicated(
+            vec![DownloadFile {
+                path: "Movie.mkv".into(),
+                size_bytes: 10,
+                leading_bytes: Some(vec![0x1A, 0x45, 0xDF, 0xA3]),
+                archive_reader: None::<Cursor<Vec<u8>>>,
+            }],
+            None,
+            "m",
+        )
+        .await;
+        let rec = v.adjudication.expect("the gate must record the LLM stage");
+        assert!(!rec.ran, "no client, so it did not run — and the verdict says so");
+        assert_eq!(v.severity, Severity::Clean, "and the deterministic verdict is unchanged");
+    }
+
     #[test]
     fn an_archive_the_caller_cannot_open_is_uninspected_not_clean() {
         use std::io::Cursor;
@@ -867,4 +888,40 @@ pub fn inspect_download<R: std::io::Read + std::io::Seek>(
     }
 
     verdict
+}
+
+/// Judge a download AND put it in front of the model.
+///
+/// [`inspect_download`] is the deterministic half. This is the whole gate, and it exists
+/// because the previous "the modules now talk to each other" claim was only two-thirds true: the
+/// archive listing was wired in, and the LLM stage still was not reachable from any
+/// orchestration (codex). A capability that nothing calls is not a capability.
+///
+/// The file list handed to the model is the LOOSE paths plus every archive ENTRY discovered, so
+/// the model sees the same shape a person would — including the executable inside the zip.
+///
+/// Availability is not a gate: with no client, or an unreachable one, the deterministic verdict
+/// stands unchanged and the record says adjudication did not run.
+pub async fn inspect_download_adjudicated<R: std::io::Read + std::io::Seek>(
+    files: Vec<DownloadFile<R>>,
+    chord: Option<&std::sync::Arc<crate::taste_model::chord_client::ChordClient>>,
+    model: &str,
+) -> Verdict {
+    // Names are collected BEFORE inspection consumes the readers.
+    let mut for_model: Vec<(String, u64)> =
+        files.iter().map(|f| (f.path.clone(), f.size_bytes)).collect();
+
+    let verdict = inspect_download(files);
+
+    // Archive entries appear in findings as "archive.zip → entry"; the model benefits from
+    // seeing those too, since the social-engineering shapes it is good at spotting are often
+    // inside the archive rather than beside it.
+    for finding in &verdict.findings {
+        if let Some((_, entry)) = finding.path.split_once(" → ") {
+            for_model.push((entry.to_string(), 0));
+        }
+    }
+
+    let adjudication = llm::adjudicate(chord, model, &for_model, verdict.severity).await;
+    llm::apply(&verdict, &adjudication)
 }

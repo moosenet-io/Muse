@@ -144,6 +144,47 @@ pub fn is_traversal(name: &str) -> bool {
 }
 
 /// List a ZIP's entries from its central directory. No compressed data is read.
+/// A `Read + Seek` wrapper that refuses to serve bytes beyond a hard cap.
+///
+/// `std::io::Take` is not usable here because `ZipArchive` needs `Seek`, which `Take` does not
+/// provide. This keeps `Seek` while bounding reads — seeking beyond the cap is allowed (the
+/// central directory lives at the END of a ZIP, so a reader that could not seek there could not
+/// list anything), but no read may cross it.
+struct BoundedReader<R> {
+    inner: R,
+    limit: u64,
+    pos: u64,
+}
+
+impl<R: Read + Seek> BoundedReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self { inner, limit, pos: 0 }
+    }
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archive exceeded the inspection byte limit",
+            ));
+        }
+        let room = (self.limit - self.pos).min(buf.len() as u64) as usize;
+        let n = self.inner.read(&mut buf[..room])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for BoundedReader<R> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let p = self.inner.seek(from)?;
+        self.pos = p;
+        Ok(p)
+    }
+}
+
 /// Refuse an archive whose size exceeds [`MAX_ARCHIVE_BYTES`] before any parsing happens.
 ///
 /// Separate from `list_zip` so the refusal is testable without constructing a 256 MB fixture.
@@ -160,13 +201,25 @@ pub fn too_large_to_inspect(size_bytes: u64) -> bool {
 /// the false claim (codex, gpt56). Putting the size in the signature makes it impossible to
 /// list an archive without having considered its size.
 pub fn list_zip<R: Read + Seek>(reader: R, size_bytes: u64) -> ArchiveListing {
+    // `size_bytes` is the caller's CLAIM about the file. It is checked first because refusing
+    // early is cheaper, but it is not trusted on its own: a caller that reports 1 KiB for a
+    // 4 GiB archive would otherwise walk straight into the eager parser (codex, gpt56). The
+    // authoritative bound is `bounded_reader` below, which caps the bytes the parser can
+    // actually consume regardless of what was declared.
     if too_large_to_inspect(size_bytes) {
         return ArchiveListing::failed(ListingFailure::Unreadable(format!(
             "archive is {size_bytes} bytes, above the {MAX_ARCHIVE_BYTES}-byte inspection limit; \
              it was NOT parsed and nothing inside it has been checked"
         )));
     }
-    let mut archive = match zip::ZipArchive::new(reader) {
+    // THE AUTHORITATIVE BOUND. `Take` caps what the parser can read no matter what the caller
+    // declared, so a lie about the size buys nothing: the reader simply ends early and the
+    // archive fails to parse, which is reported as unreadable — fail closed.
+    //
+    // `+ 1` so an archive of exactly MAX_ARCHIVE_BYTES still parses; the declared-size check
+    // above is what rejects anything larger with a precise reason.
+    let bounded = BoundedReader::new(reader, MAX_ARCHIVE_BYTES + 1);
+    let mut archive = match zip::ZipArchive::new(bounded) {
         Ok(a) => a,
         Err(e) => return ArchiveListing::failed(ListingFailure::Unreadable(e.to_string())),
     };
@@ -613,6 +666,31 @@ mod tests {
         );
         assert_eq!(v.severity, Severity::Suspicious);
         assert!(!v.is_importable());
+    }
+
+    #[test]
+    fn a_lie_about_the_size_does_not_get_past_the_byte_bound() {
+        // The declared size is the caller's CLAIM. A caller reporting 1 KiB for a huge archive
+        // would otherwise walk straight into the eager parser (codex, gpt56). The authoritative
+        // bound is on bytes actually read, so a lie buys nothing: the reader ends early, the
+        // parse fails, and it is reported unreadable — fail closed rather than parsed anyway.
+        let mut buf = zip_with(&[("Movie.mkv", b"x")]);
+        // Pad well past the cap so a truthful read would exceed it.
+        buf.resize((MAX_ARCHIVE_BYTES + 4096) as usize, 0);
+        let n = buf.len() as u64;
+
+        // Truthful size: refused up front with a precise reason.
+        let honest = list_zip(Cursor::new(buf.clone()), n);
+        assert!(honest.entries.is_empty());
+        assert!(honest.failure.is_some());
+
+        // Lied-about size: the byte bound still stops it, rather than the declared value
+        // deciding how much the parser may consume.
+        let lying = list_zip(Cursor::new(buf), 1024);
+        assert!(
+            lying.entries.is_empty() && lying.failure.is_some(),
+            "a false size must not unlock unbounded parsing: {lying:?}",
+        );
     }
 
     #[test]

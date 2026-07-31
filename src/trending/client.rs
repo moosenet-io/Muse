@@ -397,21 +397,25 @@ impl TmdbClient {
         if media_type == TmdbMediaType::Tv {
             return Ok(Vec::new());
         }
-        // Fail-open (codex): any transport/HTTP error degrades to an empty
-        // result set rather than failing the caller.
-        match self
-            .get::<Vec<RadarrMovie>>("/search", &[("q", query)])
+        // MUSE #108: this used to FAIL OPEN — any transport/HTTP error became an empty
+        // result set. That makes an outage indistinguishable from "nothing matched", which is
+        // the exact defect MUSE #106 was, and it silently propagated into `/api/search`, whose
+        // whole purpose is to keep those two apart. A search now returns the error.
+        //
+        // Safe for the other caller: `metadata::resolve::resolve_and_merge` already handles
+        // `Err` from a fallback title search by logging and skipping that provider — the same
+        // outcome an empty vec produced, so its behaviour is unchanged.
+        //
+        // NOTE this is search only. Resolve-by-id keeps failing open, because there a miss is
+        // an ordinary answer ("no such title") rather than a fault.
+        self.get::<Vec<RadarrMovie>>("/search", &[("q", query)])
             .await
-        {
-            Ok(movies) => Ok(movies
-                .into_iter()
-                .map(radarr_proxy_to_provider_metadata)
-                .collect()),
-            Err(e) => {
-                tracing::debug!(error = %e, "AMETA-2: Radarr proxy search failed; degrading to empty (fail-open)");
-                Ok(Vec::new())
-            }
-        }
+            .map(|movies| {
+                movies
+                    .into_iter()
+                    .map(radarr_proxy_to_provider_metadata)
+                    .collect()
+            })
     }
 }
 
@@ -1039,26 +1043,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_resolve_and_search_fail_open_on_connection_error() {
-        // Fail-open (codex): an unreachable proxy (refused connection) must
-        // degrade to None/empty, never Err — metadata resolution can't fail
-        // because the public proxy is down.
+    async fn proxy_resolve_fails_open_but_search_fails_LOUD_on_connection_error() {
+        // MUSE #108: the two now differ deliberately. resolve_by_id still fails open —
+        // metadata resolution must not break because a public proxy is down, and a miss
+        // there is an ordinary answer. search must NOT: an empty list is the claim
+        // "nothing matched", and returning it for an unreachable host makes an outage
+        // indistinguishable from a genuine miss (MUSE #106, recreated one layer up in
+        // /api/search until this changed).
         let client = TmdbClient::new_proxy("http://127.0.0.1:1").expect("client should construct");
 
         let resolved = MetadataProvider::resolve_by_id(&client, MetadataKind::Movie, "603")
             .await
-            .expect("connection error must degrade to Ok(None), not Err");
+            .expect("connection error must still degrade to Ok(None) for resolve-by-id");
         assert!(resolved.is_none());
 
-        let hits = MetadataProvider::search(&client, "matrix", MetadataKind::Movie)
-            .await
-            .expect("connection error must degrade to Ok(empty), not Err");
-        assert!(hits.is_empty());
+        assert!(
+            MetadataProvider::search(&client, "matrix", MetadataKind::Movie)
+                .await
+                .is_err(),
+            "an unreachable proxy must NOT be reported as an empty result set",
+        );
     }
 
     #[tokio::test]
-    async fn proxy_resolve_and_search_fail_open_on_5xx() {
-        // A proxy 5xx is not a hard failure either — degrade to None/empty.
+    async fn proxy_resolve_fails_open_but_search_fails_LOUD_on_5xx() {
+        // MUSE #108: resolve-by-id still degrades on a 5xx; SEARCH does not. A 500 from the
+        // proxy is a fault, and reporting it as "no movies matched" is the false-empty this
+        // whole issue exists to remove.
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/movie/603");
@@ -1075,10 +1086,12 @@ mod tests {
             .expect("5xx must degrade to Ok(None), not Err");
         assert!(resolved.is_none());
 
-        let hits = MetadataProvider::search(&client, "matrix", MetadataKind::Movie)
-            .await
-            .expect("5xx must degrade to Ok(empty), not Err");
-        assert!(hits.is_empty());
+        assert!(
+            MetadataProvider::search(&client, "matrix", MetadataKind::Movie)
+                .await
+                .is_err(),
+            "a 5xx must NOT be reported as an empty result set",
+        );
     }
 
     #[tokio::test]

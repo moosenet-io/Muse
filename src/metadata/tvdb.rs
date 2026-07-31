@@ -446,11 +446,13 @@ impl TvdbClient {
         let (status, bytes) = match self.skyhook_send(url).await {
             Ok(pair) => pair,
             Err(e) => {
-                // Warn, not debug: an unreachable host or a bad override is exactly the
-                // class of fault that hid MUSE #106, and search has no benign failure mode
-                // to confuse it with (codex).
-                tracing::warn!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
-                return Ok(Vec::new());
+                // MUSE #108: FAILS LOUD now. Warning about it was not enough — the RETURN
+                // VALUE was still an empty list, so `/api/search` reported a Skyhook outage
+                // as a healthy "0 results" and could mark series coverage complete. That
+                // recreated MUSE #106 one layer up, in the very endpoint built to prevent it
+                // (codex). Search returns the error; the caller decides what to say.
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search request failed");
+                return Err(e);
             }
         };
         // Unlike resolve-by-id, a 404 on SEARCH cannot mean "no results" — the endpoint
@@ -458,20 +460,25 @@ impl TvdbClient {
         // empty array. So every non-2xx here is unexpected and is logged at warn: this is
         // the precise signal that was missing while MUSE #106 silently returned zero
         // results for every series query on a key-less deployment (codex).
+        // No benign non-2xx exists here: a search that finds nothing answers 200 with an
+        // empty array, so any non-2xx is a fault and is surfaced as one.
         if !(200..300).contains(&status) {
-            tracing::warn!(
-                status,
-                "AMETA-3: Skyhook search unexpected non-2xx; degrading to empty (fail-open)"
-            );
-            return Ok(Vec::new());
+            tracing::warn!(status, "AMETA-3: Skyhook search unexpected non-2xx");
+            return Err(MuseError::Upstream {
+                status: status as u16,
+                message: "skyhook search returned a non-2xx status".to_string(),
+            });
         }
         match serde_json::from_slice::<Vec<SkyhookShow>>(&bytes) {
             Ok(hits) => Ok(hits.into_iter().map(SkyhookShow::into_metadata).collect()),
             Err(e) => {
                 // A 200 carrying HTML or otherwise unparseable JSON means we are pointed at
                 // the wrong endpoint — indistinguishable from "no results" without this.
-                tracing::warn!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
-                Ok(Vec::new())
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search parse failed");
+                Err(MuseError::Upstream {
+                    status: 200,
+                    message: format!("skyhook search returned an unparseable body: {e}"),
+                })
             }
         }
     }
@@ -1552,23 +1559,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skyhook_resolve_and_search_fail_open_on_connection_error() {
-        // Fail-open (codex): an unreachable Skyhook proxy degrades to
-        // None/empty, never Err.
+    async fn skyhook_resolve_fails_open_but_search_fails_LOUD_on_connection_error() {
+        // MUSE #108: these two now differ ON PURPOSE, and the difference is the point.
+        //
+        // resolve_by_id still fails open: a miss there is an ordinary answer ("no such
+        // series"), so degrading to None costs a caller nothing.
+        //
+        // search does NOT. An empty list from a search is a CLAIM — "nothing matched" — and
+        // returning it for an unreachable host makes an outage indistinguishable from a
+        // genuine miss. That is exactly MUSE #106, and it silently propagated into
+        // /api/search, whose entire purpose is to keep those two apart.
         let client =
             TvdbClient::new_skyhook("http://127.0.0.1:1").expect("client should construct");
 
         let resolved = client
             .resolve_by_id(MediaKind::Series, "121361")
             .await
-            .expect("connection error must degrade to Ok(None), not Err");
+            .expect("connection error must still degrade to Ok(None) for resolve-by-id");
         assert!(resolved.is_none());
 
-        let hits = client
-            .search("thrones", MediaKind::Series)
-            .await
-            .expect("connection error must degrade to Ok(empty), not Err");
-        assert!(hits.is_empty());
+        assert!(
+            client.search("thrones", MediaKind::Series).await.is_err(),
+            "an unreachable host must NOT be reported as an empty result set",
+        );
     }
 
     #[tokio::test]

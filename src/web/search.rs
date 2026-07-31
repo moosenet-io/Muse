@@ -91,10 +91,15 @@ fn kind_str(kind: MediaKind) -> &'static str {
 struct ProviderEntry {
     name: &'static str,
     mode: &'static str,
+    /// `None` when the provider is NOT configured on this deployment. It is still reported —
+    /// see `providers()`.
+    configured: bool,
     /// The kinds this provider can search IN ITS CURRENT MODE. Key-less modes are
     /// single-kind; see the module doc.
     searchable: Vec<MediaKind>,
-    client: Box<dyn MetadataProvider>,
+    /// `None` for an unconfigured provider: there is nothing to search with, but the entry
+    /// still appears so the caller can see that the provider exists and is switched off.
+    client: Option<Box<dyn MetadataProvider>>,
 }
 
 /// Build the provider set from live state, exactly as the rest of Muse constructs it.
@@ -105,10 +110,17 @@ struct ProviderEntry {
 fn providers(state: &AppState) -> Vec<ProviderEntry> {
     let mut out: Vec<ProviderEntry> = Vec::new();
 
+    // EVERY known provider gets an entry, configured or not. An earlier version pushed only
+    // successfully-constructed clients and hard-coded `configured: true`, so an unconfigured
+    // provider vanished from the array entirely — and the caller could not tell "TVDB is not
+    // set up" from "this endpoint does not know about TVDB". It saw only an uncovered kind,
+    // with no way to learn why (gpt56). The `providers` array is documented as the operator's
+    // answer to "what metadata APIs do I have"; a provider that is off is part of that answer.
     if let Some(tmdb) = state.tmdb.clone() {
         let proxy = tmdb.is_proxy_mode();
         out.push(ProviderEntry {
             name: "tmdb",
+            configured: true,
             mode: if proxy { "radarr_proxy" } else { "api" },
             // AMETA-1/2: the key-less Radarr proxy serves movie lookup/search only. Claiming
             // series coverage here would make a missing half look like an empty half.
@@ -117,7 +129,15 @@ fn providers(state: &AppState) -> Vec<ProviderEntry> {
             } else {
                 vec![MediaKind::Movie, MediaKind::Series]
             },
-            client: Box::new(tmdb),
+            client: Some(Box::new(tmdb)),
+        });
+    } else {
+        out.push(ProviderEntry {
+            name: "tmdb",
+            configured: false,
+            mode: "unconfigured",
+            searchable: Vec::new(),
+            client: None,
         });
     }
 
@@ -125,6 +145,7 @@ fn providers(state: &AppState) -> Vec<ProviderEntry> {
         let skyhook = tvdb.is_skyhook_mode();
         out.push(ProviderEntry {
             name: "tvdb",
+            configured: true,
             mode: if skyhook { "skyhook" } else { "api" },
             // AMETA-3: Skyhook is Sonarr's series proxy — no movies.
             searchable: if skyhook {
@@ -132,7 +153,15 @@ fn providers(state: &AppState) -> Vec<ProviderEntry> {
             } else {
                 vec![MediaKind::Movie, MediaKind::Series]
             },
-            client: Box::new(tvdb),
+            client: Some(Box::new(tvdb)),
+        });
+    } else {
+        out.push(ProviderEntry {
+            name: "tvdb",
+            configured: false,
+            mode: "unconfigured",
+            searchable: Vec::new(),
+            client: None,
         });
     }
 
@@ -502,7 +531,13 @@ pub async fn get_search(
         let mut kind_reports: Vec<Value> = Vec::new();
 
         for kind in &to_search {
-            match entry.client.search(&query, *kind).await {
+            let Some(client) = entry.client.as_ref() else {
+                // Unreachable in practice: an unconfigured provider has no searchable kinds,
+                // so `to_search` is empty. Handled rather than unwrapped so the invariant
+                // cannot become a panic if `searchable` is ever set independently.
+                break;
+            };
+            match client.search(&query, *kind).await {
                 Ok(found) => {
                     let returned = found.len();
                     // Detect truncation by what the provider ACTUALLY returned, before
@@ -593,7 +628,7 @@ pub async fn get_search(
         provider_reports.push(json!({
             "name": entry.name,
             "mode": entry.mode,
-            "configured": true,
+            "configured": entry.configured,
             "searchable_kinds": entry.searchable.iter().copied().map(kind_str).collect::<Vec<_>>(),
             // What this provider was actually asked for on THIS request — the intersection of
             // the caller's kinds and its own coverage. Empty means it was not consulted, which

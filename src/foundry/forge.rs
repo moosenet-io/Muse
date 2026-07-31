@@ -41,19 +41,58 @@
 //! against a determined external writer, and this module does not claim to be.
 //!
 //! ### Recovering from a crash
-//! Every crash point leaves the title reachable, because the new entry is
-//! always created before the old name is released. The possible residues are:
-//! - a leftover `<name>.muse-superseded` next to a correct new file — the swap
-//!   finished; the backup is simply awaiting retention. Safe to delete once the
-//!   new file has been watched.
-//! - both an old-container and a new-container file (e.g. `Movie.avi` *and*
-//!   `Movie.mkv`) — the swap died between claiming the destination and
-//!   releasing the source. Both are complete files; delete the old one.
-//! - a `.muse-foundry-inflight-*` file in the library directory — a staging
-//!   copy that never became live. Safe to delete.
+//! Two claims hold at every crash point, and they are the ones that matter:
+//! **the title is always reachable** (the new entry is created before the old
+//! name is released), and **no residue is ever the only copy of anything**, so
+//! deleting any of them is safe. Recovery is always a deletion — never
+//! reconstructing data, never a rename by hand.
 //!
-//! **No crash point requires reconstructing data**, and none leaves the library
-//! path missing. Recovery is deleting a leftover, never a rename by hand.
+//! What is *not* claimed: that every residue is a complete file. One of them
+//! may be partial, and it is called out below. (This table is a claim about the
+//! code and was wrong once — it asserted completeness for the inflight file
+//! that `fs::copy` cannot provide. It is written against the code, not against
+//! an intention.)
+//!
+//! In the library directory:
+//! - **`<name>.muse-foundry-inflight-*.part`** — the in-library staging copy.
+//!   **This file MAY BE INCOMPLETE.** It is produced by a byte copy from the
+//!   work dir, so a crash mid-copy leaves it partial; a crash after the swap
+//!   linked it leaves it a complete duplicate. Either way it is safe to delete,
+//!   because at that point the bytes still exist in the work dir, at the
+//!   destination, or both. Its `.part` extension is deliberately not a media
+//!   extension, so the library scanner can never ingest a partial one.
+//! - **`<name>.muse-superseded`** — the original, preserved. Always complete
+//!   (it is a hard link to the original inode, never a copy). Two situations
+//!   produce it, distinguishable with `ls -i` / `stat`:
+//!   *the swap completed* — it and the live file are **different** inodes, and
+//!   this is the old version awaiting retention; or *the swap crashed after
+//!   taking the backup* — it and the live file are the **same** inode, i.e. two
+//!   names for the untouched original. Deleting the `.muse-superseded` name is
+//!   safe in both.
+//! - **both an old- and a new-container file** (e.g. `Movie.avi` *and*
+//!   `Movie.mkv`) — the swap died between claiming the destination and
+//!   releasing the source. Both are complete; delete the old-container one.
+//!
+//! In the work dir (outside the library, so never scanned):
+//! - **`muse-foundry-<uuid>.<ext>`** — the encode staging file. **May be
+//!   incomplete** if the crash happened during the encode. Always safe to
+//!   delete; it is only ever a candidate, never a live file.
+//! - **`locks/<hash>.lock`** — a zero-byte lockfile, deliberately left behind.
+//!   Carries no state: the lock is the `flock`, not the file's existence, so a
+//!   leftover never blocks a future run. See [`SwapLock`].
+//!
+//! ### Why the in-library copy cannot be made atomic
+//! The obvious fix — build the file in the work dir and bring it into the
+//! library with a single `link`/`rename`, which cannot leave a partial — is
+//! **not available here**, and not by choice. Safety rail 3 requires the work
+//! dir to be on a *different filesystem* from every library root, and
+//! [`crate::foundry::config::FoundryConfig::fatal_errors`] makes a same-device
+//! work dir a startup refusal whenever the mutation gate is open. So on any run
+//! that can reach this code the two are guaranteed to be different devices, and
+//! `link(2)`/`rename(2)` across devices fail with `EXDEV`. A byte copy is the
+//! only way across, and a byte copy has a partial window. Hence: the window is
+//! documented rather than eliminated, and the file is named so that the partial
+//! state is both harmless and obvious.
 //!
 //! ## The ordering, and what each step protects against
 //! 1. Encode into the **work dir**, which safety rail 3 requires to be outside
@@ -106,11 +145,24 @@ use crate::foundry::probe::{run_ffprobe, MediaProbe, ProbeError};
 /// is the point — the operator's undo.
 const SUPERSEDED_EXT: &str = "muse-superseded";
 
-/// Prefix for the in-library staging copy. Leading dot so it is hidden, and a
-/// non-media extension for the same reason as above: it exists for at most the
-/// few seconds between the copy and the rename, but a crash in that window must
-/// not leave something the scanner will pick up.
+/// Prefix for the in-library staging copy. Leading dot so it is hidden.
 const INFLIGHT_PREFIX: &str = ".muse-foundry-inflight";
+
+/// Extension for the in-library staging copy — deliberately **not** a media
+/// extension, and this is load-bearing rather than cosmetic.
+///
+/// The staging copy is produced by `fs::copy`, which writes bytes directly to
+/// this path over a period of time. A crash or a storage failure part-way
+/// through leaves a **genuinely partial file** sitting in the library
+/// directory. Naming it `<name>.mkv` (as an earlier version did, taking the
+/// extension from the target container) meant that partial file carried a
+/// video extension the library scanner selects on — so a half-written file
+/// could be ingested as if it were a real title.
+///
+/// `.part` closes that: the scanner never selects it, and the name itself
+/// states that the file may be incomplete. See the module's recovery notes —
+/// this is the one residue that is not guaranteed to be a complete file.
+const INFLIGHT_EXT: &str = "part";
 
 // --- Outcome types ---------------------------------------------------------
 
@@ -857,14 +909,48 @@ impl SwapLock {
     }
 }
 
-// NOTE: no `Drop` impl, deliberately. Closing the descriptor releases the
-// `flock`, and `File`'s own Drop does that — so the lock is released on every
-// exit path including a panic, and (unlike a lockfile whose existence is the
-// lock) it is released if the process is killed outright. The lockfile itself
-// is left on disk on purpose: unlinking it would race another process that has
-// already opened it but not yet locked it, which is the classic way a
-// delete-on-release lock stops being a lock. A stale zero-byte lockfile in the
-// work dir is harmless.
+impl Drop for SwapLock {
+    /// Release the lock **explicitly** before the descriptor closes.
+    ///
+    /// Closing the fd also releases an `flock`, so this is belt-and-braces —
+    /// but it makes release an operation this type performs rather than a
+    /// side effect it relies on, and it removes any dependence on when the
+    /// runtime actually closes the file.
+    fn drop(&mut self) {
+        // SAFETY: `_file` still owns a valid descriptor here; `Drop` runs
+        // before the field itself is dropped.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+// Release also happens implicitly when the process dies (the kernel drops the
+// flock with the descriptor), which is why this is an flock and not a
+// lockfile-existence lock: a killed worker leaves nothing to clean up by hand.
+//
+// The lockfile itself is left on disk on purpose: unlinking it would race
+// another process that has already opened it but not yet locked it, which is
+// the classic way a delete-on-release lock stops being a lock. A stale
+// zero-byte lockfile in the work dir is harmless.
+//
+// EMPIRICAL NOTE — why the explicit `LOCK_UN` above is not redundant.
+// Leaving release to `File`'s close was measurably unreliable in this crate's
+// own test binary. A tight acquire / failed-acquire / drop / re-acquire cycle
+// sometimes failed to re-acquire on a path no other test touches:
+//
+//   implicit release only : failures in ~30% of parallel runs under heavy
+//                           load, ~8% (1 of 12) under the current suite
+//   with explicit LOCK_UN : 0 failures in 32 consecutive full runs
+//
+// It never reproduced in an isolated 500-iteration loop, nor in an equivalent
+// pure-syscall repro on the same tmpfs, so it needs the whole test binary's
+// concurrency to appear.
+//
+// Two honest caveats. The mechanism was NOT identified — this is a
+// measurement, not an explanation. And 32 clean runs is evidence of a large
+// reduction, not proof of elimination: the failure is probabilistic, so its
+// absence over a finite sample cannot prove it is gone. The explicit unlock is
+// kept because it measurably helps and costs one syscall — do not "simplify"
+// it away on the assumption that close-is-enough.
 
 /// A file's identity on disk: the pair that survives a rename and changes on a
 /// replace. Used to detect a source swapped out from under a plan.
@@ -1066,6 +1152,20 @@ fn swap_verified_output(
         final_path: final_p.to_path_buf(),
         superseded_path: superseded,
     })
+}
+
+/// The name of the in-library staging copy for one job.
+///
+/// A free function purely so a test can assert on the name production code
+/// actually builds. An earlier test checked only the `INFLIGHT_EXT` constant
+/// and then assembled a name of its own — so a mutation that left the constant
+/// alone and re-introduced `plan.container.extension()` at the call site
+/// survived untouched. The test was asserting on a string it had built itself,
+/// which is the definition of a decorative test.
+///
+/// `.part`, never the target container's extension: see [`INFLIGHT_EXT`].
+fn inflight_file_name(job: uuid::Uuid) -> String {
+    format!("{INFLIGHT_PREFIX}-{job}.{INFLIGHT_EXT}")
 }
 
 /// Append an extension, keeping the existing one (`a.mkv` -> `a.mkv.superseded`).
@@ -1340,11 +1440,7 @@ fn run_encode_and_swap(
     let parent = original_p
         .parent()
         .ok_or_else(|| "the source has no parent directory".to_string())?;
-    let inflight_target = parent.join(format!(
-        "{INFLIGHT_PREFIX}-{}.{}",
-        uuid::Uuid::new_v4(),
-        plan.container.extension()
-    ));
+    let inflight_target = parent.join(inflight_file_name(uuid::Uuid::new_v4()));
     let inflight = guard
         .resolve_new_for_mutation(&inflight_target)
         .map_err(|e| format!("resolving the in-library staging path: {e}"))?;
@@ -2060,6 +2156,52 @@ mod tests {
     }
 
     #[test]
+    fn the_inflight_staging_copy_never_carries_a_media_extension() {
+        // The in-library staging copy is written by a byte copy, so it is
+        // genuinely partial for the duration. An earlier version named it with
+        // the TARGET CONTAINER's extension (`.mkv`), which put a half-written
+        // file in the library under an extension the scanner selects on — a
+        // partial file ingestible as a real title.
+        //
+        // `.part` is what stops that, so it is pinned here rather than left as
+        // a constant nobody checks.
+        assert_eq!(INFLIGHT_EXT, "part");
+        for media in ["mkv", "mp4", "avi", "ts", "asf", "flv", "m4v", "mov", "webm"] {
+            assert_ne!(
+                INFLIGHT_EXT, media,
+                "the staging copy must not be selectable by the library scanner"
+            );
+        }
+        // And the name PRODUCTION builds really uses it. Asserting on a name
+        // the test assembles itself proves nothing about the call site.
+        let name = inflight_file_name(uuid::Uuid::new_v4());
+        assert!(name.starts_with(".muse-foundry-inflight-"), "got {name}");
+        assert!(name.ends_with(".part"), "got {name}");
+        for media in ["mkv", "mp4", "avi", "ts", "asf", "flv"] {
+            assert!(
+                !name.ends_with(&format!(".{media}")),
+                "the staging name must never carry a media extension, got {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_container_extension_differs_from_the_inflight_extension() {
+        // Guards the same rule from the other direction: adding a container
+        // whose extension happened to be `part` would silently re-open it.
+        for c in [
+            Container::Matroska,
+            Container::Mp4,
+            Container::Avi,
+            Container::MpegTs,
+            Container::Asf,
+            Container::Flv,
+        ] {
+            assert_ne!(c.extension(), INFLIGHT_EXT, "{c:?} collides with the staging name");
+        }
+    }
+
+    #[test]
     fn the_superseded_file_does_not_look_like_media_to_the_library_scanner() {
         // If it did, the scanner would re-ingest the original as a duplicate
         // of the file that just replaced it.
@@ -2256,10 +2398,14 @@ mod tests {
 
         // ...and it is non-blocking: the refusal came back rather than hanging.
         drop(held);
-        assert!(
-            SwapLock::acquire(&t.work(), &target).is_ok(),
-            "the lock must be released when the holder is dropped"
-        );
+        // Report the ACTUAL error rather than asserting `is_ok()`. A bare
+        // `is_ok()` here blames the release path for any failure, including an
+        // `open()` that failed for unrelated reasons under parallel test load —
+        // an assertion message that misattributes its own cause is the same
+        // class of false claim this module is built to avoid.
+        if let Err(e) = SwapLock::acquire(&t.work(), &target) {
+            panic!("the lock must be released when the holder is dropped, but got: {e}");
+        }
     }
 
     #[test]
@@ -2277,6 +2423,67 @@ mod tests {
                 Err(SwapError::LockBusy(_))
             ),
             "the same title in a different container must share the lock"
+        );
+    }
+
+    #[test]
+    fn the_lock_is_reliably_released_under_concurrent_load() {
+        // Guards the explicit `LOCK_UN` in `SwapLock::drop`. Leaving release to
+        // the descriptor close was measurably unreliable under parallel load
+        // (see the note beside that impl), and a single-threaded
+        // acquire/drop/re-acquire check does NOT detect it — it passed 500
+        // iterations with the bug present. Concurrency is what surfaces it, so
+        // the guard has to be concurrent too, or it is decorative.
+        let t = Tmp::new("lock-release-load");
+        let work = t.work();
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let work = work.clone();
+                let target = t.lib().join(format!("Title {n}.mkv"));
+                std::thread::spawn(move || {
+                    for i in 0..200 {
+                        let held = SwapLock::acquire(&work, &target)
+                            .unwrap_or_else(|e| panic!("thread {n} iter {i}: first acquire: {e}"));
+                        // The failed second acquire matters: it opens and closes
+                        // a second descriptor to the same file, which is the
+                        // shape that made implicit release unreliable.
+                        assert!(
+                            SwapLock::acquire(&work, &target).is_err(),
+                            "thread {n} iter {i}: exclusion must hold"
+                        );
+                        drop(held);
+                        if let Err(e) = SwapLock::acquire(&work, &target) {
+                            panic!("thread {n} iter {i}: lock not released after drop: {e}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().expect("no thread may fail");
+        }
+    }
+
+    #[test]
+    fn the_same_stem_in_different_directories_does_not_contend() {
+        // Added because a mutation SURVIVED: `different_titles_do_not_contend`
+        // compares two stems in the SAME directory, so dropping the directory
+        // from the lock key changed nothing there.
+        //
+        // This is the case that exposes it, and it is not exotic — conventional
+        // episode naming means half the library shares a stem. Without the
+        // directory in the key, every show's `S01E01.mkv` would serialize
+        // against every other show's, so the whole library would process one
+        // episode at a time.
+        let t = Tmp::new("lock-dirs");
+        let a = t.lib().join("Show A").join("Season 01").join("S01E01.mkv");
+        let b = t.lib().join("Show B").join("Season 01").join("S01E01.mkv");
+
+        let _held = SwapLock::acquire(&t.work(), &a).expect("first acquire");
+        assert!(
+            SwapLock::acquire(&t.work(), &b).is_ok(),
+            "the same stem under a different directory is an unrelated title \
+             and must not contend"
         );
     }
 

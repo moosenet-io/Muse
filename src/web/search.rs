@@ -158,65 +158,69 @@ fn db_kind(kind: MediaKind) -> &'static str {
     }
 }
 
-/// What Muse knows about a title it recognized.
-#[derive(Debug, Clone, Copy)]
-struct LibraryHit {
-    /// `None` when MORE THAN ONE metadata row matched this key, so no single row can be
-    /// named. See `resolve_in_library` on why that is reachable for IMDb.
-    metadata_id: Option<i64>,
-    /// True when more than one metadata row matched — the caller is told rather than handed
-    /// an arbitrary winner.
-    ambiguous: bool,
-    /// A `media_metadata` row alone does NOT mean the title is held: `/api/discover` writes
-    /// metadata rows for TRENDING titles precisely because they are *not* in the library
-    /// (`list_trending_not_in_library`). Ownership is a `media_items` row — the same join
-    /// `repo::dashboard`'s library query uses. Treating a catalog row as ownership would have
-    /// marked every discoverable title as already owned (codex).
+/// One catalog row's identifying facts, as stored.
+#[derive(Debug, Clone)]
+struct RowFacts {
+    tmdb: Option<String>,
+    tvdb: Option<String>,
+    imdb: Option<String>,
+    /// A `media_items` row exists — the same join `repo::dashboard`'s library query uses. A
+    /// `media_metadata` row alone is NOT ownership: `/api/discover` writes metadata rows for
+    /// trending titles precisely because they are not held.
     owned: bool,
 }
 
-/// Collapse the metadata rows matching one `(provider, id, kind)` key into a single answer.
-///
-/// `owned` is ANY: if any row carrying this id is held, then a title with this id IS in the
-/// library, which is exactly what the flag claims. The METADATA ID is the part that cannot be
-/// determined under ambiguity, so that is what goes `None` — rather than naming a row we
-/// cannot justify picking (codex).
-pub(crate) fn resolve_match(rows: &[(i64, bool)]) -> (Option<i64>, bool, bool) {
-    let ambiguous = rows.len() > 1;
-    let owned = rows.iter().any(|(_, o)| *o);
-    let metadata_id = if ambiguous { None } else { rows.first().map(|(id, _)| *id) };
-    (metadata_id, ambiguous, owned)
+/// The catalog rows reachable from a search hit's identifiers.
+struct CatalogIndex {
+    /// `(provider, id, db_kind)` -> every row carrying that identifier. A `Vec` because
+    /// `imdb_id` has NO uniqueness constraint (only a plain INDEX, migration 0005), unlike
+    /// `UNIQUE(kind, tmdb_id)` / `UNIQUE(kind, tvdb_id)`.
+    by_key: HashMap<(String, String, &'static str), Vec<i64>>,
+    rows: HashMap<i64, RowFacts>,
 }
 
-/// What can be said about ONE search hit, after every identifier it carries has been looked up.
+/// What can be said about ONE search hit, after every identifier it carries has been examined.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct HitResolution {
-    /// `Some(true)`/`Some(false)` when the hit resolves to exactly one catalog row and that
-    /// row's ownership is therefore this title's ownership. `None` means UNKNOWN — see below.
+    /// `Some(true)`/`Some(false)` when the hit pins exactly one catalog row. `None` means
+    /// UNKNOWN — the identifiers did not agree — and must NEVER be rendered as "not owned".
     pub in_library: Option<bool>,
     pub in_catalog: bool,
     pub metadata_id: Option<i64>,
     pub ambiguous: bool,
 }
 
-/// Collapse every identifier on a hit into one answer.
+/// A single hit identifier, paired with what the candidate row says about it.
 ///
-/// Two separate traps, both found in review, both reachable:
+/// The distinction this type exists to make: an identifier the matched row does NOT RECORD
+/// carries no information, while one the row records DIFFERENTLY is a genuine contradiction.
+/// Collapsing the two was the last real defect here — treating "not recorded" as doubt would
+/// make almost every hit unknown, because the catalog is sparse. Measured on the live library:
+/// `tvdb_id` is null on 228 of 300 owned rows (76%), so a TVDB hit against a row that only
+/// records tmdb/imdb is the NORMAL case, not a warning sign.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum IdentifierCheck {
+    /// The row carries this exact identifier.
+    Corroborates,
+    /// The row carries a DIFFERENT value for this provider — the hit and the row disagree.
+    Contradicts,
+    /// The row does not record this provider's id at all. No information either way.
+    Silent,
+}
+
+/// Decide what one hit supports, given the distinct catalog rows its identifiers reach and
+/// how the single candidate row (when there is one) answers each identifier.
 ///
-/// 1. The first version used `find_map` over the hit's ids and took the FIRST that resolved,
-///    ignoring any other id that resolved to a DIFFERENT row. `provider_ids` is a `HashMap`,
-///    so "first" is iteration order — the answer was nondeterministic between runs (codex).
-///    Every id is now consulted and they must agree.
-///
-/// 2. Ownership under ambiguity was reported as `true` on an ANY basis. That over-claims: the
-///    provider's hit is ONE title, and when several catalog rows share an identifier we do not
-///    know which of them it is — so "one of the rows sharing this id is held" is not the same
-///    statement as "you hold this title" (gpt56). Ownership becomes UNKNOWN, not true.
-///
-/// A hit Muse has never seen resolves to `in_library: Some(false)`: that one IS supported —
-/// a title with no catalog row at all cannot be in the library.
-pub(crate) fn resolve_hit(matches: &[(Option<i64>, bool, bool)]) -> HitResolution {
-    if matches.is_empty() {
+/// Conservative in exactly one direction: it settles only when a single row is pinned and
+/// nothing contradicts it. Everything else is `None` (unknown), never a guess.
+pub(crate) fn resolve_hit(
+    candidate_rows: usize,
+    checks: &[IdentifierCheck],
+    owned: Option<bool>,
+) -> HitResolution {
+    // No catalog row reachable from any identifier. This is the one NEGATIVE that is fully
+    // supported: a title Muse has never catalogued cannot have a media_items row.
+    if candidate_rows == 0 {
         return HitResolution {
             in_library: Some(false),
             in_catalog: false,
@@ -225,43 +229,44 @@ pub(crate) fn resolve_hit(matches: &[(Option<i64>, bool, bool)]) -> HitResolutio
         };
     }
 
-    let any_ambiguous = matches.iter().any(|(_, ambiguous, _)| *ambiguous);
-    let ids: Vec<i64> = matches.iter().filter_map(|(id, _, _)| *id).collect();
-    let all_same_row = !ids.is_empty() && ids.iter().all(|id| *id == ids[0]);
-    // Every identifier resolved, none was ambiguous, and they all named the SAME row.
-    let settled = !any_ambiguous && all_same_row && ids.len() == matches.len();
-
-    if settled {
-        let owned = matches.iter().any(|(_, _, owned)| *owned);
+    // Several distinct rows reachable: Muse knows the title but cannot say WHICH row this hit
+    // is, so it can answer neither ownership nor identity.
+    if candidate_rows > 1 {
         return HitResolution {
-            in_library: Some(owned),
+            in_library: None,
             in_catalog: true,
-            metadata_id: Some(ids[0]),
-            ambiguous: false,
+            metadata_id: None,
+            ambiguous: true,
+        };
+    }
+
+    // Exactly one candidate row — but an identifier that disagrees with it means the hit and
+    // the row are probably not the same title.
+    if checks.iter().any(|c| *c == IdentifierCheck::Contradicts) {
+        return HitResolution {
+            in_library: None,
+            in_catalog: true,
+            metadata_id: None,
+            ambiguous: true,
         };
     }
 
     HitResolution {
-        in_library: None,
+        in_library: owned,
         in_catalog: true,
-        metadata_id: None,
-        ambiguous: true,
+        metadata_id: None, // filled by the caller, which holds the row id
+        ambiguous: false,
     }
 }
 
-/// Which of these titles Muse already knows, keyed by `(provider, id, db_kind)`.
-///
-/// The KIND is part of the key deliberately. `media_metadata` is `UNIQUE (kind, tmdb_id)` and
-/// `UNIQUE (kind, tvdb_id)`, so the same provider id can legitimately exist as both a movie and
-/// a show. Keying on `(provider, id)` alone let one row overwrite the other in the map and
-/// could report a movie as owned on the strength of a series row, or vice versa (codex).
+/// Build a catalog index for every identifier appearing in these hits.
 ///
 /// One query for the whole result set rather than per-hit: a search returns tens of titles and
 /// a per-hit lookup would be tens of round trips on an interactive path.
-async fn resolve_in_library(
+async fn build_catalog_index(
     state: &AppState,
     hits: &[(&'static str, MediaKind, ProviderMetadata)],
-) -> MuseResult<HashMap<(String, String, &'static str), LibraryHit>> {
+) -> MuseResult<CatalogIndex> {
     let mut tmdb_ids: HashSet<String> = HashSet::new();
     let mut tvdb_ids: HashSet<String> = HashSet::new();
     let mut imdb_ids: HashSet<String> = HashSet::new();
@@ -272,23 +277,27 @@ async fn resolve_in_library(
                 "tmdb" => tmdb_ids.insert(id),
                 "tvdb" => tvdb_ids.insert(id),
                 "imdb" => imdb_ids.insert(id),
+                // Other providers (tvrage, tvmaze, anilist...) live in the `provider_ids`
+                // jsonb rather than an indexed column. They are not queried here, so they can
+                // neither corroborate nor contradict -- see `identifier_checks`.
                 _ => false,
             };
         }
     }
 
-    let mut found: HashMap<(String, String, &'static str), LibraryHit> = HashMap::new();
+    let mut index = CatalogIndex {
+        by_key: HashMap::new(),
+        rows: HashMap::new(),
+    };
     if tmdb_ids.is_empty() && tvdb_ids.is_empty() && imdb_ids.is_empty() {
-        return Ok(found);
+        return Ok(index);
     }
 
     let tmdb: Vec<String> = tmdb_ids.into_iter().collect();
     let tvdb: Vec<String> = tvdb_ids.into_iter().collect();
     let imdb: Vec<String> = imdb_ids.into_iter().collect();
 
-    // `tmdb_id`/`tvdb_id`/`imdb_id` are all `text` columns (migration 0005), so no casts are
-    // needed — an earlier version cast them anyway, which was noise that could have hidden a
-    // genuine type mismatch behind a silent coercion.
+    // All three id columns are `text` (migration 0005), so no casts are needed.
     let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, bool)> =
         sqlx::query_as(
             r#"
@@ -309,17 +318,7 @@ async fn resolve_in_library(
         .fetch_all(&state.pool)
         .await?;
 
-    // Accumulated, not `insert`-ed, because a key can legitimately match several rows.
-    // `media_metadata` is UNIQUE(kind, tmdb_id) and UNIQUE(kind, tvdb_id), but `imdb_id` has
-    // only a plain INDEX — no uniqueness at all (migration 0005). So two same-kind rows may
-    // share an IMDb id, and a bare `insert` would silently keep whichever the database
-    // happened to return last, attributing `owned` and `metadata_id` to an arbitrary one of
-    // them (codex).
-    let mut matches: HashMap<(String, String, &'static str), Vec<(i64, bool)>> = HashMap::new();
     for (id, kind, tmdb_id, tvdb_id, imdb_id, owned) in rows {
-        // Leaked once per distinct kind string the DB can produce (two), not per row — the
-        // enum has exactly the two variants below and anything else is skipped rather than
-        // silently bucketed into one of them.
         let kind_key: &'static str = match kind.as_str() {
             "movie" => "movie",
             "show" => "show",
@@ -328,27 +327,61 @@ async fn resolve_in_library(
                 continue;
             }
         };
-        for (provider, value) in [("tmdb", tmdb_id), ("tvdb", tvdb_id), ("imdb", imdb_id)] {
+        for (provider, value) in [
+            ("tmdb", tmdb_id.clone()),
+            ("tvdb", tvdb_id.clone()),
+            ("imdb", imdb_id.clone()),
+        ] {
             if let Some(v) = value {
-                matches
+                index
+                    .by_key
                     .entry((provider.to_string(), v, kind_key))
                     .or_default()
-                    .push((id, owned));
+                    .push(id);
             }
         }
+        index.rows.insert(
+            id,
+            RowFacts {
+                tmdb: tmdb_id,
+                tvdb: tvdb_id,
+                imdb: imdb_id,
+                owned,
+            },
+        );
     }
+    Ok(index)
+}
 
-    for (key, rows) in matches {
-        let (metadata_id, ambiguous, owned) = resolve_match(&rows);
-        if ambiguous {
-            tracing::warn!(
-                provider = key.0.as_str(), id = key.1.as_str(), kind = key.2, count = rows.len(),
-                "MUSE #108: several metadata rows share this provider id; reporting ambiguous"
-            );
-        }
-        found.insert(key, LibraryHit { metadata_id, ambiguous, owned });
-    }
-    Ok(found)
+/// How each of a hit's identifiers answers against one candidate row.
+///
+/// Every identifier the hit carries is examined. An earlier version silently DROPPED any that
+/// did not resolve to a database key, which made the disagreement cases unreachable through
+/// the endpoint and let one matching id assert definite ownership (codex, gpt56).
+pub(crate) fn identifier_checks(
+    hit_ids: &[(String, String)],
+    row_tmdb: Option<&str>,
+    row_tvdb: Option<&str>,
+    row_imdb: Option<&str>,
+) -> Vec<IdentifierCheck> {
+    hit_ids
+        .iter()
+        .filter_map(|(provider, id)| {
+            let stored = match provider.as_str() {
+                "tmdb" => row_tmdb,
+                "tvdb" => row_tvdb,
+                "imdb" => row_imdb,
+                // Not an indexed column -- unknowable here, so omitted rather than counted as
+                // either agreement or disagreement.
+                _ => return None,
+            };
+            Some(match stored {
+                None => IdentifierCheck::Silent,
+                Some(v) if v == id => IdentifierCheck::Corroborates,
+                Some(_) => IdentifierCheck::Contradicts,
+            })
+        })
+        .collect()
 }
 
 /// Which requested kinds no provider searched SUCCESSFULLY.
@@ -526,23 +559,46 @@ pub async fn get_search(
     let requested: Vec<&'static str> = kinds.iter().copied().map(kind_str).collect();
     let uncovered = uncovered_kinds(&outcomes, &requested);
 
-    let in_library = resolve_in_library(&state, &hits).await?;
+    let catalog = build_catalog_index(&state, &hits).await?;
 
     let results: Vec<Value> = hits
         .iter()
         .map(|(provider, kind, meta)| {
-            // EVERY identifier is consulted, not the first that resolves — see resolve_hit.
-            // Matched on (provider, id, KIND); see resolve_in_library on why the kind is in
-            // the key.
-            let matches: Vec<(Option<i64>, bool, bool)> = id_pairs(meta)
-                .into_iter()
+            // EVERY identifier is consulted -- see identifier_checks and resolve_hit.
+            let hit_ids = id_pairs(meta);
+            let mut candidates: Vec<i64> = hit_ids
+                .iter()
                 .filter_map(|(provider, id)| {
-                    in_library
-                        .get(&(provider, id, db_kind(*kind)))
-                        .map(|h| (h.metadata_id, h.ambiguous, h.owned))
+                    catalog
+                        .by_key
+                        .get(&(provider.clone(), id.clone(), db_kind(*kind)))
                 })
+                .flatten()
+                .copied()
                 .collect();
-            let known = resolve_hit(&matches);
+            candidates.sort_unstable();
+            candidates.dedup();
+
+            let single = if candidates.len() == 1 {
+                catalog.rows.get(&candidates[0]).map(|r| (candidates[0], r))
+            } else {
+                None
+            };
+            let checks = single
+                .map(|(_, r)| {
+                    identifier_checks(&hit_ids, r.tmdb.as_deref(), r.tvdb.as_deref(), r.imdb.as_deref())
+                })
+                .unwrap_or_default();
+            let mut known = resolve_hit(
+                candidates.len(),
+                &checks,
+                single.map(|(_, r)| r.owned),
+            );
+            // The row id is only asserted when resolve_hit actually settled on it.
+            if !known.ambiguous && known.in_catalog {
+                known.metadata_id = single.map(|(id, _)| id);
+            }
+
             json!({
                 "provider": provider,
                 "kind": kind_str(*kind),
@@ -653,79 +709,93 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_ambiguous_id_names_no_row_but_still_reports_ownership() {
-        // One row, unambiguous: name it.
-        assert_eq!(resolve_match(&[(7, true)]), (Some(7), false, true));
-        assert_eq!(resolve_match(&[(7, false)]), (Some(7), false, false));
 
-        // Two rows sharing an id (reachable for IMDb — no uniqueness constraint on that
-        // column). We still know a title with this id is held, but not WHICH catalog row it
-        // is, so the id goes null rather than picking an arbitrary winner.
-        let (id, ambiguous, owned) = resolve_match(&[(7, false), (9, true)]);
-        assert_eq!(id, None, "must not attribute to an arbitrary row");
-        assert!(ambiguous);
-        assert!(owned, "any owned row means a title with this id is held");
 
-        // Ambiguous and none owned.
-        let (id, ambiguous, owned) = resolve_match(&[(7, false), (9, false)]);
-        assert_eq!(id, None);
-        assert!(ambiguous);
-        assert!(!owned);
-    }
+
+
+
+
 
     #[test]
-    fn a_hit_with_no_catalog_row_is_definitively_not_in_the_library() {
-        // The one negative that IS supported: no catalog row at all means no media_items row.
-        let r = resolve_hit(&[]);
+    fn a_hit_reaching_no_catalog_row_is_definitively_not_in_the_library() {
+        // The one negative that IS fully supported: never catalogued => no media_items row.
+        let r = resolve_hit(0, &[], None);
         assert_eq!(r.in_library, Some(false));
         assert!(!r.in_catalog);
         assert!(!r.ambiguous);
     }
 
     #[test]
-    fn a_single_unambiguous_row_settles_ownership_either_way() {
-        assert_eq!(resolve_hit(&[(Some(4), false, true)]).in_library, Some(true));
-        assert_eq!(resolve_hit(&[(Some(4), false, false)]).in_library, Some(false));
-        assert_eq!(resolve_hit(&[(Some(4), false, true)]).metadata_id, Some(4));
+    fn one_row_with_nothing_contradicting_settles_ownership_either_way() {
+        let owned = resolve_hit(1, &[IdentifierCheck::Corroborates], Some(true));
+        assert_eq!(owned.in_library, Some(true));
+        assert!(!owned.ambiguous);
+
+        let not_owned = resolve_hit(1, &[IdentifierCheck::Corroborates], Some(false));
+        assert_eq!(not_owned.in_library, Some(false));
+        assert!(not_owned.in_catalog, "known to Muse, just not held");
     }
 
     #[test]
-    fn identifiers_agreeing_on_one_row_still_settle() {
-        // tmdb and imdb both resolving to row 4 is corroboration, not conflict.
-        let r = resolve_hit(&[(Some(4), false, true), (Some(4), false, true)]);
+    fn an_identifier_the_row_does_not_record_is_not_doubt() {
+        // THE case that makes this feature usable rather than perpetually "unknown".
+        // Measured live: tvdb_id is null on 228 of 300 owned rows, so a hit carrying a tvdb id
+        // against a row that records only tmdb/imdb is the NORMAL case. Silence is not
+        // disagreement.
+        let r = resolve_hit(
+            1,
+            &[IdentifierCheck::Corroborates, IdentifierCheck::Silent],
+            Some(true),
+        );
         assert_eq!(r.in_library, Some(true));
-        assert_eq!(r.metadata_id, Some(4));
         assert!(!r.ambiguous);
     }
 
     #[test]
-    fn identifiers_pointing_at_different_rows_make_ownership_unknown() {
-        // The nondeterminism codex found: `find_map` would have taken whichever id the
-        // HashMap yielded first and reported ITS ownership as fact.
-        let r = resolve_hit(&[(Some(4), false, true), (Some(9), false, false)]);
-        assert_eq!(r.in_library, None, "conflicting rows cannot settle ownership");
+    fn an_identifier_the_row_records_differently_is_disagreement() {
+        // The row says imdb=tt111 and the hit says imdb=tt222: probably not the same title,
+        // so no ownership claim is made in EITHER direction.
+        let r = resolve_hit(
+            1,
+            &[IdentifierCheck::Corroborates, IdentifierCheck::Contradicts],
+            Some(true),
+        );
+        assert_eq!(r.in_library, None, "a contradiction cannot settle ownership");
         assert_eq!(r.metadata_id, None);
         assert!(r.ambiguous);
-        assert!(r.in_catalog, "Muse does know the title, it just cannot pin the row");
+        assert!(r.in_catalog, "Muse does know a title here, it cannot pin which");
     }
 
     #[test]
-    fn an_ambiguous_key_makes_ownership_unknown_not_true() {
-        // gpt56: "some row sharing this id is held" is NOT "you hold this title". The hit is
-        // one title; if several rows share the id we do not know which one it is.
-        let r = resolve_hit(&[(None, true, true)]);
+    fn several_candidate_rows_make_ownership_unknown() {
+        // Reachable because imdb_id has no uniqueness constraint.
+        let r = resolve_hit(2, &[], None);
         assert_eq!(r.in_library, None);
         assert_eq!(r.metadata_id, None);
         assert!(r.ambiguous);
+        assert!(r.in_catalog);
     }
 
     #[test]
-    fn one_identifier_resolving_and_another_not_is_unsettled() {
-        // Only some ids resolved: the unresolved one might name a different row.
-        let r = resolve_hit(&[(Some(4), false, true), (None, true, false)]);
-        assert_eq!(r.in_library, None);
-        assert!(r.ambiguous);
+    fn identifier_checks_classifies_all_three_answers_and_skips_unindexed_providers() {
+        let ids = vec![
+            ("tmdb".to_string(), "286217".to_string()),
+            ("imdb".to_string(), "tt999".to_string()),
+            ("tvdb".to_string(), "121361".to_string()),
+            // Lives in the provider_ids jsonb, not an indexed column: unknowable here, so it
+            // must be OMITTED rather than counted as agreement or disagreement.
+            ("tvrage".to_string(), "42".to_string()),
+        ];
+        let checks = identifier_checks(&ids, Some("286217"), None, Some("tt111"));
+        assert_eq!(
+            checks,
+            vec![
+                IdentifierCheck::Corroborates, // tmdb matches
+                IdentifierCheck::Contradicts,  // imdb differs
+                IdentifierCheck::Silent,       // row records no tvdb id
+            ],
+            "the unindexed provider must not appear at all",
+        );
     }
 
     /// These hit the REAL upstreams. Ignored by default so the suite stays hermetic and

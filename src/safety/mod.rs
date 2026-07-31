@@ -292,6 +292,27 @@ pub struct Verdict {
     /// True when at least one file is an importable media container. A download with no media
     /// at all is not importable regardless of whether anything in it is hostile.
     pub has_media: bool,
+    /// Whether LLM adjudication ran, and what it contributed.
+    ///
+    /// This field exists because the claim was made before it was true. `llm`'s module doc
+    /// said the verdict "RECORDS that adjudication did not run", and it did not — `apply()`
+    /// copied the severity and dropped the status, so a clean verdict was indistinguishable
+    /// from one that had received scrutiny it never got. Both reviewers caught it. An audit
+    /// claim that is only in a comment is not an audit claim.
+    pub adjudication: Option<AdjudicationRecord>,
+}
+
+/// What the LLM stage contributed to a verdict, including having been unable to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdjudicationRecord {
+    /// Human-readable status: `completed`, `not_configured`, `unavailable: …`, `unparseable: …`.
+    pub status: String,
+    /// True only when a model actually answered and the answer parsed.
+    pub ran: bool,
+    /// Severity the model raised the verdict to, if any.
+    pub escalated_to: Option<Severity>,
+    pub concerns: Vec<String>,
+    pub model: String,
 }
 
 impl Verdict {
@@ -463,6 +484,9 @@ pub fn inspect(files: &[InspectedFile]) -> Verdict {
         severity,
         findings,
         has_media,
+        // Set by `llm::apply`. `None` means the LLM stage has not been consulted at all — a
+        // different statement from "it ran and added nothing".
+        adjudication: None,
     }
 }
 

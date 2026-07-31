@@ -47,14 +47,38 @@ use super::{
     detect_magic, InspectedFile, Severity, Verdict, ARCHIVE_EXTENSIONS, MAGIC_PREFIX_LEN,
 };
 
-/// Entries listed from one archive. A hostile archive can declare hundreds of thousands of
-/// entries in a small file; the listing is bounded so a directory read cannot itself become a
-/// denial of service. What was dropped is reported, never silently discarded.
+/// How many entries are RETAINED from a listing. What was dropped is reported, never silently
+/// discarded.
+///
+/// HONEST LIMIT, because the earlier comment here overstated what this bounds. It caps the
+/// entries this module copies and judges — it does NOT bound the ZIP parser, which reads the
+/// whole central directory inside `ZipArchive::new` before this constant is consulted (codex,
+/// gpt56). A hostile ZIP64 directory declaring millions of entries is parsed by the crate
+/// first, and this limit cannot prevent that.
+///
+/// What DOES bound the damage: [`MAX_ARCHIVE_BYTES`] caps the input handed to the parser, and
+/// [`MAX_ENTRY_NAME_LEN`] caps retained name length so a directory of enormous names cannot be
+/// copied wholesale into memory. Those are the real controls; this one is about output size.
 pub const MAX_ENTRIES: usize = 5_000;
 
-/// How deep nested archives are followed. An archive inside an archive is legitimate (a `.zip`
-/// of `.rar` parts); a chain forty deep is an attempt to exhaust something.
-pub const MAX_NESTING: usize = 3;
+/// Largest archive this module will hand to the ZIP parser.
+///
+/// The parser reads the central directory eagerly, so the only way to bound its work is to
+/// bound its input. An archive above this is reported as UNINSPECTED — refused rather than
+/// parsed — which is the fail-closed answer: a file too large to examine safely has not been
+/// cleared, and says so.
+pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Longest entry name retained. A central directory can declare very long names purely to make
+/// a listing expensive to hold; the name is truncated rather than the entry dropped, so the
+/// entry is still judged.
+pub const MAX_ENTRY_NAME_LEN: usize = 512;
+
+// NOTE: there is deliberately no MAX_NESTING constant. An earlier version declared one, with a
+// comment about how deep nested archives are followed — but no recursive inspection exists, so
+// the constant documented a behaviour the module does not have (codex). A nested archive is
+// reported as an archive ENTRY by name, and its own contents are not listed. Removed rather
+// than left as a claim; if recursion is added later the bound comes back with it.
 
 /// Why an archive could not be read into a listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +139,13 @@ pub fn is_traversal(name: &str) -> bool {
 }
 
 /// List a ZIP's entries from its central directory. No compressed data is read.
+/// Refuse an archive whose size exceeds [`MAX_ARCHIVE_BYTES`] before any parsing happens.
+///
+/// Separate from `list_zip` so the refusal is testable without constructing a 256 MB fixture.
+pub fn too_large_to_inspect(size_bytes: u64) -> bool {
+    size_bytes > MAX_ARCHIVE_BYTES
+}
+
 pub fn list_zip<R: Read + Seek>(reader: R) -> ArchiveListing {
     let mut archive = match zip::ZipArchive::new(reader) {
         Ok(a) => a,
@@ -132,10 +163,13 @@ pub fn list_zip<R: Read + Seek>(reader: R) -> ArchiveListing {
         let Ok(file) = archive.by_index_raw(i) else {
             continue;
         };
-        let name = file.name().to_string();
         if file.is_dir() {
             continue;
         }
+        // Truncated, not dropped: an absurdly long name is still an entry worth judging, and
+        // its absurdity is itself signal — but retaining it whole lets a crafted directory
+        // decide how much memory this listing occupies.
+        let name: String = file.name().chars().take(MAX_ENTRY_NAME_LEN).collect();
         if is_traversal(&name) {
             traversal_attempts.push(name.clone());
         }
@@ -205,6 +239,7 @@ pub fn inspect_listing(archive_path: &str, listing: &ArchiveListing) -> Verdict 
             severity: Severity::Clean,
             findings: Vec::new(),
             has_media: false,
+            adjudication: None,
         }
     } else {
         let files: Vec<InspectedFile> = listing
@@ -232,6 +267,32 @@ pub fn inspect_listing(archive_path: &str, listing: &ArchiveListing) -> Verdict 
             reason: "archive entry escapes the extraction directory (path traversal) — an \
                      archive built to write outside where it is unpacked"
                 .to_string(),
+        });
+    }
+
+    // ── FAIL CLOSED ON WHAT WAS NOT BYTE-CHECKED ────────────────────────────────────────
+    // An entry is judged by NAME only, because listing deliberately never decompresses. So a
+    // member named `Movie.mkv` whose bytes are actually an executable is indistinguishable
+    // here from a real video, and before this the whole archive came back CLEAN (codex).
+    //
+    // The earlier design suppressed the per-entry "contents not read" finding to avoid burying
+    // real findings under one line per entry — right about the noise, wrong about the verdict.
+    // The fix keeps the noise reduction and restores the floor: ONE archive-level finding,
+    // stating exactly what was and was not established. A listed archive can therefore never
+    // be Clean, which is correct — nothing inside it has been byte-verified.
+    //
+    // It is not merely `has_media = false` holding this back. That guard is about
+    // importability; this is about the CLAIM. Reporting Clean for an archive whose contents
+    // were never read is the same false certification this module exists to prevent.
+    if !listing.entries.is_empty() {
+        verdict.findings.push(super::Finding {
+            path: archive_path.to_string(),
+            severity: Severity::Suspicious,
+            reason: format!(
+                "{} entries were checked by NAME only — this gate does not decompress, so no \
+                 entry's actual contents have been verified",
+                listing.entries.len()
+            ),
         });
     }
 
@@ -388,13 +449,34 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_archive_of_media_is_not_dangerous_but_is_not_importable_either() {
-        // Media inside an archive still has to be extracted, and this module never extracts.
-        // Reporting has_media would let a zipped-video download look ready to import.
+    fn an_archive_of_apparently_clean_media_is_still_never_certified_clean() {
+        // This test previously asserted Clean, and that was the bug: entries are judged by NAME
+        // only, so a member called `Movie.mkv` whose bytes are an executable is
+        // indistinguishable from a real video here. Certifying the archive clean is exactly the
+        // false certification this module exists to prevent (codex).
+        //
+        // The floor is one archive-level finding stating what was and was not established —
+        // which keeps the verdict honest without one line of noise per entry.
         let bytes = zip_with(&[("Movie.2024.mkv", b"x"), ("Movie.srt", b"y")]);
         let v = inspect_listing("release.zip", &list_zip(Cursor::new(bytes)));
-        assert_eq!(v.severity, Severity::Clean, "{:?}", v.findings);
+        assert_eq!(v.severity, Severity::Suspicious, "{:?}", v.findings);
+        assert!(
+            v.findings.iter().any(|f| f.reason.contains("NAME only")),
+            "must state that nothing inside was byte-verified: {:?}",
+            v.findings,
+        );
         assert!(!v.has_media, "archived media is not yet importable media");
+        assert!(!v.is_importable());
+    }
+
+    #[test]
+    fn a_media_named_entry_hiding_an_executable_is_not_reported_clean() {
+        // The concrete attack behind the rule above: the archive equivalent of the renamed
+        // executable. We cannot SEE the bytes without decompressing, so the gate must not
+        // pretend it looked — it reports that nothing was verified rather than certifying.
+        let bytes = zip_with(&[("Movie.2024.1080p.mkv", b"MZ\x90\x00 this is really a PE")]);
+        let v = inspect_listing("release.zip", &list_zip(Cursor::new(bytes)));
+        assert_ne!(v.severity, Severity::Clean, "must never be certified clean");
         assert!(!v.is_importable());
     }
 
@@ -455,6 +537,34 @@ mod tests {
     }
 
     // ── CLASSIFICATION ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_archive_too_large_to_parse_safely_is_refused_not_parsed() {
+        // The parser reads the whole central directory eagerly, so the only way to bound its
+        // work is to bound its input. Refusing is the fail-closed answer: a file too large to
+        // examine has not been cleared.
+        assert!(!too_large_to_inspect(MAX_ARCHIVE_BYTES));
+        assert!(too_large_to_inspect(MAX_ARCHIVE_BYTES + 1));
+
+        let v = inspect_listing(
+            "huge.zip",
+            &ArchiveListing::failed(ListingFailure::Unreadable("archive exceeds the inspection size limit".into())),
+        );
+        assert_eq!(v.severity, Severity::Suspicious);
+        assert!(!v.is_importable());
+    }
+
+    #[test]
+    fn an_enormous_entry_name_is_truncated_rather_than_retained_whole() {
+        let long = "a".repeat(MAX_ENTRY_NAME_LEN * 4) + ".mkv";
+        let bytes = zip_with(&[(long.as_str(), b"x")]);
+        let listing = list_zip(Cursor::new(bytes));
+        assert_eq!(listing.entries.len(), 1);
+        assert!(
+            listing.entries[0].0.chars().count() <= MAX_ENTRY_NAME_LEN,
+            "retained name must be bounded",
+        );
+    }
 
     #[test]
     fn magic_beats_the_extension_when_classifying_an_archive() {

@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::safety::{Severity, Verdict};
+use crate::safety::{AdjudicationRecord, Severity, Verdict};
 use crate::taste_model::chord_client::ChordClient;
 
 /// Default model for adjudication. Overridable via `MUSE_SAFETY_MODEL`.
@@ -339,6 +339,22 @@ pub fn apply(verdict: &Verdict, adjudication: &Adjudication) -> Verdict {
     if let Some(sev) = adjudication.escalated_to {
         out.severity = out.severity.max(sev);
     }
+    // RECORDED on the verdict, not merely in a log line. The module doc has always claimed a
+    // clean verdict never implies scrutiny it did not receive; until this was written that
+    // claim was false, because the status was dropped here and the resulting Verdict carried
+    // no trace of whether the model had run (codex, gpt56).
+    out.adjudication = Some(AdjudicationRecord {
+        status: match &adjudication.status {
+            AdjudicationStatus::Completed => "completed".to_string(),
+            AdjudicationStatus::NotConfigured => "not_configured".to_string(),
+            AdjudicationStatus::Unavailable(e) => format!("unavailable: {e}"),
+            AdjudicationStatus::Unparseable(e) => format!("unparseable: {e}"),
+        },
+        ran: adjudication.status == AdjudicationStatus::Completed,
+        escalated_to: adjudication.escalated_to,
+        concerns: adjudication.concerns.clone(),
+        model: adjudication.model.clone(),
+    });
     out
 }
 
@@ -349,6 +365,7 @@ mod tests {
 
     fn verdict(sev: Severity, has_media: bool) -> Verdict {
         Verdict {
+            adjudication: None,
             severity: sev,
             findings: if sev == Severity::Clean {
                 Vec::new()
@@ -457,11 +474,41 @@ mod tests {
     }
 
     #[test]
-    fn no_escalation_leaves_the_verdict_exactly_as_it_was() {
+    fn no_escalation_leaves_the_severity_exactly_as_it_was() {
+        for sev in [Severity::Clean, Severity::Suspicious, Severity::Dangerous] {
+            let before = verdict(sev, true);
+            let after = apply(&before, &adj(None));
+            assert_eq!(after.severity, before.severity);
+            assert_eq!(after.findings, before.findings);
+            assert_eq!(after.has_media, before.has_media);
+        }
+    }
+
+    #[test]
+    fn the_verdict_records_whether_adjudication_actually_RAN() {
+        // The claim the module doc had been making since before it was true: a clean verdict
+        // must never imply scrutiny it did not receive. Until this was pinned, `apply` dropped
+        // the status entirely and a never-adjudicated verdict was indistinguishable from an
+        // adjudicated one.
         let clean = verdict(Severity::Clean, true);
-        assert_eq!(apply(&clean, &adj(None)), clean);
-        let susp = verdict(Severity::Suspicious, true);
-        assert_eq!(apply(&susp, &adj(None)), susp);
+
+        let completed = apply(&clean, &adj(None));
+        let rec = completed.adjudication.expect("must be recorded");
+        assert!(rec.ran, "a completed adjudication is recorded as having run");
+        assert_eq!(rec.status, "completed");
+
+        for (status, label) in [
+            (AdjudicationStatus::NotConfigured, "not_configured"),
+            (AdjudicationStatus::Unavailable("boom".into()), "unavailable: boom"),
+            (AdjudicationStatus::Unparseable("junk".into()), "unparseable: junk"),
+        ] {
+            let a = Adjudication { status, escalated_to: None, concerns: vec![], model: "m".into() };
+            let out = apply(&clean, &a);
+            let rec = out.adjudication.expect("must be recorded even when it did not run");
+            assert!(!rec.ran, "{label} must NOT be recorded as having run");
+            assert_eq!(rec.status, label);
+            assert_eq!(out.severity, Severity::Clean, "and it must not change the severity");
+        }
     }
 
     // ── UNAVAILABILITY IS NOT A GATE ─────────────────────────────────────────────────────

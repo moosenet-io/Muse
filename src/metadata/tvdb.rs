@@ -351,6 +351,15 @@ impl TvdbClient {
                 status: 0,
                 message: "skyhook base url cannot be a base".to_string(),
             })?
+            // Defense in depth, NOT a live bug fix. A raw `Url` whose path ends in `/`
+            // parses with a trailing empty segment, so extending would double the separator
+            // (`/v1/tvdb//search/en`). A reviewer flagged this as reachable via the
+            // operator-overridable `MUSE_SKYHOOK_URL`; it is not — `with_mode` already
+            // strips trailing slashes when the client is constructed, and the test below
+            // pins that. (My own first repro bypassed the constructor and appeared to
+            // confirm it; the mutation check is what showed the guard was inert.) Kept so
+            // the invariant holds locally if that trim ever moves.
+            .pop_if_empty()
             .extend(segments);
         Ok(url)
     }
@@ -373,9 +382,17 @@ impl TvdbClient {
                 return Ok(None);
             }
         };
-        // 404 and every other non-2xx alike → None, logged once.
+        // A 404 here genuinely means "no such series" — an ordinary answer, not a fault.
+        // Every OTHER non-2xx is a fault we are choosing to absorb, and absorbing it at
+        // debug level is exactly how MUSE #106 stayed invisible: the client asked a wrong
+        // URL for months and reported nothing an operator would ever see. Fail-open is
+        // kept (a metadata provider must not take the caller down); the silence is not.
         if !(200..300).contains(&status) {
-            tracing::debug!(status, id = %id, "AMETA-3: Skyhook show non-2xx; degrading to None (fail-open)");
+            if status == 404 {
+                tracing::debug!(status, id = %id, "AMETA-3: Skyhook show 404; no such series (fail-open)");
+            } else {
+                tracing::warn!(status, id = %id, "AMETA-3: Skyhook show unexpected non-2xx; degrading to None (fail-open)");
+            }
             return Ok(None);
         }
         match serde_json::from_slice::<SkyhookShow>(&bytes) {
@@ -414,10 +431,15 @@ impl TvdbClient {
                 return Ok(Vec::new());
             }
         };
+        // Unlike resolve-by-id, a 404 on SEARCH cannot mean "no results" — the endpoint
+        // either exists or it does not, and a search that found nothing answers 200 with an
+        // empty array. So every non-2xx here is unexpected and is logged at warn: this is
+        // the precise signal that was missing while MUSE #106 silently returned zero
+        // results for every series query on a key-less deployment (codex).
         if !(200..300).contains(&status) {
-            tracing::debug!(
+            tracing::warn!(
                 status,
-                "AMETA-3: Skyhook search non-2xx; degrading to empty (fail-open)"
+                "AMETA-3: Skyhook search unexpected non-2xx; degrading to empty (fail-open)"
             );
             return Ok(Vec::new());
         }
@@ -1539,6 +1561,32 @@ mod tests {
             .await
             .expect("5xx must degrade to Ok(None), not Err");
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn skyhook_base_url_with_a_trailing_slash_does_not_double_the_separator() {
+        // Pins the real protection: `with_mode` trims trailing slashes from the base url at
+        // construction, so an operator writing `MUSE_SKYHOOK_URL=…/v1/tvdb/` still gets a
+        // single separator. Both spellings must produce the same URL.
+        //
+        // Asserted on the CONSTRUCTED URL, deliberately, not through a mock server: httpmock
+        // normalizes a doubled slash in its path matcher, so a mock-based version of this
+        // test passed whether or not the joining was correct. It looked like coverage and
+        // was none — which is the same failure this whole issue is about, so it is called
+        // out rather than quietly replaced.
+        let client = TvdbClient::new_skyhook("https://example.test/v1/tvdb/")
+            .expect("skyhook client should build");
+        let url = client
+            .skyhook_url(&["search", "en"])
+            .expect("url should build");
+        assert_eq!(url.as_str(), "https://example.test/v1/tvdb/search/en");
+
+        let no_slash = TvdbClient::new_skyhook("https://example.test/v1/tvdb")
+            .expect("skyhook client should build");
+        assert_eq!(
+            no_slash.skyhook_url(&["search", "en"]).unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en",
+        );
     }
 
     #[tokio::test]

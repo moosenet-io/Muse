@@ -43,6 +43,7 @@
 //! reads those (SAFE-02). Keeping this pure is what makes the rules exhaustively testable, and
 //! this is the one module in the system where that matters most.
 
+pub mod archive;
 pub mod llm;
 
 use std::fmt;
@@ -239,8 +240,20 @@ pub struct InspectedFile {
     pub path: String,
     pub size_bytes: u64,
     /// First [`MAGIC_PREFIX_LEN`] bytes, where the caller could read them. `None` means NOT
-    /// READ — which is never treated as clean.
+    /// READ — which is never treated as clean, unless `bytes_unavailable` explains why.
     pub leading_bytes: Option<Vec<u8>>,
+    /// True when bytes are STRUCTURALLY unavailable rather than merely unread — the entry of an
+    /// archive that this gate deliberately does not decompress (SAFE-03).
+    ///
+    /// The distinction matters because the two deserve different reporting. A caller that
+    /// FAILED to read a loose file is a per-file problem worth naming per file. An archive
+    /// entry can never be byte-checked without decompressing, so repeating "unverified" for
+    /// every entry would bury the real findings under noise that says nothing an operator can
+    /// act on — the archive is reported ONCE as name-checked-only, at the archive level.
+    ///
+    /// It does NOT weaken any dangerous rule: an entry named `.exe`, or one attempting path
+    /// traversal, is judged exactly as it would be loose.
+    pub bytes_unavailable: bool,
 }
 
 /// Severity of what was found. Ordered: `Clean < Suspicious < Dangerous`.
@@ -403,6 +416,9 @@ pub fn inspect(files: &[InspectedFile]) -> Verdict {
                 Magic::Media => {
                     has_media = true;
                 }
+                // Structurally unavailable (an archive entry) is reported once at the archive
+                // level, not once per entry — see `InspectedFile::bytes_unavailable`.
+                Magic::NotProvided if file.bytes_unavailable => {}
                 Magic::NotProvided => findings.push(Finding {
                     path: file.path.clone(),
                     severity: Severity::Suspicious,
@@ -469,6 +485,7 @@ mod tests {
             path: path.to_string(),
             size_bytes: 1_000_000,
             leading_bytes: bytes.map(<[u8]>::to_vec),
+            bytes_unavailable: false,
         }
     }
 

@@ -1604,6 +1604,7 @@ dependencies = [
  "httpmock",
  "image",
  "ipnetwork",
+ "libc",
  "pgvector",
  "prometheus",
  "reqwest",

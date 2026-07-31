@@ -46,11 +46,21 @@
 //! returns `None` and no Foundry surface exists. An absent backend capability
 //! leaves the module inert, never broken.
 
+pub mod capability;
 pub mod config;
+pub mod forge;
 pub mod paths;
+pub mod plan;
+pub mod policy;
+pub mod probe;
 
+pub use capability::{Capabilities, ToolReport, ToolState};
 pub use config::FoundryConfig;
+pub use forge::{ForgeStatus, RewriteRecord, SkipReason};
 pub use paths::{PathError, PathGuard, ResolvedPath};
+pub use plan::{TranscodeDecision, TranscodePlan, TranscodeReason, Undecidable};
+pub use policy::TranscodePolicy;
+pub use probe::{MediaProbe, ProbeError};
 
 /// A configured, usable Foundry.
 ///
@@ -176,6 +186,45 @@ impl Foundry {
         self.config.retention_days
     }
 
+    // --- MUSEF-02: probe, plan, execute ------------------------------------
+
+    /// What media tooling this host actually has, right now.
+    ///
+    /// Detected on every call rather than cached at registration: on this
+    /// fleet ffmpeg is expected to *appear* during the process's lifetime (the
+    /// operator installs it into a running container), and a boot-time
+    /// snapshot would keep reporting "not installed" long after it was.
+    pub fn capabilities(&self) -> Capabilities {
+        forge::detect_capabilities(&self.config)
+    }
+
+    /// Describe one file. Returns the guard's refusal, or the probe's, rather
+    /// than an empty description — a file we could not read is reported as
+    /// unread.
+    ///
+    /// The `String` error is deliberate at this boundary: [`PathError`]'s
+    /// Display names the offending path, which is fine for an operator-facing
+    /// diagnostic, while returning the typed error would re-export a
+    /// path-carrying value that callers outside Foundry cannot otherwise get.
+    pub fn probe_file(&self, path: &std::path::Path) -> Result<MediaProbe, String> {
+        let resolved = self.guard.resolve(path).map_err(|e| e.to_string())?;
+        probe::run_ffprobe(&self.config.ffprobe_bin, &resolved).map_err(|e| e.to_string())
+    }
+
+    /// Probe, plan and — only if the tools exist, the gate is open, and the
+    /// output verifies — replace one file.
+    ///
+    /// Never returns `Err` and never panics: every outcome, including every
+    /// refusal, is a [`ForgeStatus`] the caller can count and report. See
+    /// [`crate::foundry::forge`] for the ordering that keeps the original
+    /// intact through any failure.
+    pub fn optimize_file(
+        &self,
+        path: &std::path::Path,
+        policy: &TranscodePolicy,
+    ) -> ForgeStatus {
+        forge::optimize_file(&self.guard, &self.config, policy, path)
+    }
 }
 
 impl std::fmt::Debug for Foundry {
@@ -214,6 +263,7 @@ mod tests {
             enable_mutation: false,
             retention_days: 14,
             ffprobe_bin: "ffprobe".into(),
+            ffmpeg_bin: "ffmpeg".into(),
             handbrake_bin: "HandBrakeCLI".into(),
         }
     }

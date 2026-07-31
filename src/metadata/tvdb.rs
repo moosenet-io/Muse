@@ -423,6 +423,43 @@ impl TvdbClient {
         }
     }
 
+    /// The search URL for `term`, with the base url's own query string preserved.
+    ///
+    /// A real method rather than inline code so it can be tested directly. The first version
+    /// of its test mirrored this logic inside the test body — which would have passed while
+    /// production did something else, the same false-green that let MUSE #106 survive a green
+    /// suite for months.
+    fn skyhook_search_url(&self, term: &str) -> MuseResult<reqwest::Url> {
+        let mut url = self.skyhook_url(&["search", "en"])?;
+        // Drop any `term` the BASE URL already carries before adding the caller's.
+        // `skyhook_url` deliberately preserves a configured query string, so a base url of
+        // `.../v1/tvdb?term=x` would otherwise produce TWO `term` parameters and let the
+        // configured one decide what gets searched, silently ignoring the user's query
+        // (codex). Any other configured parameter is kept untouched.
+        let preserved: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "term")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.clear();
+            for (k, v) in &preserved {
+                pairs.append_pair(k, v);
+            }
+            // `append_pair` percent-encodes, so a term with spaces or specials is carried
+            // correctly -- the property the old path-segment form relied on
+            // `path_segments_mut` for.
+            pairs.append_pair("term", term);
+        }
+        // `clear()` on a url with no other params leaves a bare `?`; harmless, but normalized
+        // so the outgoing url matches what tests and logs expect.
+        if url.query() == Some("") {
+            url.set_query(None);
+        }
+        Ok(url)
+    }
+
     /// `GET /search/en?term={term}` — Skyhook series search (thin records).
     /// Fail-open like [`Self::skyhook_show`]: transport/HTTP/parse failures
     /// degrade to an empty result set rather than erroring.
@@ -438,11 +475,7 @@ impl TvdbClient {
     ///   `/search/en?term=thrones` -> 200 with results
     ///   `/shows/en/121361`        -> 200 (resolve-by-id was never affected)
     async fn skyhook_search(&self, term: &str) -> MuseResult<Vec<ProviderMetadata>> {
-        let mut url = self.skyhook_url(&["search", "en"])?;
-        // `append_pair` percent-encodes, so a term with spaces or specials is
-        // carried correctly — the property the old path-segment form relied on
-        // `path_segments_mut` for.
-        url.query_pairs_mut().append_pair("term", term);
+        let url = self.skyhook_search_url(term)?;
         let (status, bytes) = match self.skyhook_send(url).await {
             Ok(pair) => pair,
             Err(e) => {
@@ -1652,6 +1685,37 @@ mod tests {
         assert_eq!(
             query_slash.skyhook_url(&["search", "en"]).unwrap().as_str(),
             "https://example.test/v1/tvdb/search/en?redirect=/x/",
+        );
+    }
+
+    #[test]
+    fn skyhook_search_url_replaces_a_term_already_in_the_base_url() {
+        // skyhook_url preserves a configured query string on purpose, so a base url carrying
+        // its own `term` would otherwise send TWO -- and the configured one could decide what
+        // gets searched, silently ignoring the user's query (codex). Unrelated configured
+        // parameters must survive untouched.
+        //
+        // Calls the PRODUCTION method. My first attempt at this test reproduced the logic in
+        // the test body, which proves nothing about what the client actually sends.
+        let client = TvdbClient::new_skyhook("https://example.test/v1/tvdb?term=stale&keep=yes")
+            .expect("skyhook client should build");
+        assert_eq!(
+            client.skyhook_search_url("thrones").unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?keep=yes&term=thrones",
+        );
+
+        // No configured query at all: no stray `?`, term still carried.
+        let plain =
+            TvdbClient::new_skyhook("https://example.test/v1/tvdb").expect("client should build");
+        assert_eq!(
+            plain.skyhook_search_url("thrones").unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?term=thrones",
+        );
+
+        // Encoding survives the rebuild.
+        assert_eq!(
+            plain.skyhook_search_url("game of thrones").unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?term=game+of+thrones",
         );
     }
 

@@ -43,6 +43,8 @@
 //! reads those (SAFE-02). Keeping this pure is what makes the rules exhaustively testable, and
 //! this is the one module in the system where that matters most.
 
+pub mod llm;
+
 use std::fmt;
 
 /// How many leading bytes the caller should read per file for magic detection.

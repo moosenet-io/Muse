@@ -176,6 +176,33 @@ pub enum Undecidable {
     /// cannot identify, or passing it through as "acceptable", are both claims
     /// we have no basis for.
     UnknownAudioCodec { stream_index: u32 },
+    /// ffprobe reported no channel count for an audio stream.
+    ///
+    /// The same reasoning as [`Undecidable::UnknownDuration`], applied
+    /// uniformly (review finding 3). An earlier version skipped the
+    /// channel-ceiling check when the count was absent, which meant
+    /// `AlreadyOptimal` could be returned for a file whose channel count was
+    /// never checked — while `AlreadyOptimal` is documented as "every
+    /// dimension checked and passed". Unknown must not resolve to "fine".
+    UnknownAudioChannels { stream_index: u32 },
+    /// ffprobe reported streams Foundry could not address by index, so its
+    /// view of the file is incomplete. Judging a file on a partial view is how
+    /// a stream gets silently dropped.
+    UnindexedStreams { count: usize },
+    /// The file carries `data` streams, which Foundry cannot carry across a
+    /// rewrite: most data codecs have no Matroska mapping, so `-map 0:d` fails
+    /// the encode outright. Refusing is the fail-closed choice — the
+    /// alternative is dropping them and calling the file "rewritten".
+    ///
+    /// Deliberately conservative. If a future item establishes which data
+    /// codecs remux safely, this can narrow to those; it must not widen to
+    /// "drop them quietly".
+    DataStreamsCannotBeCarried { count: usize },
+    /// The file has attachments (typically subtitle fonts) but the target
+    /// container cannot hold them. Only Matroska can, so this arises when an
+    /// MP4 source with attachments would stay MP4. Dropping the fonts would
+    /// break subtitle rendering silently.
+    AttachmentsCannotBeCarried { count: usize },
     /// The container is not one Foundry recognizes, so it cannot know whether
     /// the streams survive a remux.
     UnrecognizedContainer { found: String },
@@ -211,6 +238,29 @@ impl std::fmt::Display for Undecidable {
             Self::UnknownAudioCodec { stream_index } => write!(
                 f,
                 "ffprobe reported no codec name for audio stream {stream_index}"
+            ),
+            Self::UnknownAudioChannels { stream_index } => write!(
+                f,
+                "ffprobe reported no channel count for audio stream {stream_index}, so the \
+                 channel ceiling cannot be checked and the file cannot be declared \
+                 within policy"
+            ),
+            Self::UnindexedStreams { count } => write!(
+                f,
+                "ffprobe reported {count} stream(s) with no usable index, so Foundry's \
+                 view of this file is incomplete — refusing to judge it rather than \
+                 risk silently dropping a stream"
+            ),
+            Self::DataStreamsCannotBeCarried { count } => write!(
+                f,
+                "the file carries {count} data stream(s), which Foundry cannot carry \
+                 across a rewrite — refusing rather than dropping them silently"
+            ),
+            Self::AttachmentsCannotBeCarried { count } => write!(
+                f,
+                "the file carries {count} attachment(s) (typically subtitle fonts) that \
+                 the target container cannot hold — refusing rather than breaking \
+                 subtitle rendering silently"
             ),
             Self::UnrecognizedContainer { found } => write!(
                 f,
@@ -278,6 +328,16 @@ pub fn bitrate_verdict(
     }
 }
 
+/// Whether a container can carry attachment streams (subtitle fonts).
+///
+/// Only Matroska can, in practice. MP4 has no attachment concept at all, and
+/// the rest of the recognized set are legacy containers with none either. This
+/// is why an MP4 with fonts is refused rather than rewritten: there is nowhere
+/// for the fonts to go, and losing them breaks styled subtitle rendering.
+pub fn container_holds_attachments(container: Container) -> bool {
+    matches!(container, Container::Matroska)
+}
+
 /// The container a rewrite of this file would be written into, or `None` when
 /// the source container is not one Foundry recognizes.
 ///
@@ -320,6 +380,25 @@ pub fn plan_transcode(
     // Each of these is a fact we needed and did not get. Checked before any
     // policy comparison so a partial probe can never produce a partial verdict
     // that happens to look like "optimal".
+
+    // An incomplete view of the file comes first: every judgement below is
+    // made on the streams we could see, so if there are streams we could not
+    // address at all, none of those judgements is trustworthy.
+    if probe.unindexed_stream_count > 0 {
+        return TranscodeDecision::CannotDecide {
+            why: Undecidable::UnindexedStreams {
+                count: probe.unindexed_stream_count,
+            },
+        };
+    }
+
+    if probe.data_stream_count > 0 {
+        return TranscodeDecision::CannotDecide {
+            why: Undecidable::DataStreamsCannotBeCarried {
+                count: probe.data_stream_count,
+            },
+        };
+    }
 
     let Some(container) = normalize_container(&probe.container) else {
         return TranscodeDecision::CannotDecide {
@@ -367,6 +446,32 @@ pub fn plan_transcode(
                 },
             };
         }
+        // Review finding 3: an absent channel count used to skip the channel
+        // ceiling silently, so `AlreadyOptimal` could be returned for a file
+        // that was never checked on that axis. Same rule as duration —
+        // unknown is undecidable, not "fine".
+        if a.channels.map_or(true, |c| c == 0) {
+            return TranscodeDecision::CannotDecide {
+                why: Undecidable::UnknownAudioChannels {
+                    stream_index: a.index,
+                },
+            };
+        }
+    }
+
+    // The container a rewrite would produce, needed here (before the policy
+    // comparison) because whether attachments can survive depends on it.
+    let target_container = if policy.accepts_container(container) {
+        container
+    } else {
+        policy.output_container
+    };
+    if !probe.attachments.is_empty() && !container_holds_attachments(target_container) {
+        return TranscodeDecision::CannotDecide {
+            why: Undecidable::AttachmentsCannotBeCarried {
+                count: probe.attachments.len(),
+            },
+        };
     }
 
     // --- Policy comparison -------------------------------------------------
@@ -517,6 +622,19 @@ pub fn build_transcode_args(
     push(&mut a, "0:a?");
     push(&mut a, "-map");
     push(&mut a, "0:s?");
+    // Attachments — subtitle fonts. Mapped only into a container that can hold
+    // them; the planner refuses the file outright rather than reaching here
+    // with fonts and an MP4 target (see `Undecidable::AttachmentsCannotBeCarried`).
+    //
+    // This map was MISSING in the first version of this argv, which silently
+    // dropped every font in the file while reporting the result "rewritten" —
+    // for anime and many foreign releases that breaks styled subtitle
+    // rendering outright. `-c:t copy` is explicit for the same reason the
+    // other codec flags are: a default is not a guarantee.
+    if container_holds_attachments(plan.container) {
+        push(&mut a, "-map");
+        push(&mut a, "0:t?");
+    }
     // Explicit rather than relying on ffmpeg's defaults: chapters and global
     // metadata (title, tags the *arr tools wrote) must survive the rewrite, and
     // a default is not a guarantee across ffmpeg versions.
@@ -578,6 +696,11 @@ pub fn build_transcode_args(
     push(&mut a, "-c:s");
     push(&mut a, "copy");
 
+    if container_holds_attachments(plan.container) {
+        push(&mut a, "-c:t");
+        push(&mut a, "copy");
+    }
+
     push(&mut a, "-f");
     a.push(plan.container.ffmpeg_format().to_string());
     a.push(output_path.to_string());
@@ -599,6 +722,11 @@ mod tests {
             video,
             audio,
             subtitles: Vec::new(),
+            attachments: Vec::new(),
+            data_stream_count: 0,
+            unindexed_stream_count: 0,
+            chapter_count: 0,
+            title: None,
             other_stream_count: 0,
         }
     }
@@ -727,6 +855,127 @@ mod tests {
             decide(&p),
             TranscodeDecision::CannotDecide { why: Undecidable::UnknownVideoCodec }
         ));
+    }
+
+    #[test]
+    fn an_audio_stream_with_no_channel_count_is_undecidable_not_conforming() {
+        // Review finding 3. Skipping the ceiling check when the count is
+        // absent let `AlreadyOptimal` be returned for a file that was never
+        // checked on that axis — while `AlreadyOptimal` is documented as
+        // "every dimension checked and passed". Same rule as duration.
+        let mut p = optimal();
+        p.audio[0].channels = None;
+        assert_eq!(
+            decide(&p),
+            TranscodeDecision::CannotDecide {
+                why: Undecidable::UnknownAudioChannels { stream_index: 1 }
+            },
+            "an unchecked dimension must never resolve to 'fine'"
+        );
+
+        // Zero is as unusable as absent.
+        let mut p = optimal();
+        p.audio[0].channels = Some(0);
+        assert!(matches!(
+            decide(&p),
+            TranscodeDecision::CannotDecide {
+                why: Undecidable::UnknownAudioChannels { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn streams_we_could_not_address_make_the_whole_file_undecidable() {
+        // Every judgement is made on the streams we could see; if some could
+        // not be addressed at all, none of those judgements is trustworthy.
+        let mut p = optimal();
+        p.unindexed_stream_count = 1;
+        assert_eq!(
+            decide(&p),
+            TranscodeDecision::CannotDecide {
+                why: Undecidable::UnindexedStreams { count: 1 }
+            }
+        );
+    }
+
+    #[test]
+    fn data_streams_are_refused_rather_than_silently_dropped() {
+        // Foundry cannot carry them into Matroska, and dropping them while
+        // reporting the file "rewritten" is a false claim.
+        let mut p = optimal();
+        p.data_stream_count = 2;
+        assert_eq!(
+            decide(&p),
+            TranscodeDecision::CannotDecide {
+                why: Undecidable::DataStreamsCannotBeCarried { count: 2 }
+            }
+        );
+    }
+
+    #[test]
+    fn an_mp4_carrying_fonts_is_refused_rather_than_losing_them() {
+        // MP4 has no attachment concept. An MP4 that needs work but carries
+        // fonts cannot be rewritten without losing them, so it is refused.
+        let mut p = probe(
+            "mov,mp4,m4a,3gp,3g2,mj2",
+            vec![vid("mpeg4", 1280, 720, Some(2_000_000))],
+            vec![aud(1, "aac", 2)],
+        );
+        p.attachments = vec![crate::foundry::probe::AttachmentStream {
+            index: 5,
+            codec: "ttf".into(),
+            filename: Some("Gandhi Sans.ttf".into()),
+        }];
+        assert_eq!(
+            decide(&p),
+            TranscodeDecision::CannotDecide {
+                why: Undecidable::AttachmentsCannotBeCarried { count: 1 }
+            }
+        );
+    }
+
+    #[test]
+    fn a_matroska_file_with_fonts_carries_them_through_the_encode() {
+        // The regression for the silent-media-loss finding: the argv must
+        // actually map and copy attachments, not merely be allowed to.
+        let mut p = probe(
+            "matroska,webm",
+            vec![vid("mpeg4", 1920, 1080, Some(5_000_000))],
+            vec![aud(1, "aac", 2)],
+        );
+        p.attachments = vec![crate::foundry::probe::AttachmentStream {
+            index: 5,
+            codec: "ttf".into(),
+            filename: Some("Gandhi Sans.ttf".into()),
+        }];
+        let TranscodeDecision::Transcode { args, .. } = decide(&p) else {
+            panic!("expected a transcode");
+        };
+        assert!(
+            args.windows(2).any(|w| w[0] == "-map" && w[1] == "0:t?"),
+            "subtitle fonts must be mapped, got {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c:t" && w[1] == "copy"),
+            "and copied, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn an_mp4_target_does_not_ask_ffmpeg_for_attachments_it_cannot_write() {
+        // The flip side: emitting `-map 0:t?` into an MP4 mux would be asking
+        // for something the container cannot express.
+        let p = probe(
+            "mov,mp4,m4a,3gp,3g2,mj2",
+            vec![vid("mpeg4", 1280, 720, Some(2_000_000))],
+            vec![aud(1, "aac", 2)],
+        );
+        let TranscodeDecision::Transcode { plan, args, .. } = decide(&p) else {
+            panic!("expected a transcode");
+        };
+        assert_eq!(plan.container, Container::Mp4);
+        assert!(!args.iter().any(|s| s == "0:t?"), "got {args:?}");
+        assert!(!args.iter().any(|s| s == "-c:t"), "got {args:?}");
     }
 
     #[test]
@@ -1010,11 +1259,12 @@ mod tests {
             vec![
                 "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                 "-i", "/in.avi",
-                "-map", "0:0", "-map", "0:a?", "-map", "0:s?",
+                "-map", "0:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?",
                 "-map_metadata", "0", "-map_chapters", "0",
                 "-c:v", "copy",
                 "-c:a", "copy",
                 "-c:s", "copy",
+                "-c:t", "copy",
                 "-f", "matroska", "/work/out.mkv",
             ]
         );
@@ -1033,13 +1283,14 @@ mod tests {
             vec![
                 "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                 "-i", "/in.mkv",
-                "-map", "0:0", "-map", "0:a?", "-map", "0:s?",
+                "-map", "0:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?",
                 "-map_metadata", "0", "-map_chapters", "0",
                 "-c:v", "libx264", "-crf", "20", "-preset", "medium",
                 "-pix_fmt", "yuv420p", "-vf", "scale=1920:1080",
                 "-maxrate", "12000000", "-bufsize", "24000000",
                 "-c:a", "aac", "-ac", "6",
                 "-c:s", "copy",
+                "-c:t", "copy",
                 "-f", "matroska", "/work/out.mkv",
             ]
         );

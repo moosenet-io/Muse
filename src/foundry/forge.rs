@@ -46,8 +46,8 @@ use crate::foundry::capability::{self, Capabilities};
 use crate::foundry::config::FoundryConfig;
 use crate::foundry::paths::{MutablePath, PathError, PathGuard, ResolvedPath};
 use crate::foundry::plan::{
-    output_container, plan_transcode, TranscodeDecision, TranscodePlan, TranscodeReason,
-    Undecidable, VideoAction,
+    output_container, plan_transcode, AudioAction, TranscodeDecision, TranscodePlan,
+    TranscodeReason, Undecidable, VideoAction,
 };
 use crate::foundry::policy::TranscodePolicy;
 use crate::foundry::probe::{run_ffprobe, MediaProbe, ProbeError};
@@ -160,6 +160,14 @@ pub struct RewriteRecord {
 // --- Verification: pure ----------------------------------------------------
 
 /// What the output of a given plan must look like for the swap to be allowed.
+///
+/// ## Every field here is a promise the argv actually made
+/// An earlier version of this type carried only stream *counts*, which meant a
+/// file could be reported `Rewritten` without codecs, languages, dispositions,
+/// attachments, chapters or metadata ever having been checked — a success
+/// claim covering promises it had not verified. The rule now is one-to-one:
+/// if [`crate::foundry::plan::build_transcode_args`] asks ffmpeg for it, it is
+/// represented here and checked; if it cannot be checked, it is not promised.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifyExpectation {
     pub source_duration_secs: f64,
@@ -167,8 +175,31 @@ pub struct VerifyExpectation {
     pub video_codec: String,
     /// Dimensions the output must have, when the plan ordered a downscale.
     pub video_dimensions: Option<(u32, u32)>,
-    pub audio_stream_count: usize,
-    pub subtitle_stream_count: usize,
+    /// Per-stream audio expectations, **in order**. Order matters: `-map 0:a?`
+    /// preserves source order, so a positional comparison catches a
+    /// re-ordering that a set comparison would miss — and a re-ordered track
+    /// list means the player's default language selection changes.
+    pub audio: Vec<ExpectedAudio>,
+    /// Per-stream subtitle expectations, in order.
+    pub subtitles: Vec<ExpectedSubtitle>,
+    /// Attachment filenames, in order. Compared by *name*, not just count, so
+    /// a substituted font is caught as well as a dropped one.
+    pub attachment_filenames: Vec<Option<String>>,
+    /// Chapters the argv promised to carry with `-map_chapters 0`.
+    pub chapter_count: usize,
+    /// The container `title` tag the argv promised to carry with
+    /// `-map_metadata 0`.
+    ///
+    /// **The limit of the metadata claim, stated plainly.** `-map_metadata 0`
+    /// carries the whole global tag dictionary, but only `title` is verified
+    /// here. Comparing every tag would reject legitimate outputs — muxers
+    /// rewrite `encoder`, and Matroska and MP4 do not spell the same tags the
+    /// same way — so a full comparison would be a check that fails on correct
+    /// files. `title` is the tag the *arr tools and Plex actually read, so it
+    /// is the one worth asserting. The rest of the metadata is *passed* but
+    /// not *verified*, and this comment exists so that distinction is never
+    /// mistaken for a guarantee.
+    pub title: Option<String>,
     /// Absolute duration slack, in seconds. Default 2.0 — container duration
     /// legitimately shifts by a frame or two across a remux, and by up to
     /// about a second when a keyframe-aligned encode rounds the last GOP.
@@ -176,6 +207,29 @@ pub struct VerifyExpectation {
     /// Relative duration slack. Default 0.01 (1%) — a long feature accumulates
     /// more rounding than a short one, so the tolerance scales with it.
     pub duration_rel_tolerance: f64,
+}
+
+/// What one audio stream must look like after the rewrite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpectedAudio {
+    pub codec: String,
+    pub channels: u32,
+    /// The language tag must survive. A track that loses its language stops
+    /// being auto-selectable and looks like a duplicate to the player.
+    pub language: Option<String>,
+}
+
+/// What one subtitle stream must look like after the rewrite.
+///
+/// Subtitles are always stream-copied, so every field is expected to come
+/// through byte-identical — including the dispositions, which decide whether a
+/// forced-narrative track auto-displays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpectedSubtitle {
+    pub codec: String,
+    pub language: Option<String>,
+    pub forced: bool,
+    pub default: bool,
 }
 
 /// Derive the expectation from the source probe and the plan.
@@ -207,12 +261,53 @@ pub fn expectation_for(
         ),
     };
 
+    // Per-stream audio expectations. `None` (refusing to build an expectation
+    // at all) when any source channel count is unknown: the encode path
+    // downmixes to `min(source, ceiling)`, which is not computable without the
+    // source count, and asserting nothing there would be the same silent gap
+    // the planner's `UnknownAudioChannels` rule closes.
+    let mut audio = Vec::with_capacity(source.audio.len());
+    for a in &source.audio {
+        let channels = a.channels?;
+        audio.push(match plan.audio {
+            AudioAction::Copy => ExpectedAudio {
+                codec: a.codec.clone(),
+                channels,
+                language: a.language.clone(),
+            },
+            AudioAction::Encode => ExpectedAudio {
+                codec: "aac".to_string(),
+                // `-ac N` sets the output channel count exactly, so a source
+                // already at or below the ceiling comes out unchanged and only
+                // a wider one is downmixed.
+                channels: channels.min(policy.max_audio_channels),
+                language: a.language.clone(),
+            },
+        });
+    }
+
     Some(VerifyExpectation {
         source_duration_secs,
         video_codec,
         video_dimensions,
-        audio_stream_count: source.audio.len(),
-        subtitle_stream_count: source.subtitles.len(),
+        audio,
+        subtitles: source
+            .subtitles
+            .iter()
+            .map(|s| ExpectedSubtitle {
+                codec: s.codec.clone(),
+                language: s.language.clone(),
+                forced: s.forced,
+                default: s.default,
+            })
+            .collect(),
+        attachment_filenames: source
+            .attachments
+            .iter()
+            .map(|a| a.filename.clone())
+            .collect(),
+        chapter_count: source.chapter_count,
+        title: source.title.clone(),
         duration_abs_tolerance_secs: 2.0,
         duration_rel_tolerance: 0.01,
     })
@@ -249,6 +344,35 @@ pub enum VerifyFailure {
     SubtitleStreamCountMismatch {
         expected: usize,
         found: usize,
+    },
+    /// An audio stream survived but came out wrong — wrong codec, wrong
+    /// channel count, or a lost language tag.
+    AudioStreamMismatch {
+        ordinal: usize,
+        detail: String,
+    },
+    /// A subtitle stream survived but came out wrong. Includes a lost `forced`
+    /// or `default` disposition, which silently changes whether a
+    /// forced-narrative track auto-displays.
+    SubtitleStreamMismatch {
+        ordinal: usize,
+        detail: String,
+    },
+    /// Attachments were dropped, added or substituted. For anime and many
+    /// foreign releases these are the fonts the subtitle track is styled with.
+    AttachmentsMismatch {
+        expected: Vec<String>,
+        found: Vec<String>,
+    },
+    /// `-map_chapters 0` did not carry the chapters across.
+    ChapterCountMismatch {
+        expected: usize,
+        found: usize,
+    },
+    /// `-map_metadata 0` did not carry the container title across.
+    TitleMismatch {
+        expected: Option<String>,
+        found: Option<String>,
     },
     /// A zero-byte or unmeasurable output.
     EmptyOutput,
@@ -290,6 +414,25 @@ impl std::fmt::Display for VerifyFailure {
                 f,
                 "the output has {found} subtitle streams, the source had {expected} — \
                  a track was lost"
+            ),
+            Self::AudioStreamMismatch { ordinal, detail } => {
+                write!(f, "output audio stream #{ordinal} is wrong: {detail}")
+            }
+            Self::SubtitleStreamMismatch { ordinal, detail } => {
+                write!(f, "output subtitle stream #{ordinal} is wrong: {detail}")
+            }
+            Self::AttachmentsMismatch { expected, found } => write!(
+                f,
+                "attachments changed — expected {expected:?}, found {found:?} \
+                 (these are typically the fonts the subtitles are styled with)"
+            ),
+            Self::ChapterCountMismatch { expected, found } => write!(
+                f,
+                "the output has {found} chapters, the source had {expected}"
+            ),
+            Self::TitleMismatch { expected, found } => write!(
+                f,
+                "the container title changed — expected {expected:?}, found {found:?}"
             ),
             Self::EmptyOutput => write!(f, "the output is empty or its size could not be read"),
         }
@@ -353,17 +496,106 @@ pub fn verify_output(
         });
     }
 
-    if output.audio.len() != expect.audio_stream_count {
+    // --- audio: count first, then every stream, positionally ---------------
+    if output.audio.len() != expect.audio.len() {
         return Err(VerifyFailure::AudioStreamCountMismatch {
-            expected: expect.audio_stream_count,
+            expected: expect.audio.len(),
             found: output.audio.len(),
         });
     }
+    for (i, (want, got)) in expect.audio.iter().zip(&output.audio).enumerate() {
+        if !got.codec.eq_ignore_ascii_case(&want.codec) {
+            return Err(VerifyFailure::AudioStreamMismatch {
+                ordinal: i,
+                detail: format!("codec is `{}`, expected `{}`", got.codec, want.codec),
+            });
+        }
+        // `None` is a mismatch, not a skip: an output whose channel count we
+        // cannot read has not been shown to satisfy the downmix.
+        if got.channels != Some(want.channels) {
+            return Err(VerifyFailure::AudioStreamMismatch {
+                ordinal: i,
+                detail: format!(
+                    "channel count is {:?}, expected {}",
+                    got.channels, want.channels
+                ),
+            });
+        }
+        if got.language != want.language {
+            return Err(VerifyFailure::AudioStreamMismatch {
+                ordinal: i,
+                detail: format!(
+                    "language is {:?}, expected {:?} — a track that loses its language \
+                     stops being auto-selectable",
+                    got.language, want.language
+                ),
+            });
+        }
+    }
 
-    if output.subtitles.len() != expect.subtitle_stream_count {
+    // --- subtitles: always stream-copied, so every field must survive ------
+    if output.subtitles.len() != expect.subtitles.len() {
         return Err(VerifyFailure::SubtitleStreamCountMismatch {
-            expected: expect.subtitle_stream_count,
+            expected: expect.subtitles.len(),
             found: output.subtitles.len(),
+        });
+    }
+    for (i, (want, got)) in expect.subtitles.iter().zip(&output.subtitles).enumerate() {
+        if !got.codec.eq_ignore_ascii_case(&want.codec) {
+            return Err(VerifyFailure::SubtitleStreamMismatch {
+                ordinal: i,
+                detail: format!("codec is `{}`, expected `{}`", got.codec, want.codec),
+            });
+        }
+        if got.language != want.language {
+            return Err(VerifyFailure::SubtitleStreamMismatch {
+                ordinal: i,
+                detail: format!("language is {:?}, expected {:?}", got.language, want.language),
+            });
+        }
+        if got.forced != want.forced || got.default != want.default {
+            return Err(VerifyFailure::SubtitleStreamMismatch {
+                ordinal: i,
+                detail: format!(
+                    "disposition is forced={} default={}, expected forced={} default={} \
+                     — this decides whether a forced-narrative track auto-displays",
+                    got.forced, got.default, want.forced, want.default
+                ),
+            });
+        }
+    }
+
+    // --- attachments: by filename, not by count ----------------------------
+    // A substituted font is as broken as a missing one, and a count comparison
+    // cannot tell them apart.
+    let found_attachments: Vec<String> = output
+        .attachments
+        .iter()
+        .map(|a| a.filename.clone().unwrap_or_default())
+        .collect();
+    let want_attachments: Vec<String> = expect
+        .attachment_filenames
+        .iter()
+        .map(|f| f.clone().unwrap_or_default())
+        .collect();
+    if found_attachments != want_attachments {
+        return Err(VerifyFailure::AttachmentsMismatch {
+            expected: want_attachments,
+            found: found_attachments,
+        });
+    }
+
+    if output.chapter_count != expect.chapter_count {
+        return Err(VerifyFailure::ChapterCountMismatch {
+            expected: expect.chapter_count,
+            found: output.chapter_count,
+        });
+    }
+
+    if output.title != expect.title {
+        return Err(VerifyFailure::TitleMismatch {
+            expected: expect.title.clone(),
+            found: output.title.clone(),
         });
     }
 
@@ -389,6 +621,22 @@ pub enum SwapError {
     /// Refused, because overwriting it would destroy the older original, which
     /// is the one thing this design promises not to do.
     SupersededNameOccupied(PathBuf),
+    /// The file on disk is no longer the one that was probed and planned
+    /// against — something replaced it after the probe. Detected by comparing
+    /// the inode we captured at probe time against the inode we actually
+    /// linked. Refusing is mandatory: the plan describes a file that is no
+    /// longer there, so applying it would move a newer, unrelated file aside
+    /// and replace it with an encode of something else.
+    SourceChangedUnderUs {
+        path: PathBuf,
+        expected: FileIdentity,
+        found: FileIdentity,
+    },
+    /// The filesystem refused to create a hard link, which is the primitive
+    /// this swap uses to claim a name atomically. Some filesystems do not
+    /// support links at all — in that case the swap **refuses rather than
+    /// racing**, see [`swap_verified_output`].
+    LinkUnsupported { path: PathBuf, message: String },
     Io { step: &'static str, message: String },
 }
 
@@ -405,9 +653,60 @@ impl std::fmt::Display for SwapError {
                 "{} already exists (a previous run's original) — refusing to destroy it",
                 p.display()
             ),
+            Self::SourceChangedUnderUs {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{} was replaced after it was probed (inode {}:{} became {}:{}) — the plan \
+                 describes a file that is no longer there, so it was not applied",
+                path.display(),
+                expected.dev,
+                expected.ino,
+                found.dev,
+                found.ino
+            ),
+            Self::LinkUnsupported { path, message } => write!(
+                f,
+                "could not create a hard link next to {} ({message}) — Foundry's swap needs \
+                 hard links to claim a name without a race, and refuses rather than \
+                 falling back to a check-then-rename that could overwrite a file",
+                path.display()
+            ),
             Self::Io { step, message } => write!(f, "{step}: {message}"),
         }
     }
+}
+
+/// A file's identity on disk: the pair that survives a rename and changes on a
+/// replace. Used to detect a source swapped out from under a plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Read a path's [`FileIdentity`] without following symlinks.
+pub fn identity_of(p: &Path) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(p)?;
+    Ok(FileIdentity {
+        dev: md.dev(),
+        ino: md.ino(),
+    })
+}
+
+/// `fsync` a directory so a rename/link in it survives a power loss.
+///
+/// On Linux, opening a directory read-only and calling `fsync` is the
+/// documented way to make its *entries* durable. Without it the new file can
+/// be fully written and the directory entry still lost on a crash, leaving the
+/// library path simply absent — the original is recoverable from the
+/// `.muse-superseded` entry only if that entry is durable too, which is why
+/// this is called once after both links are in place.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Put a **already-verified** file into place, renaming the original aside.
@@ -417,58 +716,165 @@ impl std::fmt::Display for SwapError {
 /// media checks of its own — it is the mechanical half, split out precisely so
 /// it can be tested with ordinary files on a host with no ffmpeg.
 ///
+/// # Why this does not use `rename`
+/// **`rename(2)` silently overwrites its destination on Unix.** The previous
+/// version of this function guarded it with `Path::exists()` checks, which is
+/// a textbook check-then-act race: neither check is atomic with the rename
+/// that follows, so a concurrent writer could create the destination (or the
+/// `.muse-superseded` name) in the window between them and have its file
+/// destroyed without a word. That directly contradicted the module's
+/// never-clobber claim, so the whole approach is gone.
+///
+/// The primitive used instead is `link(2)` via [`std::fs::hard_link`], which
+/// **fails with `EEXIST` atomically** and never overwrites. Claiming a name is
+/// therefore a single indivisible operation, and occupancy is discovered by
+/// *failing to claim*, not by looking first. (`renameat2(RENAME_NOREPLACE)`
+/// would work equally well but needs a `libc` dependency this crate does not
+/// carry; `hard_link` is in `std` and gives the same guarantee.)
+///
+/// If the filesystem does not support hard links at all, this **refuses**
+/// ([`SwapError::LinkUnsupported`]) rather than falling back to a racy
+/// rename — a swap that cannot be made safely is not performed.
+///
 /// # Ordering
-/// Both files are in the same directory, so both renames are atomic and
-/// instant. The original moves aside *first*: at no instant does the
-/// destination name hold a partially-written file, and if the second rename
-/// fails the first is rolled back so the original is back where it started.
+/// 1. `link(original -> superseded)` — atomically claims the backup name. The
+///    original's inode now has two names, so it cannot be lost by anything
+///    that follows.
+/// 2. Compare the linked inode against the identity captured at probe time. A
+///    mismatch means the file was replaced after we planned against it, so
+///    the plan describes something that is no longer there — undo and refuse.
+/// 3. `unlink(original)` — the inode survives via the backup name.
+/// 4. `link(new -> final)` — atomically claims the destination. `EEXIST` here
+///    means a bystander occupies it; roll the original back and refuse,
+///    leaving the bystander untouched.
+/// 5. `unlink(new)` to drop the staging name, then `fsync` the directory so
+///    both entries are durable.
+///
+/// The only window where the destination name is briefly absent is between
+/// steps 3 and 4, and any failure in it is rolled back.
+///
+/// # Preconditions the caller owns
+/// `verified_new` must have passed [`verify_output`]. This function performs
+/// no media checks of its own.
 fn swap_verified_output(
     original: &MutablePath,
     verified_new: &MutablePath,
     final_path: &MutablePath,
+    expected_identity: FileIdentity,
 ) -> Result<SwapRecord, SwapError> {
     let original_p = original.as_path();
     let final_p = final_path.as_path();
     let new_p = verified_new.as_path();
 
-    // Only a *different* existing file blocks the swap. When the container is
-    // unchanged the final path IS the original path, which is expected.
-    if final_p != original_p && final_p.exists() {
-        return Err(SwapError::DestinationOccupied(final_p.to_path_buf()));
-    }
-
     let superseded = with_added_extension(original_p, SUPERSEDED_EXT);
-    if superseded.exists() {
-        return Err(SwapError::SupersededNameOccupied(superseded));
-    }
 
-    std::fs::rename(original_p, &superseded).map_err(|e| SwapError::Io {
-        step: "moving the original aside",
-        message: e.to_string(),
-    })?;
-
-    if let Err(e) = std::fs::rename(new_p, final_p) {
-        // Roll back so the original is exactly where it was. If the rollback
-        // itself fails there is nothing further we can do but report both —
-        // and the original still exists under the superseded name, so nothing
-        // has been lost even in that case.
-        let rollback = std::fs::rename(&superseded, original_p);
-        return Err(SwapError::Io {
-            step: "moving the new file into place",
-            message: match rollback {
-                Ok(()) => format!("{e} (the original was rolled back into place)"),
-                Err(re) => format!(
-                    "{e} — AND the rollback failed ({re}); the original is at {}",
-                    superseded.display()
-                ),
+    // --- 1. atomically claim the backup name -------------------------------
+    if let Err(e) = std::fs::hard_link(original_p, &superseded) {
+        return Err(match e.kind() {
+            std::io::ErrorKind::AlreadyExists => SwapError::SupersededNameOccupied(superseded),
+            // EPERM/EMLINK/ENOSYS: the filesystem will not give us the atomic
+            // primitive. Refuse rather than race.
+            _ => SwapError::LinkUnsupported {
+                path: original_p.to_path_buf(),
+                message: e.to_string(),
             },
         });
+    }
+
+    // --- 2. is this still the file we planned against? ---------------------
+    // Comparing the inode we just linked (not a fresh stat of the path, which
+    // would be another race) against the one captured at probe time.
+    match identity_of(&superseded) {
+        Ok(found) if found == expected_identity => {}
+        Ok(found) => {
+            let _ = std::fs::remove_file(&superseded);
+            return Err(SwapError::SourceChangedUnderUs {
+                path: original_p.to_path_buf(),
+                expected: expected_identity,
+                found,
+            });
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&superseded);
+            return Err(SwapError::Io {
+                step: "confirming the original had not been replaced",
+                message: e.to_string(),
+            });
+        }
+    }
+
+    // --- 3. drop the original name (the inode lives on as the backup) ------
+    if let Err(e) = std::fs::remove_file(original_p) {
+        let _ = std::fs::remove_file(&superseded);
+        return Err(SwapError::Io {
+            step: "releasing the original name",
+            message: e.to_string(),
+        });
+    }
+
+    // --- 4. atomically claim the destination -------------------------------
+    if let Err(e) = std::fs::hard_link(new_p, final_p) {
+        // Roll back: re-link the original inode to its own name, then drop the
+        // backup name. If the rollback fails there is still nothing lost — the
+        // original remains reachable under `superseded` — and the message says
+        // exactly where it is.
+        let rollback = std::fs::hard_link(&superseded, original_p)
+            .and_then(|()| std::fs::remove_file(&superseded));
+        let occupied = e.kind() == std::io::ErrorKind::AlreadyExists;
+        let detail = match rollback {
+            Ok(()) => "the original was rolled back into place".to_string(),
+            Err(re) => format!(
+                "AND the rollback failed ({re}); the original is at {}",
+                superseded.display()
+            ),
+        };
+        return Err(if occupied && rollback_succeeded(&detail) {
+            SwapError::DestinationOccupied(final_p.to_path_buf())
+        } else {
+            SwapError::Io {
+                step: "claiming the destination name",
+                message: format!("{e} ({detail})"),
+            }
+        });
+    }
+
+    // --- 5. drop the staging name and make both entries durable ------------
+    if let Err(e) = std::fs::remove_file(new_p) {
+        // Not fatal: the content is correctly in place under `final_p`. A
+        // leftover staging name is untidy, not destructive.
+        tracing::warn!(
+            error = %e,
+            path = %new_p.display(),
+            "foundry: could not remove the in-library staging name after a successful swap"
+        );
+    }
+
+    if let Some(dir) = final_p.parent() {
+        if let Err(e) = fsync_dir(dir) {
+            // The swap itself succeeded and the library is correct right now;
+            // only crash-durability is unconfirmed. Reporting failure here
+            // would be wrong (the work IS done), so this is a warning that
+            // names the specific residual risk.
+            tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                "foundry: swap completed but the directory could not be fsynced — the \
+                 new name may not survive a power loss"
+            );
+        }
     }
 
     Ok(SwapRecord {
         final_path: final_p.to_path_buf(),
         superseded_path: superseded,
     })
+}
+
+/// Whether the rollback detail string reports success. Kept as a named helper
+/// so the branch above reads as the intent ("only call it `DestinationOccupied`
+/// if the library is actually back to its original state").
+fn rollback_succeeded(detail: &str) -> bool {
+    detail.starts_with("the original was rolled back")
 }
 
 /// Append an extension, keeping the existing one (`a.mkv` -> `a.mkv.superseded`).
@@ -536,6 +942,18 @@ pub(in crate::foundry) fn optimize_file(
             },
         };
     }
+
+    // Captured BEFORE the probe, so it covers the whole probe-plan-encode
+    // window: if anything replaces the file while we are working, the swap
+    // compares this against the inode it actually links and refuses.
+    let source_identity = match identity_of(resolved.as_path()) {
+        Ok(id) => id,
+        Err(e) => {
+            return ForgeStatus::Failed {
+                reason: format!("could not read the source file's identity: {e}"),
+            }
+        }
+    };
 
     let source = match run_ffprobe(&cfg.ffprobe_bin, &resolved) {
         Ok(p) => p,
@@ -627,7 +1045,9 @@ pub(in crate::foundry) fn optimize_file(
     };
 
     let bytes_before = source.size_bytes.unwrap_or(0);
-    let result = run_encode_and_swap(guard, cfg, policy, &resolved, &source, &plan, &args, &staged);
+    let result = run_encode_and_swap(
+        guard, cfg, policy, &resolved, &source, &plan, &args, &staged, source_identity,
+    );
 
     // Unconditionally, on BOTH paths: the work-dir encode has served its
     // purpose either way (on success it was copied into the library, on
@@ -669,6 +1089,7 @@ fn run_encode_and_swap(
     plan: &TranscodePlan,
     args: &[String],
     staged: &MutablePath,
+    source_identity: FileIdentity,
 ) -> Result<CompletedSwap, String> {
     // --- 1. encode ---------------------------------------------------------
     // The ONE process spawn on this path. Everything above and below it is
@@ -726,6 +1147,15 @@ fn run_encode_and_swap(
         }
     };
 
+    // Flush the copy to disk before verifying it. `fs::copy` leaves the bytes
+    // in the page cache; verifying a file that exists only in cache and then
+    // losing power leaves a library entry pointing at a partial file that our
+    // own verification vouched for.
+    if let Err(e) = std::fs::File::open(inflight.as_path()).and_then(|fh| fh.sync_all()) {
+        discard_staged(&inflight);
+        return Err(format!("flushing the in-library copy to disk: {e}"));
+    }
+
     let inflight_probe = match run_ffprobe(&cfg.ffprobe_bin, inflight.as_resolved()) {
         Ok(p) => p,
         Err(e) => {
@@ -753,7 +1183,7 @@ fn run_encode_and_swap(
         }
     };
 
-    match swap_verified_output(&original_mut, &inflight, &final_mut) {
+    match swap_verified_output(&original_mut, &inflight, &final_mut, source_identity) {
         Ok(record) => Ok(CompletedSwap {
             final_path: record.final_path,
             superseded_path: record.superseded_path,
@@ -789,7 +1219,7 @@ pub(in crate::foundry) fn detect_capabilities(cfg: &FoundryConfig) -> Capabiliti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundry::plan::AudioAction;
+
     use crate::foundry::policy::Container;
     use crate::foundry::probe::{AudioStream, SubtitleStream, VideoStream};
     use std::fs;
@@ -836,6 +1266,11 @@ mod tests {
                     default: false,
                 })
                 .collect(),
+            attachments: Vec::new(),
+            data_stream_count: 0,
+            unindexed_stream_count: 0,
+            chapter_count: 0,
+            title: None,
             other_stream_count: 0,
         }
     }
@@ -1044,6 +1479,246 @@ mod tests {
         );
     }
 
+    // --- verification now covers what the argv actually promised ----------
+
+    /// A source with the full range of things the argv promises to carry:
+    /// languages, dispositions, fonts, chapters and a title.
+    fn rich_source() -> MediaProbe {
+        let mut p = probe_of(Some(1420.0), "h264", (1920, 1080), 2, 2, Some(4_000_000_000));
+        p.audio[0].language = Some("jpn".to_string());
+        p.audio[1].language = Some("eng".to_string());
+        p.subtitles[0].language = Some("eng".to_string());
+        p.subtitles[0].forced = true;
+        p.subtitles[1].language = Some("eng".to_string());
+        p.subtitles[1].default = true;
+        p.attachments = vec![
+            crate::foundry::probe::AttachmentStream {
+                index: 20,
+                codec: "ttf".into(),
+                filename: Some("Gandhi Sans Bold.ttf".into()),
+            },
+            crate::foundry::probe::AttachmentStream {
+                index: 21,
+                codec: "otf".into(),
+                filename: Some("Trebuchet MS.otf".into()),
+            },
+        ];
+        p.chapter_count = 4;
+        p.title = Some("Cowboy Bebop - 01".to_string());
+        p
+    }
+
+    fn rich_expect() -> VerifyExpectation {
+        expectation_for(&rich_source(), &remux_plan(), &TranscodePolicy::default())
+            .expect("the fixture has a duration and channel counts")
+    }
+
+    #[test]
+    fn a_faithful_rich_output_verifies() {
+        assert_eq!(verify_output(&rich_expect(), &rich_source()), Ok(()));
+    }
+
+    #[test]
+    fn dropped_subtitle_fonts_are_rejected() {
+        // The silent-media-loss regression. For anime and many foreign
+        // releases these attachments ARE the subtitle styling; losing them
+        // while reporting the file "rewritten" is a false success claim.
+        let mut out = rich_source();
+        out.attachments.clear();
+        assert!(
+            matches!(
+                verify_output(&rich_expect(), &out),
+                Err(VerifyFailure::AttachmentsMismatch { .. })
+            ),
+            "a rewrite that dropped every font must not be accepted"
+        );
+    }
+
+    #[test]
+    fn a_substituted_font_is_rejected_even_though_the_count_matches() {
+        // Precisely what a count-only check cannot see.
+        let mut out = rich_source();
+        out.attachments[1].filename = Some("Comic Sans MS.ttf".into());
+        assert_eq!(out.attachments.len(), rich_expect().attachment_filenames.len());
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::AttachmentsMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn lost_chapters_are_rejected() {
+        // `-map_chapters 0` is a promise; this is what makes it checkable.
+        let mut out = rich_source();
+        out.chapter_count = 0;
+        assert_eq!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::ChapterCountMismatch { expected: 4, found: 0 })
+        );
+    }
+
+    #[test]
+    fn a_lost_container_title_is_rejected() {
+        let mut out = rich_source();
+        out.title = None;
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::TitleMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_audio_track_that_lost_its_language_is_rejected() {
+        // A track without a language stops being auto-selectable and looks
+        // like a duplicate to the player — a real regression a count check
+        // cannot see.
+        let mut out = rich_source();
+        out.audio[0].language = None;
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::AudioStreamMismatch { ordinal: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn an_audio_track_that_came_out_in_the_wrong_codec_is_rejected() {
+        // Added because a mutation SURVIVED: deleting the output-side audio
+        // codec check changed nothing observable. The test that was supposed
+        // to cover it only exercised `expectation_for` (what we *intend*),
+        // never `verify_output` (what we *got*) — so the rule that an audio
+        // stream must actually come out in the expected codec was untested.
+        //
+        // This matters on both plan shapes: a stream copy that silently
+        // re-encoded, and an encode that produced something other than AAC.
+        let expect = rich_expect();
+        assert_eq!(expect.audio[0].codec, "aac", "the remux fixture copies AAC");
+
+        let mut out = rich_source();
+        out.audio[0].codec = "mp3".to_string();
+        assert!(
+            matches!(
+                verify_output(&expect, &out),
+                Err(VerifyFailure::AudioStreamMismatch { ordinal: 0, .. })
+            ),
+            "an audio stream that came out in the wrong codec must be rejected"
+        );
+
+        // And on the encode path, where the expected codec is the encoder's.
+        let mut s = rich_source();
+        s.audio[0].codec = "truehd".to_string();
+        let enc = expectation_for(&s, &encode_plan(None), &TranscodePolicy::default()).unwrap();
+        assert_eq!(enc.audio[0].codec, "aac");
+        let mut out = rich_source();
+        out.audio[0].codec = "ac3".to_string();
+        assert!(
+            matches!(
+                verify_output(&enc, &out),
+                Err(VerifyFailure::AudioStreamMismatch { ordinal: 0, .. })
+            ),
+            "an encode that produced AC3 instead of AAC must be rejected"
+        );
+    }
+
+    #[test]
+    fn re_ordered_audio_tracks_are_rejected() {
+        // Same set, different order: the default track the player picks
+        // changes. A set comparison would pass this; a positional one catches it.
+        let mut out = rich_source();
+        out.audio.swap(0, 1);
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::AudioStreamMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_audio_track_with_the_wrong_channel_count_is_rejected() {
+        let mut out = rich_source();
+        out.audio[0].channels = Some(1);
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::AudioStreamMismatch { ordinal: 0, .. })
+        ));
+
+        // And an unreadable count is a rejection, not a skipped check.
+        let mut out = rich_source();
+        out.audio[0].channels = None;
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::AudioStreamMismatch { ordinal: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_subtitle_that_lost_its_forced_disposition_is_rejected() {
+        // This decides whether a forced-narrative track auto-displays. Losing
+        // it is invisible in a count and very visible on screen.
+        let mut out = rich_source();
+        out.subtitles[0].forced = false;
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::SubtitleStreamMismatch { ordinal: 0, .. })
+        ));
+
+        let mut out = rich_source();
+        out.subtitles[1].default = false;
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::SubtitleStreamMismatch { ordinal: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_subtitle_that_changed_codec_or_language_is_rejected() {
+        let mut out = rich_source();
+        out.subtitles[0].codec = "ass".to_string();
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::SubtitleStreamMismatch { ordinal: 0, .. })
+        ));
+
+        let mut out = rich_source();
+        out.subtitles[1].language = Some("fra".to_string());
+        assert!(matches!(
+            verify_output(&rich_expect(), &out),
+            Err(VerifyFailure::SubtitleStreamMismatch { ordinal: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn an_audio_re_encode_expects_the_downmix_it_actually_ordered() {
+        // The encode path promises `-c:a aac -ac N`; the expectation must
+        // follow that, and must NOT "downmix" a source already below the
+        // ceiling (`-ac` sets the count exactly).
+        let mut s = rich_source();
+        s.audio[0].channels = Some(8);
+        s.audio[1].channels = Some(2);
+        let expect = expectation_for(&s, &encode_plan(None), &TranscodePolicy::default()).unwrap();
+        assert_eq!(expect.audio[0].codec, "aac");
+        assert_eq!(expect.audio[0].channels, 6, "8ch must be downmixed to the ceiling");
+        assert_eq!(
+            expect.audio[1].channels, 2,
+            "a stereo track must stay stereo, not be inflated to the ceiling"
+        );
+        assert_eq!(
+            expect.audio[0].language.as_deref(),
+            Some("jpn"),
+            "a re-encode must still carry the language"
+        );
+    }
+
+    #[test]
+    fn a_source_with_an_unknown_channel_count_yields_no_expectation_at_all() {
+        // Consistent with the duration rule: the downmix target is not
+        // computable, so no expectation can be built and no swap authorized.
+        let mut s = rich_source();
+        s.audio[0].channels = None;
+        assert_eq!(
+            expectation_for(&s, &encode_plan(None), &TranscodePolicy::default()),
+            None
+        );
+    }
+
     #[test]
     fn a_source_with_no_duration_yields_no_expectation_at_all() {
         // The second, independent refusal of the unverifiable case: even if
@@ -1096,10 +1771,12 @@ mod tests {
         fs::write(&original, b"ORIGINAL").unwrap();
         fs::write(&staged, b"NEW-VERIFIED").unwrap();
 
+        let id = identity_of(&original).unwrap();
         let rec = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
+            id,
         )
         .expect("the swap must succeed");
 
@@ -1123,10 +1800,12 @@ mod tests {
         fs::write(&original, b"O").unwrap();
         fs::write(&staged, b"N").unwrap();
 
+        let id = identity_of(&original).unwrap();
         let rec = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(t.lib().join("Movie.mkv")).unwrap(),
+            id,
         )
         .unwrap();
 
@@ -1161,10 +1840,12 @@ mod tests {
         fs::write(&bystander, b"SOMEONE-ELSES-FILE").unwrap();
         fs::write(&staged, b"NEW").unwrap();
 
+        let id = identity_of(&original).unwrap();
         let err = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&bystander).unwrap(),
+            id,
         )
         .unwrap_err();
 
@@ -1183,10 +1864,12 @@ mod tests {
         fs::write(t.lib().join("Movie.mkv.muse-superseded"), b"OLDER-ORIGINAL").unwrap();
         fs::write(&staged, b"NEW").unwrap();
 
+        let id = identity_of(&original).unwrap();
         let err = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
+            id,
         )
         .unwrap_err();
 
@@ -1212,13 +1895,15 @@ mod tests {
         fs::write(&original, b"ORIGINAL").unwrap();
         fs::write(&staged, b"NEW").unwrap();
 
+        let id = identity_of(&original).unwrap();
         let original_mut = g.resolve_for_mutation(&original).unwrap();
         let staged_mut = g.resolve_for_mutation(&staged).unwrap();
         let final_mut = g.resolve_new_for_mutation(&original).unwrap();
         // ...and now it is gone, after resolution and before the swap.
         fs::remove_file(&staged).unwrap();
 
-        let err = swap_verified_output(&original_mut, &staged_mut, &final_mut).unwrap_err();
+        let err =
+            swap_verified_output(&original_mut, &staged_mut, &final_mut, id).unwrap_err();
 
         assert!(matches!(err, SwapError::Io { .. }), "got {err:?}");
         assert!(
@@ -1234,6 +1919,100 @@ mod tests {
             !t.lib().join("Movie.mkv.muse-superseded").exists(),
             "and the aside-name must not be left behind"
         );
+    }
+
+    #[test]
+    fn the_swap_refuses_when_the_source_was_replaced_after_it_was_probed() {
+        // The third TOCTOU case from review. The plan describes the file we
+        // probed; if something replaced it in the meantime, applying that plan
+        // would move a NEWER, unrelated file aside and replace it with an
+        // encode of something else entirely.
+        let t = Tmp::new("swap-changed");
+        let g = t.guard();
+        let original = t.lib().join("Movie.mkv");
+        let staged = t.lib().join(".inflight.mkv");
+        fs::write(&original, b"THE FILE WE PROBED").unwrap();
+        fs::write(&staged, b"NEW").unwrap();
+
+        let stale_identity = identity_of(&original).unwrap();
+
+        // ...and now someone replaces it with a different inode.
+        fs::remove_file(&original).unwrap();
+        fs::write(&original, b"A DIFFERENT, NEWER FILE").unwrap();
+
+        let err = swap_verified_output(
+            &g.resolve_for_mutation(&original).unwrap(),
+            &g.resolve_for_mutation(&staged).unwrap(),
+            &g.resolve_new_for_mutation(&original).unwrap(),
+            stale_identity,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, SwapError::SourceChangedUnderUs { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            fs::read(&original).unwrap(),
+            b"A DIFFERENT, NEWER FILE",
+            "the newer file must be left exactly as it was"
+        );
+        assert!(
+            !t.lib().join("Movie.mkv.muse-superseded").exists(),
+            "and no backup name may be left behind after a refusal"
+        );
+    }
+
+    #[test]
+    fn claiming_a_name_never_overwrites_even_though_rename_would_have() {
+        // The core of the TOCTOU fix, asserted on the primitive itself rather
+        // than only through the swap: `fs::rename` silently destroys its
+        // destination, `fs::hard_link` refuses atomically. If this ever
+        // changes, the swap's whole safety argument is void.
+        let t = Tmp::new("primitive");
+        let a = t.lib().join("a");
+        let b = t.lib().join("b");
+        fs::write(&a, b"AAA").unwrap();
+        fs::write(&b, b"BBB").unwrap();
+
+        let e = fs::hard_link(&a, &b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&b).unwrap(), b"BBB", "hard_link must not clobber");
+
+        // The primitive the old code used, for contrast.
+        fs::rename(&a, &b).unwrap();
+        assert_eq!(
+            fs::read(&b).unwrap(),
+            b"AAA",
+            "rename DOES clobber — which is why it is not used to claim a name"
+        );
+    }
+
+    #[test]
+    fn a_successful_swap_leaves_exactly_two_names_and_no_staging_file() {
+        let t = Tmp::new("swap-tidy");
+        let g = t.guard();
+        let original = t.lib().join("Movie.mkv");
+        let staged = t.lib().join(".inflight.mkv");
+        fs::write(&original, b"ORIGINAL").unwrap();
+        fs::write(&staged, b"NEW-VERIFIED").unwrap();
+        let id = identity_of(&original).unwrap();
+
+        swap_verified_output(
+            &g.resolve_for_mutation(&original).unwrap(),
+            &g.resolve_for_mutation(&staged).unwrap(),
+            &g.resolve_new_for_mutation(&original).unwrap(),
+            id,
+        )
+        .unwrap();
+
+        assert!(!staged.exists(), "the staging name must be gone");
+        let mut names: Vec<String> = fs::read_dir(t.lib())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Movie.mkv", "Movie.mkv.muse-superseded"]);
     }
 
     // --- the driver, on a host with no media tooling -----------------------

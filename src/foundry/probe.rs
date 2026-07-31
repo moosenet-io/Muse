@@ -32,7 +32,13 @@ use crate::foundry::paths::ResolvedPath;
 /// `-v quiet` plus `-print_format json` means stdout is *only* JSON: any
 /// diagnostic noise would otherwise be interleaved into the document we are
 /// about to parse. `-show_format` gives the container/duration, `-show_streams`
-/// the per-stream detail; both are needed and neither is the default.
+/// the per-stream detail, `-show_chapters` the chapter list; none is the
+/// default and all three are needed.
+///
+/// `-show_chapters` is not optional decoration: the transcode argv promises
+/// `-map_chapters 0`, and a promise that is never checked is the class of
+/// false claim this module exists to avoid. Chapters are not streams, so
+/// `-show_streams` does not report them.
 pub fn build_ffprobe_args(file_path: &str) -> Vec<String> {
     vec![
         "-v".to_string(),
@@ -41,6 +47,7 @@ pub fn build_ffprobe_args(file_path: &str) -> Vec<String> {
         "json".to_string(),
         "-show_format".to_string(),
         "-show_streams".to_string(),
+        "-show_chapters".to_string(),
         file_path.to_string(),
     ]
 }
@@ -64,10 +71,56 @@ pub struct MediaProbe {
     pub video: Vec<VideoStream>,
     pub audio: Vec<AudioStream>,
     pub subtitles: Vec<SubtitleStream>,
-    /// Streams of any other type (`data`, `attachment`). Counted rather than
-    /// described: nothing here plans against them, but a nonzero count is
-    /// honest about the file containing more than we modelled.
+    /// Matroska attachments — **including subtitle fonts**.
+    ///
+    /// Modelled rather than counted, and that is a correction: an earlier
+    /// version of this parser folded attachments into a generic "other" count,
+    /// and the transcode argv did not map them at all. For anime and many
+    /// foreign releases the attached fonts are what the ASS/SSA subtitle track
+    /// is styled with — dropping them makes subtitles render in a fallback
+    /// face, mispositioned, or not at all. Silently losing them while
+    /// reporting the file "rewritten" is exactly the false-claim class this
+    /// module is built to prevent, so they are named, carried, and verified.
+    pub attachments: Vec<AttachmentStream>,
+    /// Count of `data`-type streams (timecode tracks, mov text metadata).
+    ///
+    /// Counted rather than modelled because Foundry cannot carry them: most
+    /// data codecs have no Matroska mapping, so `-map 0:d` would fail the
+    /// encode outright. A nonzero count therefore makes the file undecidable
+    /// (see `Undecidable::DataStreamsCannotBeCarried`) rather than being
+    /// dropped quietly.
+    pub data_stream_count: usize,
+    /// Streams ffprobe reported with no usable index.
+    ///
+    /// An index we did not observe cannot be invented — the argv maps streams
+    /// by absolute index, so a guess maps the *wrong* stream. But excluding
+    /// them silently would let a file be judged on a partial view of its
+    /// contents, so the count is surfaced and the planner refuses to decide
+    /// while it is nonzero.
+    pub unindexed_stream_count: usize,
+    /// Chapters. The argv promises `-map_chapters 0`; this is what makes that
+    /// promise checkable.
+    pub chapter_count: usize,
+    /// The container-level `title` tag, when present. The argv promises
+    /// `-map_metadata 0`; verifying this one tag is a bounded, honest check on
+    /// that promise (see [`crate::foundry::forge::verify_output`] for exactly
+    /// how far the metadata claim is verified, and how far it is not).
+    pub title: Option<String>,
+    /// Streams of a type Foundry does not model at all. Honest about the file
+    /// containing more than we described.
     pub other_stream_count: usize,
+}
+
+/// A Matroska attachment (typically a subtitle font).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachmentStream {
+    pub index: u32,
+    /// The attachment's codec name (`ttf`, `otf`, `mimetype`-driven).
+    pub codec: String,
+    /// `tags.filename` — the font's filename, which is what the subtitle
+    /// renderer looks up. Verified across a rewrite by filename, not just by
+    /// count, so a *substituted* font is caught as well as a missing one.
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -262,6 +315,8 @@ struct RawProbe {
     streams: Vec<RawStream>,
     #[serde(default)]
     format: Option<RawFormat>,
+    #[serde(default)]
+    chapters: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +329,8 @@ struct RawFormat {
     bit_rate: Option<serde_json::Value>,
     #[serde(default)]
     size: Option<serde_json::Value>,
+    #[serde(default)]
+    tags: Option<RawTags>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +376,13 @@ struct RawTags {
     /// a subtitle/audio track silently loses its language.
     #[serde(default, rename = "LANGUAGE")]
     language_upper: Option<String>,
+    /// Attachment filename (the font file name a subtitle renderer looks up).
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, rename = "TITLE")]
+    title_upper: Option<String>,
 }
 
 /// Read a JSON value that may be a number **or** a numeric string, returning
@@ -384,14 +448,21 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
     let mut video = Vec::new();
     let mut audio = Vec::new();
     let mut subtitles = Vec::new();
+    let mut attachments = Vec::new();
+    let mut data_stream_count = 0usize;
+    let mut unindexed_stream_count = 0usize;
     let mut other_stream_count = 0usize;
 
     for s in &raw.streams {
         // A stream with no index cannot be mapped in an ffmpeg argv, so it
-        // cannot be planned against. Count it as "other" rather than
-        // inventing an index — a guessed index would map the WRONG stream.
+        // cannot be planned against — a guessed index would map the WRONG
+        // stream. It is counted in its OWN field rather than folded into
+        // `other_stream_count`, because the two mean different things: "a
+        // stream type we chose not to model" is benign, while "a stream we
+        // could not address at all" means our view of the file is incomplete
+        // and the planner must refuse to judge it.
         let Some(index) = as_u32(&s.index) else {
-            other_stream_count += 1;
+            unindexed_stream_count += 1;
             continue;
         };
         let codec = s.codec_name.clone().unwrap_or_default();
@@ -439,9 +510,27 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
                 forced: disposition.and_then(|d| d.forced).unwrap_or(0) != 0,
                 default: disposition.and_then(|d| d.default).unwrap_or(0) != 0,
             }),
+            Some("attachment") => attachments.push(AttachmentStream {
+                index,
+                codec,
+                filename: s
+                    .tags
+                    .as_ref()
+                    .and_then(|t| t.filename.clone())
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty()),
+            }),
+            Some("data") => data_stream_count += 1,
             _ => other_stream_count += 1,
         }
     }
+
+    let title = format
+        .as_ref()
+        .and_then(|f| f.tags.as_ref())
+        .and_then(|t| t.title.clone().or_else(|| t.title_upper.clone()))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
 
     Ok(MediaProbe {
         container,
@@ -451,6 +540,11 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
         video,
         audio,
         subtitles,
+        attachments,
+        data_stream_count,
+        unindexed_stream_count,
+        chapter_count: raw.chapters.len(),
+        title,
         other_stream_count,
     })
 }
@@ -506,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn ffprobe_argv_asks_for_json_only_with_both_sections() {
+    fn ffprobe_argv_asks_for_json_only_with_every_section() {
         assert_eq!(
             build_ffprobe_args("/srv/media/Movies/A/A.mkv"),
             vec![
@@ -516,6 +610,7 @@ mod tests {
                 "json",
                 "-show_format",
                 "-show_streams",
+                "-show_chapters",
                 "/srv/media/Movies/A/A.mkv",
             ]
         );
@@ -660,9 +755,12 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_with_no_index_is_counted_not_guessed_at() {
+    fn a_stream_with_no_index_is_counted_separately_not_guessed_at() {
         // An index we did not observe cannot be invented: the argv maps
         // streams by absolute index, so a guess would map the wrong stream.
+        // It lands in its OWN counter, not `other_stream_count` — the planner
+        // refuses to judge a file it cannot fully address, and folding the two
+        // together would hide that.
         let json = r#"{
             "streams": [
                 { "index": 0, "codec_name": "h264", "codec_type": "video" },
@@ -672,7 +770,96 @@ mod tests {
         }"#;
         let p = parse_probe_json(json).unwrap();
         assert_eq!(p.audio.len(), 0, "an unindexable stream must not be planned against");
-        assert_eq!(p.other_stream_count, 1);
+        assert_eq!(p.unindexed_stream_count, 1);
+        assert_eq!(p.other_stream_count, 0, "it is not merely an unmodelled type");
+    }
+
+    #[test]
+    fn matroska_font_attachments_are_modelled_by_filename() {
+        // Dropping these makes styled ASS/SSA subtitles render in a fallback
+        // face or not at all. They are named (not just counted) so a
+        // SUBSTITUTED font is caught across a rewrite as well as a missing one.
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "h264", "codec_type": "video" },
+                { "index": 1, "codec_name": "ass", "codec_type": "subtitle",
+                  "tags": { "language": "eng" } },
+                { "index": 2, "codec_name": "ttf", "codec_type": "attachment",
+                  "tags": { "filename": "Gandhi Sans Bold.ttf" } },
+                { "index": 3, "codec_name": "otf", "codec_type": "attachment",
+                  "tags": { "filename": "Trebuchet MS.otf" } }
+            ],
+            "format": { "format_name": "matroska,webm", "duration": "1420.0" }
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        assert_eq!(p.attachments.len(), 2);
+        assert_eq!(p.attachments[0].index, 2);
+        assert_eq!(p.attachments[0].codec, "ttf");
+        assert_eq!(
+            p.attachments[0].filename.as_deref(),
+            Some("Gandhi Sans Bold.ttf")
+        );
+        assert_eq!(p.attachments[1].filename.as_deref(), Some("Trebuchet MS.otf"));
+        assert_eq!(
+            p.other_stream_count, 0,
+            "attachments are modelled now, not lumped into an opaque count"
+        );
+    }
+
+    #[test]
+    fn data_streams_are_counted_distinctly_from_unmodelled_types() {
+        // Foundry cannot carry data streams into Matroska, so the planner has
+        // to know they exist in order to refuse rather than drop them.
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "h264", "codec_type": "video" },
+                { "index": 1, "codec_name": "bin_data", "codec_type": "data" },
+                { "index": 2, "codec_name": "smpte_2038", "codec_type": "data" }
+            ],
+            "format": { "format_name": "mpegts", "duration": "60.0" }
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        assert_eq!(p.data_stream_count, 2);
+        assert_eq!(p.other_stream_count, 0);
+        assert_eq!(p.unindexed_stream_count, 0);
+    }
+
+    #[test]
+    fn chapters_and_the_container_title_are_parsed() {
+        // The argv promises `-map_chapters 0` and `-map_metadata 0`; these are
+        // what make those promises checkable rather than decorative.
+        let json = r#"{
+            "streams": [ { "index": 0, "codec_name": "h264", "codec_type": "video" } ],
+            "format": {
+                "format_name": "matroska,webm", "duration": "5400.0",
+                "tags": { "title": "The Thing (1982)" }
+            },
+            "chapters": [
+                { "id": 0, "start_time": "0.000", "end_time": "600.000" },
+                { "id": 1, "start_time": "600.000", "end_time": "1200.000" },
+                { "id": 2, "start_time": "1200.000", "end_time": "5400.000" }
+            ]
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        assert_eq!(p.chapter_count, 3);
+        assert_eq!(p.title.as_deref(), Some("The Thing (1982)"));
+    }
+
+    #[test]
+    fn a_file_with_no_chapters_or_title_reports_zero_and_none() {
+        let p = h264_mkv();
+        assert_eq!(p.chapter_count, 0);
+        assert_eq!(p.title, None);
+        assert!(p.attachments.is_empty());
+        assert_eq!(p.data_stream_count, 0);
+        assert_eq!(p.unindexed_stream_count, 0);
+    }
+
+    #[test]
+    fn the_ffprobe_argv_asks_for_chapters() {
+        // Without this flag `chapter_count` is always 0 and the
+        // `-map_chapters 0` promise silently verifies against nothing.
+        assert!(build_ffprobe_args("/x.mkv").contains(&"-show_chapters".to_string()));
     }
 
     #[test]

@@ -188,6 +188,67 @@ pub(crate) fn resolve_match(rows: &[(i64, bool)]) -> (Option<i64>, bool, bool) {
     (metadata_id, ambiguous, owned)
 }
 
+/// What can be said about ONE search hit, after every identifier it carries has been looked up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HitResolution {
+    /// `Some(true)`/`Some(false)` when the hit resolves to exactly one catalog row and that
+    /// row's ownership is therefore this title's ownership. `None` means UNKNOWN — see below.
+    pub in_library: Option<bool>,
+    pub in_catalog: bool,
+    pub metadata_id: Option<i64>,
+    pub ambiguous: bool,
+}
+
+/// Collapse every identifier on a hit into one answer.
+///
+/// Two separate traps, both found in review, both reachable:
+///
+/// 1. The first version used `find_map` over the hit's ids and took the FIRST that resolved,
+///    ignoring any other id that resolved to a DIFFERENT row. `provider_ids` is a `HashMap`,
+///    so "first" is iteration order — the answer was nondeterministic between runs (codex).
+///    Every id is now consulted and they must agree.
+///
+/// 2. Ownership under ambiguity was reported as `true` on an ANY basis. That over-claims: the
+///    provider's hit is ONE title, and when several catalog rows share an identifier we do not
+///    know which of them it is — so "one of the rows sharing this id is held" is not the same
+///    statement as "you hold this title" (gpt56). Ownership becomes UNKNOWN, not true.
+///
+/// A hit Muse has never seen resolves to `in_library: Some(false)`: that one IS supported —
+/// a title with no catalog row at all cannot be in the library.
+pub(crate) fn resolve_hit(matches: &[(Option<i64>, bool, bool)]) -> HitResolution {
+    if matches.is_empty() {
+        return HitResolution {
+            in_library: Some(false),
+            in_catalog: false,
+            metadata_id: None,
+            ambiguous: false,
+        };
+    }
+
+    let any_ambiguous = matches.iter().any(|(_, ambiguous, _)| *ambiguous);
+    let ids: Vec<i64> = matches.iter().filter_map(|(id, _, _)| *id).collect();
+    let all_same_row = !ids.is_empty() && ids.iter().all(|id| *id == ids[0]);
+    // Every identifier resolved, none was ambiguous, and they all named the SAME row.
+    let settled = !any_ambiguous && all_same_row && ids.len() == matches.len();
+
+    if settled {
+        let owned = matches.iter().any(|(_, _, owned)| *owned);
+        return HitResolution {
+            in_library: Some(owned),
+            in_catalog: true,
+            metadata_id: Some(ids[0]),
+            ambiguous: false,
+        };
+    }
+
+    HitResolution {
+        in_library: None,
+        in_catalog: true,
+        metadata_id: None,
+        ambiguous: true,
+    }
+}
+
 /// Which of these titles Muse already knows, keyed by `(provider, id, db_kind)`.
 ///
 /// The KIND is part of the key deliberately. `media_metadata` is `UNIQUE (kind, tmdb_id)` and
@@ -470,11 +531,18 @@ pub async fn get_search(
     let results: Vec<Value> = hits
         .iter()
         .map(|(provider, kind, meta)| {
-            // Matched on (provider, id, KIND) — see resolve_in_library on why the kind
-            // belongs in the key.
-            let known = id_pairs(meta)
+            // EVERY identifier is consulted, not the first that resolves — see resolve_hit.
+            // Matched on (provider, id, KIND); see resolve_in_library on why the kind is in
+            // the key.
+            let matches: Vec<(Option<i64>, bool, bool)> = id_pairs(meta)
                 .into_iter()
-                .find_map(|(provider, id)| in_library.get(&(provider, id, db_kind(*kind))).copied());
+                .filter_map(|(provider, id)| {
+                    in_library
+                        .get(&(provider, id, db_kind(*kind)))
+                        .map(|h| (h.metadata_id, h.ambiguous, h.owned))
+                })
+                .collect();
+            let known = resolve_hit(&matches);
             json!({
                 "provider": provider,
                 "kind": kind_str(*kind),
@@ -488,17 +556,17 @@ pub async fn get_search(
                 // are already in the library, so a search hit that is NOT owned has no Muse
                 // art url — the remote one is passed through as-is and may be null.
                 "poster_url": meta.images.poster_url.clone(),
-                // `in_library` means Muse HOLDS this title (a media_items row), which is
-                // what the library query itself requires. A metadata row alone means only
-                // that Muse has seen the title — every trending title on /api/discover has
-                // one — so the two are reported separately rather than conflated.
-                "in_library": known.map(|k| k.owned).unwrap_or(false),
-                "in_catalog": known.is_some(),
-                // Null when several catalog rows share this id (possible for IMDb, which has
-                // no uniqueness constraint) — the title is known, but no single row can be
-                // named, and naming an arbitrary one would be a fabricated attribution.
-                "media_metadata_id": known.and_then(|k| k.metadata_id),
-                "ambiguous_match": known.map(|k| k.ambiguous).unwrap_or(false),
+                // TRI-STATE. true/false when the hit resolves to exactly one catalog row;
+                // NULL when it does not, which means UNKNOWN and must not be rendered as
+                // "not in library". Ownership is a media_items row — the same join the
+                // library query uses — because a media_metadata row alone means only that
+                // Muse has SEEN the title (every trending title on /api/discover has one).
+                "in_library": known.in_library,
+                "in_catalog": known.in_catalog,
+                // Null when the hit's identifiers do not agree on a single unambiguous row.
+                // Naming one anyway would be an attribution nothing supports.
+                "media_metadata_id": known.metadata_id,
+                "ambiguous_match": known.ambiguous,
             })
         })
         .collect();
@@ -604,6 +672,60 @@ mod tests {
         assert_eq!(id, None);
         assert!(ambiguous);
         assert!(!owned);
+    }
+
+    #[test]
+    fn a_hit_with_no_catalog_row_is_definitively_not_in_the_library() {
+        // The one negative that IS supported: no catalog row at all means no media_items row.
+        let r = resolve_hit(&[]);
+        assert_eq!(r.in_library, Some(false));
+        assert!(!r.in_catalog);
+        assert!(!r.ambiguous);
+    }
+
+    #[test]
+    fn a_single_unambiguous_row_settles_ownership_either_way() {
+        assert_eq!(resolve_hit(&[(Some(4), false, true)]).in_library, Some(true));
+        assert_eq!(resolve_hit(&[(Some(4), false, false)]).in_library, Some(false));
+        assert_eq!(resolve_hit(&[(Some(4), false, true)]).metadata_id, Some(4));
+    }
+
+    #[test]
+    fn identifiers_agreeing_on_one_row_still_settle() {
+        // tmdb and imdb both resolving to row 4 is corroboration, not conflict.
+        let r = resolve_hit(&[(Some(4), false, true), (Some(4), false, true)]);
+        assert_eq!(r.in_library, Some(true));
+        assert_eq!(r.metadata_id, Some(4));
+        assert!(!r.ambiguous);
+    }
+
+    #[test]
+    fn identifiers_pointing_at_different_rows_make_ownership_unknown() {
+        // The nondeterminism codex found: `find_map` would have taken whichever id the
+        // HashMap yielded first and reported ITS ownership as fact.
+        let r = resolve_hit(&[(Some(4), false, true), (Some(9), false, false)]);
+        assert_eq!(r.in_library, None, "conflicting rows cannot settle ownership");
+        assert_eq!(r.metadata_id, None);
+        assert!(r.ambiguous);
+        assert!(r.in_catalog, "Muse does know the title, it just cannot pin the row");
+    }
+
+    #[test]
+    fn an_ambiguous_key_makes_ownership_unknown_not_true() {
+        // gpt56: "some row sharing this id is held" is NOT "you hold this title". The hit is
+        // one title; if several rows share the id we do not know which one it is.
+        let r = resolve_hit(&[(None, true, true)]);
+        assert_eq!(r.in_library, None);
+        assert_eq!(r.metadata_id, None);
+        assert!(r.ambiguous);
+    }
+
+    #[test]
+    fn one_identifier_resolving_and_another_not_is_unsettled() {
+        // Only some ids resolved: the unresolved one might name a different row.
+        let r = resolve_hit(&[(Some(4), false, true), (None, true, false)]);
+        assert_eq!(r.in_library, None);
+        assert!(r.ambiguous);
     }
 
     /// These hit the REAL upstreams. Ignored by default so the suite stays hermetic and

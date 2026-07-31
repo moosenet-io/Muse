@@ -1231,6 +1231,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_mode_is_reportable_so_discover_can_explain_itself() {
+        // MUSE #111: /api/discover must be able to distinguish "a TMDb client exists" from
+        // "trending works". In proxy mode trending returns empty WITHOUT asking, so a panel
+        // told only `tmdb.is_some()` reports a configured provider that returned nothing —
+        // and sends the operator hunting for a worker that never had anything to do.
+        let proxy = TmdbClient::new_proxy("https://api.radarr.video/v1").expect("proxy client");
+        assert!(proxy.is_proxy_mode(), "keyless mode must be reportable");
+
+        let api = TmdbClient::new("https://api.themoviedb.org/3", "k").expect("api client");
+        assert!(!api.is_proxy_mode(), "a keyed client CAN do trending");
+    }
+
     #[tokio::test]
     async fn proxy_trending_and_watch_providers_degrade_to_empty_not_error() {
         // AMETA-2 caveat: the proxy has no /trending or /watch/providers, so

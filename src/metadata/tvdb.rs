@@ -137,7 +137,13 @@ impl TvdbClient {
 
         Ok(Self {
             http,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            // Stored VERBATIM. This used to trim trailing slashes off the raw string, which
+            // silently corrupted any base url whose QUERY ended in `/` (`?redirect=/x/`
+            // became `?redirect=/x`) — gpt56. Api mode still needs the trim for its
+            // `format!("{base}{path}")` concat, so it is applied there, at the point of use,
+            // where it can only affect the concat and never the stored value. Skyhook mode
+            // parses this url properly and normalizes the PATH in `skyhook_url`.
+            base_url: base_url.into(),
             api_key: api_key.into(),
             pin,
             token: std::sync::Arc::new(RwLock::new(None)),
@@ -201,7 +207,7 @@ impl TvdbClient {
     /// transparent re-auth after a `401` — never speculatively per-request
     /// when a cached token is already held.
     async fn login(&self) -> MuseResult<String> {
-        let url = format!("{}{LOGIN_PATH}", self.base_url);
+        let url = format!("{}{LOGIN_PATH}", self.base_url.trim_end_matches('/'));
 
         let resp = self
             .http
@@ -257,7 +263,7 @@ impl TvdbClient {
         path: &str,
         query: &[(&str, &str)],
     ) -> MuseResult<(u16, Vec<u8>)> {
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url.trim_end_matches('/'));
 
         let token = self.ensure_token().await?;
         let resp = self
@@ -346,6 +352,24 @@ impl TvdbClient {
             status: 0,
             message: format!("invalid skyhook base url {}: {e}", self.base_url),
         })?;
+        // Normalize on the PARSED PATH, not the raw string. Three spellings an operator
+        // can supply, all of which reached a doubled separator (`/v1/tvdb//search/en`) that
+        // 404s — and fail-open hid, for resolve-by-id as much as for search:
+        //
+        //   ".../v1/tvdb/"       plain trailing slash    (caught by with_mode's string trim)
+        //   ".../v1/tvdb/?x=1"   trim is a NO-OP: the string ends in `1`, the path in `/`
+        //   ".../v1/tvdb//?x=1"  repeated slashes: popping a single empty segment is not enough
+        //
+        // Trimming the path here handles all three and, unlike the raw-string trim, cannot
+        // corrupt a query value that happens to end in `/` (gpt56) — it never touches the
+        // query or fragment at all.
+        //
+        // NOTE: `with_mode`'s raw-string trim is left in place because Api mode builds its
+        // urls by `format!("{base}{path}")` and depends on it. That concat has its own
+        // weaknesses with query-bearing base urls; fixing it is a change to the authenticated
+        // TVDB path and is deliberately NOT bundled into this bug fix. Filed separately.
+        let normalized_path = url.path().trim_end_matches('/').to_string();
+        url.set_path(&normalized_path);
         url.path_segments_mut()
             .map_err(|_| MuseError::Upstream {
                 status: 0,
@@ -369,47 +393,84 @@ impl TvdbClient {
         let (status, bytes) = match self.skyhook_send(url).await {
             Ok(pair) => pair,
             Err(e) => {
-                tracing::debug!(error = %e, id = %id, "AMETA-3: Skyhook show request failed; degrading to None (fail-open)");
+                // Warn: an unreachable host or a bad override is a misconfiguration, not a
+                // missing series, and resolve-by-id was hiding it just as search was (codex).
+                tracing::warn!(error = %e, id = %id, "AMETA-3: Skyhook show request failed; degrading to None (fail-open)");
                 return Ok(None);
             }
         };
-        // 404 and every other non-2xx alike → None, logged once.
+        // A 404 here genuinely means "no such series" — an ordinary answer, not a fault.
+        // Every OTHER non-2xx is a fault we are choosing to absorb, and absorbing it at
+        // debug level is exactly how MUSE #106 stayed invisible: the client asked a wrong
+        // URL for months and reported nothing an operator would ever see. Fail-open is
+        // kept (a metadata provider must not take the caller down); the silence is not.
         if !(200..300).contains(&status) {
-            tracing::debug!(status, id = %id, "AMETA-3: Skyhook show non-2xx; degrading to None (fail-open)");
+            if status == 404 {
+                tracing::debug!(status, id = %id, "AMETA-3: Skyhook show 404; no such series (fail-open)");
+            } else {
+                tracing::warn!(status, id = %id, "AMETA-3: Skyhook show unexpected non-2xx; degrading to None (fail-open)");
+            }
             return Ok(None);
         }
         match serde_json::from_slice::<SkyhookShow>(&bytes) {
             Ok(show) => Ok(Some(show.into_metadata())),
             Err(e) => {
-                tracing::debug!(error = %e, id = %id, "AMETA-3: Skyhook show parse failed; degrading to None (fail-open)");
+                // A 200 that will not parse means we are pointed at the wrong endpoint —
+                // otherwise indistinguishable from "no such series".
+                tracing::warn!(error = %e, id = %id, "AMETA-3: Skyhook show parse failed; degrading to None (fail-open)");
                 Ok(None)
             }
         }
     }
 
-    /// `GET /search/en/{term}` — Skyhook series search (thin records).
+    /// `GET /search/en?term={term}` — Skyhook series search (thin records).
     /// Fail-open like [`Self::skyhook_show`]: transport/HTTP/parse failures
     /// degrade to an empty result set rather than erroring.
+    ///
+    /// MUSE #106: the term is a QUERY PARAMETER, not a path segment. This
+    /// built `/search/en/{term}`, which Skyhook answers with 404 — and
+    /// because this function fails open, every series search on a key-less
+    /// deployment returned an empty list with nothing logged above debug.
+    /// That is the whole of TVDB search whenever `MUSE_TVDB_API_KEY` is
+    /// unset, which is the default posture (see `TvdbMode::Skyhook`).
+    /// Probed live against `skyhook.sonarr.tv/v1/tvdb`:
+    ///   `/search/en/thrones`      -> 404
+    ///   `/search/en?term=thrones` -> 200 with results
+    ///   `/shows/en/121361`        -> 200 (resolve-by-id was never affected)
     async fn skyhook_search(&self, term: &str) -> MuseResult<Vec<ProviderMetadata>> {
-        let url = self.skyhook_url(&["search", "en", term])?;
+        let mut url = self.skyhook_url(&["search", "en"])?;
+        // `append_pair` percent-encodes, so a term with spaces or specials is
+        // carried correctly — the property the old path-segment form relied on
+        // `path_segments_mut` for.
+        url.query_pairs_mut().append_pair("term", term);
         let (status, bytes) = match self.skyhook_send(url).await {
             Ok(pair) => pair,
             Err(e) => {
-                tracing::debug!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
+                // Warn, not debug: an unreachable host or a bad override is exactly the
+                // class of fault that hid MUSE #106, and search has no benign failure mode
+                // to confuse it with (codex).
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
                 return Ok(Vec::new());
             }
         };
+        // Unlike resolve-by-id, a 404 on SEARCH cannot mean "no results" — the endpoint
+        // either exists or it does not, and a search that found nothing answers 200 with an
+        // empty array. So every non-2xx here is unexpected and is logged at warn: this is
+        // the precise signal that was missing while MUSE #106 silently returned zero
+        // results for every series query on a key-less deployment (codex).
         if !(200..300).contains(&status) {
-            tracing::debug!(
+            tracing::warn!(
                 status,
-                "AMETA-3: Skyhook search non-2xx; degrading to empty (fail-open)"
+                "AMETA-3: Skyhook search unexpected non-2xx; degrading to empty (fail-open)"
             );
             return Ok(Vec::new());
         }
         match serde_json::from_slice::<Vec<SkyhookShow>>(&bytes) {
             Ok(hits) => Ok(hits.into_iter().map(SkyhookShow::into_metadata).collect()),
             Err(e) => {
-                tracing::debug!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
+                // A 200 carrying HTML or otherwise unparseable JSON means we are pointed at
+                // the wrong endpoint — indistinguishable from "no results" without this.
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
                 Ok(Vec::new())
             }
         }
@@ -1424,12 +1485,17 @@ mod tests {
 
     #[tokio::test]
     async fn skyhook_search_parses_hits() {
-        // Single-token term (no percent-encoding needed) keeps the path
-        // matcher unambiguous on the gate; the term is still routed through
-        // `Url::path_segments_mut`, which percent-encodes any spaces/specials.
+        // MUSE #106: this test previously mocked `/search/en/thrones` — the
+        // PATH-SEGMENT form — and passed, which is precisely why the bug
+        // survived: the test encoded the same wrong contract as the code, so
+        // the pair agreed with each other and disagreed with Skyhook. The
+        // mock now pins the query-parameter form the live service actually
+        // answers, so a regression to the path form fails here.
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(GET).path("/search/en/thrones");
+            when.method(GET)
+                .path("/search/en")
+                .query_param("term", "thrones");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!([
@@ -1519,6 +1585,85 @@ mod tests {
             .await
             .expect("5xx must degrade to Ok(None), not Err");
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn skyhook_base_url_with_a_trailing_slash_does_not_double_the_separator() {
+        // Two distinct protections, both pinned here:
+        //   - the plain trailing slash is handled by `with_mode`'s string trim;
+        //   - a base url with a QUERY or FRAGMENT slips past that trim entirely (the string
+        //     does not end in `/`, but the path does), and is handled only by
+        //     `pop_if_empty()` in `skyhook_url`.
+        // The second case is why that guard is load-bearing rather than decorative.
+        //
+        // Asserted on the CONSTRUCTED URL, deliberately, not through a mock server: httpmock
+        // normalizes a doubled slash in its path matcher, so a mock-based version of this
+        // test passed whether or not the joining was correct. It looked like coverage and
+        // was none — which is the same failure this whole issue is about, so it is called
+        // out rather than quietly replaced.
+        let client = TvdbClient::new_skyhook("https://example.test/v1/tvdb/")
+            .expect("skyhook client should build");
+        let url = client
+            .skyhook_url(&["search", "en"])
+            .expect("url should build");
+        assert_eq!(url.as_str(), "https://example.test/v1/tvdb/search/en");
+
+        let no_slash = TvdbClient::new_skyhook("https://example.test/v1/tvdb")
+            .expect("skyhook client should build");
+        assert_eq!(
+            no_slash.skyhook_url(&["search", "en"]).unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en",
+        );
+
+        // The case the string trim cannot see: the raw base url ends in `1`, not `/`, so
+        // `trim_end_matches('/')` is a no-op — but the PATH still ends in `/`.
+        let with_query = TvdbClient::new_skyhook("https://example.test/v1/tvdb/?x=1")
+            .expect("skyhook client should build");
+        assert_eq!(
+            with_query.skyhook_url(&["search", "en"]).unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?x=1",
+        );
+
+        // REPEATED trailing slashes before a query: popping one empty segment is not enough.
+        let doubled = TvdbClient::new_skyhook("https://example.test/v1/tvdb//?x=1")
+            .expect("skyhook client should build");
+        assert_eq!(
+            doubled.skyhook_url(&["search", "en"]).unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?x=1",
+        );
+
+        // A query value ending in `/` must survive intact — the raw-string trim would have
+        // eaten it, which is why normalization happens on the parsed path (gpt56).
+        let query_slash = TvdbClient::new_skyhook("https://example.test/v1/tvdb?redirect=/x/")
+            .expect("skyhook client should build");
+        assert_eq!(
+            query_slash.skyhook_url(&["search", "en"]).unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?redirect=/x/",
+        );
+    }
+
+    #[tokio::test]
+    async fn skyhook_search_encodes_a_multi_word_term() {
+        // The old path-segment form leaned on `path_segments_mut` for encoding.
+        // `append_pair` must carry the same property for terms with spaces.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/search/en")
+                .query_param("term", "game of thrones");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([]));
+        });
+
+        let client = skyhook_client_for(&server);
+        let hits = client
+            .search("game of thrones", MediaKind::Series)
+            .await
+            .expect("search should parse");
+
+        mock.assert();
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

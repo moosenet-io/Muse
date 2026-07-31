@@ -183,11 +183,15 @@ struct CatalogIndex {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct HitResolution {
     /// `Some(true)`/`Some(false)` when the hit pins exactly one catalog row. `None` means
-    /// UNKNOWN — the identifiers did not agree — and must NEVER be rendered as "not owned".
+    /// UNKNOWN — the identifiers did not agree, or nothing could be checked — and must NEVER
+    /// be rendered as "not owned".
     pub in_library: Option<bool>,
-    pub in_catalog: bool,
+    /// Also tri-state, for the same reason: when the hit carries no identifier this endpoint
+    /// can look up, whether Muse has the title is unknown rather than false.
+    pub in_catalog: Option<bool>,
     pub metadata_id: Option<i64>,
     pub ambiguous: bool,
+    pub resolution: Resolution,
 }
 
 /// A single hit identifier, paired with what the candidate row says about it.
@@ -208,35 +212,84 @@ pub(crate) enum IdentifierCheck {
     Silent,
 }
 
+/// Why a hit resolved the way it did. Carried on the wire so a caller never has to infer the
+/// difference between "we checked and it is not there" and "we could not check".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Resolution {
+    /// Exactly one catalog row, nothing contradicting it. `in_library` is definite.
+    Settled,
+    /// Indexed identifiers were checked and matched no catalog row. `in_library` is a
+    /// definite false.
+    Absent,
+    /// The hit carried NO identifier this endpoint can look up, so nothing was checked.
+    NoIndexedIdentifier,
+    /// Several distinct catalog rows were reachable.
+    AmbiguousRows,
+    /// One row, but an identifier it records disagrees with the hit.
+    Contradicted,
+}
+
+impl Resolution {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Resolution::Settled => "settled",
+            Resolution::Absent => "absent",
+            Resolution::NoIndexedIdentifier => "no_indexed_identifier",
+            Resolution::AmbiguousRows => "ambiguous_rows",
+            Resolution::Contradicted => "contradicted",
+        }
+    }
+}
+
 /// Decide what one hit supports, given the distinct catalog rows its identifiers reach and
 /// how the single candidate row (when there is one) answers each identifier.
 ///
+/// `indexed_identifiers` is how many of the hit's ids this endpoint can actually look up
+/// (tmdb/tvdb/imdb — the indexed columns). It matters for the zero-candidate case: finding no
+/// row is only a NEGATIVE ANSWER if something was actually asked. See below.
+///
 /// Conservative in exactly one direction: it settles only when a single row is pinned and
-/// nothing contradicts it. Everything else is `None` (unknown), never a guess.
+/// nothing contradicts it. Everything else is unknown, never a guess.
 pub(crate) fn resolve_hit(
     candidate_rows: usize,
+    indexed_identifiers: usize,
     checks: &[IdentifierCheck],
     owned: Option<bool>,
 ) -> HitResolution {
-    // No catalog row reachable from any identifier. This is the one NEGATIVE that is fully
-    // supported: a title Muse has never catalogued cannot have a media_items row.
     if candidate_rows == 0 {
+        // "No indexed candidate found" is NOT "never catalogued" (codex, gpt56). Candidate
+        // collection only consults tmdb/tvdb/imdb; ids living in the `provider_ids` jsonb
+        // (tvrage, tvmaze, anilist) are not queried, so a hit carrying only those was never
+        // actually looked up and nothing can be concluded from the silence.
+        if indexed_identifiers == 0 {
+            return HitResolution {
+                in_library: None,
+                in_catalog: None,
+                metadata_id: None,
+                ambiguous: true,
+                resolution: Resolution::NoIndexedIdentifier,
+            };
+        }
+        // Something WAS asked and answered nothing: a title with no catalog row cannot have a
+        // media_items row. This is the one negative that is fully supported.
         return HitResolution {
             in_library: Some(false),
-            in_catalog: false,
+            in_catalog: Some(false),
             metadata_id: None,
             ambiguous: false,
+            resolution: Resolution::Absent,
         };
     }
 
-    // Several distinct rows reachable: Muse knows the title but cannot say WHICH row this hit
-    // is, so it can answer neither ownership nor identity.
+    // Several distinct rows reachable: Muse knows a title here but cannot say WHICH row this
+    // hit is, so it can answer neither ownership nor identity.
     if candidate_rows > 1 {
         return HitResolution {
             in_library: None,
-            in_catalog: true,
+            in_catalog: Some(true),
             metadata_id: None,
             ambiguous: true,
+            resolution: Resolution::AmbiguousRows,
         };
     }
 
@@ -245,17 +298,19 @@ pub(crate) fn resolve_hit(
     if checks.iter().any(|c| *c == IdentifierCheck::Contradicts) {
         return HitResolution {
             in_library: None,
-            in_catalog: true,
+            in_catalog: Some(true),
             metadata_id: None,
             ambiguous: true,
+            resolution: Resolution::Contradicted,
         };
     }
 
     HitResolution {
         in_library: owned,
-        in_catalog: true,
+        in_catalog: Some(true),
         metadata_id: None, // filled by the caller, which holds the row id
         ambiguous: false,
+        resolution: Resolution::Settled,
     }
 }
 
@@ -589,13 +644,20 @@ pub async fn get_search(
                     identifier_checks(&hit_ids, r.tmdb.as_deref(), r.tvdb.as_deref(), r.imdb.as_deref())
                 })
                 .unwrap_or_default();
+            // How many of this hit's ids this endpoint can actually look up. Zero means
+            // nothing was checked, which is not the same as nothing being found.
+            let indexed = hit_ids
+                .iter()
+                .filter(|(p, _)| matches!(p.as_str(), "tmdb" | "tvdb" | "imdb"))
+                .count();
             let mut known = resolve_hit(
                 candidates.len(),
+                indexed,
                 &checks,
                 single.map(|(_, r)| r.owned),
             );
             // The row id is only asserted when resolve_hit actually settled on it.
-            if !known.ambiguous && known.in_catalog {
+            if !known.ambiguous && known.in_catalog == Some(true) {
                 known.metadata_id = single.map(|(id, _)| id);
             }
 
@@ -619,6 +681,9 @@ pub async fn get_search(
                 // Muse has SEEN the title (every trending title on /api/discover has one).
                 "in_library": known.in_library,
                 "in_catalog": known.in_catalog,
+                // Why the two flags above say what they say — so a caller never has to infer
+                // the difference between "checked and absent" and "could not check".
+                "resolution": known.resolution.as_str(),
                 // Null when the hit's identifiers do not agree on a single unambiguous row.
                 // Naming one anyway would be an attribution nothing supports.
                 "media_metadata_id": known.metadata_id,
@@ -719,21 +784,21 @@ mod tests {
     #[test]
     fn a_hit_reaching_no_catalog_row_is_definitively_not_in_the_library() {
         // The one negative that IS fully supported: never catalogued => no media_items row.
-        let r = resolve_hit(0, &[], None);
+        let r = resolve_hit(0, 1, &[], None);
         assert_eq!(r.in_library, Some(false));
-        assert!(!r.in_catalog);
+        assert_eq!(r.in_catalog, Some(false));
         assert!(!r.ambiguous);
     }
 
     #[test]
     fn one_row_with_nothing_contradicting_settles_ownership_either_way() {
-        let owned = resolve_hit(1, &[IdentifierCheck::Corroborates], Some(true));
+        let owned = resolve_hit(1, 1, &[IdentifierCheck::Corroborates], Some(true));
         assert_eq!(owned.in_library, Some(true));
         assert!(!owned.ambiguous);
 
-        let not_owned = resolve_hit(1, &[IdentifierCheck::Corroborates], Some(false));
+        let not_owned = resolve_hit(1, 1, &[IdentifierCheck::Corroborates], Some(false));
         assert_eq!(not_owned.in_library, Some(false));
-        assert!(not_owned.in_catalog, "known to Muse, just not held");
+        assert_eq!(not_owned.in_catalog, Some(true), "known to Muse, just not held");
     }
 
     #[test]
@@ -744,6 +809,7 @@ mod tests {
         // disagreement.
         let r = resolve_hit(
             1,
+            2,
             &[IdentifierCheck::Corroborates, IdentifierCheck::Silent],
             Some(true),
         );
@@ -757,23 +823,51 @@ mod tests {
         // so no ownership claim is made in EITHER direction.
         let r = resolve_hit(
             1,
+            2,
             &[IdentifierCheck::Corroborates, IdentifierCheck::Contradicts],
             Some(true),
         );
         assert_eq!(r.in_library, None, "a contradiction cannot settle ownership");
         assert_eq!(r.metadata_id, None);
         assert!(r.ambiguous);
-        assert!(r.in_catalog, "Muse does know a title here, it cannot pin which");
+        assert_eq!(r.in_catalog, Some(true), "Muse does know a title here, it cannot pin which");
     }
 
     #[test]
     fn several_candidate_rows_make_ownership_unknown() {
         // Reachable because imdb_id has no uniqueness constraint.
-        let r = resolve_hit(2, &[], None);
+        let r = resolve_hit(2, 1, &[], None);
         assert_eq!(r.in_library, None);
         assert_eq!(r.metadata_id, None);
         assert!(r.ambiguous);
-        assert!(r.in_catalog);
+        assert_eq!(r.in_catalog, Some(true));
+    }
+
+    #[test]
+    fn a_hit_with_no_lookupable_identifier_is_unknown_not_absent() {
+        // Candidate collection only consults tmdb/tvdb/imdb. A hit carrying only ids from the
+        // provider_ids jsonb (tvrage, tvmaze, anilist) was never actually looked up, so zero
+        // candidates means nothing was ASKED — not that the title is absent (codex, gpt56).
+        let r = resolve_hit(0, 0, &[], None);
+        assert_eq!(r.in_library, None, "nothing was checked, so nothing is known");
+        assert_eq!(r.in_catalog, None);
+        assert_eq!(r.resolution, Resolution::NoIndexedIdentifier);
+        assert!(r.ambiguous);
+
+        // With at least one indexed id checked, zero rows IS a real negative.
+        let asked = resolve_hit(0, 1, &[], None);
+        assert_eq!(asked.in_library, Some(false));
+        assert_eq!(asked.resolution, Resolution::Absent);
+    }
+
+    #[test]
+    fn resolution_reports_why_each_state_was_reached() {
+        assert_eq!(resolve_hit(1, 1, &[IdentifierCheck::Silent], Some(true)).resolution, Resolution::Settled);
+        assert_eq!(resolve_hit(2, 1, &[], None).resolution, Resolution::AmbiguousRows);
+        assert_eq!(
+            resolve_hit(1, 1, &[IdentifierCheck::Contradicts], Some(true)).resolution,
+            Resolution::Contradicted,
+        );
     }
 
     #[test]

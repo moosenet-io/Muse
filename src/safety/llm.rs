@@ -77,6 +77,13 @@ pub enum AdjudicationStatus {
     Unavailable(String),
     /// The model answered with something this code could not read.
     Unparseable(String),
+    /// There was nothing to adjudicate, so no model was contacted.
+    ///
+    /// Distinct from `Completed`, which is documented as "the model answered and the answer
+    /// parsed". An empty file list previously returned `Completed`, and `apply` recorded that
+    /// as `ran: true` — reintroducing precisely the unestablished audit claim this record was
+    /// added to remove (codex).
+    NothingToAdjudicate,
 }
 
 /// The model's contribution. Deliberately has no field capable of expressing "this is safe":
@@ -233,7 +240,7 @@ pub async fn adjudicate(
         return Adjudication::none(AdjudicationStatus::NotConfigured, model);
     };
     if files.is_empty() {
-        return Adjudication::none(AdjudicationStatus::Completed, model);
+        return Adjudication::none(AdjudicationStatus::NothingToAdjudicate, model);
     }
 
     let user_prompt = build_user_prompt(files);
@@ -349,6 +356,7 @@ pub fn apply(verdict: &Verdict, adjudication: &Adjudication) -> Verdict {
             AdjudicationStatus::NotConfigured => "not_configured".to_string(),
             AdjudicationStatus::Unavailable(e) => format!("unavailable: {e}"),
             AdjudicationStatus::Unparseable(e) => format!("unparseable: {e}"),
+            AdjudicationStatus::NothingToAdjudicate => "nothing_to_adjudicate".to_string(),
         },
         ran: adjudication.status == AdjudicationStatus::Completed,
         escalated_to: adjudication.escalated_to,
@@ -512,6 +520,39 @@ mod tests {
     }
 
     // ── UNAVAILABILITY IS NOT A GATE ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_empty_file_list_is_not_recorded_as_having_been_adjudicated() {
+        // `Completed` means a model answered. Nothing was asked here, so claiming it ran is the
+        // same unestablished audit claim the record exists to prevent (codex).
+        // Exercises the PRODUCTION branch with a real client. My first version passed `None`,
+        // which returns NotConfigured before the empty-list check is ever reached — so the
+        // branch under test never ran and a mutation restoring `Completed` survived. A
+        // hand-constructed Adjudication tested only that I could build the struct.
+        //
+        // The client is constructed against an address nothing listens on, deliberately: the
+        // empty-list branch must return BEFORE any HTTP is attempted, so if that early return
+        // is ever removed this test fails by timing out or erroring rather than passing.
+        let client = std::sync::Arc::new(
+            ChordClient::new("http://127.0.0.1:1").expect("client constructs"),
+        );
+        let a = adjudicate(Some(&client), "m", &[], Severity::Clean).await;
+        assert_eq!(
+            a.status,
+            AdjudicationStatus::NothingToAdjudicate,
+            "nothing was asked, so nothing was adjudicated",
+        );
+
+        let out = apply(&verdict(Severity::Clean, true), &a);
+        let rec = out.adjudication.expect("recorded");
+        assert!(!rec.ran, "nothing was adjudicated, so nothing ran");
+        assert_eq!(rec.status, "nothing_to_adjudicate");
+        assert_eq!(out.severity, Severity::Clean);
+
+        // And with no client at all, the absent client is what gets reported.
+        let none = adjudicate(None, "m", &[], Severity::Clean).await;
+        assert_eq!(none.status, AdjudicationStatus::NotConfigured);
+    }
 
     #[tokio::test]
     async fn an_unconfigured_client_yields_no_escalation_and_says_so() {

@@ -106,6 +106,11 @@ pub struct ArchiveListing {
 }
 
 impl ArchiveListing {
+    /// A listing that could not be produced because no reader exists for this format here.
+    pub fn unsupported(format: impl Into<String>) -> Self {
+        Self::failed(ListingFailure::UnsupportedFormat(format.into()))
+    }
+
     fn failed(failure: ListingFailure) -> Self {
         Self {
             entries: Vec::new(),
@@ -146,7 +151,21 @@ pub fn too_large_to_inspect(size_bytes: u64) -> bool {
     size_bytes > MAX_ARCHIVE_BYTES
 }
 
-pub fn list_zip<R: Read + Seek>(reader: R) -> ArchiveListing {
+/// List a ZIP, refusing to parse anything larger than [`MAX_ARCHIVE_BYTES`].
+///
+/// `size_bytes` is REQUIRED rather than optional, and the refusal happens here rather than in a
+/// helper a caller may forget. An earlier version exposed `too_large_to_inspect` as a free
+/// function and documented it as "refuses before parsing" — but `list_zip` took only a reader
+/// and never called it, so the control did not exist and the comment claiming it did was itself
+/// the false claim (codex, gpt56). Putting the size in the signature makes it impossible to
+/// list an archive without having considered its size.
+pub fn list_zip<R: Read + Seek>(reader: R, size_bytes: u64) -> ArchiveListing {
+    if too_large_to_inspect(size_bytes) {
+        return ArchiveListing::failed(ListingFailure::Unreadable(format!(
+            "archive is {size_bytes} bytes, above the {MAX_ARCHIVE_BYTES}-byte inspection limit; \
+             it was NOT parsed and nothing inside it has been checked"
+        )));
+    }
     let mut archive = match zip::ZipArchive::new(reader) {
         Ok(a) => a,
         Err(e) => return ArchiveListing::failed(ListingFailure::Unreadable(e.to_string())),
@@ -163,15 +182,20 @@ pub fn list_zip<R: Read + Seek>(reader: R) -> ArchiveListing {
         let Ok(file) = archive.by_index_raw(i) else {
             continue;
         };
-        if file.is_dir() {
-            continue;
-        }
         // Truncated, not dropped: an absurdly long name is still an entry worth judging, and
         // its absurdity is itself signal — but retaining it whole lets a crafted directory
         // decide how much memory this listing occupies.
         let name: String = file.name().chars().take(MAX_ENTRY_NAME_LEN).collect();
+
+        // TRAVERSAL IS CHECKED BEFORE THE DIRECTORY SKIP. This used to skip `is_dir()` first,
+        // so a zip-slip payload declared as a DIRECTORY entry (`../../etc/`) was never examined
+        // and the archive came back clean — the exact hostile shape the check exists for
+        // (codex). A directory entry escaping the extraction root is as hostile as a file one.
         if is_traversal(&name) {
             traversal_attempts.push(name.clone());
+        }
+        if file.is_dir() {
+            continue;
         }
         entries.push((name, file.size()));
     }
@@ -234,6 +258,9 @@ pub fn archive_kind(path: &str, leading_bytes: Option<&[u8]>) -> ArchiveKind {
 /// this module avoids. So an entry is judged on its NAME alone, and `inspect`'s fail-closed
 /// default does the rest — an unrecognized entry type is suspicious, not clean.
 pub fn inspect_listing(archive_path: &str, listing: &ArchiveListing) -> Verdict {
+    // An archive that listed successfully but yielded no file entries is still an archive whose
+    // contents were not byte-checked, and it may carry directory-only traversal entries. It
+    // therefore does not get to skip the floor below.
     let mut verdict = if listing.entries.is_empty() {
         Verdict {
             severity: Severity::Clean,
@@ -284,6 +311,9 @@ pub fn inspect_listing(archive_path: &str, listing: &ArchiveListing) -> Verdict 
     // It is not merely `has_media = false` holding this back. That guard is about
     // importability; this is about the CLAIM. Reporting Clean for an archive whose contents
     // were never read is the same false certification this module exists to prevent.
+    // Applies when the archive actually carries file entries. An EMPTY archive hides nothing,
+    // so there is nothing to withhold certification about — and codex's directory-entry case is
+    // handled by checking traversal BEFORE the is_dir skip, not by this floor.
     if !listing.entries.is_empty() {
         verdict.findings.push(super::Finding {
             path: archive_path.to_string(),
@@ -399,7 +429,7 @@ mod tests {
         // which is honest but useless: the operator still has to open it by hand. The whole
         // point is to name the executable without ever decompressing a byte of it.
         let bytes = zip_with(&[("Movie.2024.mkv", b"x"), ("Setup.exe", b"MZ fake")]);
-        let listing = list_zip(Cursor::new(bytes));
+        let listing = list_zip(Cursor::new(bytes.clone()), bytes.len() as u64);
         assert!(listing.failure.is_none());
 
         let v = inspect_listing("release.zip", &listing);
@@ -416,11 +446,42 @@ mod tests {
     }
 
     #[test]
+    fn a_traversal_payload_declared_as_a_DIRECTORY_is_still_caught() {
+        // The zip-slip variant that slipped through: entries were skipped on `is_dir()` BEFORE
+        // traversal was checked, so an archive whose escape was declared as a directory came
+        // back clean (codex). Traversal is now checked first, for every entry.
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            w.add_directory("../../etc/cron.d/", SimpleFileOptions::default()).unwrap();
+            w.finish().unwrap();
+        }
+        let n = buf.len() as u64;
+        let listing = list_zip(Cursor::new(buf), n);
+        assert_eq!(listing.traversal_attempts.len(), 1, "{listing:?}");
+        let v = inspect_listing("evil.zip", &listing);
+        assert_eq!(v.severity, Severity::Dangerous);
+    }
+
+    #[test]
+    fn an_archive_above_the_size_limit_is_refused_before_it_is_parsed() {
+        // The control is now IN list_zip's signature, so an archive cannot be listed without
+        // its size having been considered. Previously this lived in a helper nothing called,
+        // while the doc claimed the refusal happened.
+        let bytes = zip_with(&[("Movie.mkv", b"x")]);
+        let listing = list_zip(Cursor::new(bytes), MAX_ARCHIVE_BYTES + 1);
+        assert!(listing.entries.is_empty(), "must not have parsed it");
+        assert!(matches!(listing.failure, Some(ListingFailure::Unreadable(_))));
+        let v = inspect_listing("huge.zip", &listing);
+        assert_eq!(v.severity, Severity::Suspicious);
+    }
+
+    #[test]
     fn a_path_traversal_entry_is_dangerous_on_its_own() {
         // Zip slip. No legitimate release ships `../` entries; an archive that does was built
         // to write outside wherever it is unpacked.
         let bytes = zip_with(&[("../../etc/cron.d/pwn", b"x"), ("Movie.mkv", b"y")]);
-        let listing = list_zip(Cursor::new(bytes));
+        let listing = list_zip(Cursor::new(bytes.clone()), bytes.len() as u64);
         assert_eq!(listing.traversal_attempts.len(), 1, "{listing:?}");
 
         let v = inspect_listing("release.zip", &listing);
@@ -458,7 +519,7 @@ mod tests {
         // The floor is one archive-level finding stating what was and was not established —
         // which keeps the verdict honest without one line of noise per entry.
         let bytes = zip_with(&[("Movie.2024.mkv", b"x"), ("Movie.srt", b"y")]);
-        let v = inspect_listing("release.zip", &list_zip(Cursor::new(bytes)));
+        let v = inspect_listing("release.zip", &list_zip(Cursor::new(bytes.clone()), bytes.len() as u64));
         assert_eq!(v.severity, Severity::Suspicious, "{:?}", v.findings);
         assert!(
             v.findings.iter().any(|f| f.reason.contains("NAME only")),
@@ -475,7 +536,7 @@ mod tests {
         // executable. We cannot SEE the bytes without decompressing, so the gate must not
         // pretend it looked — it reports that nothing was verified rather than certifying.
         let bytes = zip_with(&[("Movie.2024.1080p.mkv", b"MZ\x90\x00 this is really a PE")]);
-        let v = inspect_listing("release.zip", &list_zip(Cursor::new(bytes)));
+        let v = inspect_listing("release.zip", &list_zip(Cursor::new(bytes.clone()), bytes.len() as u64));
         assert_ne!(v.severity, Severity::Clean, "must never be certified clean");
         assert!(!v.is_importable());
     }
@@ -511,14 +572,14 @@ mod tests {
 
     #[test]
     fn a_garbage_zip_fails_to_list_rather_than_panicking() {
-        let listing = list_zip(Cursor::new(b"not a zip at all".to_vec()));
+        let listing = list_zip(Cursor::new(b"not a zip at all".to_vec()), 16);
         assert!(matches!(listing.failure, Some(ListingFailure::Unreadable(_))));
         assert!(listing.entries.is_empty());
     }
 
     #[test]
     fn an_empty_zip_is_clean_but_carries_no_media() {
-        let v = inspect_listing("empty.zip", &list_zip(Cursor::new(zip_with(&[]))));
+        let v = inspect_listing("empty.zip", &{ let b = zip_with(&[]); let n = b.len() as u64; list_zip(Cursor::new(b), n) });
         assert_eq!(v.severity, Severity::Clean);
         assert!(!v.is_importable());
     }
@@ -558,7 +619,7 @@ mod tests {
     fn an_enormous_entry_name_is_truncated_rather_than_retained_whole() {
         let long = "a".repeat(MAX_ENTRY_NAME_LEN * 4) + ".mkv";
         let bytes = zip_with(&[(long.as_str(), b"x")]);
-        let listing = list_zip(Cursor::new(bytes));
+        let listing = list_zip(Cursor::new(bytes.clone()), bytes.len() as u64);
         assert_eq!(listing.entries.len(), 1);
         assert!(
             listing.entries[0].0.chars().count() <= MAX_ENTRY_NAME_LEN,
@@ -606,7 +667,7 @@ mod tests {
         // One rule set, so the gate cannot develop two opinions about the same file. A `.lnk`
         // is dangerous loose; it is dangerous zipped.
         let bytes = zip_with(&[("RARBG.lnk", b"x")]);
-        let v = inspect_listing("r.zip", &list_zip(Cursor::new(bytes)));
+        let v = inspect_listing("r.zip", &list_zip(Cursor::new(bytes.clone()), bytes.len() as u64));
         assert_eq!(v.severity, Severity::Dangerous);
     }
 }

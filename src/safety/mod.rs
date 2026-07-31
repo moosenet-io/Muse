@@ -705,6 +705,61 @@ mod tests {
 
     // ── DETAIL ───────────────────────────────────────────────────────────────────────────
 
+    // ── ORCHESTRATION: the parts actually talking to each other ─────────────────────────
+
+    #[test]
+    fn a_download_is_as_dangerous_as_its_worst_part_loose_or_archived() {
+        // The gap a reviewer found: three correct modules wired to nothing. `inspect` treated
+        // an archive as merely opaque and the listing logic had no production caller, so the
+        // archive-level executable detection did not actually happen anywhere.
+        use std::io::{Cursor, Write};
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            w.start_file("Setup.exe", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"MZ").unwrap();
+            w.finish().unwrap();
+        }
+        let size = buf.len() as u64;
+
+        let v = inspect_download(vec![
+            DownloadFile {
+                path: "Movie.2024.mkv".into(),
+                size_bytes: 1_000_000,
+                leading_bytes: Some(vec![0x1A, 0x45, 0xDF, 0xA3]),
+                archive_reader: None::<Cursor<Vec<u8>>>,
+            },
+            DownloadFile {
+                path: "extras.zip".into(),
+                size_bytes: size,
+                leading_bytes: Some(b"PK\x03\x04".to_vec()),
+                archive_reader: Some(Cursor::new(buf)),
+            },
+        ]);
+
+        assert_eq!(v.severity, Severity::Dangerous, "{:?}", v.findings);
+        assert!(
+            v.findings.iter().any(|f| f.path.contains("Setup.exe")),
+            "the executable INSIDE the zip must be named: {:?}",
+            v.findings,
+        );
+        assert!(!v.is_importable());
+    }
+
+    #[test]
+    fn an_archive_the_caller_cannot_open_is_uninspected_not_clean() {
+        use std::io::Cursor;
+        let v = inspect_download(vec![DownloadFile {
+            path: "release.rar".into(),
+            size_bytes: 5_000_000,
+            leading_bytes: Some(b"Rar!\x1a\x07\x00".to_vec()),
+            archive_reader: None::<Cursor<Vec<u8>>>,
+        }]);
+        assert_eq!(v.severity, Severity::Suspicious);
+        assert!(!v.is_importable());
+        assert!(v.findings.iter().any(|f| f.reason.contains("NOT inspected")));
+    }
+
     #[test]
     fn extensions_are_matched_case_insensitively_and_by_the_last_dot() {
         assert_eq!(extension_of("A.Movie.2024.MKV").as_deref(), Some("mkv"));
@@ -750,4 +805,66 @@ mod tests {
             assert!(finding.reason.len() > 10, "reason too thin: {}", finding.reason);
         }
     }
+}
+
+// ===========================================================================
+// Orchestration
+// ===========================================================================
+
+/// One file of a download, as the caller can present it.
+///
+/// Separate from [`InspectedFile`] because a caller that can open an archive has more to offer
+/// than one that can only stat a name: `archive_reader` lets the gate look INSIDE without this
+/// module doing any I/O of its own.
+pub struct DownloadFile<R> {
+    pub path: String,
+    pub size_bytes: u64,
+    pub leading_bytes: Option<Vec<u8>>,
+    /// A seekable reader, supplied only for files the caller believes are archives. `None`
+    /// means the archive is not openable here — which is reported as uninspected, not clean.
+    pub archive_reader: Option<R>,
+}
+
+/// Judge a whole download: loose files, then anything inside its archives.
+///
+/// THIS FUNCTION EXISTS BECAUSE THE PARTS DID NOT TALK TO EACH OTHER. `inspect`, `archive` and
+/// `llm` were each built and tested in isolation, and a reviewer pointed out that nothing
+/// called across them — so `inspect` still treated an archive as merely opaque, the listing
+/// logic had no production caller, and the LLM stage was never reached. Three correct modules
+/// wired to nothing is not a gate, and describing it as one would have been the largest
+/// unsupported claim in the whole feature.
+///
+/// The severities compose by MAXIMUM: a download is as dangerous as its worst part, whether
+/// that part is loose on disk or inside a `.zip`.
+pub fn inspect_download<R: std::io::Read + std::io::Seek>(
+    files: Vec<DownloadFile<R>>,
+) -> Verdict {
+    let loose: Vec<InspectedFile> = files
+        .iter()
+        .map(|f| InspectedFile {
+            path: f.path.clone(),
+            size_bytes: f.size_bytes,
+            leading_bytes: f.leading_bytes.clone(),
+            bytes_unavailable: false,
+        })
+        .collect();
+    let mut verdict = inspect(&loose);
+
+    for file in files {
+        if !archive::should_list(&file.path, file.leading_bytes.as_deref()) {
+            continue;
+        }
+        let kind = archive::archive_kind(&file.path, file.leading_bytes.as_deref());
+        let listing = match (kind, file.archive_reader) {
+            (archive::ArchiveKind::Zip, Some(reader)) => archive::list_zip(reader, file.size_bytes),
+            // A format with no reader on this deployment, or an archive the caller could not
+            // open. Either way its contents are unknown, and unknown is not clean.
+            (kind, _) => archive::ArchiveListing::unsupported(format!("{kind:?}")),
+        };
+        let sub = archive::inspect_listing(&file.path, &listing);
+        verdict.severity = verdict.severity.max(sub.severity);
+        verdict.findings.extend(sub.findings);
+    }
+
+    verdict
 }

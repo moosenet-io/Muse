@@ -423,6 +423,43 @@ impl TvdbClient {
         }
     }
 
+    /// The search URL for `term`, with the base url's own query string preserved.
+    ///
+    /// A real method rather than inline code so it can be tested directly. The first version
+    /// of its test mirrored this logic inside the test body — which would have passed while
+    /// production did something else, the same false-green that let MUSE #106 survive a green
+    /// suite for months.
+    fn skyhook_search_url(&self, term: &str) -> MuseResult<reqwest::Url> {
+        let mut url = self.skyhook_url(&["search", "en"])?;
+        // Drop any `term` the BASE URL already carries before adding the caller's.
+        // `skyhook_url` deliberately preserves a configured query string, so a base url of
+        // `.../v1/tvdb?term=x` would otherwise produce TWO `term` parameters and let the
+        // configured one decide what gets searched, silently ignoring the user's query
+        // (codex). Any other configured parameter is kept untouched.
+        let preserved: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "term")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.clear();
+            for (k, v) in &preserved {
+                pairs.append_pair(k, v);
+            }
+            // `append_pair` percent-encodes, so a term with spaces or specials is carried
+            // correctly -- the property the old path-segment form relied on
+            // `path_segments_mut` for.
+            pairs.append_pair("term", term);
+        }
+        // `clear()` on a url with no other params leaves a bare `?`; harmless, but normalized
+        // so the outgoing url matches what tests and logs expect.
+        if url.query() == Some("") {
+            url.set_query(None);
+        }
+        Ok(url)
+    }
+
     /// `GET /search/en?term={term}` — Skyhook series search (thin records).
     /// Fail-open like [`Self::skyhook_show`]: transport/HTTP/parse failures
     /// degrade to an empty result set rather than erroring.
@@ -438,19 +475,17 @@ impl TvdbClient {
     ///   `/search/en?term=thrones` -> 200 with results
     ///   `/shows/en/121361`        -> 200 (resolve-by-id was never affected)
     async fn skyhook_search(&self, term: &str) -> MuseResult<Vec<ProviderMetadata>> {
-        let mut url = self.skyhook_url(&["search", "en"])?;
-        // `append_pair` percent-encodes, so a term with spaces or specials is
-        // carried correctly — the property the old path-segment form relied on
-        // `path_segments_mut` for.
-        url.query_pairs_mut().append_pair("term", term);
+        let url = self.skyhook_search_url(term)?;
         let (status, bytes) = match self.skyhook_send(url).await {
             Ok(pair) => pair,
             Err(e) => {
-                // Warn, not debug: an unreachable host or a bad override is exactly the
-                // class of fault that hid MUSE #106, and search has no benign failure mode
-                // to confuse it with (codex).
-                tracing::warn!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
-                return Ok(Vec::new());
+                // MUSE #108: FAILS LOUD now. Warning about it was not enough — the RETURN
+                // VALUE was still an empty list, so `/api/search` reported a Skyhook outage
+                // as a healthy "0 results" and could mark series coverage complete. That
+                // recreated MUSE #106 one layer up, in the very endpoint built to prevent it
+                // (codex). Search returns the error; the caller decides what to say.
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search request failed");
+                return Err(e);
             }
         };
         // Unlike resolve-by-id, a 404 on SEARCH cannot mean "no results" — the endpoint
@@ -458,20 +493,25 @@ impl TvdbClient {
         // empty array. So every non-2xx here is unexpected and is logged at warn: this is
         // the precise signal that was missing while MUSE #106 silently returned zero
         // results for every series query on a key-less deployment (codex).
+        // No benign non-2xx exists here: a search that finds nothing answers 200 with an
+        // empty array, so any non-2xx is a fault and is surfaced as one.
         if !(200..300).contains(&status) {
-            tracing::warn!(
-                status,
-                "AMETA-3: Skyhook search unexpected non-2xx; degrading to empty (fail-open)"
-            );
-            return Ok(Vec::new());
+            tracing::warn!(status, "AMETA-3: Skyhook search unexpected non-2xx");
+            return Err(MuseError::Upstream {
+                status: status as u16,
+                message: "skyhook search returned a non-2xx status".to_string(),
+            });
         }
         match serde_json::from_slice::<Vec<SkyhookShow>>(&bytes) {
             Ok(hits) => Ok(hits.into_iter().map(SkyhookShow::into_metadata).collect()),
             Err(e) => {
                 // A 200 carrying HTML or otherwise unparseable JSON means we are pointed at
                 // the wrong endpoint — indistinguishable from "no results" without this.
-                tracing::warn!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
-                Ok(Vec::new())
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search parse failed");
+                Err(MuseError::Upstream {
+                    status: 200,
+                    message: format!("skyhook search returned an unparseable body: {e}"),
+                })
             }
         }
     }
@@ -1552,23 +1592,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skyhook_resolve_and_search_fail_open_on_connection_error() {
-        // Fail-open (codex): an unreachable Skyhook proxy degrades to
-        // None/empty, never Err.
+    async fn skyhook_resolve_fails_open_but_search_fails_LOUD_on_connection_error() {
+        // MUSE #108: these two now differ ON PURPOSE, and the difference is the point.
+        //
+        // resolve_by_id still fails open: a miss there is an ordinary answer ("no such
+        // series"), so degrading to None costs a caller nothing.
+        //
+        // search does NOT. An empty list from a search is a CLAIM — "nothing matched" — and
+        // returning it for an unreachable host makes an outage indistinguishable from a
+        // genuine miss. That is exactly MUSE #106, and it silently propagated into
+        // /api/search, whose entire purpose is to keep those two apart.
         let client =
             TvdbClient::new_skyhook("http://127.0.0.1:1").expect("client should construct");
 
         let resolved = client
             .resolve_by_id(MediaKind::Series, "121361")
             .await
-            .expect("connection error must degrade to Ok(None), not Err");
+            .expect("connection error must still degrade to Ok(None) for resolve-by-id");
         assert!(resolved.is_none());
 
-        let hits = client
-            .search("thrones", MediaKind::Series)
-            .await
-            .expect("connection error must degrade to Ok(empty), not Err");
-        assert!(hits.is_empty());
+        assert!(
+            client.search("thrones", MediaKind::Series).await.is_err(),
+            "an unreachable host must NOT be reported as an empty result set",
+        );
     }
 
     #[tokio::test]
@@ -1639,6 +1685,37 @@ mod tests {
         assert_eq!(
             query_slash.skyhook_url(&["search", "en"]).unwrap().as_str(),
             "https://example.test/v1/tvdb/search/en?redirect=/x/",
+        );
+    }
+
+    #[test]
+    fn skyhook_search_url_replaces_a_term_already_in_the_base_url() {
+        // skyhook_url preserves a configured query string on purpose, so a base url carrying
+        // its own `term` would otherwise send TWO -- and the configured one could decide what
+        // gets searched, silently ignoring the user's query (codex). Unrelated configured
+        // parameters must survive untouched.
+        //
+        // Calls the PRODUCTION method. My first attempt at this test reproduced the logic in
+        // the test body, which proves nothing about what the client actually sends.
+        let client = TvdbClient::new_skyhook("https://example.test/v1/tvdb?term=stale&keep=yes")
+            .expect("skyhook client should build");
+        assert_eq!(
+            client.skyhook_search_url("thrones").unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?keep=yes&term=thrones",
+        );
+
+        // No configured query at all: no stray `?`, term still carried.
+        let plain =
+            TvdbClient::new_skyhook("https://example.test/v1/tvdb").expect("client should build");
+        assert_eq!(
+            plain.skyhook_search_url("thrones").unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?term=thrones",
+        );
+
+        // Encoding survives the rebuild.
+        assert_eq!(
+            plain.skyhook_search_url("game of thrones").unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?term=game+of+thrones",
         );
     }
 

@@ -10,6 +10,51 @@
 //! established, the staged file is deleted and the original is left exactly as
 //! it was.
 //!
+//! ## What the swap does and does not guarantee — read this first
+//! **The swap is not atomic and it is not crash-safe.** It is a sequence of
+//! filesystem operations with rollback, serialized against other Muse workers
+//! by an advisory lock ([`SwapLock`]). Concretely:
+//!
+//! | Property | Status |
+//! |---|---|
+//! | Never overwrites an unrelated file | **Guaranteed** — names are claimed with `link(2)`, which fails `EEXIST` atomically |
+//! | Never deletes the original | **Guaranteed** — it ends up renamed to a sibling `.muse-superseded` entry |
+//! | Never leaves the library path absent | **Guaranteed** — the new entry is always established before the old name is released |
+//! | Safe against concurrent *Muse* workers | **Guaranteed** — by the advisory lock |
+//! | Safe against an arbitrary *external* writer | **NO** — see below |
+//! | Atomic as a whole | **NO** — it is several syscalls |
+//!
+//! ### The residual race, stated exactly
+//! The swap hard-links the original to its backup name, checks that the linked
+//! inode is the one that was probed, and then releases the original name. The
+//! identity check proves the *link* grabbed the expected inode; it says nothing
+//! about the *unlink* that follows. A process that replaces the original in
+//! that gap leaves the check passing while the unlink removes the newer file.
+//!
+//! **This cannot be closed with POSIX primitives.** It would need an atomic
+//! "remove this directory entry only if it still points at inode X" —
+//! a compare-and-unlink — which POSIX does not provide and which no combination
+//! of `link`/`rename`/`unlink` synthesizes. So: the lock is the real mitigation
+//! for the concurrency Muse itself creates (the realistic case, since Muse is
+//! intended to be the sole writer to the library), and the identity check is
+//! best-effort detection of the common external case. Neither is a guarantee
+//! against a determined external writer, and this module does not claim to be.
+//!
+//! ### Recovering from a crash
+//! Every crash point leaves the title reachable, because the new entry is
+//! always created before the old name is released. The possible residues are:
+//! - a leftover `<name>.muse-superseded` next to a correct new file — the swap
+//!   finished; the backup is simply awaiting retention. Safe to delete once the
+//!   new file has been watched.
+//! - both an old-container and a new-container file (e.g. `Movie.avi` *and*
+//!   `Movie.mkv`) — the swap died between claiming the destination and
+//!   releasing the source. Both are complete files; delete the old one.
+//! - a `.muse-foundry-inflight-*` file in the library directory — a staging
+//!   copy that never became live. Safe to delete.
+//!
+//! **No crash point requires reconstructing data**, and none leaves the library
+//! path missing. Recovery is deleting a leftover, never a rename by hand.
+//!
 //! ## The ordering, and what each step protects against
 //! 1. Encode into the **work dir**, which safety rail 3 requires to be outside
 //!    the library and on a different filesystem. A half-written file never
@@ -20,14 +65,14 @@
 //!    non-media name, and re-probe *that* too. The cross-filesystem copy is
 //!    itself a step that can truncate, and the copy is the thing that becomes
 //!    the library file — so it is verified, not assumed.
-//! 4. `rename` the original aside (same directory, so atomic and instant), then
-//!    `rename` the new file into place. If the second rename fails, the first
-//!    is rolled back.
+//! 4. Claim the backup name, then establish the new entry, then release the old
+//!    name. Never the other way round -- see `swap_verified_output`.
 //!
-//! The original is never `remove`d and never opened for writing. It ends up
-//! renamed to a sibling `.muse-superseded` file, which the library scanner
-//! ignores (not a media extension) and which the operator or a later retention
-//! sweep can delete once the new file has been watched.
+//! The original is never `remove`d while it is the only name for its inode, and
+//! never opened for writing. It ends up as a sibling `.muse-superseded` entry,
+//! which the library scanner ignores (not a media extension) and which the
+//! operator or a later retention sweep can delete once the new file has been
+//! watched.
 //!
 //! ## Why the interesting parts are pure
 //! `ffmpeg` and `ffprobe` are **not installed** on <host> or on the dev box
@@ -39,6 +84,7 @@
 //! and is tested with ordinary text files. What genuinely cannot be tested here
 //! is the single `Command::new(ffmpeg)` call and nothing else.
 
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -107,6 +153,12 @@ pub enum SkipReason {
     Undecidable(Undecidable),
     /// The path guard refused the path.
     PathRefused(PathError),
+    /// Another Foundry swap already holds the lock covering this title, so a
+    /// second worker is already handling it. Not a failure — and reported as
+    /// its own reason rather than folded into a generic error, because "someone
+    /// else is doing it" and "this file could not be processed" call for
+    /// completely different operator responses.
+    SwapLockBusy,
     /// The source is a symlink. Replacing the file it points at would silently
     /// change whatever else links to it, and if the container changes the link
     /// is left dangling. Hardlinks are *not* affected by this and are not
@@ -134,6 +186,11 @@ impl std::fmt::Display for SkipReason {
             Self::AlreadyOptimal => write!(f, "the file already meets the transcode policy"),
             Self::Undecidable(u) => write!(f, "{u}"),
             Self::PathRefused(e) => write!(f, "{e}"),
+            Self::SwapLockBusy => write!(
+                f,
+                "another Foundry worker already holds the swap lock for this title — \
+                 skipped so the two do not race (and so the same file is not encoded twice)"
+            ),
             Self::SourceIsSymlink => write!(
                 f,
                 "the source is a symlink; replacing its target could affect other \
@@ -632,6 +689,10 @@ pub enum SwapError {
         expected: FileIdentity,
         found: FileIdentity,
     },
+    /// Another swap already holds the lock covering this file. Not an error
+    /// condition — the other worker is doing the work — so the caller reports
+    /// it as a skip with a reason, not a failure.
+    LockBusy(PathBuf),
     /// The filesystem refused to create a hard link, which is the primitive
     /// this swap uses to claim a name atomically. Some filesystems do not
     /// support links at all — in that case the swap **refuses rather than
@@ -667,6 +728,12 @@ impl std::fmt::Display for SwapError {
                 found.dev,
                 found.ino
             ),
+            Self::LockBusy(p) => write!(
+                f,
+                "another Foundry swap already holds the lock covering {} — skipping this \
+                 file rather than racing the worker that has it",
+                p.display()
+            ),
             Self::LinkUnsupported { path, message } => write!(
                 f,
                 "could not create a hard link next to {} ({message}) — Foundry's swap needs \
@@ -678,6 +745,126 @@ impl std::fmt::Display for SwapError {
         }
     }
 }
+
+/// An advisory `flock(2)` held for the duration of one swap.
+///
+/// ## What this does and does not protect against — read this before trusting it
+///
+/// **It serializes Muse's own workers**, which is the realistic contention case:
+/// Muse is intended to be the sole writer to the library, so two Foundry passes
+/// racing on the same file is the collision that can actually happen here, and
+/// this eliminates it.
+///
+/// **It does not protect against an arbitrary external process.** `flock` is
+/// *advisory* — a process that never asks for the lock is not stopped by it.
+/// Sonarr moving a file, an operator with `mv`, or a script that knows nothing
+/// about Foundry can still replace the file mid-swap, and this lock will not
+/// notice.
+///
+/// **That residual race cannot be closed with POSIX primitives, and this code
+/// does not pretend otherwise.** The specific hole, stated exactly: the swap
+/// hard-links the original to its backup name, checks that the linked inode is
+/// the one that was probed, and then unlinks the original name. The identity
+/// check proves the *link* grabbed the right inode; it says nothing about the
+/// *unlink* that follows. An external actor replacing the original in that gap
+/// leaves the check passing while the unlink removes the newer file. Closing it
+/// would need an atomic "remove this directory entry only if it still points at
+/// inode X", which POSIX does not provide — there is no compare-and-unlink, and
+/// no combination of `link`/`rename`/`unlink` synthesizes one. So the identity
+/// check is best-effort detection of the common case, not a guarantee, and the
+/// lock is the real mitigation for the concurrency Muse actually creates.
+///
+/// ## Non-blocking on purpose, and held across the encode
+/// Acquired with `LOCK_EX | LOCK_NB`. A background pass that *blocked* on a
+/// lock held by a long encode would wedge its whole worker; reporting
+/// [`SkipReason::SwapLockBusy`] and moving to the next file is the correct
+/// posture, and it is a skip with a reason like every other refusal here.
+///
+/// Because it never blocks, it is taken *before* the encode rather than just
+/// around the swap. That costs a second worker nothing (it skips this title and
+/// picks up another) and buys two things: the same file is never encoded twice
+/// concurrently only for one result to be discarded, and the window in which
+/// another Muse worker could replace the source covers probe-through-swap
+/// instead of the swap alone.
+struct SwapLock {
+    /// Held open for the lifetime of the lock: closing the descriptor is what
+    /// releases the `flock`, so this field is load-bearing despite never being
+    /// read.
+    _file: std::fs::File,
+}
+
+impl SwapLock {
+    /// Take the lock covering every name one swap touches.
+    ///
+    /// **Keyed on the destination's directory + file stem, not on a full
+    /// path.** A single swap can touch three names — `Movie.avi`,
+    /// `Movie.avi.muse-superseded` and `Movie.mkv` — and locking only one of
+    /// them would let a second worker converting the same title from a
+    /// different container proceed concurrently. The stem is what those names
+    /// share, so it is the correct granularity.
+    ///
+    /// The lockfile lives in the **work dir**, not the library: a lockfile in
+    /// the library would be scratch state inside the media tree, which safety
+    /// rail 3 exists to prevent, and the library may be mounted read-only
+    /// (it is on <host> today — `MUSE_LIBRARY_ROOT=/srv/media` is `ro`).
+    fn acquire(lock_dir: &Path, target: &Path) -> Result<Self, SwapError> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut hasher = Sha256::new();
+        if let Some(parent) = target.parent() {
+            hasher.update(parent.as_os_str().as_bytes());
+        }
+        hasher.update(b"\0");
+        if let Some(stem) = target.file_stem() {
+            hasher.update(stem.as_bytes());
+        }
+        let key = format!("{:x}", hasher.finalize());
+
+        let dir = lock_dir.join("locks");
+        std::fs::create_dir_all(&dir).map_err(|e| SwapError::Io {
+            step: "creating the Foundry lock directory",
+            message: e.to_string(),
+        })?;
+
+        let path = dir.join(format!("{key}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| SwapError::Io {
+                step: "opening the Foundry swap lockfile",
+                message: e.to_string(),
+            })?;
+
+        // SAFETY: `file` owns a valid open descriptor for the duration of this
+        // call, and `flock` only ever inspects it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(match err.raw_os_error() {
+                Some(libc::EWOULDBLOCK) => SwapError::LockBusy(target.to_path_buf()),
+                _ => SwapError::Io {
+                    step: "taking the Foundry swap lock",
+                    message: err.to_string(),
+                },
+            });
+        }
+
+        Ok(Self { _file: file })
+    }
+}
+
+// NOTE: no `Drop` impl, deliberately. Closing the descriptor releases the
+// `flock`, and `File`'s own Drop does that — so the lock is released on every
+// exit path including a panic, and (unlike a lockfile whose existence is the
+// lock) it is released if the process is killed outright. The lockfile itself
+// is left on disk on purpose: unlinking it would race another process that has
+// already opened it but not yet locked it, which is the classic way a
+// delete-on-release lock stops being a lock. A stale zero-byte lockfile in the
+// work dir is harmless.
 
 /// A file's identity on disk: the pair that survives a rename and changes on a
 /// replace. Used to detect a source swapped out from under a plan.
@@ -709,58 +896,67 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// Put a **already-verified** file into place, renaming the original aside.
+/// Put an **already-verified** file into place, moving the original aside.
 ///
 /// # Preconditions the caller owns
 /// `verified_new` must have passed [`verify_output`]. This function performs no
 /// media checks of its own — it is the mechanical half, split out precisely so
 /// it can be tested with ordinary files on a host with no ffmpeg.
 ///
-/// # Why this does not use `rename`
-/// **`rename(2)` silently overwrites its destination on Unix.** The previous
-/// version of this function guarded it with `Path::exists()` checks, which is
-/// a textbook check-then-act race: neither check is atomic with the rename
-/// that follows, so a concurrent writer could create the destination (or the
-/// `.muse-superseded` name) in the window between them and have its file
-/// destroyed without a word. That directly contradicted the module's
-/// never-clobber claim, so the whole approach is gone.
+/// The `_lock` parameter is not read. It exists so that holding the swap lock
+/// is a *type-level* precondition rather than a comment someone has to
+/// remember — the same trick [`MutablePath`] plays for the mutation gate.
 ///
-/// The primitive used instead is `link(2)` via [`std::fs::hard_link`], which
-/// **fails with `EEXIST` atomically** and never overwrites. Claiming a name is
-/// therefore a single indivisible operation, and occupancy is discovered by
-/// *failing to claim*, not by looking first. (`renameat2(RENAME_NOREPLACE)`
-/// would work equally well but needs a `libc` dependency this crate does not
-/// carry; `hard_link` is in `std` and gives the same guarantee.)
+/// # What is and is not guaranteed — stated plainly
 ///
-/// If the filesystem does not support hard links at all, this **refuses**
-/// ([`SwapError::LinkUnsupported`]) rather than falling back to a racy
-/// rename — a swap that cannot be made safely is not performed.
+/// **This swap is not atomic and it is not crash-safe.** It is a sequence of
+/// filesystem operations with rollback, serialized against other Muse workers
+/// by an advisory lock. Specifically:
+///
+/// - **Never clobbers a bystander.** Claiming a name uses `link(2)`, which
+///   fails `EEXIST` atomically and never overwrites, so occupancy is discovered
+///   by *failing to claim* rather than by an `exists()` check that a concurrent
+///   writer could invalidate. The one place `rename(2)` is used is the case
+///   where the destination *is* the original — the file we have already
+///   backed up and are deliberately replacing — so its overwriting behaviour
+///   destroys nothing that is not already safe under the backup name.
+/// - **Never deletes the original.** It ends up renamed to a sibling
+///   `.muse-superseded` entry; nothing here calls `remove_file` on a path that
+///   is not either a staging file or a name whose inode is already reachable
+///   under another entry.
+/// - **Does NOT protect against an arbitrary external writer.** See
+///   [`SwapLock`] for the exact residual race (replace-between-link-and-unlink)
+///   and why POSIX cannot close it.
 ///
 /// # Ordering
-/// 1. `link(original -> superseded)` — atomically claims the backup name. The
-///    original's inode now has two names, so it cannot be lost by anything
-///    that follows.
-/// 2. Compare the linked inode against the identity captured at probe time. A
-///    mismatch means the file was replaced after we planned against it, so
-///    the plan describes something that is no longer there — undo and refuse.
-/// 3. `unlink(original)` — the inode survives via the backup name.
-/// 4. `link(new -> final)` — atomically claims the destination. `EEXIST` here
-///    means a bystander occupies it; roll the original back and refuse,
-///    leaving the bystander untouched.
-/// 5. `unlink(new)` to drop the staging name, then `fsync` the directory so
-///    both entries are durable.
+/// 1. `link(original -> superseded)` — atomically claims the backup name. From
+///    here the original's inode has two names and cannot be lost.
+/// 2. Compare the linked inode against the identity captured before the probe.
+///    Best-effort detection that the file was not swapped out underneath the
+///    plan (see [`SwapLock`] for why it is best-effort and not a guarantee).
+/// 3. Put the new file at the destination, whichever of the two shapes applies:
+///    - **destination == original** (container unchanged): `rename(new ->
+///      final)`, which replaces the entry in one step. The original is already
+///      safe under the backup name, so there is no moment when the library
+///      path is missing.
+///    - **destination != original** (e.g. `.avi` becoming `.mkv`):
+///      `link(new -> final)` — atomic, refuses `EEXIST` so an unrelated
+///      `.mkv` sitting alongside is never destroyed — and only then
+///      `unlink(original)`. Both names exist briefly; neither is ever absent.
+/// 4. Drop the staging name, then `fsync` the directory.
 ///
-/// The only window where the destination name is briefly absent is between
-/// steps 3 and 4, and any failure in it is rolled back.
-///
-/// # Preconditions the caller owns
-/// `verified_new` must have passed [`verify_output`]. This function performs
-/// no media checks of its own.
+/// **The absent-name window is gone.** An earlier version unlinked the original
+/// *before* claiming the destination, leaving the library path missing in
+/// between; a crash there left the bytes recoverable only by hand. Both shapes
+/// above now establish the new entry before removing the old one, so no crash
+/// point leaves the title unreachable — the worst case is a leftover
+/// `.muse-superseded` entry, or briefly both an `.avi` and an `.mkv`.
 fn swap_verified_output(
     original: &MutablePath,
     verified_new: &MutablePath,
     final_path: &MutablePath,
     expected_identity: FileIdentity,
+    _lock: &SwapLock,
 ) -> Result<SwapRecord, SwapError> {
     let original_p = original.as_path();
     let final_p = final_path.as_path();
@@ -782,8 +978,6 @@ fn swap_verified_output(
     }
 
     // --- 2. is this still the file we planned against? ---------------------
-    // Comparing the inode we just linked (not a fresh stat of the path, which
-    // would be another race) against the one captured at probe time.
     match identity_of(&superseded) {
         Ok(found) if found == expected_identity => {}
         Ok(found) => {
@@ -803,52 +997,56 @@ fn swap_verified_output(
         }
     }
 
-    // --- 3. drop the original name (the inode lives on as the backup) ------
-    if let Err(e) = std::fs::remove_file(original_p) {
-        let _ = std::fs::remove_file(&superseded);
-        return Err(SwapError::Io {
-            step: "releasing the original name",
-            message: e.to_string(),
-        });
+    // --- 3. establish the new entry BEFORE removing the old one ------------
+    if final_p == original_p {
+        // Same name: replace it in one step. `rename` overwrites, which is
+        // exactly what is wanted here and is safe precisely because the thing
+        // being overwritten is the original we just backed up.
+        if let Err(e) = std::fs::rename(new_p, final_p) {
+            let _ = std::fs::remove_file(&superseded);
+            return Err(SwapError::Io {
+                step: "moving the new file into place",
+                message: format!("{e} (the original was left untouched)"),
+            });
+        }
+    } else {
+        // Different name: claim it atomically so an unrelated file already
+        // sitting there is never destroyed...
+        if let Err(e) = std::fs::hard_link(new_p, final_p) {
+            let occupied = e.kind() == std::io::ErrorKind::AlreadyExists;
+            let _ = std::fs::remove_file(&superseded);
+            return Err(if occupied {
+                SwapError::DestinationOccupied(final_p.to_path_buf())
+            } else {
+                SwapError::Io {
+                    step: "claiming the destination name",
+                    message: format!("{e} (the original was left untouched)"),
+                }
+            });
+        }
+        // ...and only now release the old name. The inode is reachable under
+        // the backup name, so this cannot lose it.
+        if let Err(e) = std::fs::remove_file(original_p) {
+            // Roll back the destination we just claimed, so a partial swap
+            // does not leave two live copies of the title.
+            let _ = std::fs::remove_file(final_p);
+            let _ = std::fs::remove_file(&superseded);
+            return Err(SwapError::Io {
+                step: "releasing the original name",
+                message: format!("{e} (the destination link was rolled back)"),
+            });
+        }
+        // The staging name still points at the same inode as `final_p`.
+        if let Err(e) = std::fs::remove_file(new_p) {
+            tracing::warn!(
+                error = %e,
+                path = %new_p.display(),
+                "foundry: could not remove the in-library staging name after a successful swap"
+            );
+        }
     }
 
-    // --- 4. atomically claim the destination -------------------------------
-    if let Err(e) = std::fs::hard_link(new_p, final_p) {
-        // Roll back: re-link the original inode to its own name, then drop the
-        // backup name. If the rollback fails there is still nothing lost — the
-        // original remains reachable under `superseded` — and the message says
-        // exactly where it is.
-        let rollback = std::fs::hard_link(&superseded, original_p)
-            .and_then(|()| std::fs::remove_file(&superseded));
-        let occupied = e.kind() == std::io::ErrorKind::AlreadyExists;
-        let detail = match rollback {
-            Ok(()) => "the original was rolled back into place".to_string(),
-            Err(re) => format!(
-                "AND the rollback failed ({re}); the original is at {}",
-                superseded.display()
-            ),
-        };
-        return Err(if occupied && rollback_succeeded(&detail) {
-            SwapError::DestinationOccupied(final_p.to_path_buf())
-        } else {
-            SwapError::Io {
-                step: "claiming the destination name",
-                message: format!("{e} ({detail})"),
-            }
-        });
-    }
-
-    // --- 5. drop the staging name and make both entries durable ------------
-    if let Err(e) = std::fs::remove_file(new_p) {
-        // Not fatal: the content is correctly in place under `final_p`. A
-        // leftover staging name is untidy, not destructive.
-        tracing::warn!(
-            error = %e,
-            path = %new_p.display(),
-            "foundry: could not remove the in-library staging name after a successful swap"
-        );
-    }
-
+    // --- 4. make the directory entries durable -----------------------------
     if let Some(dir) = final_p.parent() {
         if let Err(e) = fsync_dir(dir) {
             // The swap itself succeeded and the library is correct right now;
@@ -868,13 +1066,6 @@ fn swap_verified_output(
         final_path: final_p.to_path_buf(),
         superseded_path: superseded,
     })
-}
-
-/// Whether the rollback detail string reports success. Kept as a named helper
-/// so the branch above reads as the intent ("only call it `DestinationOccupied`
-/// if the library is actually back to its original state").
-fn rollback_succeeded(detail: &str) -> bool {
-    detail.starts_with("the original was rolled back")
 }
 
 /// Append an extension, keeping the existing one (`a.mkv` -> `a.mkv.superseded`).
@@ -1044,9 +1235,29 @@ pub(in crate::foundry) fn optimize_file(
         }
     };
 
+    // Take the swap lock BEFORE the encode, not just around the swap. Holding
+    // it across the encode costs nothing (it is non-blocking, so a second
+    // worker skips this title and moves to another) and buys two things: two
+    // workers never burn CPU encoding the same file only for one result to be
+    // thrown away, and the window in which another Muse worker could replace
+    // the source now covers probe-through-swap rather than the swap alone.
+    let lock = match SwapLock::acquire(&work_dir, &final_path_for(
+        resolved.as_path(),
+        plan.container.extension(),
+    )) {
+        Ok(l) => l,
+        Err(e) => {
+            return match skip_for_lock_error(&e) {
+                Some(reason) => ForgeStatus::Skipped { reason },
+                None => ForgeStatus::Failed { reason: e.to_string() },
+            }
+        }
+    };
+
     let bytes_before = source.size_bytes.unwrap_or(0);
     let result = run_encode_and_swap(
         guard, cfg, policy, &resolved, &source, &plan, &args, &staged, source_identity,
+        &lock,
     );
 
     // Unconditionally, on BOTH paths: the work-dir encode has served its
@@ -1090,6 +1301,7 @@ fn run_encode_and_swap(
     args: &[String],
     staged: &MutablePath,
     source_identity: FileIdentity,
+    lock: &SwapLock,
 ) -> Result<CompletedSwap, String> {
     // --- 1. encode ---------------------------------------------------------
     // The ONE process spawn on this path. Everything above and below it is
@@ -1183,7 +1395,9 @@ fn run_encode_and_swap(
         }
     };
 
-    match swap_verified_output(&original_mut, &inflight, &final_mut, source_identity) {
+    // The lock was taken by `optimize_file` before the encode and is held for
+    // this whole call. See `SwapLock` for what it covers and what it does not.
+    match swap_verified_output(&original_mut, &inflight, &final_mut, source_identity, lock) {
         Ok(record) => Ok(CompletedSwap {
             final_path: record.final_path,
             superseded_path: record.superseded_path,
@@ -1208,6 +1422,27 @@ fn discard_staged(p: &MutablePath) {
                 "foundry: could not remove a staging file"
             );
         }
+    }
+}
+
+/// Classify a lock-acquisition failure: contention is a **skip**, anything else
+/// is a real failure.
+///
+/// Extracted from [`optimize_file`] purely so this rule is reachable by a test.
+/// Inline, it was unreachable on every host in this fleet — the lock is taken
+/// after the probe, and with no ffprobe installed `optimize_file` returns
+/// `ToolUnavailable` long before it. A mutation that turned the skip into a
+/// failure therefore survived, which is exactly the "test is decorative"
+/// signal. As a free function it is directly testable.
+///
+/// The distinction is not cosmetic: "another worker is already handling this
+/// title" needs no operator action at all, while a failure means something is
+/// wrong with the lock directory or the filesystem. Reporting the first as the
+/// second turns a healthy parallel run into a page of spurious errors.
+fn skip_for_lock_error(e: &SwapError) -> Option<SkipReason> {
+    match e {
+        SwapError::LockBusy(_) => Some(SkipReason::SwapLockBusy),
+        _ => None,
     }
 }
 
@@ -1755,6 +1990,11 @@ mod tests {
         fn guard(&self) -> PathGuard {
             PathGuard::new([self.lib(), self.work()], true)
         }
+        /// A real `SwapLock` over this fixture's work dir, so the swap tests
+        /// exercise the same locked path production takes.
+        fn lock(&self, target: &Path) -> SwapLock {
+            SwapLock::acquire(&self.work(), target).expect("uncontended lock must be available")
+        }
     }
     impl Drop for Tmp {
         fn drop(&mut self) {
@@ -1777,6 +2017,7 @@ mod tests {
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
             id,
+            &t.lock(&original),
         )
         .expect("the swap must succeed");
 
@@ -1806,6 +2047,7 @@ mod tests {
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(t.lib().join("Movie.mkv")).unwrap(),
             id,
+            &t.lock(&t.lib().join("Movie.mkv")),
         )
         .unwrap();
 
@@ -1828,6 +2070,47 @@ mod tests {
     }
 
     #[test]
+    fn a_container_changing_swap_also_leaves_no_staging_file() {
+        // Added because a mutation SURVIVED. The swap has two shapes, and they
+        // dispose of the staging name differently: when the destination name
+        // is unchanged, `rename` consumes it; when the container changes, the
+        // staging name is a separate link that must be explicitly removed.
+        // The existing "exactly two names" test only covered the first shape,
+        // so deleting the explicit removal in the second was invisible — it
+        // would have leaked a full-size hard link into the library directory on
+        // every container conversion.
+        let t = Tmp::new("swap-tidy-convert");
+        let g = t.guard();
+        let original = t.lib().join("Movie.avi");
+        let staged = t.lib().join(".muse-foundry-inflight-x.mkv");
+        fs::write(&original, b"ORIGINAL").unwrap();
+        fs::write(&staged, b"NEW-VERIFIED").unwrap();
+        let id = identity_of(&original).unwrap();
+
+        swap_verified_output(
+            &g.resolve_for_mutation(&original).unwrap(),
+            &g.resolve_for_mutation(&staged).unwrap(),
+            &g.resolve_new_for_mutation(t.lib().join("Movie.mkv")).unwrap(),
+            id,
+            &t.lock(&t.lib().join("Movie.mkv")),
+        )
+        .expect("the conversion swap must succeed");
+
+        assert!(!staged.exists(), "the staging name must not survive the swap");
+        let mut names: Vec<String> = fs::read_dir(t.lib())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["Movie.avi.muse-superseded", "Movie.mkv"],
+            "exactly the new file and the backup, nothing else"
+        );
+        assert_eq!(fs::read(t.lib().join("Movie.mkv")).unwrap(), b"NEW-VERIFIED");
+    }
+
+    #[test]
     fn the_swap_refuses_to_clobber_a_different_existing_file() {
         // An .avi becoming an .mkv must not destroy an unrelated .mkv that was
         // already sitting next to it.
@@ -1846,6 +2129,7 @@ mod tests {
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&bystander).unwrap(),
             id,
+            &t.lock(&bystander),
         )
         .unwrap_err();
 
@@ -1870,6 +2154,7 @@ mod tests {
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
             id,
+            &t.lock(&original),
         )
         .unwrap_err();
 
@@ -1882,12 +2167,13 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_second_rename_rolls_the_original_back_into_place() {
-        // The one window where the library is momentarily missing the file:
-        // between the two renames. The new file vanishing in that window (a
-        // concurrent cleaner, a scratch reaper) makes the second rename fail
-        // after the first has already succeeded — and the original MUST come
-        // back rather than being left aside under a name nothing plays.
+    fn a_failed_swap_leaves_the_original_exactly_where_it_was() {
+        // The new file vanishing mid-swap (a concurrent cleaner, a scratch
+        // reaper) must leave the library exactly as it was. Note what this
+        // asserts NOW versus before: the swap no longer moves the original
+        // aside first, so there is no rollback to perform — the original was
+        // never moved at all. That is the stronger property, and it is why
+        // there is no longer a crash point that leaves the title unreachable.
         let t = Tmp::new("swap-rollback");
         let g = t.guard();
         let original = t.lib().join("Movie.mkv");
@@ -1903,21 +2189,140 @@ mod tests {
         fs::remove_file(&staged).unwrap();
 
         let err =
-            swap_verified_output(&original_mut, &staged_mut, &final_mut, id).unwrap_err();
+            swap_verified_output(&original_mut, &staged_mut, &final_mut, id, &t.lock(&original))
+                .unwrap_err();
 
         assert!(matches!(err, SwapError::Io { .. }), "got {err:?}");
         assert!(
-            err.to_string().contains("rolled back"),
-            "the failure must say the original was restored, got {err}"
+            err.to_string().contains("left untouched"),
+            "the failure must say the original was never moved, got {err}"
         );
         assert_eq!(
             fs::read(&original).unwrap(),
             b"ORIGINAL",
-            "the original must be rolled back into place, byte-for-byte"
+            "the original must still be in place, byte-for-byte"
         );
         assert!(
             !t.lib().join("Movie.mkv.muse-superseded").exists(),
-            "and the aside-name must not be left behind"
+            "and the backup name must not be left behind"
+        );
+    }
+
+    // --- the swap lock -----------------------------------------------------
+
+    #[test]
+    fn lock_contention_is_a_skip_but_a_broken_lock_is_a_failure() {
+        // Added because a mutation SURVIVED: turning the busy-lock skip into a
+        // hard failure was invisible, since nothing could reach that code path
+        // on a host with no ffprobe (the lock is taken after the probe). The
+        // rule now lives in a free function so it is actually reachable.
+        //
+        // The distinction matters operationally: "another worker has this
+        // title" needs no response, while a lock that cannot be created at all
+        // is a real fault. Collapsing them turns a healthy parallel run into a
+        // page of spurious errors.
+        assert_eq!(
+            skip_for_lock_error(&SwapError::LockBusy(PathBuf::from("/lib/Movie.mkv"))),
+            Some(SkipReason::SwapLockBusy),
+            "contention must be reported as a skip"
+        );
+
+        for e in [
+            SwapError::Io { step: "creating the Foundry lock directory", message: "EROFS".into() },
+            SwapError::LinkUnsupported { path: PathBuf::from("/lib/a"), message: "EPERM".into() },
+            SwapError::DestinationOccupied(PathBuf::from("/lib/b")),
+        ] {
+            assert_eq!(
+                skip_for_lock_error(&e),
+                None,
+                "a genuine lock fault must not be silently downgraded to a skip: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_swap_on_the_same_file_cannot_take_the_lock() {
+        // The property the lock exists for: two Muse workers cannot be inside
+        // the swap for the same title at once.
+        let t = Tmp::new("lock-excl");
+        let target = t.lib().join("Movie.mkv");
+
+        let held = SwapLock::acquire(&t.work(), &target).expect("first acquire");
+        let second = SwapLock::acquire(&t.work(), &target);
+        assert!(
+            matches!(second, Err(SwapError::LockBusy(_))),
+            "a second holder must be refused"
+        );
+
+        // ...and it is non-blocking: the refusal came back rather than hanging.
+        drop(held);
+        assert!(
+            SwapLock::acquire(&t.work(), &target).is_ok(),
+            "the lock must be released when the holder is dropped"
+        );
+    }
+
+    #[test]
+    fn the_lock_covers_every_name_one_swap_touches() {
+        // A swap converting Movie.avi -> Movie.mkv touches Movie.avi,
+        // Movie.avi.muse-superseded and Movie.mkv. Keying on the full path
+        // would let a second worker converting the same title from a different
+        // container run concurrently, which is exactly the collision the lock
+        // is for — so the key is the directory + stem.
+        let t = Tmp::new("lock-key");
+        let _held = SwapLock::acquire(&t.work(), &t.lib().join("Movie.mkv")).unwrap();
+        assert!(
+            matches!(
+                SwapLock::acquire(&t.work(), &t.lib().join("Movie.avi")),
+                Err(SwapError::LockBusy(_))
+            ),
+            "the same title in a different container must share the lock"
+        );
+    }
+
+    #[test]
+    fn different_titles_do_not_contend() {
+        // The flip side: the lock must not serialize the whole library.
+        let t = Tmp::new("lock-indep");
+        let _a = SwapLock::acquire(&t.work(), &t.lib().join("A.mkv")).unwrap();
+        assert!(
+            SwapLock::acquire(&t.work(), &t.lib().join("B.mkv")).is_ok(),
+            "unrelated titles must proceed in parallel"
+        );
+    }
+
+    #[test]
+    fn the_lockfile_lives_outside_the_library() {
+        // Two reasons, both real on <host> today: scratch state inside the media
+        // tree is what safety rail 3 forbids, and the library is mounted
+        // READ-ONLY there (MUSE_LIBRARY_ROOT=/srv/media is ro), so a lockfile
+        // in the library could not even be created.
+        let t = Tmp::new("lock-location");
+        let _held = SwapLock::acquire(&t.work(), &t.lib().join("Movie.mkv")).unwrap();
+
+        let locks: Vec<_> = fs::read_dir(t.work().join("locks")).unwrap().collect();
+        assert_eq!(locks.len(), 1, "the lockfile belongs in the work dir");
+        assert!(
+            fs::read_dir(t.lib()).unwrap().next().is_none(),
+            "and nothing may be written into the library to take a lock"
+        );
+    }
+
+    #[test]
+    fn a_stale_lockfile_from_a_dead_process_does_not_block_forever() {
+        // The reason this is flock and not a create_new() lockfile: an
+        // existence-based lock left behind by a killed process blocks every
+        // future run until someone deletes it by hand. flock is released by the
+        // kernel when the descriptor closes, including on SIGKILL.
+        let t = Tmp::new("lock-stale");
+        let target = t.lib().join("Movie.mkv");
+        drop(SwapLock::acquire(&t.work(), &target).unwrap());
+
+        let locks: Vec<_> = fs::read_dir(t.work().join("locks")).unwrap().collect();
+        assert_eq!(locks.len(), 1, "the lockfile is deliberately left on disk");
+        assert!(
+            SwapLock::acquire(&t.work(), &target).is_ok(),
+            "a leftover lockfile must not be mistaken for a held lock"
         );
     }
 
@@ -1945,6 +2350,7 @@ mod tests {
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
             stale_identity,
+            &t.lock(&original),
         )
         .unwrap_err();
 
@@ -2003,6 +2409,7 @@ mod tests {
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
             id,
+            &t.lock(&original),
         )
         .unwrap();
 

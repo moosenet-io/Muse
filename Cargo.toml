@@ -63,6 +63,18 @@ base64 = "0.22"
 # `jpeg` feature only -- no other format decoders.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
+# MUSEF-02: `flock(2)` for the Foundry swap lock (src/foundry/forge.rs).
+# `std` exposes no advisory file locking, and the swap needs one to serialize
+# concurrent Muse workers against the same library file.
+#
+# This adds NO new supply-chain surface: libc 0.2 was already in Cargo.lock as
+# a transitive dependency (tokio et al) and is already linked into the binary —
+# this only makes the existing dependency direct. The alternative considered
+# and rejected was a hand-written `extern "C" { fn flock(...) }` block, which
+# avoids the manifest line but is less reviewable for exactly the same
+# underlying call.
+libc = "0.2"
+
 [dev-dependencies]
 httpmock = "0.7"
 tokio-test = "0.4"

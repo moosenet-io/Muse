@@ -161,13 +161,31 @@ fn db_kind(kind: MediaKind) -> &'static str {
 /// What Muse knows about a title it recognized.
 #[derive(Debug, Clone, Copy)]
 struct LibraryHit {
-    metadata_id: i64,
+    /// `None` when MORE THAN ONE metadata row matched this key, so no single row can be
+    /// named. See `resolve_in_library` on why that is reachable for IMDb.
+    metadata_id: Option<i64>,
+    /// True when more than one metadata row matched — the caller is told rather than handed
+    /// an arbitrary winner.
+    ambiguous: bool,
     /// A `media_metadata` row alone does NOT mean the title is held: `/api/discover` writes
     /// metadata rows for TRENDING titles precisely because they are *not* in the library
     /// (`list_trending_not_in_library`). Ownership is a `media_items` row — the same join
     /// `repo::dashboard`'s library query uses. Treating a catalog row as ownership would have
     /// marked every discoverable title as already owned (codex).
     owned: bool,
+}
+
+/// Collapse the metadata rows matching one `(provider, id, kind)` key into a single answer.
+///
+/// `owned` is ANY: if any row carrying this id is held, then a title with this id IS in the
+/// library, which is exactly what the flag claims. The METADATA ID is the part that cannot be
+/// determined under ambiguity, so that is what goes `None` — rather than naming a row we
+/// cannot justify picking (codex).
+pub(crate) fn resolve_match(rows: &[(i64, bool)]) -> (Option<i64>, bool, bool) {
+    let ambiguous = rows.len() > 1;
+    let owned = rows.iter().any(|(_, o)| *o);
+    let metadata_id = if ambiguous { None } else { rows.first().map(|(id, _)| *id) };
+    (metadata_id, ambiguous, owned)
 }
 
 /// Which of these titles Muse already knows, keyed by `(provider, id, db_kind)`.
@@ -230,6 +248,13 @@ async fn resolve_in_library(
         .fetch_all(&state.pool)
         .await?;
 
+    // Accumulated, not `insert`-ed, because a key can legitimately match several rows.
+    // `media_metadata` is UNIQUE(kind, tmdb_id) and UNIQUE(kind, tvdb_id), but `imdb_id` has
+    // only a plain INDEX — no uniqueness at all (migration 0005). So two same-kind rows may
+    // share an IMDb id, and a bare `insert` would silently keep whichever the database
+    // happened to return last, attributing `owned` and `metadata_id` to an arbitrary one of
+    // them (codex).
+    let mut matches: HashMap<(String, String, &'static str), Vec<(i64, bool)>> = HashMap::new();
     for (id, kind, tmdb_id, tvdb_id, imdb_id, owned) in rows {
         // Leaked once per distinct kind string the DB can produce (two), not per row — the
         // enum has exactly the two variants below and anything else is skipped rather than
@@ -242,12 +267,25 @@ async fn resolve_in_library(
                 continue;
             }
         };
-        let hit = LibraryHit { metadata_id: id, owned };
         for (provider, value) in [("tmdb", tmdb_id), ("tvdb", tvdb_id), ("imdb", imdb_id)] {
             if let Some(v) = value {
-                found.insert((provider.to_string(), v, kind_key), hit);
+                matches
+                    .entry((provider.to_string(), v, kind_key))
+                    .or_default()
+                    .push((id, owned));
             }
         }
+    }
+
+    for (key, rows) in matches {
+        let (metadata_id, ambiguous, owned) = resolve_match(&rows);
+        if ambiguous {
+            tracing::warn!(
+                provider = key.0.as_str(), id = key.1.as_str(), kind = key.2, count = rows.len(),
+                "MUSE #108: several metadata rows share this provider id; reporting ambiguous"
+            );
+        }
+        found.insert(key, LibraryHit { metadata_id, ambiguous, owned });
     }
     Ok(found)
 }
@@ -354,13 +392,42 @@ pub async fn get_search(
             }
         }
 
-        let any_error = kind_reports
+        // A requested kind this provider CANNOT search in its current mode gets an explicit
+        // entry rather than being omitted. Silence in the `kinds` array read as "not asked
+        // about", which is indistinguishable from "asked and returned nothing" unless the
+        // caller cross-references searchable_kinds — and a per-kind array that quietly omits
+        // kinds is exactly the sort of gap that makes a partial answer look whole (gpt56).
+        for kind in &kinds {
+            if !entry.searchable.contains(kind) {
+                kind_reports.push(json!({
+                    "kind": kind_str(*kind),
+                    "status": "not_consulted",
+                    "error": Value::Null,
+                    "reason": format!(
+                        "{} in {} mode cannot search {}",
+                        entry.name, entry.mode, kind_str(*kind)
+                    ),
+                    "result_count": 0,
+                    "truncated": false,
+                    "provider_returned": Value::Null,
+                    "limit": MAX_PER_PROVIDER,
+                }));
+            }
+        }
+
+        // Rolled up over the kinds actually ATTEMPTED — a not_consulted kind is neither a
+        // success nor a failure, and counting it as either would misreport the provider.
+        let attempted: Vec<&Value> = kind_reports
             .iter()
-            .any(|r| r.get("status").and_then(Value::as_str) == Some("error"));
-        let all_error = !kind_reports.is_empty()
-            && kind_reports
+            .filter(|r| r.get("status").and_then(Value::as_str) != Some("not_consulted"))
+            .collect();
+        let all_error = !attempted.is_empty()
+            && attempted
                 .iter()
                 .all(|r| r.get("status").and_then(Value::as_str) == Some("error"));
+        let any_error = attempted
+            .iter()
+            .any(|r| r.get("status").and_then(Value::as_str) == Some("error"));
         let total: u64 = kind_reports
             .iter()
             .filter_map(|r| r.get("result_count").and_then(Value::as_u64))
@@ -378,7 +445,7 @@ pub async fn get_search(
             // Rolled up from the per-kind results, and PARTIAL is its own state: a provider
             // that answered for one kind and failed for another is neither ok nor error, and
             // flattening it to either would misdescribe half of what happened.
-            "status": if kind_reports.is_empty() {
+            "status": if attempted.is_empty() {
                 "not_consulted"
             } else if all_error {
                 "error"
@@ -427,7 +494,11 @@ pub async fn get_search(
                 // one — so the two are reported separately rather than conflated.
                 "in_library": known.map(|k| k.owned).unwrap_or(false),
                 "in_catalog": known.is_some(),
-                "media_metadata_id": known.map(|k| k.metadata_id),
+                // Null when several catalog rows share this id (possible for IMDb, which has
+                // no uniqueness constraint) — the title is known, but no single row can be
+                // named, and naming an arbitrary one would be a fabricated attribution.
+                "media_metadata_id": known.and_then(|k| k.metadata_id),
+                "ambiguous_match": known.map(|k| k.ambiguous).unwrap_or(false),
             })
         })
         .collect();
@@ -512,6 +583,27 @@ mod tests {
             coverage(&[("movie", true)], &["movie", "series"]),
             vec!["series"],
         );
+    }
+
+    #[test]
+    fn an_ambiguous_id_names_no_row_but_still_reports_ownership() {
+        // One row, unambiguous: name it.
+        assert_eq!(resolve_match(&[(7, true)]), (Some(7), false, true));
+        assert_eq!(resolve_match(&[(7, false)]), (Some(7), false, false));
+
+        // Two rows sharing an id (reachable for IMDb — no uniqueness constraint on that
+        // column). We still know a title with this id is held, but not WHICH catalog row it
+        // is, so the id goes null rather than picking an arbitrary winner.
+        let (id, ambiguous, owned) = resolve_match(&[(7, false), (9, true)]);
+        assert_eq!(id, None, "must not attribute to an arbitrary row");
+        assert!(ambiguous);
+        assert!(owned, "any owned row means a title with this id is held");
+
+        // Ambiguous and none owned.
+        let (id, ambiguous, owned) = resolve_match(&[(7, false), (9, false)]);
+        assert_eq!(id, None);
+        assert!(ambiguous);
+        assert!(!owned);
     }
 
     /// These hit the REAL upstreams. Ignored by default so the suite stays hermetic and

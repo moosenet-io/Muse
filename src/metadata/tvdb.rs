@@ -351,14 +351,19 @@ impl TvdbClient {
                 status: 0,
                 message: "skyhook base url cannot be a base".to_string(),
             })?
-            // Defense in depth, NOT a live bug fix. A raw `Url` whose path ends in `/`
-            // parses with a trailing empty segment, so extending would double the separator
-            // (`/v1/tvdb//search/en`). A reviewer flagged this as reachable via the
-            // operator-overridable `MUSE_SKYHOOK_URL`; it is not — `with_mode` already
-            // strips trailing slashes when the client is constructed, and the test below
-            // pins that. (My own first repro bypassed the constructor and appeared to
-            // confirm it; the mutation check is what showed the guard was inert.) Kept so
-            // the invariant holds locally if that trim ever moves.
+            // LOAD-BEARING. A url whose path ends in `/` parses with a trailing empty
+            // segment, so extending doubles the separator (`/v1/tvdb//search/en`), which
+            // 404s — and fail-open hides it, for resolve-by-id as well as search.
+            //
+            // `with_mode`'s `trim_end_matches('/')` does NOT cover this: it trims the raw
+            // STRING, so a base url carrying a query or fragment slips through untouched
+            // while its PATH still ends in `/`. Verified:
+            //   "https://h/v1/tvdb/?x=1" -> trim is a no-op -> "//search/en?x=1"
+            // `MUSE_SKYHOOK_URL` is operator-supplied, so that spelling is reachable.
+            //
+            // I originally argued this guard was inert, because my repro tested the plain
+            // trailing-slash form — which the trim DOES handle — and concluded from that
+            // one case. codex supplied the query-string counterexample; it reproduces.
             .pop_if_empty()
             .extend(segments);
         Ok(url)
@@ -427,7 +432,10 @@ impl TvdbClient {
         let (status, bytes) = match self.skyhook_send(url).await {
             Ok(pair) => pair,
             Err(e) => {
-                tracing::debug!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
+                // Warn, not debug: an unreachable host or a bad override is exactly the
+                // class of fault that hid MUSE #106, and search has no benign failure mode
+                // to confuse it with (codex).
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search request failed; degrading to empty (fail-open)");
                 return Ok(Vec::new());
             }
         };
@@ -446,7 +454,9 @@ impl TvdbClient {
         match serde_json::from_slice::<Vec<SkyhookShow>>(&bytes) {
             Ok(hits) => Ok(hits.into_iter().map(SkyhookShow::into_metadata).collect()),
             Err(e) => {
-                tracing::debug!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
+                // A 200 carrying HTML or otherwise unparseable JSON means we are pointed at
+                // the wrong endpoint — indistinguishable from "no results" without this.
+                tracing::warn!(error = %e, "AMETA-3: Skyhook search parse failed; degrading to empty (fail-open)");
                 Ok(Vec::new())
             }
         }
@@ -1565,9 +1575,12 @@ mod tests {
 
     #[test]
     fn skyhook_base_url_with_a_trailing_slash_does_not_double_the_separator() {
-        // Pins the real protection: `with_mode` trims trailing slashes from the base url at
-        // construction, so an operator writing `MUSE_SKYHOOK_URL=…/v1/tvdb/` still gets a
-        // single separator. Both spellings must produce the same URL.
+        // Two distinct protections, both pinned here:
+        //   - the plain trailing slash is handled by `with_mode`'s string trim;
+        //   - a base url with a QUERY or FRAGMENT slips past that trim entirely (the string
+        //     does not end in `/`, but the path does), and is handled only by
+        //     `pop_if_empty()` in `skyhook_url`.
+        // The second case is why that guard is load-bearing rather than decorative.
         //
         // Asserted on the CONSTRUCTED URL, deliberately, not through a mock server: httpmock
         // normalizes a doubled slash in its path matcher, so a mock-based version of this
@@ -1586,6 +1599,15 @@ mod tests {
         assert_eq!(
             no_slash.skyhook_url(&["search", "en"]).unwrap().as_str(),
             "https://example.test/v1/tvdb/search/en",
+        );
+
+        // The case the string trim cannot see: the raw base url ends in `1`, not `/`, so
+        // `trim_end_matches('/')` is a no-op — but the PATH still ends in `/`.
+        let with_query = TvdbClient::new_skyhook("https://example.test/v1/tvdb/?x=1")
+            .expect("skyhook client should build");
+        assert_eq!(
+            with_query.skyhook_url(&["search", "en"]).unwrap().as_str(),
+            "https://example.test/v1/tvdb/search/en?x=1",
         );
     }
 

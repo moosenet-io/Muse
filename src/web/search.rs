@@ -286,7 +286,12 @@ pub(crate) fn resolve_hit(
     if candidate_rows > 1 {
         return HitResolution {
             in_library: None,
-            in_catalog: Some(true),
+            // Also unknown, not true. A row matched one of the hit's identifiers on a unique
+            // key, so "some catalog row carries this id" IS a fact — but `in_catalog` claims
+            // something narrower, that MUSE HAS THIS TITLE, and when identifiers point at
+            // different rows that is exactly what is not established (codex). The weaker fact
+            // is not lost: `resolution` reports ambiguous_rows.
+            in_catalog: None,
             metadata_id: None,
             ambiguous: true,
             resolution: Resolution::AmbiguousRows,
@@ -298,7 +303,10 @@ pub(crate) fn resolve_hit(
     if checks.iter().any(|c| *c == IdentifierCheck::Contradicts) {
         return HitResolution {
             in_library: None,
-            in_catalog: Some(true),
+            // Same reasoning as the ambiguous case above: an identifier disagreeing with the
+            // row is evidence the hit and the row are different titles, so this title's
+            // presence in the catalog is unestablished. `resolution` says contradicted.
+            in_catalog: None,
             metadata_id: None,
             ambiguous: true,
             resolution: Resolution::Contradicted,
@@ -830,7 +838,7 @@ mod tests {
         assert_eq!(r.in_library, None, "a contradiction cannot settle ownership");
         assert_eq!(r.metadata_id, None);
         assert!(r.ambiguous);
-        assert_eq!(r.in_catalog, Some(true), "Muse does know a title here, it cannot pin which");
+        assert_eq!(r.in_catalog, None, "identity unestablished, so catalog presence is too");
     }
 
     #[test]
@@ -840,7 +848,7 @@ mod tests {
         assert_eq!(r.in_library, None);
         assert_eq!(r.metadata_id, None);
         assert!(r.ambiguous);
-        assert_eq!(r.in_catalog, Some(true));
+        assert_eq!(r.in_catalog, None);
     }
 
     #[test]

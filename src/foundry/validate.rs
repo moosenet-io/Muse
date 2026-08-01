@@ -1610,17 +1610,50 @@ pub fn check_free_space(dir: &Path, needed: u64) -> Result<(), ValidationRefusal
 /// Returns the probes that succeeded (with their paths) and a count of the
 /// ones that did not. The probe failures are counted rather than dropped: a run
 /// where nothing could be probed must not report as a clean, empty validation.
+/// Which candidate indices to probe, and in what order.
+///
+/// Named and separate so the CHOICE is testable — `probe_candidates` needs a
+/// live `Foundry`, and when this was inline a mutation reverting a targeted run
+/// to stride sampling survived every test.
+///
+/// - **Unrestricted:** an even stride, so the sample spans the whole library.
+/// - **Targeted:** EVERY candidate, in order. A stride over ~25,000 entries
+///   looking for the ~1% that is 4K/HDR would find almost none of it, which is
+///   the failure the filter exists to fix. The probe budget then bounds how
+///   many MATCHES are collected, not how many files are looked at.
+pub fn probe_order(len: usize, probe_budget: usize, filter: &CandidateFilter) -> Vec<usize> {
+    if filter.is_unrestricted() {
+        stride_sample(len, probe_budget)
+    } else {
+        (0..len).collect()
+    }
+}
+
 pub fn probe_candidates(
     foundry: &Foundry,
     candidates: &[PathBuf],
     probe_budget: usize,
+    filter: &CandidateFilter,
 ) -> (Vec<(PathBuf, MediaProbe)>, usize) {
     let mut probed = Vec::new();
     let mut failures = 0;
-    for i in stride_sample(candidates.len(), probe_budget) {
+    // A restricted run walks the WHOLE candidate list rather than a stride
+    // sample. A stride over 25,000 entries looking for the ~1% that is 4K/HDR
+    // would find almost none of it, which is the failure this filter exists to
+    // fix — so the probe budget bounds how many MATCHES are collected, not how
+    // many files are looked at.
+    let order: Vec<usize> = probe_order(candidates.len(), probe_budget, filter);
+    for i in order {
+        if probed.len() >= probe_budget {
+            break;
+        }
         let path = &candidates[i];
         match foundry.probe_file(path) {
-            Ok(p) => probed.push((path.clone(), p)),
+            Ok(p) => {
+                if filter.admits(&p) {
+                    probed.push((path.clone(), p));
+                }
+            }
             Err(e) => {
                 failures += 1;
                 tracing::debug!(path = %path.display(), error = %e, "foundry/validate: probe failed");
@@ -1628,6 +1661,68 @@ pub fn probe_candidates(
         }
     }
     (probed, failures)
+}
+
+/// Which files a run is allowed to consider, before diversity sampling.
+///
+/// The diversity sampler picks for SHAPE COVERAGE, which is right for "does the
+/// encoder handle the range of things in this library" and exactly wrong for
+/// "does it handle the dangerous 1%". 4K/HDR/Dolby Vision is roughly 1% of this
+/// library, so a diverse sample of 16 files will essentially never contain one
+/// — raising the size ceiling made that content ELIGIBLE without making it
+/// REACHABLE.
+///
+/// That matters because the 1% is precisely the content whose misclassification
+/// is unrecoverable: Path A deletes the original.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CandidateFilter {
+    /// Only consider files at least this large. Targets the large tail, which
+    /// is where 4K lives.
+    pub min_input_bytes: Option<u64>,
+    /// Only consider files whose video carries an HDR transfer or a Dolby
+    /// Vision signal.
+    pub hdr_only: bool,
+}
+
+impl CandidateFilter {
+    pub fn is_unrestricted(&self) -> bool {
+        self.min_input_bytes.is_none() && !self.hdr_only
+    }
+
+    /// Whether a probed file passes. Pure, so the targeting rule is testable
+    /// without a filesystem.
+    pub fn admits(&self, probe: &MediaProbe) -> bool {
+        if let Some(min) = self.min_input_bytes {
+            match probe.size_bytes {
+                Some(sz) if sz >= min => {}
+                // Unknown size cannot be shown to meet the floor, so it does
+                // not — the filter exists to GUARANTEE the risky content is
+                // reached, and admitting unknowns would dilute that.
+                _ => return false,
+            }
+        }
+        if self.hdr_only {
+            let Some(v) = probe.primary_video() else {
+                return false;
+            };
+            let hdr = matches!(
+                crate::foundry::hdr::classify_hdr(v),
+                crate::foundry::hdr::HdrVerdict::Hdr { .. }
+            );
+            let dv = crate::foundry::hdr::classify_dolby_vision(v).is_present();
+            // `Unknown` dynamic range is deliberately INCLUDED: an untagged
+            // 10-bit file is exactly the ambiguous case worth validating, and
+            // excluding it would hide the files most likely to be misjudged.
+            let unknown = matches!(
+                crate::foundry::hdr::classify_hdr(v),
+                crate::foundry::hdr::HdrVerdict::Unknown { .. }
+            );
+            if !(hdr || dv || unknown) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Encode and verify a diverse sample. **Never writes outside `scratch_dir`,
@@ -2200,6 +2295,117 @@ mod tests {
             remaining,
             "an encode may not run past the run's own deadline"
         );
+    }
+
+    fn probe_with(size: Option<u64>, transfer: Option<&str>, pix: &str) -> MediaProbe {
+        // Built on the module's existing fixture so it stays in step with the
+        // struct rather than duplicating every field.
+        let mut p = probe("matroska,webm", "hevc", 3840, 2160, &["aac"], 0);
+        p.size_bytes = size;
+        if let Some(v) = p.video.first_mut() {
+            v.pix_fmt = Some(pix.to_string());
+            v.color_transfer = transfer.map(str::to_string);
+        }
+        p
+    }
+
+    /// The gap this filter closes.
+    ///
+    /// The diversity sampler picks for SHAPE coverage, so a 16-file sample of a
+    /// library that is ~1% 4K/HDR essentially never contains one. Raising
+    /// `max_input_mb` (FOUNDRY-09) made that content ELIGIBLE without making it
+    /// REACHABLE — and it is precisely the content whose misclassification is
+    /// unrecoverable, because Path A deletes the original.
+    #[test]
+    fn the_size_floor_admits_the_large_tail_and_excludes_the_rest() {
+        let f = CandidateFilter {
+            min_input_bytes: Some(8 * 1024 * 1024 * 1024),
+            hdr_only: false,
+        };
+        assert!(f.admits(&probe_with(Some(20 * 1024 * 1024 * 1024), None, "yuv420p")));
+        assert!(!f.admits(&probe_with(Some(700 * 1024 * 1024), None, "yuv420p")));
+        // An UNKNOWN size cannot be shown to meet the floor, so it does not.
+        // The filter exists to GUARANTEE the risky content is reached;
+        // admitting unknowns would dilute exactly that.
+        assert!(!f.admits(&probe_with(None, None, "yuv420p")));
+    }
+
+    #[test]
+    fn hdr_only_admits_hdr_and_dolby_vision() {
+        let f = CandidateFilter { min_input_bytes: None, hdr_only: true };
+        // PQ HDR10.
+        assert!(f.admits(&probe_with(Some(1), Some("smpte2084"), "yuv420p10le")));
+        // HLG.
+        assert!(f.admits(&probe_with(Some(1), Some("arib-std-b67"), "yuv420p10le")));
+        // Ordinary SDR is excluded — that is the point of the filter.
+        assert!(!f.admits(&probe_with(Some(1), Some("bt709"), "yuv420p")));
+    }
+
+    /// UNDETERMINED dynamic range is INCLUDED, deliberately.
+    ///
+    /// An untagged 10-bit file is the ambiguous case most likely to be
+    /// misjudged, so excluding it would hide exactly the files worth looking
+    /// at — the filter would then validate only the content the classifier
+    /// already finds easy.
+    #[test]
+    fn an_undetermined_dynamic_range_is_included_not_filtered_out() {
+        let f = CandidateFilter { min_input_bytes: None, hdr_only: true };
+        let untagged_10bit = probe_with(Some(1), None, "yuv420p10le");
+        assert_eq!(
+            crate::foundry::hdr::classify_hdr(untagged_10bit.primary_video().unwrap()),
+            crate::foundry::hdr::HdrVerdict::Unknown {
+                why: crate::foundry::hdr::DynamicRangeUnknown::NoTransferTagAndUnknownBitDepth {
+                    pix_fmt: Some("yuv420p10le".to_string())
+                }
+            },
+            "fixture must actually be the undetermined case"
+        );
+        assert!(
+            f.admits(&untagged_10bit),
+            "the ambiguous case is the one most worth validating"
+        );
+        // ...while untagged 8-bit is confidently SDR and is excluded.
+        assert!(!f.admits(&probe_with(Some(1), None, "yuv420p")));
+    }
+
+    /// A targeted run must walk EVERYTHING, not a stride.
+    ///
+    /// A stride of 250 over ~25,000 entries samples 1%, and the 4K/HDR tail is
+    /// itself ~1% — so a strided targeted run would find essentially none of
+    /// the content it was asked to target, while still reporting "all
+    /// verified". The budget must bound MATCHES, not files examined.
+    #[test]
+    fn a_targeted_run_examines_every_candidate_rather_than_a_stride() {
+        let targeted = CandidateFilter {
+            min_input_bytes: Some(8 * 1024 * 1024 * 1024),
+            hdr_only: false,
+        };
+        let order = probe_order(25_000, 250, &targeted);
+        assert_eq!(
+            order.len(),
+            25_000,
+            "a targeted run must look at every candidate; the budget bounds MATCHES"
+        );
+        assert_eq!(order.first(), Some(&0));
+        assert_eq!(order.last(), Some(&24_999));
+
+        // Unrestricted keeps the stride, which is right for shape coverage.
+        let open = CandidateFilter::default();
+        let strided = probe_order(25_000, 250, &open);
+        assert_eq!(strided.len(), 250, "an unrestricted run samples");
+        assert!(
+            strided.last().unwrap() > &20_000,
+            "the stride must still span the library: {:?}",
+            strided.last()
+        );
+    }
+
+    #[test]
+    fn an_unrestricted_filter_admits_everything_and_says_so() {
+        let f = CandidateFilter::default();
+        assert!(f.is_unrestricted());
+        assert!(f.admits(&probe_with(None, None, "yuv420p")));
+        assert!(f.admits(&probe_with(Some(1), Some("bt709"), "yuv420p")));
     }
 
     #[test]

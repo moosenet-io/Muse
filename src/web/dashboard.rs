@@ -2209,6 +2209,20 @@ pub struct ValidateQuery {
     ///
     /// Clamped to 60..=86400 (24 h).
     pub run_deadline_secs: Option<u64>,
+    /// Only validate files at least this large, in MiB.
+    ///
+    /// Targets the large tail. The diversity sampler picks for SHAPE coverage,
+    /// so a 16-file sample of a library that is ~1% 4K will essentially never
+    /// contain a 4K file — raising `max_input_mb` made that content eligible
+    /// without making it reachable.
+    pub min_input_mb: Option<u64>,
+    /// Only validate files that carry an HDR transfer, a Dolby Vision signal,
+    /// or an UNDETERMINED dynamic range.
+    ///
+    /// Undetermined is included on purpose: an untagged 10-bit file is the
+    /// ambiguous case most likely to be misjudged, and excluding it would hide
+    /// exactly the files worth looking at.
+    pub hdr_only: Option<bool>,
 }
 
 /// `POST /ops/foundry/validate` — really encode a diverse sample to scratch,
@@ -2313,6 +2327,11 @@ pub async fn foundry_validate(
         q.run_deadline_secs,
     );
     let coverage_note = bounds.coverage_note();
+    let filter = validate::CandidateFilter {
+        min_input_bytes: q.min_input_mb.map(|m| m * 1024 * 1024),
+        hdr_only: q.hdr_only.unwrap_or(false),
+    };
+    let filter_is_unrestricted = filter.is_unrestricted();
 
 
     use crate::foundry::validate;
@@ -2323,6 +2342,20 @@ pub async fn foundry_validate(
         return Ok(Json(json!({
             "ran": false,
             "coverage": coverage_note,
+        // Stated on the response: a TARGETED run covers a deliberately narrow
+        // slice, and its "all_verified" means something much smaller than an
+        // unrestricted run's. Reading one as the other is the whole risk.
+        "targeting": {
+            "min_input_mb": q.min_input_mb,
+            "hdr_only": q.hdr_only.unwrap_or(false),
+            "note": if filter_is_unrestricted {
+                "unrestricted: the diverse sample spans the library's shapes, which \
+                 under-represents the ~1% 4K/HDR tail by construction"
+            } else {
+                "TARGETED: only files matching the filter were considered, so this \
+                 result says nothing about the rest of the library"
+            },
+        },
             "reason": "foundry is not configured (MUSE_FOUNDRY_* unset) — nothing was validated",
         })));
     };
@@ -2334,6 +2367,20 @@ pub async fn foundry_validate(
         return Ok(Json(json!({
             "ran": false,
             "coverage": coverage_note,
+        // Stated on the response: a TARGETED run covers a deliberately narrow
+        // slice, and its "all_verified" means something much smaller than an
+        // unrestricted run's. Reading one as the other is the whole risk.
+        "targeting": {
+            "min_input_mb": q.min_input_mb,
+            "hdr_only": q.hdr_only.unwrap_or(false),
+            "note": if filter_is_unrestricted {
+                "unrestricted: the diverse sample spans the library's shapes, which \
+                 under-represents the ~1% 4K/HDR tail by construction"
+            } else {
+                "TARGETED: only files matching the filter were considered, so this \
+                 result says nothing about the rest of the library"
+            },
+        },
             "reason": "ffmpeg and ffprobe must both be usable to validate an encode",
             "capabilities": {
                 "ffprobe": caps.ffprobe.summary(),
@@ -2346,6 +2393,20 @@ pub async fn foundry_validate(
         return Ok(Json(json!({
             "ran": false,
             "coverage": coverage_note,
+        // Stated on the response: a TARGETED run covers a deliberately narrow
+        // slice, and its "all_verified" means something much smaller than an
+        // unrestricted run's. Reading one as the other is the whole risk.
+        "targeting": {
+            "min_input_mb": q.min_input_mb,
+            "hdr_only": q.hdr_only.unwrap_or(false),
+            "note": if filter_is_unrestricted {
+                "unrestricted: the diverse sample spans the library's shapes, which \
+                 under-represents the ~1% 4K/HDR tail by construction"
+            } else {
+                "TARGETED: only files matching the filter were considered, so this \
+                 result says nothing about the rest of the library"
+            },
+        },
             "reason": "MUSE_LIBRARY_ROOT is not set — there is nothing to validate",
         })));
     };
@@ -2376,7 +2437,7 @@ pub async fn foundry_validate(
         let candidate_count = candidates.len();
 
         let (probed, probe_failures) =
-            validate::probe_candidates(&foundry, &candidates, probe_budget);
+            validate::probe_candidates(&foundry, &candidates, probe_budget, &filter);
 
         let policy = crate::foundry::policy::TranscodePolicy::default();
         let run = validate::validate_sample(
@@ -2399,6 +2460,20 @@ pub async fn foundry_validate(
             return Ok(Json(json!({
                 "ran": false,
             "coverage": coverage_note,
+        // Stated on the response: a TARGETED run covers a deliberately narrow
+        // slice, and its "all_verified" means something much smaller than an
+        // unrestricted run's. Reading one as the other is the whole risk.
+        "targeting": {
+            "min_input_mb": q.min_input_mb,
+            "hdr_only": q.hdr_only.unwrap_or(false),
+            "note": if filter_is_unrestricted {
+                "unrestricted: the diverse sample spans the library's shapes, which \
+                 under-represents the ~1% 4K/HDR tail by construction"
+            } else {
+                "TARGETED: only files matching the filter were considered, so this \
+                 result says nothing about the rest of the library"
+            },
+        },
                 "reason": refusal.to_string(),
             })))
         }

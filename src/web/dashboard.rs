@@ -2964,7 +2964,18 @@ pub async fn foundry_survey(
             "path": f.path,
             "outcome": f.outcome.as_str(),
             "detail": match &f.outcome {
-                crate::foundry::survey::SurveyOutcome::WouldTranscode { reasons } => json!(reasons),
+                crate::foundry::survey::SurveyOutcome::WouldTranscode {
+                    reasons,
+                    predicted_deletion_refusals,
+                } => json!({
+                    "reasons": reasons,
+                    // What the deletion gate will say AFTERWARDS, known now.
+                    // Non-empty means Path A would spend a full re-encode and
+                    // then KEEP the original — doubling disk for this title
+                    // rather than reclaiming any.
+                    "predicted_deletion_refusals": predicted_deletion_refusals,
+                    "reclaims_disk": predicted_deletion_refusals.is_empty(),
+                }),
                 crate::foundry::survey::SurveyOutcome::CannotDecide { why } => json!(why),
                 crate::foundry::survey::SurveyOutcome::ProbeFailed { error } => json!(error),
                 crate::foundry::survey::SurveyOutcome::AlreadyOptimal => Value::Null,

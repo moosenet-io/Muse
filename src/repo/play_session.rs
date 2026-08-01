@@ -700,6 +700,35 @@ pub async fn list_history(pool: &PgPool, limit: i64) -> MuseResult<Vec<SessionJo
         .map_err(MuseError::Database)
 }
 
+/// `GET /api/sessions/live` filtered to one `session_key` — the read
+/// MACT-02's `POST /api/sessions/:session_key/terminate` resolves against
+/// before ever touching a `CastController`. This is the whole safety
+/// property: a caller supplies only a `session_key`, and Muse — not the
+/// caller — decides whether it names a currently-live session at all.
+///
+/// Deliberately reuses [`SESSION_JOIN_SELECT`]'s `stopped_at IS NULL`
+/// liveness scope (same as [`list_live`]), so an already-stopped session
+/// (webhook/poller already recorded its end) or a `session_key` Muse never
+/// saw both resolve to `None` here — indistinguishable to the caller, both
+/// correctly `404` upstream. `session_key` has no uniqueness constraint
+/// (Plex reuses it across sessions — see [`SESSION_JOIN_SELECT`]'s doc
+/// comment), so this takes the newest open row for the key, same tiebreak
+/// as [`list_live`].
+pub async fn find_live_by_session_key(
+    pool: &PgPool,
+    session_key: &str,
+) -> MuseResult<Option<SessionJoinRow>> {
+    let sql = format!(
+        "{SESSION_JOIN_SELECT} WHERE ps.stopped_at IS NULL AND ps.session_key = $1 \
+         ORDER BY ps.started_at DESC LIMIT 1"
+    );
+    sqlx::query_as::<_, SessionJoinRow>(&sql)
+        .bind(session_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(MuseError::Database)
+}
+
 #[cfg(test)]
 mod mact01_tests {
     use super::*;

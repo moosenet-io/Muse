@@ -57,6 +57,29 @@ async fn upsert_player(pool: &PgPool, player: &PlexPlayer) -> MuseResult<()> {
     Ok(())
 }
 
+/// Best-effort resolution from a `play_sessions.player` display name (e.g.
+/// "Living Room") to the `plex_clients.machine_identifier` MACT-02 needs to
+/// address a Companion stop command — Muse doesn't (yet) stamp the exact
+/// client id on `play_sessions` at ingest time, only the name Plex reported.
+/// Ties (two discovered clients sharing a name) resolve to the most
+/// recently seen one. Returns `None` on no match rather than erroring —
+/// callers report that as "no resolvable target", never a false success.
+pub async fn find_machine_identifier_by_name(
+    pool: &PgPool,
+    name: &str,
+) -> MuseResult<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT machine_identifier FROM plex_clients WHERE name = $1 \
+         ORDER BY last_seen_at DESC LIMIT 1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .map_err(MuseError::Database)?;
+
+    Ok(row.map(|(id,)| id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

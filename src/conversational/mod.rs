@@ -1377,6 +1377,7 @@ mod db_gated {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         })
     }
 

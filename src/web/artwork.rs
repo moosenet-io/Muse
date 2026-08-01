@@ -613,6 +613,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         });
 
         // First request: cache miss, fetches from (mocked) Plex.
@@ -718,6 +719,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         });
 
         let resp = art_handler(

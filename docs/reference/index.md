@@ -39,7 +39,7 @@ runtime subsystem.)
 
 - [Architecture at a glance](architecture-at-a-glance.md)
 - [Running](running.md)
-- [HTTP API surface (24 routes)](http-api-surface-24-routes.md)
+- [HTTP API surface (25 routes)](http-api-surface-25-routes.md)
 - [Acquisition domain schema (MUSEM-01)](acquisition-domain-schema-musem-01.md)
 - [Release-decision engine](release-decision-engine.md)
 - [Acquisition orchestrator + request lifecycle (MUSEM-05)](acquisition-orchestrator-request-lifecycle-musem-05.md)

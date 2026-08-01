@@ -1,4 +1,4 @@
-## HTTP API surface (24 routes)
+## HTTP API surface (25 routes)
 
 Every route below is real. The `/ingest/*`, `/query/*`, and `/proactive/*` nests each also carry a
 `fallback` that answers **`501 Not Implemented`** for any un-mounted sub-path (a documented seam for
@@ -70,6 +70,18 @@ either off, `POST /requests` still persists the request — it just never reache
 - `GET /api/sessions/history?limit=` — Muse's permanent historical record over stopped sessions
   (`source: "muse-history"`), same per-session projection minus the liveness fields. `limit` defaults
   to 50, capped at 500.
+- `POST /api/sessions/{session_key}/terminate` (MACT-02) — stop a live stream. The only mutation in
+  this group. `session_key` is resolved against the SAME live set `GET /api/sessions/live` reports —
+  a caller can never name an arbitrary player; Muse decides the target. Optional body
+  `{"reason": "..."}`, logged for the operator (today's `CastController::stop` has no channel to
+  surface it to the viewer, so `reason_delivered` is always `false`). Relays through
+  `CastController::stop` (`src/plex_control/cast.rs`) — never a second HTTP path to Plex.
+  `{stopped, backend, reason_delivered}` reports what actually happened; `stopped` is `false` on any
+  controller error, never a fabricated `true`. `404` for an unknown or already-stopped
+  `session_key` (no relay attempted). `503` when no cast controller is configured, or when the live
+  session has no resolvable Plex client target — never a `200` implying the stream stopped.
+  Layered auth: Terminus's `proxy_muse` rejects a `viewer`'s `POST` with `403` before it is proxied
+  here at all; this route's bearer check is Muse's independent second layer.
 
 **Linear tuner (HDHomeRun-emulation) + streaming**
 - `GET /discover.json` — HDHomeRun device descriptor.

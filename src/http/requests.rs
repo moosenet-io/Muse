@@ -443,6 +443,7 @@ mod db_gated {
             tmdb: None,
             embed: None,
             download,
+            cast_controller: None,
         })
     }
 

@@ -769,6 +769,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         };
 
         let summary = run_maintenance_pass(&state).await;

@@ -46,6 +46,7 @@ fn degraded_state(pool: sqlx::PgPool) -> Arc<AppState> {
         tmdb: None,
         embed: None,
         download: None,
+        cast_controller: None,
     })
 }
 

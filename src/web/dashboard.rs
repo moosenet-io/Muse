@@ -2292,6 +2292,22 @@ pub async fn foundry_reap(
         // real one when the numbers are read later.
         "mutation_enabled": run.mutation_enabled,
         "retention_secs": run.retention_secs,
+        // Coverage, so "examined: 0" can be told apart from "I could not
+        // look". On the one endpoint that can permanently delete data, those
+        // must never render identically.
+        "coverage": {
+            "dirs_read": run.dirs_read,
+            "dirs_unreadable": run.dirs_unreadable,
+            "trustworthy": run.dirs_read > 0,
+            "note": if run.dirs_read == 0 {
+                "NOTHING was read — this result establishes nothing about the library"
+            } else if run.dirs_unreadable > 0 {
+                "PARTIAL — some directories could not be listed, so backups may exist \
+                 that this pass never saw"
+            } else {
+                "the whole tree under every allowed root was listed"
+            },
+        },
         "examined": run.files.len(),
         "deleted": run.deleted(),
         "would_delete": run.would_delete(),

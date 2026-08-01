@@ -100,10 +100,34 @@ async fn capture_still(ffmpeg_path: &str, file_path: &str, seek_ms: i64) -> Muse
         .await
         .map_err(|e| MuseError::ServiceUnavailable(format!("failed reading ffmpeg stdout: {e}")))?;
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| MuseError::ServiceUnavailable(format!("ffmpeg wait failed: {e}")))?;
+    // Bounded. An async `wait()` does not block a thread, but it waits
+    // forever — so a ffmpeg wedged on a stalled library read leaves this
+    // request hanging until the client gives up, and the task holding it never
+    // completes. Same defect class as FOUNDRY-10/13, observed live on this
+    // mount; the only difference here is that it costs a task rather than a
+    // thread.
+    //
+    // 5 minutes: extracting ONE still frame is a seek plus a decode, seconds
+    // at worst even over NFS.
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(|e| {
+            MuseError::ServiceUnavailable(format!("ffmpeg wait failed: {e}"))
+        })?,
+        Err(_) => {
+            // Kill, then do NOT await the reap: a child wedged in
+            // uninterruptible D-state ignores SIGKILL until its I/O returns,
+            // and awaiting it here would reproduce the hang we just escaped.
+            let _ = child.start_kill();
+            return Err(MuseError::ServiceUnavailable(format!(
+                "ffmpeg did not produce a still within 300s and was abandoned — the                  media file or its filesystem stalled; this is NOT a statement that the                  file has no frame at {seek_ms}ms"
+            )));
+        }
+    };
 
     if !status.success() || bytes.is_empty() {
         return Err(MuseError::ServiceUnavailable(format!(

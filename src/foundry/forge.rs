@@ -125,7 +125,6 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::foundry::capability::{self, Capabilities};
 use crate::foundry::config::FoundryConfig;

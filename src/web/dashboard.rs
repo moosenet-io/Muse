@@ -1757,12 +1757,29 @@ pub async fn terminate_session(
     let machine_identifier = match crate::plex_control::resolve_live_target(
         &state.pool,
         &session_key,
+        state.config.session_active_grace_secs,
+        state.config.terminate_target_fresh_within_secs,
     )
     .await?
     {
         crate::plex_control::ResolveOutcome::NotFound => {
             return Err(MuseError::NotFound(format!(
                 "no live session for session_key {session_key}"
+            )));
+        }
+        // Review finding, cycle 2 (MACT-02, codex, confirmed): MACT-01
+        // deliberately retains stale open rows (that's what its `stale`
+        // state is for), so an old stale session must not resolve a target
+        // at all -- it could stop a NEWER session sharing the same device.
+        // Grouped with `NotFound`'s 404: both mean "no session Muse
+        // currently vouches for as live", which is the only fact this
+        // caller-facing status needs to carry (see `ResolveOutcome::StaleSession`'s
+        // doc comment for why this reuses MACT-01's own liveness judgement
+        // rather than a second, driftable definition of "live").
+        crate::plex_control::ResolveOutcome::StaleSession => {
+            return Err(MuseError::NotFound(format!(
+                "session_key {session_key} has no play_events within the liveness grace \
+                 window; refusing to treat a stale session as live"
             )));
         }
         // Review finding (MACT-02, codex, confirmed): `session_key` and the
@@ -1782,6 +1799,20 @@ pub async fn terminate_session(
                 "session {session_key} is live but has no resolvable cast-control target"
             )));
         }
+        // Review finding, cycle 2 (codex, confirmed): a UNIQUE plex_clients
+        // match is not necessarily a CURRENT one -- rows are never pruned,
+        // so the one match found could be an obsolete client sharing a
+        // display name with whatever device the session actually plays on
+        // now. Distinct 503 from `NoTarget` (there WAS a match, just not a
+        // trustworthy one) for logs/diagnostics; the caller sees the same
+        // "nothing to relay to safely" outcome either way.
+        crate::plex_control::ResolveOutcome::StaleTarget => {
+            return Err(MuseError::ServiceUnavailable(format!(
+                "session {session_key}'s player name matches only a stale plex_clients row \
+                 (older than {}s); refusing to relay to a possibly-obsolete device",
+                state.config.terminate_target_fresh_within_secs
+            )));
+        }
         crate::plex_control::ResolveOutcome::AmbiguousTarget => {
             return Err(MuseError::Conflict(format!(
                 "more than one discovered Plex client matches session {session_key}'s player \
@@ -1793,10 +1824,16 @@ pub async fn terminate_session(
         }
     };
 
+    // Review finding (MACT-02, codex, confirmed): the module doc + HTTP
+    // reference doc both say the reason is "logged for the operator" --
+    // logging only `reason.is_some()` doesn't actually do that. Log the
+    // text itself (an empty string when none was given) alongside the
+    // boolean, so the claim in the docs matches what's on disk.
     tracing::info!(
         session_key = %session_key,
         target = %machine_identifier,
         reason_provided = reason.is_some(),
+        reason = %reason.as_deref().unwrap_or(""),
         "terminate_session: relaying stop"
     );
 
@@ -2403,7 +2440,46 @@ mod mact02_terminate_tests {
 
     /// Insert a minimal open (`stopped_at IS NULL`) `play_sessions` row for
     /// a fresh `session_key`, with the given `player` display name.
+    /// Seeds an open `play_sessions` row AND a matching, FRESH `play_events`
+    /// row (`media.play`, `received_at = now()`), so `classify_session_state`
+    /// reports `Playing` -- i.e. this session passes `resolve_live_target`'s
+    /// cycle-2 staleness check the same way `GET /api/sessions/live` would
+    /// report it `state: "playing"`. Every existing terminate test wants a
+    /// genuinely-live session by default; use [`seed_stale_live_session`]
+    /// for the dedicated staleness-refusal test.
     async fn seed_live_session(pool: &PgPool, session_key: &str, player: &str) {
+        sqlx::query(
+            "INSERT INTO play_sessions (session_key, started_at, player) \
+             VALUES ($1, now(), $2)",
+        )
+        .bind(session_key)
+        .bind(player)
+        .execute(pool)
+        .await
+        .expect("seed play_sessions row");
+
+        // `ON CONFLICT DO NOTHING`: the ambiguous-session-key test seeds two
+        // live rows sharing one `session_key`, which would otherwise collide
+        // on `play_events`'s `(source, event_type, session_key,
+        // view_offset_ms)` uniqueness. Harmless here -- that test only cares
+        // about row MULTIPLICITY (checked before staleness ever runs), not
+        // play state.
+        sqlx::query(
+            "INSERT INTO play_events (source, event_type, session_key, view_offset_ms, raw) \
+             VALUES ('plex_poll', 'media.play', $1, 0, '{}'::jsonb) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(session_key)
+        .execute(pool)
+        .await
+        .expect("seed a fresh play_events row");
+    }
+
+    /// Same as [`seed_live_session`] but with NO `play_events` row at all --
+    /// `classify_session_state` reports `Stale` (no `last_event_at` to
+    /// trust), same as a crashed player or a missed stop event MACT-01
+    /// already has to handle.
+    async fn seed_stale_live_session(pool: &PgPool, session_key: &str, player: &str) {
         sqlx::query(
             "INSERT INTO play_sessions (session_key, started_at, player) \
              VALUES ($1, now(), $2)",
@@ -2415,6 +2491,7 @@ mod mact02_terminate_tests {
         .expect("seed play_sessions row");
     }
 
+    /// `last_seen_at` defaults to `now()` (see migration 0090) -- fresh.
     async fn seed_plex_client(pool: &PgPool, machine_identifier: &str, name: &str) {
         sqlx::query(
             "INSERT INTO plex_clients (machine_identifier, name) VALUES ($1, $2)",
@@ -2424,6 +2501,21 @@ mod mact02_terminate_tests {
         .execute(pool)
         .await
         .expect("seed plex_clients row");
+    }
+
+    /// A `plex_clients` row seen a full day ago -- well outside
+    /// `Config::default().terminate_target_fresh_within_secs` (300s), for
+    /// the stale-target refusal test.
+    async fn seed_stale_plex_client(pool: &PgPool, machine_identifier: &str, name: &str) {
+        sqlx::query(
+            "INSERT INTO plex_clients (machine_identifier, name, last_seen_at) \
+             VALUES ($1, $2, now() - interval '1 day')",
+        )
+        .bind(machine_identifier)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed stale plex_clients row");
     }
 
     #[tokio::test]
@@ -2619,6 +2711,78 @@ mod mact02_terminate_tests {
         assert!(
             matches!(err, MuseError::Conflict(_)),
             "expected Conflict (409), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_session_is_404_never_stops_a_newer_session_on_the_same_device() {
+        // Cycle-2 finding, the one the reviewer most wanted fixed: an OLD
+        // stale session must not resolve a target at all, because doing so
+        // (via its player name) could stop a NEWER, genuinely-live session
+        // on that same device.
+        let Some(pool) = test_pool_or_skip(
+            "stale_session_is_404_never_stops_a_newer_session_on_the_same_device",
+        )
+        .await
+        else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("mact02-stalesession-{suffix}");
+        let player_name = format!("Den {suffix}");
+        // Deliberately the STALE seed (no play_events row) -- even though a
+        // matching, FRESH plex_clients row exists, resolution must refuse
+        // before it ever reaches target lookup.
+        seed_stale_live_session(&pool, &key, &player_name).await;
+        seed_plex_client(&pool, &format!("machine-{suffix}"), &player_name).await;
+
+        let controller = Arc::new(FakeController::new(false));
+        let state = test_state(pool, Some(controller.clone() as Arc<dyn CastController>));
+
+        let err = terminate_session(State(state), Path(key), axum::body::Bytes::new())
+            .await
+            .expect_err("a stale open session must not resolve to a stop target");
+        assert!(
+            matches!(err, MuseError::NotFound(_)),
+            "expected NotFound (404), got {err:?}"
+        );
+        assert!(
+            controller.stop_targets().is_empty(),
+            "no relay may be attempted for a stale session, ever"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_plex_client_match_is_503_never_relayed_to_an_obsolete_device() {
+        let Some(pool) = test_pool_or_skip(
+            "stale_plex_client_match_is_503_never_relayed_to_an_obsolete_device",
+        )
+        .await
+        else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("mact02-staletarget-{suffix}");
+        let player_name = format!("Loft {suffix}");
+        seed_live_session(&pool, &key, &player_name).await;
+        // The ONLY plex_clients match is a day old -- well outside
+        // Config::default()'s 300s freshness window. Unambiguous (exactly
+        // one row) but not current; must still refuse.
+        seed_stale_plex_client(&pool, &format!("machine-{suffix}"), &player_name).await;
+
+        let controller = Arc::new(FakeController::new(false));
+        let state = test_state(pool, Some(controller.clone() as Arc<dyn CastController>));
+
+        let err = terminate_session(State(state), Path(key), axum::body::Bytes::new())
+            .await
+            .expect_err("a stale-only plex_clients match must not resolve to a stop target");
+        assert!(
+            matches!(err, MuseError::ServiceUnavailable(_)),
+            "expected ServiceUnavailable (503), got {err:?}"
+        );
+        assert!(
+            controller.stop_targets().is_empty(),
+            "no relay may be attempted against an obsolete-only match, ever"
         );
     }
 

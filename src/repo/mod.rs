@@ -67,6 +67,55 @@ pub fn at_most_one<T>(mut rows: Vec<T>) -> AtMostOne<T> {
     }
 }
 
+/// Classify a resolution attempt that has a FRESHNESS requirement, not just
+/// a uniqueness one — MACT-02 (Plane MUSE #122) review finding, cycle 2:
+/// "`LIMIT 2` fixed *ambiguity*, but resolution also needs *freshness*.
+/// Uniqueness is not identity." A row set that is unambiguous under
+/// [`at_most_one`] can still be the WRONG answer if it's stale — a
+/// `plex_clients` row nobody pruned, sharing a display name with a
+/// newly-connected device the stale row's `machine_identifier` no longer
+/// belongs to. So a caller fetches only rows passing an app-defined
+/// freshness cutoff, and ALSO checks (cheaply, only when needed) whether
+/// any match exists at all regardless of freshness — this function turns
+/// those two pieces of information into one of four outcomes:
+///
+/// - `NoMatch` — nothing matched, fresh or not. Same "nothing to find"
+///   posture as [`AtMostOne::None`].
+/// - `StaleOnly` — at least one match exists, but none passed the caller's
+///   freshness cutoff. A DISTINCT refusal from `NoMatch` (there WAS
+///   something, it just isn't trustworthy right now) and from `Ambiguous`
+///   (there's no multiplicity question here — the problem is currency, not
+///   count). Never silently promoted to `Found` just because it happens to
+///   be the only stale row.
+/// - `Ambiguous` — more than one FRESH match; see [`AtMostOne::Ambiguous`].
+/// - `Found(T)` — exactly one match passed the freshness cutoff.
+///
+/// Pure and generic (no I/O, no timestamp comparison — the caller does the
+/// `last_seen_at >= cutoff` filtering in SQL and passes the already-fresh
+/// rows here), so this has fast unit coverage that runs unconditionally —
+/// see `repo::tests::classify_with_freshness_*`.
+#[derive(Debug)]
+pub enum FreshnessLookup<T> {
+    NoMatch,
+    StaleOnly,
+    Ambiguous,
+    Found(T),
+}
+
+pub fn classify_with_freshness<T>(fresh_rows: Vec<T>, any_match_exists: bool) -> FreshnessLookup<T> {
+    match at_most_one(fresh_rows) {
+        AtMostOne::One(v) => FreshnessLookup::Found(v),
+        AtMostOne::Ambiguous => FreshnessLookup::Ambiguous,
+        AtMostOne::None => {
+            if any_match_exists {
+                FreshnessLookup::StaleOnly
+            } else {
+                FreshnessLookup::NoMatch
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +141,58 @@ mod tests {
         match at_most_one(vec![only.clone()]) {
             AtMostOne::One(v) => assert_eq!(v, only),
             other => panic!("expected One(_), got {other:?}"),
+        }
+    }
+
+    // -- classify_with_freshness (MACT-02 cycle 2) -----------------------
+
+    #[test]
+    fn classify_with_freshness_no_fresh_rows_and_no_stale_ones_is_no_match() {
+        assert!(matches!(
+            classify_with_freshness::<i32>(vec![], false),
+            FreshnessLookup::NoMatch
+        ));
+    }
+
+    #[test]
+    fn classify_with_freshness_no_fresh_rows_but_a_stale_one_exists_is_stale_only() {
+        // The whole point of this cycle's fix: a match existing is NOT
+        // enough on its own -- an unambiguous but stale match must refuse,
+        // distinctly from "nothing matched at all".
+        assert!(matches!(
+            classify_with_freshness::<i32>(vec![], true),
+            FreshnessLookup::StaleOnly
+        ));
+    }
+
+    #[test]
+    fn classify_with_freshness_exactly_one_fresh_row_is_found_regardless_of_stale_flag() {
+        // `any_match_exists` only matters when there are ZERO fresh rows --
+        // it must never suppress a genuinely fresh, unambiguous match.
+        assert!(matches!(
+            classify_with_freshness(vec![42], true),
+            FreshnessLookup::Found(42)
+        ));
+        assert!(matches!(
+            classify_with_freshness(vec![42], false),
+            FreshnessLookup::Found(42)
+        ));
+    }
+
+    #[test]
+    fn classify_with_freshness_more_than_one_fresh_row_is_ambiguous() {
+        assert!(matches!(
+            classify_with_freshness(vec![1, 2], true),
+            FreshnessLookup::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn classify_with_freshness_found_preserves_the_value_unmodified() {
+        let only = "the-fresh-one".to_string();
+        match classify_with_freshness(vec![only.clone()], true) {
+            FreshnessLookup::Found(v) => assert_eq!(v, only),
+            other => panic!("expected Found(_), got {other:?}"),
         }
     }
 }

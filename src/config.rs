@@ -288,6 +288,15 @@ pub struct Config {
     /// Scratch dir for transcode output, staged before verify-and-swap.
     /// Should live on a different device from any allowed root.
     pub foundry_work_dir: Option<String>,
+    /// Wall-clock ceiling on one production encode, in seconds. Default 6h,
+    /// clamped 60s..48h. See `FoundryConfig::encode_timeout`.
+    ///
+    /// **Raise this for CPU-only 4K HDR.** Software encoding at 2-5 fps puts a
+    /// feature at an estimated 11-28 hours, well past the 6h default. The
+    /// failure mode is safe — nothing is swapped — but the title stays
+    /// perpetually skipped, and nothing in the report says the CEILING rather
+    /// than the file was the obstacle.
+    pub foundry_encode_timeout_secs: Option<u64>,
     /// The mutation kill-switch. **Defaults false**: with it closed Foundry
     /// probes, plans and reports but cannot modify a byte.
     pub foundry_enable_mutation: bool,
@@ -690,6 +699,8 @@ impl Config {
 
             foundry_allowed_roots: env_opt("MUSE_FOUNDRY_ALLOWED_ROOTS"),
             foundry_work_dir: env_opt("MUSE_FOUNDRY_WORK_DIR"),
+            foundry_encode_timeout_secs: env_opt("MUSE_FOUNDRY_ENCODE_TIMEOUT_SECS")
+                .and_then(|v| v.parse().ok()),
             foundry_enable_mutation: env_bool("MUSE_FOUNDRY_ENABLE_MUTATION", false),
             foundry_retention_days: env_opt("MUSE_FOUNDRY_RETENTION_DAYS")
                 .and_then(|v| v.parse::<u32>().ok()),
@@ -832,6 +843,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            foundry_encode_timeout_secs: None,
             database_url: None,
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             log_level: DEFAULT_LOG_LEVEL.to_string(),

@@ -1224,16 +1224,25 @@ fn run_encode_with_timeout(
                 let elapsed = start.elapsed();
                 if elapsed >= timeout {
                     let _ = child.kill();
-                    // Reap it, so the run does not accumulate zombies across
-                    // twelve files.
-                    let _ = child.wait();
+                    // `try_wait`, NEVER `wait`. A child wedged in
+                    // uninterruptible D-state on a stalled NFS read ignores
+                    // SIGKILL until its I/O returns, so a blocking `wait()`
+                    // here hangs forever — the timeout path would itself
+                    // become the hang it exists to prevent. Seen live in the
+                    // probe path (FOUNDRY-12); this is the same defect in the
+                    // encoder.
+                    //
+                    // Not reaping leaves a zombie, bounded by the number of
+                    // STALLS rather than of files. A few zombies are
+                    // survivable; a hang is not.
+                    let _ = child.try_wait();
                     return EncodeRun::TimedOut { after: elapsed };
                 }
                 std::thread::sleep(ENCODE_POLL);
             }
             Err(e) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.try_wait();
                 return EncodeRun::SpawnFailed {
                     detail: format!("waiting on ffmpeg: {e}"),
                 };

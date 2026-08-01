@@ -275,6 +275,7 @@ mod tests {
 
     fn cfg(roots: Vec<std::path::PathBuf>) -> FoundryConfig {
         FoundryConfig {
+            encode_timeout: std::time::Duration::from_secs(6 * 60 * 60),
             allowed_roots: roots,
             work_dir: None,
             enable_mutation: false,

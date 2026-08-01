@@ -51,6 +51,14 @@ const DEFAULT_HANDBRAKE_BIN: &str = "HandBrakeCLI";
 // value. The hand-written impl below prints shapes and counts, never paths.
 #[allow(dead_code)]
 pub struct FoundryConfig {
+    /// Wall-clock ceiling on ONE production encode.
+    ///
+    /// Default **6 hours**: a 4K feature is legitimately hours on a CPU, so
+    /// this never fires on honest work. It exists because the encode holds the
+    /// title's swap lock, so an ffmpeg wedged on a stalled NFS read would block
+    /// that title forever — for every future pass too, indistinguishable from
+    /// "still encoding".
+    pub(in crate::foundry) encode_timeout: std::time::Duration,
     /// Default-deny allowlist of roots Foundry may address. Empty ⇒ inert.
     pub(in crate::foundry) allowed_roots: Vec<PathBuf>,
     /// Scratch directory for transcode output, before verification and swap.
@@ -107,6 +115,16 @@ impl FoundryConfig {
     /// docs) and Foundry stays testable without touching process state.
     pub(in crate::foundry) fn from_config(cfg: &crate::config::Config) -> Self {
         Self {
+            // Generous by design: only a wedge should ever hit it.
+            // Upper clamp 48h, not 24h. Opus, FOUNDRY-13 gate: a software
+            // (CPU-only) 4K HDR encode at 2-5 fps is an estimated 11-28 hours,
+            // so a 24h ceiling could abandon legitimate work — and because the
+            // failure is safe (nothing is swapped), such a title would simply
+            // stay perpetually skipped with no signal that the CEILING, not
+            // the file, was the problem. The default stays 6h.
+            encode_timeout: std::time::Duration::from_secs(
+                cfg.foundry_encode_timeout_secs.unwrap_or(6 * 60 * 60).clamp(60, 48 * 60 * 60),
+            ),
             allowed_roots: parse_roots(cfg.foundry_allowed_roots.as_deref()),
             work_dir: cfg
                 .foundry_work_dir
@@ -481,6 +499,7 @@ mod tests {
 
     fn cfg_with(roots: Option<&str>, mutation: bool) -> FoundryConfig {
         FoundryConfig {
+            encode_timeout: std::time::Duration::from_secs(6 * 60 * 60),
             allowed_roots: parse_roots(roots),
             work_dir: None,
             enable_mutation: mutation,

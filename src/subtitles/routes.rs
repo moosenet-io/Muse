@@ -76,13 +76,58 @@ async fn media_path(state: &AppState, media_item_id: i64) -> MuseResult<std::pat
             "media item {media_item_id} has no filesystem path recorded"
         )));
     }
-    resolve_media_file(&path).ok_or_else(|| {
-        MuseError::NotFound(format!(
-            "media item {media_item_id}: no media file found at {}",
+    match resolve_media_file(&path) {
+        MediaFileResolution::Resolved(f) => Ok(f),
+        // Three DIFFERENT facts, reported as three different errors. Collapsing
+        // them into one "not found" would let "the directory could not be read"
+        // render as "this title has no media", which is the same
+        // absence-vs-ignorance confusion the subtitle tiers are careful about.
+        MediaFileResolution::NoMediaPresent => Err(MuseError::NotFound(format!(
+            "media item {media_item_id}: {} contains no media file",
             path.display()
-        ))
-    })
+        ))),
+        MediaFileResolution::Ambiguous { count } => Err(MuseError::BadRequest(format!(
+            "media item {media_item_id}: {} holds {count} comparably-sized media files, so \
+             which one this row refers to cannot be determined — a split release (CD1/CD2) or \
+             a season folder needs one row per file",
+            path.display()
+        ))),
+        MediaFileResolution::CouldNotLook { reason } => Err(MuseError::Internal(anyhow::anyhow!(
+            "media item {media_item_id}: could not inspect {} — {reason}. This is NOT a \
+             statement that the title has no media",
+            path.display()
+        ))),
+    }
 }
+
+/// What resolving an item's recorded path to a media FILE produced.
+///
+/// Four outcomes rather than `Option`, because "found nothing" and "could not
+/// look" are different facts and the caller must be able to say which. An
+/// earlier version returned `Option` and the read collapsed a permission error
+/// into "contains no media file" — asserting an absence that was never
+/// observed. Raised by codex, opus and free at the SUBS-05 gate.
+#[derive(Debug, PartialEq)]
+pub enum MediaFileResolution {
+    Resolved(std::path::PathBuf),
+    /// The directory was read successfully and holds no media file.
+    NoMediaPresent,
+    /// Several media files of comparable size. A release folder normally holds
+    /// one feature plus much smaller extras; comparable sizes mean a split
+    /// release or a season folder, and picking the largest would silently make
+    /// one episode stand in for the row.
+    Ambiguous { count: usize },
+    /// The path could not be inspected at all.
+    CouldNotLook { reason: String },
+}
+
+/// Fraction of the largest file's size at which a second file makes the choice
+/// ambiguous.
+///
+/// A sample or trailer is a few percent of a feature; the two halves of a split
+/// rip, or two episodes in one folder, are within a factor of two. Half is
+/// comfortably between them.
+const AMBIGUITY_RATIO: f64 = 0.5;
 
 /// Resolve an item's recorded path to the actual media FILE.
 ///
@@ -93,37 +138,72 @@ async fn media_path(state: &AppState, media_item_id: i64) -> MuseResult<std::pat
 /// for the whole library. The failure was invisible in tests because every
 /// fixture used a file path.
 ///
-/// Picks the LARGEST media file in the folder. Release folders routinely carry
-/// a sample or a trailer alongside the feature, and "largest" separates them
-/// reliably where "first alphabetically" does not. Non-recursive: a season
+/// Picks the largest media file, and REFUSES when a second is comparable in
+/// size — see [`MediaFileResolution::Ambiguous`]. Non-recursive: a season
 /// folder's episodes are separate items with their own rows, and descending
-/// would make one episode's subtitles stand in for the season's.
+/// would make one episode's subtitles stand in for the season.
+///
+/// Does not attempt VIDEO_TS/BDMV or `.iso` layouts. Those are not "a file with
+/// subtitle streams" in the sense the rest of this module means, and guessing
+/// at one would be worse than declining.
 ///
 /// A path that is already a file is returned unchanged, so this is correct for
 /// both layouts.
-fn resolve_media_file(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    if path.is_file() {
-        return Some(path.to_path_buf());
-    }
-    if !path.is_dir() {
-        return None;
-    }
-    let mut best: Option<(u64, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(path).ok()? {
-        let Ok(entry) = entry else { continue };
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
+pub fn resolve_media_file(path: &std::path::Path) -> MediaFileResolution {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => return MediaFileResolution::Resolved(path.to_path_buf()),
+        Ok(m) if !m.is_dir() => {
+            return MediaFileResolution::CouldNotLook {
+                reason: "path is neither a file nor a directory".to_string(),
+            }
         }
+        Ok(_) => {}
+        Err(e) => return MediaFileResolution::CouldNotLook { reason: e.to_string() },
+    }
+
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => return MediaFileResolution::CouldNotLook { reason: e.to_string() },
+    };
+
+    let mut sized: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            // One unreadable entry is not the whole directory failing, but it
+            // is also not nothing: the file it names might be the feature.
+            Err(e) => return MediaFileResolution::CouldNotLook { reason: e.to_string() },
+        };
+        let p = entry.path();
         if !crate::library::scan::has_media_extension(&p) {
             continue;
         }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if best.as_ref().is_none_or(|(b, _)| size > *b) {
-            best = Some((size, p));
+        match entry.metadata() {
+            Ok(m) if m.is_file() => sized.push((m.len(), p)),
+            Ok(_) => {}
+            // NOT size 0 — that would rank an unmeasurable file last and let a
+            // smaller one win. If a candidate cannot be measured, the
+            // comparison cannot be made.
+            Err(e) => {
+                return MediaFileResolution::CouldNotLook {
+                    reason: format!("{}: {e}", p.display()),
+                }
+            }
         }
     }
-    best.map(|(_, p)| p)
+
+    sized.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    match sized.as_slice() {
+        [] => MediaFileResolution::NoMediaPresent,
+        [(_, only)] => MediaFileResolution::Resolved(only.clone()),
+        [(big, first), (second, _), ..] => {
+            if *big > 0 && (*second as f64) >= (*big as f64) * AMBIGUITY_RATIO {
+                MediaFileResolution::Ambiguous { count: sized.len() }
+            } else {
+                MediaFileResolution::Resolved(first.clone())
+            }
+        }
+    }
 }
 
 /// Probe a media file through Foundry's path guard.
@@ -692,7 +772,7 @@ mod tests {
 
 #[cfg(test)]
 mod media_file_resolution_tests {
-    use super::resolve_media_file;
+    use super::{resolve_media_file, MediaFileResolution};
     use std::fs;
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -706,74 +786,129 @@ mod media_file_resolution_tests {
         fs::write(p, vec![b'x'; bytes]).expect("write fixture");
     }
 
-    /// The bug this fixes: every `media_items.path` in this library is the
-    /// release DIRECTORY, and SUBS-01 handed it straight to ffprobe, which
-    /// exits 1 on a directory. The whole embedded tier reported "unreadable"
-    /// for all 1892 items, and no test caught it because every fixture was a
-    /// file path.
+    fn resolved(r: MediaFileResolution) -> std::path::PathBuf {
+        match r {
+            MediaFileResolution::Resolved(p) => p,
+            other => panic!("expected a resolved file, got {other:?}"),
+        }
+    }
+
+    /// The bug this fixes: every `media_items.path` is the release DIRECTORY,
+    /// and SUBS-01 handed it straight to ffprobe, which exits 1 on a directory.
+    /// The whole embedded tier reported "unreadable" for all 1892 items, and no
+    /// test caught it because every fixture used a file path.
+    ///
+    /// The artwork here is deliberately LARGER than the feature. Opus caught
+    /// the first version at the gate: with the .avi also the largest file, the
+    /// test passed whether or not the extension filter existed, so it did not
+    /// test the thing its name claims.
     #[test]
-    fn a_release_directory_resolves_to_the_feature_file() {
+    fn a_release_directory_resolves_to_the_feature_file_not_the_artwork() {
         let d = tmp("dir");
-        write(&d.join("1984.avi"), 5000);
-        write(&d.join("1984.jpg"), 100); // artwork, not media
-        write(&d.join("!!!READ_ME.txt"), 50);
-        assert_eq!(resolve_media_file(&d), Some(d.join("1984.avi")));
+        write(&d.join("1984.avi"), 5_000);
+        write(&d.join("fanart.jpg"), 50_000);
+        write(&d.join("!!!READ_ME.txt"), 90_000);
+        assert_eq!(resolved(resolve_media_file(&d)), d.join("1984.avi"));
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// Release folders routinely ship a sample alongside the feature. Picking
-    /// the first entry alphabetically would select "sample.mkv" over
-    /// "The.Movie.mkv"; size separates them reliably.
+    /// Release folders ship a sample beside the feature.
+    ///
+    /// The sample is named to sort BEFORE the feature — codex caught the first
+    /// version, where `The.Movie.mkv` sorted before lowercase `sample.mkv` in
+    /// byte order, so a lexicographic-first implementation passed too.
     #[test]
-    fn the_largest_media_file_wins_over_a_sample() {
+    fn the_largest_media_file_wins_over_a_sample_that_sorts_first() {
         let d = tmp("sample");
-        write(&d.join("sample.mkv"), 100);
+        write(&d.join("AAA-sample.mkv"), 1_000);
         write(&d.join("The.Movie.2020.mkv"), 900_000);
-        assert_eq!(resolve_media_file(&d), Some(d.join("The.Movie.2020.mkv")));
+        assert_eq!(
+            resolved(resolve_media_file(&d)),
+            d.join("The.Movie.2020.mkv"),
+            "must pick by SIZE, not by name order"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// A path that is already a file must pass through unchanged, so this is
-    /// correct for both layouts rather than only the one this library uses.
+    /// A season folder of sibling episodes, or a CD1/CD2 split, has no single
+    /// feature. Picking the largest would silently make one episode stand in
+    /// for the whole row.
+    #[test]
+    fn comparably_sized_media_files_are_ambiguous_rather_than_guessed_at() {
+        let d = tmp("ambig");
+        write(&d.join("S01E01.mkv"), 500_000);
+        write(&d.join("S01E02.mkv"), 480_000);
+        assert_eq!(
+            resolve_media_file(&d),
+            MediaFileResolution::Ambiguous { count: 2 },
+            "two comparable files must refuse, not pick one"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn a_file_path_is_returned_unchanged() {
         let d = tmp("file");
         let f = d.join("movie.mkv");
         write(&f, 10);
-        assert_eq!(resolve_media_file(&f), Some(f.clone()));
+        assert_eq!(resolved(resolve_media_file(&f)), f);
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// A folder with no media at all is None, not an arbitrary file — probing
-    /// a .txt would report "unreadable" and read as "this title has no
-    /// subtitles", which is the confusion the tri-state reporting exists to
-    /// prevent.
+    /// "Looked and found none" — distinct from "could not look".
     #[test]
-    fn a_directory_with_no_media_resolves_to_nothing() {
+    fn a_directory_with_no_media_reports_absence_not_failure() {
         let d = tmp("nomedia");
         write(&d.join("readme.txt"), 10);
         write(&d.join("poster.jpg"), 10);
-        assert_eq!(resolve_media_file(&d), None);
+        assert_eq!(resolve_media_file(&d), MediaFileResolution::NoMediaPresent);
         let _ = fs::remove_dir_all(&d);
     }
 
     /// Non-recursive on purpose: a season folder's episodes are separate items
-    /// with their own rows, and descending would let one episode's subtitles
-    /// stand in for the whole season.
+    /// with their own rows.
     #[test]
     fn resolution_does_not_descend_into_subdirectories() {
         let d = tmp("nested");
         fs::create_dir_all(d.join("Season 01")).expect("subdir");
         write(&d.join("Season 01").join("S01E01.mkv"), 900_000);
-        assert_eq!(resolve_media_file(&d), None);
+        assert_eq!(resolve_media_file(&d), MediaFileResolution::NoMediaPresent);
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// The tri-state rule: a path that cannot be inspected must NOT report as
+    /// an absence. Both opus and free raised this at the SUBS-05 gate — the
+    /// first version collapsed every filesystem error into `None`, which the
+    /// caller then rendered as "contains no media file", asserting something
+    /// it had never observed.
     #[test]
-    fn a_nonexistent_path_resolves_to_nothing() {
-        assert_eq!(
-            resolve_media_file(std::path::Path::new("/nonexistent-muse-subs05")),
-            None
+    fn a_path_that_cannot_be_inspected_is_not_reported_as_an_absence() {
+        let r = resolve_media_file(std::path::Path::new("/nonexistent-muse-subs05"));
+        assert!(
+            matches!(r, MediaFileResolution::CouldNotLook { .. }),
+            "expected CouldNotLook, got {r:?}"
+        );
+        assert_ne!(r, MediaFileResolution::NoMediaPresent);
+    }
+
+    /// An unreadable DIRECTORY (mode 000) is the case the criteria named
+    /// explicitly. Skipped when running as root, which can read it anyway.
+    #[test]
+    fn an_unreadable_directory_is_not_reported_as_an_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("noperm");
+        write(&d.join("movie.mkv"), 100);
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).expect("chmod");
+        let r = resolve_media_file(&d);
+        let readable_anyway = matches!(r, MediaFileResolution::Resolved(_));
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).expect("restore");
+        let _ = fs::remove_dir_all(&d);
+        if readable_anyway {
+            return; // running as root; the permission bit does not apply
+        }
+        assert!(
+            matches!(r, MediaFileResolution::CouldNotLook { .. }),
+            "expected CouldNotLook, got {r:?}"
         );
     }
 }

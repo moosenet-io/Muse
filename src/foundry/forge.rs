@@ -2784,6 +2784,34 @@ mod tests {
     /// A timeout must say that nothing was swapped. An operator reading
     /// "ffmpeg timed out" needs to know the library is untouched, not wonder
     /// whether a half-written file replaced their title.
+    /// The staged file must be discarded on EVERY path, timeout included.
+    ///
+    /// Both reviewers raised this at the gate, reading only the encode call
+    /// site — where it does look unhandled. It is not: `discard_staged` runs
+    /// unconditionally after `run_encode_and_swap` returns, on success and on
+    /// every error. Pinned here so it stays that way, because the leak it
+    /// prevents is the kind nobody notices: one full-size encode per file
+    /// until the scratch filesystem fills, which then presents as unrelated
+    /// encode failures.
+    #[test]
+    fn the_staged_file_is_discarded_on_every_path_including_a_timeout() {
+        let body = include_str!("forge.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        let call = body
+            .find("discard_staged(&staged);")
+            .expect("the staged file must be discarded");
+        let matched = body
+            .find("match result {")
+            .expect("the result is matched after the encode");
+        assert!(
+            call < matched,
+            "discard_staged must run BEFORE the result is matched, so it happens on the \
+             error paths too — not only on success"
+        );
+    }
+
     #[test]
     fn an_encode_timeout_says_the_original_is_untouched() {
         // The NON-TEST body only. Searching the whole file matches this
@@ -2812,8 +2840,8 @@ mod tests {
         absurd.foundry_encode_timeout_secs = Some(u64::MAX);
         assert_eq!(
             FoundryConfig::from_config(&absurd).encode_timeout,
-            std::time::Duration::from_secs(24 * 60 * 60),
-            "clamped to a day"
+            std::time::Duration::from_secs(48 * 60 * 60),
+            "clamped to 48h — CPU-only 4K HDR can legitimately run past a day"
         );
 
         let mut zero = crate::config::Config::default();

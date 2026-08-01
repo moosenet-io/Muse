@@ -289,7 +289,13 @@ pub struct Config {
     /// Should live on a different device from any allowed root.
     pub foundry_work_dir: Option<String>,
     /// Wall-clock ceiling on one production encode, in seconds. Default 6h,
-    /// clamped 60s..24h. See `FoundryConfig::encode_timeout`.
+    /// clamped 60s..48h. See `FoundryConfig::encode_timeout`.
+    ///
+    /// **Raise this for CPU-only 4K HDR.** Software encoding at 2-5 fps puts a
+    /// feature at an estimated 11-28 hours, well past the 6h default. The
+    /// failure mode is safe — nothing is swapped — but the title stays
+    /// perpetually skipped, and nothing in the report says the CEILING rather
+    /// than the file was the obstacle.
     pub foundry_encode_timeout_secs: Option<u64>,
     /// The mutation kill-switch. **Defaults false**: with it closed Foundry
     /// probes, plans and reports but cannot modify a byte.

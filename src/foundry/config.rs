@@ -116,8 +116,14 @@ impl FoundryConfig {
     pub(in crate::foundry) fn from_config(cfg: &crate::config::Config) -> Self {
         Self {
             // Generous by design: only a wedge should ever hit it.
+            // Upper clamp 48h, not 24h. Opus, FOUNDRY-13 gate: a software
+            // (CPU-only) 4K HDR encode at 2-5 fps is an estimated 11-28 hours,
+            // so a 24h ceiling could abandon legitimate work — and because the
+            // failure is safe (nothing is swapped), such a title would simply
+            // stay perpetually skipped with no signal that the CEILING, not
+            // the file, was the problem. The default stays 6h.
             encode_timeout: std::time::Duration::from_secs(
-                cfg.foundry_encode_timeout_secs.unwrap_or(6 * 60 * 60).clamp(60, 24 * 60 * 60),
+                cfg.foundry_encode_timeout_secs.unwrap_or(6 * 60 * 60).clamp(60, 48 * 60 * 60),
             ),
             allowed_roots: parse_roots(cfg.foundry_allowed_roots.as_deref()),
             work_dir: cfg

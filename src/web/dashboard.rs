@@ -144,6 +144,8 @@ fn kind_str(kind: MediaKind) -> &'static str {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LibraryQuery {
     pub limit: Option<i64>,
+    /// MUSE #112: `movie` or `show` (aliases: movies/shows/series/tv). Absent = every kind.
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,10 +191,28 @@ pub struct LibraryGridResponse {
 pub async fn get_library(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LibraryQuery>,
-) -> Json<LibraryGridResponse> {
-    let limit = q.limit.unwrap_or(DEFAULT_GRID_LIMIT).clamp(1, 1000);
+) -> MuseResult<Json<LibraryGridResponse>> {
+    // MUSE #112: raised 1000 -> 5000, matching the table endpoint. The operator's library is
+    // 1892 owned titles, so the old cap could not return it however large a limit was asked
+    // for — the page showed a slice and reported it as loaded.
+    let limit = q.limit.unwrap_or(DEFAULT_GRID_LIMIT).clamp(1, 5000);
+    // `movie` / `show` (the DB vocabulary). Anything else is rejected rather than silently
+    // ignored: quietly serving a MIXED library to a page that asked for one kind is the kind of
+    // false answer this codebase keeps having to remove.
+    let kind = match q.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(k) => match k.to_ascii_lowercase().as_str() {
+            "movie" | "movies" => Some("movie"),
+            "show" | "shows" | "series" | "tv" => Some("show"),
+            other => {
+                return Err(MuseError::BadRequest(format!(
+                    "unknown kind {other:?}; expected movie or show"
+                )))
+            }
+        },
+    };
 
-    let owned_rows = repo::dashboard::library_grid(&state.pool, limit)
+    let owned_rows = repo::dashboard::library_grid(&state.pool, limit, kind)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "get_library: owned grid query failed; serving empty");
@@ -241,11 +261,11 @@ pub async fn get_library(
         })
         .collect();
 
-    Json(LibraryGridResponse {
+    Ok(Json(LibraryGridResponse {
         owned,
         wanted,
         counts,
-    })
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1526,5 +1546,42 @@ mod discover_capability_tests {
         // configuring at all, the other needs an API KEY adding to a working client.
         assert_eq!(trending_capability(false, false), TrendingCapability::NotConfigured);
         assert_eq!(trending_capability(false, true), TrendingCapability::NotConfigured);
+    }
+}
+
+#[cfg(test)]
+mod library_kind_tests {
+    /// The accepted spellings for `?kind=`, mirroring the handler's match arms.
+    ///
+    /// MUSE #112. Rejecting an unknown kind matters more than it looks: quietly ignoring it
+    /// would serve a MIXED library to a page that asked for one kind, and the page would
+    /// present it as "all your movies". Serving the wrong set under a confident label is the
+    /// failure mode this codebase keeps having to remove — a 400 is the honest answer.
+    fn normalize(k: &str) -> Option<&'static str> {
+        match k.trim().to_ascii_lowercase().as_str() {
+            "movie" | "movies" => Some("movie"),
+            "show" | "shows" | "series" | "tv" => Some("show"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn both_vocabularies_are_accepted_and_map_to_the_db_spelling() {
+        // The DB enum says `show`; the GUI, the ecosystem and the operator all say "series"
+        // or "TV". Callers should not have to guess which one this endpoint wants.
+        for k in ["movie", "Movies", " MOVIE "] {
+            assert_eq!(normalize(k), Some("movie"), "{k}");
+        }
+        for k in ["show", "shows", "series", "tv", "TV"] {
+            assert_eq!(normalize(k), Some("show"), "{k}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_rejected_rather_than_ignored() {
+        // NOT None-meaning-all. The handler turns this into a 400.
+        assert_eq!(normalize("anime"), None);
+        assert_eq!(normalize("documentary"), None);
+        assert_eq!(normalize("movie;drop"), None);
     }
 }

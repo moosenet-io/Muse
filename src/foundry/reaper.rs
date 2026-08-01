@@ -372,18 +372,37 @@ pub fn decide_one(
 ///
 /// `Ok(None)` means no lock was needed (no work dir, so forge cannot swap).
 /// `Err(())` means a swap holds it.
-#[allow(clippy::result_unit_err)]
 pub fn acquire_title_lock(
     lock_dir: Option<&Path>,
     superseded: &Path,
-) -> Result<Option<crate::foundry::forge::SwapLock>, ()> {
+) -> Result<Option<crate::foundry::forge::SwapLock>, LockRefusal> {
     let (Some(dir), Some(target)) = (lock_dir, replacement_of(superseded)) else {
         return Ok(None);
     };
     match crate::foundry::forge::SwapLock::acquire(dir, &target) {
         Ok(l) => Ok(Some(l)),
-        Err(_) => Err(()),
+        // Contention and a BROKEN lock are different facts. Mapping both to
+        // "a swap is in flight" would report an unusable lock directory as
+        // ordinary busyness, and the operator would wait for a swap that is
+        // not happening. Opus, FOUNDRY-12 gate.
+        Err(e) => Err(match e {
+            crate::foundry::forge::SwapError::LockBusy(_) => LockRefusal::Contended,
+            other => LockRefusal::Unusable {
+                detail: other.to_string(),
+            },
+        }),
     }
+}
+
+/// Why the title lock could not be taken.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockRefusal {
+    /// A swap holds it. Ordinary; retry later.
+    Contended,
+    /// The lock itself could not be used. NOT contention — this must not be
+    /// reported as "a swap is in flight", or the operator waits for something
+    /// that is not happening.
+    Unusable { detail: String },
 }
 
 /// Re-verify, then unlink. **The only deletion in Muse.**
@@ -480,9 +499,14 @@ pub fn reap(foundry: &Foundry, retention: Duration, mutate: bool) -> ReapRun {
             // `Movie.mkv.muse-superseded` has stem `Movie.mkv`. Two different
             // keys means no exclusion at all. Caught by the test below, which
             // failed on the first attempt.
+            // `_lock`, not `_`: a `let _ = ...` binding drops immediately, so
+            // the guard would be released before the decide+delete it exists
+            // to protect. The underscore-prefixed NAME keeps it alive to the
+            // end of the loop body. Subtle enough that a source-level test
+            // below asserts it.
             let _lock = match acquire_title_lock(lock_dir.as_deref(), &superseded) {
                 Ok(l) => l,
-                Err(()) => {
+                Err(refusal) => {
                     run.files.push(ReapedFile {
                         superseded_path: superseded.display().to_string(),
                         replacement_path: replacement_of(&superseded)
@@ -584,7 +608,7 @@ mod tests {
     /// `Movie.mkv` must also exclude a reap of `Movie.mkv.muse-superseded`.
     /// That shared-stem behaviour is the property under test.
     #[test]
-    fn a_swap_holding_the_lock_excludes_a_reap_of_the_same_title() {
+    fn the_swap_lock_key_is_the_live_name_not_the_backups_own_path() {
         use crate::foundry::forge::SwapLock;
         let work = tmp("lockwork");
         let lib = tmp("locklib");
@@ -657,6 +681,55 @@ mod tests {
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&lib);
+    }
+
+    /// A broken lock is not a busy lock.
+    ///
+    /// Mapping both to "a swap is in flight" would report an unusable lock
+    /// directory as ordinary busyness, and the operator would wait for a swap
+    /// that is not happening. Opus, FOUNDRY-12 gate.
+    #[test]
+    fn an_unusable_lock_is_not_reported_as_a_swap_in_flight() {
+        let contended = LockRefusal::Contended;
+        let broken = LockRefusal::Unusable {
+            detail: "permission denied creating the lock directory".to_string(),
+        };
+        assert_ne!(contended, broken);
+
+        // The mapping the reap loop performs, asserted directly.
+        let as_outcome = |r: LockRefusal| match r {
+            LockRefusal::Contended => ReapOutcome::SwapInFlight,
+            LockRefusal::Unusable { detail } => ReapOutcome::CouldNotInspect { detail },
+        };
+        assert_eq!(as_outcome(contended), ReapOutcome::SwapInFlight);
+        assert!(
+            matches!(as_outcome(broken), ReapOutcome::CouldNotInspect { .. }),
+            "a broken lock must not read as a swap being in progress"
+        );
+    }
+
+    /// The lock must live across the WHOLE decide+delete, not be dropped at
+    /// the end of its own statement.
+    ///
+    /// `let _lock = ...` keeps the guard to the end of scope; `let _ = ...`
+    /// drops it IMMEDIATELY, releasing the lock before the work it protects.
+    /// The two differ by three characters and behave completely differently,
+    /// and no runtime test in this module can see it because `reap` needs a
+    /// live Foundry. Opus flagged the gap at the FOUNDRY-12 gate; this is a
+    /// source-level assertion because that is what can actually catch it.
+    #[test]
+    fn the_title_lock_is_bound_to_a_name_so_it_outlives_the_statement() {
+        let src = include_str!("reaper.rs");
+        let body = src.split("#[cfg(test)]").next().expect("a non-test body");
+        assert!(
+            body.contains("let _lock = match acquire_title_lock("),
+            "the lock must be bound to a NAMED binding; `let _ = ...` would release it \
+             immediately and the reap would run unprotected"
+        );
+        assert!(
+            !body.contains("let _ = acquire_title_lock("),
+            "an anonymous binding drops the guard at once — the lock would protect nothing"
+        );
     }
 
     /// Symlinks are never followed, and never collected.

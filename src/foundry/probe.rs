@@ -465,13 +465,23 @@ pub fn spawn_with_timeout(
                         break status;
                     }
                     let _ = child.kill();
-                    // Best-effort reap. A child in uninterruptible D-state
-                    // ignores SIGKILL until its I/O returns, so this may not
-                    // succeed and the process may linger for the run's
-                    // lifetime — bounded by the number of stalls, not by the
-                    // number of files. The point is not that the child dies;
-                    // it is that WE stop waiting on it.
-                    let _ = child.wait();
+                    // `try_wait`, NEVER `wait`. A child in uninterruptible
+                    // D-state ignores SIGKILL until its I/O returns, so a
+                    // blocking `wait()` here hangs forever — which would make
+                    // the timeout path itself hang and defeat the entire
+                    // purpose of this function. An earlier revision of this
+                    // code did exactly that.
+                    //
+                    // The consequence of not reaping is a zombie for the run's
+                    // lifetime, bounded by the number of STALLS rather than by
+                    // the number of files. That is the correct trade: a
+                    // handful of zombies is survivable, a hang is not.
+                    let _ = child.try_wait();
+                    // The reader threads are deliberately abandoned too. They
+                    // are blocked in `read` on the wedged child's pipes and
+                    // cannot be interrupted; joining them would block for the
+                    // same reason. They exit on their own if the child's I/O
+                    // ever returns.
                     return Err(ProbeError::Timeout { secs: timeout.as_secs() });
                 }
                 std::thread::sleep(Duration::from_millis(25));

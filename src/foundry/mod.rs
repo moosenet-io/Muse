@@ -55,6 +55,7 @@ pub mod ladder;
 pub mod paths;
 pub mod rendition;
 pub mod survey;
+pub mod validate;
 pub mod plan;
 pub mod policy;
 pub mod probe;

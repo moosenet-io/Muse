@@ -17,7 +17,7 @@
 //! Both default to the safe value: an operator who sets nothing gets a Foundry
 //! that does not exist, not a Foundry pointed at their library.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::foundry::paths::PathGuard;
 
@@ -250,10 +250,40 @@ impl FoundryConfig {
     /// Reported as warnings while mutation is closed and as fatal errors once
     /// it is open — see [`FoundryConfig::fatal_errors`].
     fn rail3_problems(&self) -> Vec<String> {
+        match &self.work_dir {
+            Some(work) => self.rail3_problems_for("MUSE_FOUNDRY_WORK_DIR", work),
+            None => Vec::new(),
+        }
+    }
+
+    /// The configured work dir, for FOUNDRY-04's validation harness to base its
+    /// scratch directory on.
+    ///
+    /// A distinct accessor rather than making the field visible: the harness
+    /// needs the *location*, and nothing else about the config's mutation
+    /// posture. Named for its caller so a future reader knows why a read-only
+    /// path exists to a field the swap owns.
+    pub(in crate::foundry) fn work_dir_for_validation(&self) -> Option<PathBuf> {
+        self.work_dir.clone()
+    }
+
+    /// Rail-3 problems for an arbitrary scratch directory.
+    ///
+    /// FOUNDRY-04 writes real encodes to scratch while the mutation gate is
+    /// CLOSED, which [`FoundryConfig::fatal_errors`] deliberately treats as
+    /// harmless — because for the *swap* it is (nothing is staged while the gate
+    /// is shut). The validation harness breaks that assumption: it stages for
+    /// real regardless of the gate, so it re-runs this check itself and refuses
+    /// on any problem. Exposed here, against the same code the startup check
+    /// uses, so the two can never drift into disagreeing about what rail 3 means.
+    pub(in crate::foundry) fn scratch_rail3_problems(&self, dir: &Path) -> Vec<String> {
+        self.rail3_problems_for("the Foundry validation scratch directory", dir)
+    }
+
+    /// The shared implementation. `label` names the setting in the message, so
+    /// the operator is told which knob to change.
+    fn rail3_problems_for(&self, label: &str, work: &Path) -> Vec<String> {
         let mut out = Vec::new();
-        let Some(work) = &self.work_dir else {
-            return out;
-        };
 
         // A scratch dir very often does not exist yet at startup. Statting it
         // directly would return None and silently skip the whole check (S128
@@ -280,7 +310,7 @@ impl FoundryConfig {
                         .or_else(|| nearest_existing_ancestor(root));
                     if root_anchor.as_deref().and_then(device_of) == Some(work_dev) {
                         out.push(format!(
-                            "MUSE_FOUNDRY_WORK_DIR ({}) is on the same filesystem as the \
+                            "{label} ({}) is on the same filesystem as the \
                              allowed root {} — a failed swap could consume the library's \
                              own free space; put the work dir on a different device",
                             work.display(),
@@ -294,7 +324,7 @@ impl FoundryConfig {
                 // cannot assert rail 3 holds, and this list is consulted as
                 // fatal_errors() when mutation is enabled.
                 out.push(format!(
-                    "MUSE_FOUNDRY_WORK_DIR ({}) has no resolvable existing ancestor, so \
+                    "{label} ({}) has no resolvable existing ancestor, so \
                      its filesystem cannot be determined and the never-in-place rail \
                      cannot be verified",
                     work.display()
@@ -318,7 +348,7 @@ impl FoundryConfig {
             };
             if inside {
                 out.push(format!(
-                    "MUSE_FOUNDRY_WORK_DIR ({}) is inside the allowed root {} — \
+                    "{label} ({}) is inside the allowed root {} — \
                      scratch output would appear in the library",
                     work.display(),
                     root.display()

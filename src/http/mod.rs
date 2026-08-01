@@ -235,6 +235,11 @@ fn ops_routes() -> Router<Arc<AppState>> {
         .route("/library/scan", post(crate::web::dashboard::trigger_library_scan))
         // FOUNDRY-02: report what transcoding WOULD do. Encodes nothing, writes nothing.
         .route("/foundry/survey", post(crate::web::dashboard::foundry_survey))
+        // FOUNDRY-04: really encode a diverse sample TO SCRATCH and verify it.
+        // Writes only inside the Foundry work dir; never renames, replaces or
+        // deletes anything in the library. This is a LONG call — up to 24 real
+        // encodes, 20 minutes each, 60 minutes for the whole run.
+        .route("/foundry/validate", post(crate::web::dashboard::foundry_validate))
 }
 
 /// MUSE-28/29: the linear tuner surface — HDHomeRun-emulation discovery

@@ -1671,3 +1671,203 @@ pub async fn foundry_survey(
         })).collect::<Vec<_>>(),
     })))
 }
+
+// ===========================================================================
+// FOUNDRY-04: transcode validation (real encodes, to scratch, never in place)
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ValidateQuery {
+    /// How many files to actually encode. Default 12 — the operator's own
+    /// number ("a dozen types of files"). Clamped to 1..=24: every one of these
+    /// is a real encode with a 20-minute ceiling, so an unbounded limit is an
+    /// unbounded run.
+    pub limit: Option<usize>,
+    /// How many candidates to probe when choosing the sample. Default 400 —
+    /// the size of the operator's own measured container survey. More probes
+    /// means more distinct shapes to choose between; it costs one ffprobe each.
+    pub probe_budget: Option<usize>,
+}
+
+/// `POST /ops/foundry/validate` — really encode a diverse sample to scratch,
+/// verify the outputs with forge's own rules, and report. **Never touches an
+/// original.**
+///
+/// This is the evidence step between FOUNDRY-02's survey (which plans and
+/// encodes nothing) and enabling destructive mutation. It does not call
+/// `forge::optimize_file`, does not read `MUSE_FOUNDRY_ENABLE_MUTATION`, and
+/// writes only inside a scratch directory that is re-checked against safety
+/// rail 3 before the run starts. See [`crate::foundry::validate`].
+///
+/// **This is a long call.** Up to `limit` real encodes, each capped at 20
+/// minutes, with a 60-minute ceiling on the whole run. It is dispatched onto a
+/// blocking thread so the encodes do not occupy an async worker for an hour.
+pub async fn foundry_validate(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ValidateQuery>,
+) -> MuseResult<Json<Value>> {
+    // Stated on EVERY response, including refusals. Codex, FOUNDRY-04 gate: the
+    // >2 GiB exclusion was disclosed only when a run succeeded, so a refusal
+    // read as "nothing to report" when it actually meant the 4K/HDR/DV tail was
+    // never going to be covered either way.
+    const COVERAGE_NOTE: &str = "files above max_input_bytes (2 GiB) are SKIPPED, never \
+         validated — that exclusion covers most of the 4K/HDR/DV tail, which is \
+         therefore NOT validated by this harness";
+
+
+    use crate::foundry::validate;
+
+    let Some(foundry) = crate::foundry::Foundry::from_config(&state.config) else {
+        // Not an empty run. "Foundry is not configured" and "nothing failed"
+        // are different facts, and a zero-count report would read as the second.
+        return Ok(Json(json!({
+            "ran": false,
+            "coverage": COVERAGE_NOTE,
+            "reason": "foundry is not configured (MUSE_FOUNDRY_* unset) — nothing was validated",
+        })));
+    };
+
+    let caps = foundry.capabilities();
+    if !caps.can_transcode() {
+        // Both tools, not just ffmpeg: without ffprobe an output could be
+        // produced and never verified, and an unverified success is a failure.
+        return Ok(Json(json!({
+            "ran": false,
+            "coverage": COVERAGE_NOTE,
+            "reason": "ffmpeg and ffprobe must both be usable to validate an encode",
+            "capabilities": {
+                "ffprobe": caps.ffprobe.summary(),
+                "ffmpeg": caps.ffmpeg.summary(),
+            },
+        })));
+    }
+
+    let Some(root) = state.config.library_root.clone() else {
+        return Ok(Json(json!({
+            "ran": false,
+            "coverage": COVERAGE_NOTE,
+            "reason": "MUSE_LIBRARY_ROOT is not set — there is nothing to validate",
+        })));
+    };
+
+    let limit = q.limit.unwrap_or(12).clamp(1, 24);
+    let probe_budget = q.probe_budget.unwrap_or(400).clamp(limit, 4000);
+
+    // Every encode and every probe below is blocking, and the run can take an
+    // hour. Off the async executor it goes.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let scratch = validate::prepare_scratch_dir(&foundry)?;
+
+        // The budget is accounting; this is the disk. A run admitted on
+        // accounting alone can still fill the filesystem partway through, and
+        // on this fleet a full scratch filesystem presents as unrelated
+        // failures rather than as an obvious disk error. Raised at the
+        // FOUNDRY-04 review gate.
+        let bounds_for_space = validate::ValidationBounds::default();
+        validate::check_free_space(&scratch, bounds_for_space.max_total_output_bytes)?;
+
+        let candidates: Vec<std::path::PathBuf> =
+            crate::library::scan::walk_media_files(std::path::Path::new(&root))
+                .into_iter()
+                .map(|f| f.absolute_path)
+                .collect();
+        let candidate_count = candidates.len();
+
+        let (probed, probe_failures) =
+            validate::probe_candidates(&foundry, &candidates, probe_budget);
+
+        let policy = crate::foundry::policy::TranscodePolicy::default();
+        let bounds = validate::ValidationBounds::default();
+        let run = validate::validate_sample(
+            &foundry,
+            &policy,
+            &scratch,
+            &probed,
+            probe_failures,
+            limit,
+            &bounds,
+        );
+        Ok::<_, validate::ValidationRefusal>((run, bounds, candidate_count))
+    })
+    .await
+    .map_err(|e| MuseError::Internal(anyhow::anyhow!("the validation run panicked or was cancelled: {e}")))?;
+
+    let (run, bounds, candidate_count) = match outcome {
+        Ok(v) => v,
+        Err(refusal) => {
+            return Ok(Json(json!({
+                "ran": false,
+            "coverage": COVERAGE_NOTE,
+                "reason": refusal.to_string(),
+            })))
+        }
+    };
+
+    let verdict = run.verdict();
+    Ok(Json(json!({
+        "ran": true,
+        // Stated on every response, not just in the docs: this endpoint writes
+        // only to scratch and the operator should be able to see that claim
+        // next to the numbers it is asking them to trust.
+        "originals_modified": 0,
+        "mutation_used": false,
+        "candidates_found": candidate_count,
+        "candidates_probed": run.candidates_probed,
+        "source_probe_failures": run.source_probe_failures,
+        "distinct_shapes_available": run.distinct_shapes,
+        "counts": {
+            "verified": run.verified,
+            "failed": run.failed,
+            "skipped": run.skipped,
+        },
+        // Failures first, deliberately, and there is no pass rate anywhere in
+        // this payload: one broken output in twelve is the finding.
+        "verdict": verdict.as_str(),
+        "deadline_hit": run.deadline_hit,
+        "bounds": {
+            "max_input_bytes": bounds.max_input_bytes,
+            "max_total_output_bytes": bounds.max_total_output_bytes,
+            "output_reserve_factor": bounds.output_reserve_factor,
+            "per_encode_timeout_secs": bounds.per_encode_timeout.as_secs(),
+            "run_deadline_secs": bounds.run_deadline.as_secs(),
+            "scratch_bytes_reserved": run.scratch_bytes_reserved,
+            "note": "files above max_input_bytes are SKIPPED, not validated — \
+                     the ~1% of the library that is 4K/HDR is not covered by this run",
+        },
+        "files": run.files.iter().map(|f| json!({
+            "path": f.path,
+            "outcome": f.outcome.as_str(),
+            "detail": match &f.outcome {
+                validate::ValidationOutcome::Verified => Value::Null,
+                validate::ValidationOutcome::Failed { failure } => json!(failure.to_string()),
+                validate::ValidationOutcome::Skipped { reason } => json!(reason.to_string()),
+            },
+            "input": {
+                "container": f.input_container,
+                "video_codec": f.input_video_codec,
+                "dimensions": f.input_dimensions.map(|(w, h)| format!("{w}x{h}")),
+                "audio_codecs": f.input_audio_codecs,
+                "subtitles": f.input_subtitle_count,
+                "attachments": f.input_attachment_count,
+                "chapters": f.input_chapter_count,
+                "duration_secs": f.input_duration_secs,
+                "bytes": f.input_bytes,
+            },
+            "plan": {
+                "summary": f.plan_summary,
+                "reasons": f.plan_reasons,
+            },
+            "output": {
+                "container": f.output_container,
+                "video_codec": f.output_video_codec,
+                "dimensions": f.output_dimensions.map(|(w, h)| format!("{w}x{h}")),
+                "audio_codecs": f.output_audio_codecs,
+                "subtitles": f.output_subtitle_count,
+                "duration_secs": f.output_duration_secs,
+                "bytes": f.output_bytes,
+                "size_delta_bytes": f.size_delta_bytes,
+            },
+            "encode_wall_secs": f.encode_wall_secs,
+        })).collect::<Vec<_>>(),
+    })))
+}

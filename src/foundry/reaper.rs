@@ -153,6 +153,12 @@ pub struct ReapRun {
     pub mutation_enabled: bool,
     pub retention_secs: u64,
     pub bytes_reclaimed: u64,
+    /// Directories successfully listed across every root.
+    pub dirs_read: usize,
+    /// Directories that could not be listed. Non-zero means the pass covered
+    /// LESS than the library, and `examined: 0` may be ignorance rather than
+    /// absence.
+    pub dirs_unreadable: usize,
 }
 
 impl ReapRun {
@@ -187,30 +193,60 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
 /// deliberately ignores non-media extensions — and `.muse-superseded` is
 /// non-media by design, exactly so the scanner will not index a backup as a
 /// title.
-pub fn find_superseded(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk(root, &mut out);
-    out.sort();
-    out
+pub fn find_superseded(root: &Path) -> WalkResult {
+    let mut result = WalkResult::default();
+    walk(root, &mut result);
+    result.found.sort();
+    result
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+/// What a walk saw, including what it could NOT see.
+///
+/// `found` alone is not enough to report on. A reap that examined nothing
+/// because the library holds no backups, and a reap that examined nothing
+/// because every directory was unreadable, produce the identical `examined: 0`
+/// — and on the one endpoint that can permanently delete data, "there is
+/// nothing to do" and "I could not look" must not render the same way.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WalkResult {
+    pub found: Vec<PathBuf>,
+    /// Directories entered successfully.
+    pub dirs_read: usize,
+    /// Directories that could not be listed. Skipped so one bad folder does
+    /// not abort the pass — but COUNTED, so the pass cannot claim coverage it
+    /// did not have.
+    pub dirs_unreadable: usize,
+}
+
+impl WalkResult {
+    /// Whether the walk saw enough of the tree to be believed.
+    ///
+    /// A walk that read nothing at all has established nothing, and its empty
+    /// result is ignorance rather than absence.
+    pub fn is_trustworthy(&self) -> bool {
+        self.dirs_read > 0
+    }
+}
+
+fn walk(dir: &Path, result: &mut WalkResult) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        // A directory that cannot be listed is logged and skipped rather than
-        // aborting the pass: one unreadable folder must not stop the rest.
+        // Skipped rather than fatal — one unreadable folder must not stop the
+        // rest — but COUNTED, so the response can say the coverage was partial.
+        result.dirs_unreadable += 1;
         tracing::warn!(dir = %dir.display(), "foundry reaper: could not list directory; skipping");
         return;
     };
+    result.dirs_read += 1;
     for entry in entries.flatten() {
         let p = entry.path();
         match entry.file_type() {
             // Never follow symlinks: a link could point outside the allowed
             // roots entirely, and this module deletes what it is given.
             Ok(t) if t.is_symlink() => continue,
-            Ok(t) if t.is_dir() => walk(&p, out),
+            Ok(t) if t.is_dir() => walk(&p, result),
             Ok(t) if t.is_file() => {
                 if p.extension().and_then(|e| e.to_str()) == Some(SUPERSEDED_EXT) {
-                    out.push(p);
+                    result.found.push(p);
                 }
             }
             _ => {}
@@ -481,7 +517,10 @@ pub fn reap(foundry: &Foundry, retention: Duration, mutate: bool) -> ReapRun {
 
     let probe = |p: &Path| foundry.probe_file(p);
     for root in &cfg.allowed_roots {
-        for superseded in find_superseded(root) {
+        let walked = find_superseded(root);
+        run.dirs_read += walked.dirs_read;
+        run.dirs_unreadable += walked.dirs_unreadable;
+        for superseded in walked.found {
             // Take the SAME lock a swap takes, for the whole decide+delete of
             // this title. Keyed on directory + file stem, so it covers
             // `Movie.avi`, `Movie.avi.muse-superseded` and `Movie.mkv`
@@ -589,7 +628,7 @@ mod tests {
         fs::write(d.join("a.mkv.muse-superseded"), b"x").unwrap();
         fs::write(d.join("sub").join("b.avi.muse-superseded"), b"x").unwrap();
         fs::write(d.join("sub").join("b.avi"), b"x").unwrap();
-        let found = find_superseded(&d);
+        let found = find_superseded(&d).found;
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|p| p.extension().unwrap() == SUPERSEDED_EXT));
         let _ = fs::remove_dir_all(&d);
@@ -750,7 +789,7 @@ mod tests {
         // ...and a symlinked DIRECTORY, which would otherwise be descended.
         std::os::unix::fs::symlink(&outside, inside.join("subdir")).unwrap();
 
-        let found = find_superseded(&inside);
+        let found = find_superseded(&inside).found;
         assert!(
             found.is_empty(),
             "a symlink must never be collected for deletion: {found:?}"
@@ -758,6 +797,59 @@ mod tests {
         assert!(target.exists(), "the target must be untouched");
         let _ = fs::remove_dir_all(&inside);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// "Nothing to do" and "I could not look" must not render the same.
+    ///
+    /// The live dry-run returned `examined: 0` against the real library, which
+    /// was correct — nothing has ever swapped. But the identical response
+    /// would have come back if every directory had been unreadable, and on the
+    /// one endpoint that can permanently delete data that ambiguity is not
+    /// acceptable.
+    #[test]
+    fn a_walk_reports_what_it_could_not_read_not_just_what_it_found() {
+        let d = tmp("coverage");
+        fs::create_dir_all(d.join("readable")).unwrap();
+        fs::write(d.join("readable").join("a.mkv.muse-superseded"), b"x").unwrap();
+
+        let ok = find_superseded(&d);
+        assert_eq!(ok.found.len(), 1);
+        assert!(ok.dirs_read >= 2, "root + subdir: {}", ok.dirs_read);
+        assert_eq!(ok.dirs_unreadable, 0);
+        assert!(ok.is_trustworthy());
+
+        // An unreadable subtree is COUNTED, not silently skipped.
+        use std::os::unix::fs::PermissionsExt;
+        let blocked = d.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        let partial = find_superseded(&d);
+        let running_as_root = partial.dirs_unreadable == 0;
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&d);
+
+        if running_as_root {
+            return; // root can read anything; the permission bit does not apply
+        }
+        assert_eq!(
+            partial.dirs_unreadable, 1,
+            "an unreadable directory must be counted so the pass cannot claim full coverage"
+        );
+        assert!(partial.is_trustworthy(), "it still read most of the tree");
+    }
+
+    /// A walk that read NOTHING has established nothing — its empty result is
+    /// ignorance, not absence.
+    #[test]
+    fn a_walk_that_read_nothing_is_not_trustworthy() {
+        let missing = find_superseded(Path::new("/nonexistent-muse-reaper-root"));
+        assert!(missing.found.is_empty());
+        assert_eq!(missing.dirs_read, 0);
+        assert_eq!(missing.dirs_unreadable, 1);
+        assert!(
+            !missing.is_trustworthy(),
+            "an empty result from a walk that read nothing must not read as 'no backups'"
+        );
     }
 
     /// The single most important refusal: if the replacement is gone, the

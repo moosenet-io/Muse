@@ -484,9 +484,20 @@ pub fn classify_session_state(
     if elapsed_secs < 0 || elapsed_secs as u64 > grace_secs {
         return SessionPlayState::Stale;
     }
+    // Enumerate the recognized Plex-vocabulary event kinds explicitly
+    // (`tracker::interpret::PlayStateEventKind::to_plex_event_type` is the
+    // authoritative mapping this mirrors) rather than defaulting
+    // everything-that-isn't-pause to `Playing`. A TERMINAL event
+    // (`media.stop`/`media.scrobble`) landing fresh on a row that hasn't
+    // been marked `stopped_at` yet (an ingest race) means playback ended,
+    // not that it's still playing -- and an unrecognized event type is not
+    // a trustworthy "still playing" signal either. Both fall through to
+    // `Stale`: the spec's rule is "a pause event => paused; a newer
+    // play/progress event => playing" -- a stop is neither.
     match last_event_type {
         Some("media.pause") => SessionPlayState::Paused,
-        _ => SessionPlayState::Playing,
+        Some("media.play") | Some("media.resume") => SessionPlayState::Playing,
+        _ => SessionPlayState::Stale,
     }
 }
 
@@ -594,7 +605,21 @@ const SESSION_JOIN_SELECT: &str = r#"
         SELECT pe.event_type, pe.received_at
         FROM play_events pe
         WHERE pe.session_key = ps.session_key
-        ORDER BY pe.received_at DESC
+          -- `session_key` has no uniqueness constraint on either table (Plex
+          -- session keys are per-server counters that DO get reused), so an
+          -- unbounded correlation can attach a PREVIOUS session's newest
+          -- event -- including one that predates this session even
+          -- starting -- and falsely mark a dead session as live. Bound the
+          -- correlation to this session's own lifetime: no earlier than
+          -- `started_at`, no later than `stopped_at` when the session has
+          -- one (an open session has no upper bound yet).
+          AND pe.received_at >= ps.started_at
+          AND (ps.stopped_at IS NULL OR pe.received_at <= ps.stopped_at)
+        -- `id DESC` as a deterministic tiebreak: two events can share the
+        -- same `received_at` (timestamp granularity), and without a
+        -- secondary key `ORDER BY received_at DESC LIMIT 1` picks between
+        -- them non-deterministically.
+        ORDER BY pe.received_at DESC, pe.id DESC
         LIMIT 1
     ) ev ON true
 "#;
@@ -718,6 +743,42 @@ mod mact01_tests {
         assert_eq!(
             classify_session_state(Some("media.play"), Some(last), now, 60),
             SessionPlayState::Playing
+        );
+    }
+
+    /// Review finding (codex, confirmed): a fresh TERMINAL event
+    /// (`media.stop`/`media.scrobble`) on a row that hasn't been marked
+    /// `stopped_at` yet (an ingest race between the reconstruction worker
+    /// and this read) must NOT classify as `Playing` — the old
+    /// `_ => Playing` fallthrough got this wrong for anything that wasn't
+    /// literally `media.pause`.
+    #[test]
+    fn fresh_stop_event_is_not_playing() {
+        let now = Utc::now();
+        let last = now - Duration::seconds(5);
+        assert_eq!(
+            classify_session_state(Some("media.stop"), Some(last), now, 60),
+            SessionPlayState::Stale
+        );
+    }
+
+    #[test]
+    fn fresh_scrobble_completion_event_is_not_playing() {
+        let now = Utc::now();
+        let last = now - Duration::seconds(5);
+        assert_eq!(
+            classify_session_state(Some("media.scrobble"), Some(last), now, 60),
+            SessionPlayState::Stale
+        );
+    }
+
+    #[test]
+    fn fresh_unrecognized_event_type_is_not_playing() {
+        let now = Utc::now();
+        let last = now - Duration::seconds(5);
+        assert_eq!(
+            classify_session_state(Some("media.rate"), Some(last), now, 60),
+            SessionPlayState::Stale
         );
     }
 
@@ -914,6 +975,30 @@ mod mact01_tests {
             .await
             .expect("insert play_event");
 
+            // Review finding (codex, confirmed): the joined media-info decision
+            // block was asserted nowhere -- populate it and check it comes back
+            // verbatim through `list_live`.
+            upsert_media_info(
+                &pool,
+                open_session.id,
+                &NewPlaySessionMediaInfo {
+                    video_decision: Some(DecisionKind::Transcode),
+                    audio_decision: Some(DecisionKind::Copy),
+                    transcode_decision: Some(DecisionKind::Transcode),
+                    container: Some("mkv".to_string()),
+                    video_codec: Some("hevc".to_string()),
+                    audio_codec: Some("aac".to_string()),
+                    audio_channels: Some(2.0),
+                    video_resolution: Some("1080".to_string()),
+                    bitrate: Some(8_000_000),
+                    width: Some(1920),
+                    height: Some(1080),
+                    transcode_reason: Some("video codec unsupported by device".to_string()),
+                },
+            )
+            .await
+            .expect("upsert play_session_media_info");
+
             // A STOPPED session -- must appear only in `list_history`, never
             // in `list_live`.
             let stopped_session = upsert(
@@ -955,6 +1040,20 @@ mod mact01_tests {
             assert_eq!(live_hit.state, SessionPlayState::Playing);
             assert_eq!(live_hit.row.media_metadata_id, Some(metadata.id));
             assert_eq!(live_hit.row.title.as_deref(), Some(metadata.title.as_str()));
+            // The joined `play_session_media_info` decision block, verbatim.
+            assert_eq!(live_hit.row.video_decision, Some(DecisionKind::Transcode));
+            assert_eq!(live_hit.row.audio_decision, Some(DecisionKind::Copy));
+            assert_eq!(live_hit.row.transcode_decision, Some(DecisionKind::Transcode));
+            assert_eq!(live_hit.row.container.as_deref(), Some("mkv"));
+            assert_eq!(live_hit.row.video_codec.as_deref(), Some("hevc"));
+            assert_eq!(live_hit.row.audio_codec.as_deref(), Some("aac"));
+            assert_eq!(live_hit.row.audio_channels, Some(2.0));
+            assert_eq!(live_hit.row.video_resolution.as_deref(), Some("1080"));
+            assert_eq!(live_hit.row.bitrate, Some(8_000_000));
+            assert_eq!(
+                live_hit.row.transcode_reason.as_deref(),
+                Some("video codec unsupported by device")
+            );
             assert!(live
                 .iter()
                 .all(|s| s.row.session_id != stopped_session.id));
@@ -964,6 +1063,203 @@ mod mact01_tests {
                 .iter()
                 .any(|s| s.session_id == stopped_session.id));
             assert!(history.iter().all(|s| s.session_id != open_session.id));
+        }
+
+        /// Review finding (codex, confirmed): `session_key` carries no
+        /// uniqueness constraint on either table (Plex session keys are
+        /// per-server counters that DO get reused), so an unbounded
+        /// correlated-subquery join could attach a PREVIOUS session's event
+        /// to a brand new session reusing the same key. Proves the fix: an
+        /// older, STOPPED session's event does not leak onto a new OPEN
+        /// session that reuses its `session_key`.
+        #[tokio::test]
+        async fn reused_session_key_does_not_leak_an_older_sessions_event() {
+            let Some(pool) = test_pool_or_skip(
+                "reused_session_key_does_not_leak_an_older_sessions_event",
+            )
+            .await
+            else {
+                return;
+            };
+
+            let (account_id,): (i64,) = sqlx::query_as(
+                "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
+                 VALUES ('mact01-reuse-fixture', 'MACT01 Reuse Fixture', true, false) \
+                 RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("seed account");
+            let suffix = account_id;
+
+            let library = crate::repo::library::create(
+                &pool,
+                &NewLibrary {
+                    name: format!("mact01-reuse-lib-{suffix}"),
+                    kind: LibraryKind::Movie,
+                    root_folder: "/media/mact01-reuse-test".to_string(),
+                    source_arr_name: None,
+                    source_arr_url: None,
+                },
+            )
+            .await
+            .expect("create library");
+
+            let metadata = crate::repo::media_metadata::upsert_by_tmdb(
+                &pool,
+                &NewMediaMetadata {
+                    kind: MediaKind::Movie,
+                    tmdb_id: Some(format!("mact01-reuse-{suffix}")),
+                    tvdb_id: None,
+                    imdb_id: None,
+                    provider_ids: serde_json::json!({}),
+                    title: format!("MACT01 Reuse Fixture Film {suffix}"),
+                    sort_title: None,
+                    original_title: None,
+                    original_language: None,
+                    status: None,
+                    overview: None,
+                    studio: None,
+                    network: None,
+                    runtime_minutes: Some(100),
+                    year: Some(2021),
+                    images: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("upsert media_metadata");
+
+            let item = crate::repo::media_item::upsert(
+                &pool,
+                &NewMediaItem {
+                    library_id: library.id,
+                    media_metadata_id: metadata.id,
+                    path: format!("/media/mact01-reuse-test/film-{suffix}.mkv"),
+                    monitored: true,
+                    quality_profile_id: None,
+                    minimum_availability: None,
+                    plex_rating_key: Some(format!("mact01-reuse-rk-{suffix}")),
+                    added_at: None,
+                },
+            )
+            .await
+            .expect("upsert media_item");
+
+            let reused_key = format!("mact01-reused-key-{suffix}");
+            let now = Utc::now();
+
+            // Older session: started 2h ago, stopped 1h ago.
+            let older_started_at = now - chrono::Duration::hours(2);
+            let older_stopped_at = now - chrono::Duration::hours(1);
+            let older_session = upsert(
+                &pool,
+                &NewPlaySession {
+                    account_id: Some(account_id),
+                    media_item_id: Some(item.id),
+                    episode_id: None,
+                    session_key: Some(reused_key.clone()),
+                    tautulli_ref_id: None,
+                    started_at: older_started_at,
+                    stopped_at: Some(older_stopped_at),
+                    duration_ms: Some(6_000_000),
+                    watched_ms: Some(6_000_000),
+                    view_offset_ms: Some(6_000_000),
+                    percent_complete: Some(1.0),
+                    paused_counter: 0,
+                    paused_ms: 0,
+                    is_finished: true,
+                    is_abandoned: false,
+                    player: Some("Living Room".to_string()),
+                    platform: Some("Plex Web".to_string()),
+                    product: Some("Plex Web".to_string()),
+                    device: Some("Chrome".to_string()),
+                    ip_address: None,
+                    started_hour: None,
+                    started_dow: None,
+                    is_cinema_context: None,
+                },
+            )
+            .await
+            .expect("upsert older session");
+
+            // The older session's event, backdated (via raw SQL -- `insert()`
+            // always stamps `received_at = now()`, which cannot express "this
+            // event happened within the OLDER session's window" for a test
+            // fixture) to land squarely inside the older session's lifetime,
+            // well before the new session below even starts.
+            let older_event_at = now - chrono::Duration::minutes(90);
+            sqlx::query(
+                r#"
+                INSERT INTO play_events
+                    (received_at, source, event_type, session_key, rating_key, raw)
+                VALUES ($1, 'mact01_test', 'media.play', $2, $3, '{}'::jsonb)
+                "#,
+            )
+            .bind(older_event_at)
+            .bind(&reused_key)
+            .bind(format!("mact01-reuse-rk-{suffix}"))
+            .execute(&pool)
+            .await
+            .expect("insert backdated play_event for the older session");
+
+            // A NEW session reusing the SAME `session_key`, opened after the
+            // older session stopped, with NO event of its own yet.
+            let new_session = upsert(
+                &pool,
+                &NewPlaySession {
+                    account_id: Some(account_id),
+                    media_item_id: Some(item.id),
+                    episode_id: None,
+                    session_key: Some(reused_key.clone()),
+                    tautulli_ref_id: None,
+                    started_at: now,
+                    stopped_at: None,
+                    duration_ms: Some(6_000_000),
+                    watched_ms: Some(0),
+                    view_offset_ms: Some(0),
+                    percent_complete: Some(0.0),
+                    paused_counter: 0,
+                    paused_ms: 0,
+                    is_finished: false,
+                    is_abandoned: false,
+                    player: Some("Living Room".to_string()),
+                    platform: Some("Plex Web".to_string()),
+                    product: Some("Plex Web".to_string()),
+                    device: Some("Chrome".to_string()),
+                    ip_address: None,
+                    started_hour: None,
+                    started_dow: None,
+                    is_cinema_context: None,
+                },
+            )
+            .await
+            .expect("upsert new session reusing the key");
+
+            let live = list_live(&pool, 60).await.expect("list_live");
+            let new_hit = live
+                .iter()
+                .find(|s| s.row.session_id == new_session.id)
+                .expect("the new session must appear in list_live");
+
+            // The bug: without the `received_at >= ps.started_at` bound, the
+            // LATERAL join would attach the OLDER session's 90-minutes-ago
+            // event to this brand new session (same `session_key`), and
+            // 90 minutes is well outside any sane grace window -- but the
+            // deeper bug is attaching it AT ALL, since that event predates
+            // `new_session.started_at` entirely. Assert it was NOT attached.
+            assert_eq!(
+                new_hit.row.last_event_at, None,
+                "the older, out-of-window session's event must not be joined onto \
+                 the new session that reused its session_key"
+            );
+            assert_eq!(new_hit.row.last_event_type, None);
+            // With no matching event, the new session is honestly `Stale`,
+            // never fabricated as `Playing` from a leaked older event.
+            assert_eq!(new_hit.state, SessionPlayState::Stale);
+
+            // The older session must never appear in `list_live` at all
+            // (it's stopped) regardless of the key reuse.
+            assert!(live.iter().all(|s| s.row.session_id != older_session.id));
         }
     }
 }

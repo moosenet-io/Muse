@@ -1491,6 +1491,7 @@ pub struct LiveSessionOut {
     pub backdrop_url: Option<String>,
     pub view_offset_ms: Option<i64>,
     pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_pct: Option<f32>,
     pub player: Option<String>,
     pub platform: Option<String>,
@@ -1546,15 +1547,25 @@ pub struct LiveSessionsResponse {
 /// when no ingest is configured / nobody is watching — distinguishable from
 /// a degrade because a query FAILURE propagates as an error instead (see
 /// this section's module doc).
+/// Builds the actual envelope the handler serializes, factored out so a test
+/// can assert against the REAL `source` discriminator the handler emits
+/// (from an empty `Vec`, requiring no DB) instead of a hand-typed string
+/// that could drift from what `get_live_sessions` actually returns.
+fn build_live_sessions_response(
+    rows: Vec<repo::play_session::LiveSession>,
+) -> LiveSessionsResponse {
+    LiveSessionsResponse {
+        source: "muse-derived",
+        sessions: rows.into_iter().map(LiveSessionOut::from).collect(),
+    }
+}
+
 pub async fn get_live_sessions(
     State(state): State<Arc<AppState>>,
 ) -> MuseResult<Json<LiveSessionsResponse>> {
     let grace_secs = state.config.session_active_grace_secs;
     let rows = repo::play_session::list_live(&state.pool, grace_secs).await?;
-    Ok(Json(LiveSessionsResponse {
-        source: "muse-derived",
-        sessions: rows.into_iter().map(LiveSessionOut::from).collect(),
-    }))
+    Ok(Json(build_live_sessions_response(rows)))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1567,6 +1578,7 @@ pub struct HistorySessionOut {
     pub backdrop_url: Option<String>,
     pub view_offset_ms: Option<i64>,
     pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_pct: Option<f32>,
     pub player: Option<String>,
     pub platform: Option<String>,
@@ -1613,6 +1625,16 @@ pub struct HistorySessionsResponse {
 
 /// `GET /api/sessions/history?limit=` — Muse's permanent historical record
 /// over stopped sessions. Same projection as `/live`, `source: "muse-history"`.
+/// See [`build_live_sessions_response`] — same rationale, for history.
+fn build_history_sessions_response(
+    rows: Vec<repo::play_session::SessionJoinRow>,
+) -> HistorySessionsResponse {
+    HistorySessionsResponse {
+        source: "muse-history",
+        sessions: rows.into_iter().map(HistorySessionOut::from).collect(),
+    }
+}
+
 pub async fn get_session_history(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SessionHistoryQuery>,
@@ -1622,10 +1644,7 @@ pub async fn get_session_history(
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
     let rows = repo::play_session::list_history(&state.pool, limit).await?;
-    Ok(Json(HistorySessionsResponse {
-        source: "muse-history",
-        sessions: rows.into_iter().map(HistorySessionOut::from).collect(),
-    }))
+    Ok(Json(build_history_sessions_response(rows)))
 }
 
 #[cfg(test)]
@@ -1844,21 +1863,21 @@ mod mact01_sessions_tests {
         assert_eq!(decision_kind_str(DecisionKind::Copy), "copy");
     }
 
+    /// Calls the SAME builder functions `get_live_sessions`/
+    /// `get_session_history` call ([`build_live_sessions_response`] /
+    /// [`build_history_sessions_response`]) rather than hand-constructing a
+    /// `LiveSessionsResponse`/`HistorySessionsResponse` literal — a
+    /// hand-typed literal would pass even if the handler's actual `source`
+    /// string drifted, since it never exercises the handler's own code.
     #[test]
     fn live_and_history_responses_carry_their_own_source_discriminator() {
-        let live = serde_json::to_value(LiveSessionsResponse {
-            source: "muse-derived",
-            sessions: Vec::new(),
-        })
-        .unwrap();
+        let live = serde_json::to_value(build_live_sessions_response(Vec::new())).unwrap();
         assert_eq!(live["source"], "muse-derived");
+        assert_eq!(live["sessions"], serde_json::json!([]));
 
-        let history = serde_json::to_value(HistorySessionsResponse {
-            source: "muse-history",
-            sessions: Vec::new(),
-        })
-        .unwrap();
+        let history = serde_json::to_value(build_history_sessions_response(Vec::new())).unwrap();
         assert_eq!(history["source"], "muse-history");
+        assert_eq!(history["sessions"], serde_json::json!([]));
     }
 
     fn sample_join_row() -> repo::play_session::SessionJoinRow {
@@ -1932,18 +1951,60 @@ mod mact01_sessions_tests {
         assert_eq!(json["progress_pct"], 48.0);
     }
 
+    /// MACT-01 edge case, asserted at the SERIALIZED shape (not just the
+    /// Rust `Option` value): `duration_ms: None` must make `progress_pct`
+    /// absent from the JSON body entirely, never present as `null`. A
+    /// dashboard client checking `"progress_pct" in body` (or any falsy/
+    /// nullish check that still sees the key) would otherwise be fooled by
+    /// a `null` that reads differently from a genuinely missing field.
+    #[test]
+    fn progress_pct_is_absent_from_the_serialized_body_not_null_when_duration_is_unknown() {
+        let mut row = sample_join_row();
+        row.duration_ms = None;
+
+        let live_json = serde_json::to_value(LiveSessionOut::from(repo::play_session::LiveSession {
+            row: row.clone(),
+            state: repo::play_session::SessionPlayState::Playing,
+        }))
+        .unwrap();
+        assert!(
+            live_json.as_object().unwrap().get("progress_pct").is_none(),
+            "progress_pct must be OMITTED, not serialized as null: {live_json}"
+        );
+
+        let history_json = serde_json::to_value(HistorySessionOut::from(row)).unwrap();
+        assert!(
+            history_json.as_object().unwrap().get("progress_pct").is_none(),
+            "progress_pct must be OMITTED, not serialized as null: {history_json}"
+        );
+    }
+
     /// Same fail-open-proof pattern as
     /// `the_new_dashboard_handlers_cannot_swallow_a_query_error_into_a_2xx`
-    /// above, for the two MACT-01 handlers: a `MuseResult` return type
-    /// cannot silently fold a query error into a fabricated empty `200`.
+    /// above, for the two MACT-01 handlers — strengthened past a bare
+    /// `Fn(&AppState) -> T` (which unifies `T` with whatever the function
+    /// actually returns and therefore proves nothing about `MuseResult`
+    /// specifically): these helpers pin the closure's `Fut::Output` to
+    /// `MuseResult<Json<_>>`, so this fails to COMPILE if either handler's
+    /// signature ever changes to return a bare `Json<_>` (a fail-open).
+    fn assert_state_handler_returns_museresult<T, Fut, F>(_: F)
+    where
+        F: Fn(State<Arc<AppState>>) -> Fut,
+        Fut: std::future::Future<Output = MuseResult<Json<T>>>,
+    {
+    }
+
+    fn assert_state_query_handler_returns_museresult<T, Q, Fut, F>(_: F)
+    where
+        F: Fn(State<Arc<AppState>>, Query<Q>) -> Fut,
+        Fut: std::future::Future<Output = MuseResult<Json<T>>>,
+    {
+    }
+
     #[test]
     fn sessions_handlers_cannot_swallow_a_query_error_into_a_2xx() {
-        fn assert_fallible<T, F: Fn(&AppState) -> T>(_: F) {}
-        let _ = assert_fallible::<_, _>(|_s: &AppState| {
-            let _live: fn(State<Arc<AppState>>) -> _ = get_live_sessions;
-            let _history: fn(State<Arc<AppState>>, Query<SessionHistoryQuery>) -> _ =
-                get_session_history;
-        });
+        assert_state_handler_returns_museresult(get_live_sessions);
+        assert_state_query_handler_returns_museresult(get_session_history);
     }
 }
 

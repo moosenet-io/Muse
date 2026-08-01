@@ -165,6 +165,19 @@ impl ValidationBounds {
         }
     }
 
+    /// Free space this run actually needs, in bytes.
+    ///
+    /// The MAXIMUM of the cumulative budget and one file's peak reserve, not
+    /// the budget alone. Cumulative bounds total work; peak is what has to fit
+    /// on the disk at one instant, and with a large `max_input_bytes` the peak
+    /// is the larger of the two.
+    pub fn required_free_bytes(&self) -> u64 {
+        let peak = self
+            .max_input_bytes
+            .saturating_mul(self.output_reserve_factor);
+        self.max_total_output_bytes.max(peak)
+    }
+
     /// The coverage sentence for THIS run, generated from the bound actually
     /// in force.
     ///
@@ -173,11 +186,18 @@ impl ValidationBounds {
     /// the run used — a report that lies about its own coverage is worse than
     /// one that omits it, because it reads as verified.
     pub fn coverage_note(&self) -> String {
+        // EXACT bytes, with the GiB figure as a readability aid only.
+        // Formatting to one decimal GiB was lossy in both directions — a
+        // 1 MiB ceiling printed "0.0 GiB" and 2050 MiB printed "2.0 GiB" —
+        // so the note could misstate the very bound it exists to disclose,
+        // and the tests missed it by only ever using round numbers. Codex,
+        // FOUNDRY-09 gate.
         let gib = self.max_input_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         format!(
-            "files larger than {gib:.1} GiB were SKIPPED, never validated — this run does \
-             NOT cover them. 4K/HDR/Dolby Vision content is the large tail, so a ceiling \
-             below it means that content is unvalidated."
+            "files larger than {} bytes (~{gib:.2} GiB) were SKIPPED, never validated — \
+             this run does NOT cover them. 4K/HDR/Dolby Vision content is the large tail, \
+             so a ceiling below it means that content is unvalidated.",
+            self.max_input_bytes
         )
     }
 }
@@ -1302,6 +1322,9 @@ fn validate_one(
     probe: &MediaProbe,
     bounds: &ValidationBounds,
     already_reserved: u64,
+    // Wall-clock left in the whole run, if a deadline applies. The encode's
+    // own ceiling is reduced to this so one encode cannot outlive the run.
+    deadline_remaining: Option<Duration>,
 ) -> (ValidatedFile, u64) {
     let mut file = describe_input(source_path, probe);
 
@@ -1386,12 +1409,16 @@ fn validate_one(
 
     // --- encode ------------------------------------------------------------
     let started = Instant::now();
-    let run = run_encode_with_timeout(
-        &cfg.ffmpeg_bin,
-        &args,
-        &scratch.stderr,
-        bounds.per_encode_timeout,
-    );
+    // Capped by the time the RUN has left, not just the per-encode ceiling.
+    // The two clamps are independent, so `run_deadline_secs=60` with
+    // `encode_timeout_secs=21600` was accepted and an in-flight encode could
+    // run six hours past a stated one-minute deadline — the deadline was only
+    // consulted BETWEEN files. Codex, FOUNDRY-09 gate.
+    let encode_timeout = match deadline_remaining {
+        Some(left) => bounds.per_encode_timeout.min(left),
+        None => bounds.per_encode_timeout,
+    };
+    let run = run_encode_with_timeout(&cfg.ffmpeg_bin, &args, &scratch.stderr, encode_timeout);
     file.encode_wall_secs = Some(started.elapsed().as_secs_f64());
 
     if let Some(failure) = encode_failure(run) {
@@ -1544,10 +1571,14 @@ pub fn free_bytes_for(dir: &Path) -> Option<u64> {
         .ok()
 }
 
-/// Refuse a run whose budget the scratch filesystem cannot actually hold.
+/// Refuse a run the scratch filesystem cannot actually hold.
 ///
-/// `needed` is the run's cumulative budget, not one file: a run admitted on
-/// per-file room alone can still fill the disk across twelve encodes.
+/// Pass [`ValidationBounds::required_free_bytes`], which is the MAXIMUM of the
+/// cumulative budget and one file's peak reserve. Checking the budget alone was
+/// wrong in the direction that matters once the size ceiling became
+/// configurable: with a 64 GiB `max_input_bytes` a single encode reserves
+/// 128 GiB, which a 6 GiB budget check would happily admit onto a filesystem
+/// that cannot hold it. Raised by opus and free at the FOUNDRY-09 gate.
 pub fn check_free_space(dir: &Path, needed: u64) -> Result<(), ValidationRefusal> {
     let Some(available) = free_bytes_for(dir) else {
         // Unreadable is not free. Refuse and say so.
@@ -1663,6 +1694,7 @@ pub fn validate_sample(
             probe,
             bounds,
             run.scratch_bytes_reserved,
+            bounds.run_deadline.checked_sub(started.elapsed()),
         );
         run.scratch_bytes_reserved += reserved;
         run.record(file);
@@ -2099,20 +2131,66 @@ mod tests {
     /// verified when it is not, which is worse than omitting the note.
     #[test]
     fn the_coverage_note_states_the_ceiling_actually_in_force() {
-        let low = ValidationBounds::from_overrides(Some(2048), None, None, None);
-        assert!(low.coverage_note().contains("than 2.0 GiB"), "{}", low.coverage_note());
+        const MIB: u64 = 1024 * 1024;
+        for mb in [2048u64, 32768, 1, 2050, 65_536] {
+            let b = ValidationBounds::from_overrides(Some(mb), None, None, None);
+            let note = b.coverage_note();
+            // The EXACT byte count, so the note cannot round away the real
+            // ceiling. Codex caught the first version at the gate: it printed
+            // one decimal GiB, so a 1 MiB ceiling read as "0.0 GiB" and 2050
+            // MiB read as "2.0 GiB" — misstating the very bound the note
+            // exists to disclose. The round-number-only fixtures missed it,
+            // which is why 1 and 2050 are in this list.
+            assert!(
+                note.contains(&format!("{} bytes", mb * MIB)),
+                "note must state the exact ceiling for {mb} MiB: {note}"
+            );
+            // And it must keep naming what the exclusion COSTS, not just a number.
+            assert!(note.to_lowercase().contains("4k"), "{note}");
+        }
 
-        let high = ValidationBounds::from_overrides(Some(32768), None, None, None);
-        let note = high.coverage_note();
-        assert!(note.contains("than 32.0 GiB"), "{note}");
-        // "than" anchors the match: "32.0 GiB" CONTAINS "2.0 GiB", so a bare
-        // substring check here passes for the wrong reason.
-        assert!(
-            !note.contains("than 2.0 GiB"),
-            "the note must not still be claiming the old ceiling: {note}"
+        // Two ceilings that round to the same GiB string must still produce
+        // DIFFERENT notes — the property the rounding bug violated.
+        let a = ValidationBounds::from_overrides(Some(2048), None, None, None).coverage_note();
+        let b = ValidationBounds::from_overrides(Some(2050), None, None, None).coverage_note();
+        assert_ne!(a, b, "2048 and 2050 MiB must not produce the same coverage claim");
+    }
+
+    /// Peak, not just cumulative. Raised by opus and free at the gate: with a
+    /// 64 GiB size ceiling one encode reserves 128 GiB, which a 6 GiB budget
+    /// check would admit onto a filesystem that cannot hold it.
+    #[test]
+    fn the_required_free_space_covers_one_files_peak_not_only_the_budget() {
+        const MIB: u64 = 1024 * 1024;
+        // Large ceiling, small budget: the PEAK dominates.
+        let big = ValidationBounds::from_overrides(Some(65_536), Some(6144), None, None);
+        assert_eq!(
+            big.required_free_bytes(),
+            65_536 * MIB * big.output_reserve_factor,
+            "one file's reserve must dominate when the ceiling is large"
         );
-        // And it must keep naming what the exclusion COSTS, not just the number.
-        assert!(note.to_lowercase().contains("4k"), "{note}");
+        assert!(big.required_free_bytes() > big.max_total_output_bytes);
+
+        // Small ceiling, large budget: the CUMULATIVE budget dominates.
+        let many = ValidationBounds::from_overrides(Some(512), Some(102_400), None, None);
+        assert_eq!(many.required_free_bytes(), many.max_total_output_bytes);
+    }
+
+    /// One encode must not outlive the run it belongs to. The two clamps are
+    /// independent, so a 60s deadline with a 6h encode ceiling was accepted
+    /// and the deadline was only consulted between files.
+    #[test]
+    fn an_encodes_ceiling_is_reduced_to_the_time_the_run_has_left() {
+        let b = ValidationBounds::from_overrides(None, None, Some(21_600), Some(60));
+        assert_eq!(b.per_encode_timeout, Duration::from_secs(21_600));
+        assert_eq!(b.run_deadline, Duration::from_secs(60));
+        // The effective ceiling is the smaller of the two.
+        let remaining = Duration::from_secs(5);
+        assert_eq!(
+            b.per_encode_timeout.min(remaining),
+            remaining,
+            "an encode may not run past the run's own deadline"
+        );
     }
 
     #[test]

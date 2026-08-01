@@ -1805,7 +1805,7 @@ pub async fn foundry_validate(
         // Against the budget this run actually asked for, not the default —
         // otherwise raising the budget would skip the disk check that makes
         // raising it safe.
-        validate::check_free_space(&scratch, bounds.max_total_output_bytes)?;
+        validate::check_free_space(&scratch, bounds.required_free_bytes())?;
 
         let candidates: Vec<std::path::PathBuf> =
             crate::library::scan::walk_media_files(std::path::Path::new(&root))

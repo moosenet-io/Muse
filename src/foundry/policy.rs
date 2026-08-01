@@ -211,6 +211,22 @@ pub fn normalize_container(format_name: &str) -> Option<Container> {
     }
 }
 
+/// The audio codecs left alone, including DTS unless the operator opts out.
+///
+/// Read here rather than threaded through every policy constructor so the two
+/// policies (`default` and `direct_play_normalization`) cannot drift: they
+/// share this list, so a change cannot apply to one and not the other.
+fn default_audio_codecs() -> Vec<String> {
+    let mut v = vec!["aac".to_string(), "ac3".to_string(), "eac3".to_string()];
+    let reencode_dts = std::env::var("MUSE_FOUNDRY_REENCODE_DTS")
+        .map(|s| matches!(s.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !reencode_dts {
+        v.push("dts".to_string());
+    }
+    v
+}
+
 impl Default for TranscodePolicy {
     /// See each field's doc comment for why it holds the value it does.
     fn default() -> Self {
@@ -223,11 +239,29 @@ impl Default for TranscodePolicy {
             max_height: 1080,
             max_video_bitrate_bps: 12_000_000,
             bitrate_tolerance: 1.25,
-            acceptable_audio_codecs: vec![
-                "aac".to_string(),
-                "ac3".to_string(),
-                "eac3".to_string(),
-            ],
+            // DTS is accepted, and that is a DELIBERATE, MEASURED choice.
+            //
+            // A 500-file survey of this library's 16,221 titles found 60%
+            // would be re-encoded, and 31% of those would then be refused
+            // deletion — ~3,000 titles that cost a full encode and reclaim
+            // nothing. 91 of the 93 flagged were DTS, from two individually
+            // correct behaviours composing badly:
+            //
+            //   1. `dts` was not accepted, so Path A re-encoded it to AAC;
+            //   2. `dts` IS on the undetectable list (DTS:X inside DTS-HD MA),
+            //      so may_delete_original then refused, because a re-encode
+            //      cannot be shown to have preserved it.
+            //
+            // Net: lose DTS-HD, gain AAC, KEEP the original, use more disk.
+            // Accepting DTS makes those titles `already_optimal` — left
+            // completely alone, which is strictly less destructive and
+            // preserves the operator's options.
+            //
+            // The trade, stated: a client that cannot decode DTS will
+            // transcode on the fly, exactly as it does today. Nothing gets
+            // worse; ~3,000 titles simply stop being rewritten.
+            // MUSE_FOUNDRY_REENCODE_DTS=1 restores the old behaviour.
+            acceptable_audio_codecs: default_audio_codecs(),
             max_audio_channels: 6,
             acceptable_containers: vec![Container::Matroska, Container::Mp4],
             output_container: Container::Matroska,
@@ -367,6 +401,53 @@ pub fn scale_to_fit(width: u32, height: u32, max_width: u32, max_height: u32) ->
 #[cfg(test)]
 mod tests {
 
+    /// DTS is left alone by default, and this is measured rather than assumed.
+    ///
+    /// A 500-file survey of 16,221 titles found ~3,000 that would be
+    /// re-encoded and then REFUSED deletion — 91 of 93 flagged files were DTS.
+    /// Two correct behaviours composing badly: `dts` was not accepted so it
+    /// was re-encoded to AAC, and `dts` IS on the undetectable list, so the
+    /// gate then refused because DTS:X cannot be shown to have survived.
+    #[test]
+    fn dts_is_accepted_so_those_titles_are_left_alone() {
+        for p in [TranscodePolicy::default(), TranscodePolicy::direct_play_normalization()] {
+            assert!(
+                p.acceptable_audio_codecs.iter().any(|c| c == "dts"),
+                "DTS must be accepted, or ~3,000 titles are re-encoded and then kept"
+            );
+        }
+    }
+
+    /// The two policies must share the list, or a change applies to one and
+    /// not the other — which is how they would silently drift.
+    #[test]
+    fn both_policies_share_the_same_audio_codec_list() {
+        let d = TranscodePolicy::default();
+        let a = TranscodePolicy::direct_play_normalization();
+        assert_eq!(
+            d.acceptable_audio_codecs, a.acceptable_audio_codecs,
+            "the audio lists must not diverge between the two policies"
+        );
+    }
+
+    /// Accepting DTS must not quietly accept everything else — the change is
+    /// specific, and a list that accepted every codec would pass the test
+    /// above while disabling the whole stage.
+    #[test]
+    fn accepting_dts_does_not_widen_the_list_to_everything() {
+        let p = TranscodePolicy::default();
+        for unaccepted in ["truehd", "flac", "pcm_s16le", "vorbis", "opus"] {
+            assert!(
+                !p.acceptable_audio_codecs.iter().any(|c| c == unaccepted),
+                "{unaccepted} must still be re-encoded; only DTS was added"
+            );
+        }
+        // ...and the ones that were always accepted still are.
+        for kept in ["aac", "ac3", "eac3"] {
+            assert!(p.acceptable_audio_codecs.iter().any(|c| c == kept), "{kept}");
+        }
+    }
+
     /// Path A's policy must be the one production actually uses.
     ///
     /// It was not. `direct_play_normalization` — 4K ceiling, 100 Mbps, built
@@ -443,7 +524,9 @@ mod tests {
         assert_eq!((p.max_width, p.max_height), (1920, 1080));
         assert_eq!(p.max_video_bitrate_bps, 12_000_000);
         assert_eq!(p.bitrate_tolerance, 1.25);
-        assert_eq!(p.acceptable_audio_codecs, vec!["aac", "ac3", "eac3"]);
+        // DTS included by default since FOUNDRY-23 — see
+        // lossless_audio_is_not_accepted_but_dts_now_is for the measurement.
+        assert_eq!(p.acceptable_audio_codecs, vec!["aac", "ac3", "eac3", "dts"]);
         assert_eq!(p.max_audio_channels, 6);
         assert_eq!(p.acceptable_containers, vec![Container::Matroska, Container::Mp4]);
         assert_eq!(p.output_container, Container::Matroska);
@@ -494,15 +577,36 @@ mod tests {
     }
 
     #[test]
-    fn lossless_and_object_audio_are_not_accepted() {
-        // These are exactly the formats that force a client-side transcode,
-        // which is the problem this stage exists to remove.
+    fn lossless_audio_is_not_accepted_but_dts_now_is() {
+        // TrueHD and FLAC still force a client-side transcode, which is the
+        // problem this stage exists to remove.
         let p = TranscodePolicy::default();
         assert!(p.accepts_audio_codec("aac"));
         assert!(p.accepts_audio_codec("EAC3"), "codec matching is case-insensitive");
         assert!(!p.accepts_audio_codec("truehd"));
-        assert!(!p.accepts_audio_codec("dts"));
         assert!(!p.accepts_audio_codec("flac"));
+
+        // DTS CHANGED, and the reason is measured rather than aesthetic.
+        //
+        // This assertion used to be `!accepts_audio_codec("dts")`, on the
+        // reasoning that DTS forces a client-side transcode. That reasoning
+        // was sound in isolation and wrong in combination: re-encoding DTS
+        // does not help, because `dts` is also on the undetectable-formats
+        // list (DTS:X inside DTS-HD MA), so may_delete_original then REFUSES
+        // the deletion — the re-encode cannot be shown to have preserved it.
+        //
+        // Measured on this library: a 500-file survey of 16,221 titles found
+        // ~3,000 that would be re-encoded and then kept. 91 of the 93 flagged
+        // files were DTS. The outcome was: lose DTS-HD, gain AAC, KEEP the
+        // original, use more disk.
+        //
+        // Leaving DTS alone is strictly less destructive. A client that cannot
+        // decode it transcodes on the fly, exactly as it does today.
+        assert!(
+            p.accepts_audio_codec("dts"),
+            "DTS is accepted so those ~3,000 titles are left alone; \
+             MUSE_FOUNDRY_REENCODE_DTS=1 restores the old behaviour"
+        );
     }
 
     #[test]

@@ -2123,8 +2123,14 @@ mod tests {
             ("video codec", probe("matroska,webm", "msmpeg4v2", 1920, 1080, &["aac"], 2)),
             // the 42-subtitle file
             ("subtitle count", probe("matroska,webm", "h264", 1920, 1080, &["aac"], 42)),
-            // dts forces a re-encode of the audio side
-            ("audio codec", probe("matroska,webm", "h264", 1920, 1080, &["dts"], 2)),
+            // truehd forces a re-encode of the audio side.
+            //
+            // Was `dts` until FOUNDRY-23 made DTS an ACCEPTED codec — at which
+            // point a dts file scores the same as an ordinary one and this
+            // axis silently stopped being tested. The axis is "an audio codec
+            // that must be re-encoded", so the fixture has to be a codec that
+            // still is one.
+            ("audio codec", probe("matroska,webm", "h264", 1920, 1080, &["truehd"], 2)),
             // avi is 48% of the measured library and is a container rewrite
             ("container", probe("avi", "h264", 1920, 1080, &["aac"], 2)),
             ("resolution band", probe("matroska,webm", "h264", 3840, 2160, &["aac"], 2)),
@@ -2904,7 +2910,13 @@ mod tests {
     fn a_dropped_subtitle_track_is_caught() {
         // The 42-subtitle file is in the sample precisely because this is where
         // a mapping bug shows up.
-        let src = probe("matroska,webm", "h264", 1918, 802, &["dts"], 42);
+        //
+        // `truehd`, not `dts`: DTS became an ACCEPTED codec in FOUNDRY-23, so a
+        // dts+h264+matroska file is now `AlreadyOptimal` and produces no plan
+        // to expect anything from. TrueHD still forces a re-encode, which is
+        // what this fixture needs — the subject is the SUBTITLE mapping, and
+        // the audio codec is only there to make the file transcode at all.
+        let src = probe("matroska,webm", "h264", 1918, 802, &["truehd"], 42);
         let (e, container) = expectation_of(&src);
         let mut out = good_output_for(&src);
         out.subtitles.truncate(41);

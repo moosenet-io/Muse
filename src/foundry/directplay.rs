@@ -1540,7 +1540,12 @@ mod tests {
     #[test]
     fn the_familiar_blockers_are_still_reported() {
         let policy = TranscodePolicy::direct_play_normalization();
-        let mut p = probe(vec![video("mpeg4", 1920, 1080)], vec![audio(1, "dts", 8)]);
+        // `truehd`, not `dts`. DTS is now an accepted codec (FOUNDRY-23,
+        // measured: re-encoding it produced ~3,000 titles the deletion gate
+        // then refused), so it no longer raises this blocker. TrueHD still
+        // does and is the right fixture for "an audio codec clients cannot
+        // direct-play".
+        let mut p = probe(vec![video("mpeg4", 1920, 1080)], vec![audio(1, "truehd", 8)]);
         p.container = "avi".into();
         let b = direct_play_blockers(&p, &policy);
         assert!(b

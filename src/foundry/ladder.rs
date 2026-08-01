@@ -128,6 +128,18 @@ pub enum RenditionRefusal {
     /// cannot carry PGS or VobSub at all, so the encode would fail outright —
     /// or, worse, succeed with the track silently dropped.
     BitmapSubtitlesCannotEnterMp4 { stream_index: u32, codec: String },
+    /// The rung asks to re-encode HDR while declaring
+    /// [`DynamicRangeTreatment::Preserve`]. Preserve means "do not touch the
+    /// picture", which only holds for a copy — encoding under it would emit
+    /// HDR pixels through an SDR encode with no tone map, which is the
+    /// washed-out/clipped result the module exists to avoid.
+    ///
+    /// Not reachable from the built-in ladder. It IS reachable from a
+    /// caller-supplied `Rendition`, since the fields are public, which is why
+    /// this is a refusal and no longer a `debug_assert` — that check vanished
+    /// in release builds, so the malformed config panicked in tests and
+    /// silently produced a bad encode in production. Flagged by codex.
+    HdrEncodeUnderPreserve { transfer: HdrTransfer },
     /// The plan would enlarge the picture. Should be unreachable — the shared
     /// `scale_to_fit` never upscales — and is checked on the emitted plan
     /// anyway, because "unreachable" is a claim about today's code.
@@ -137,6 +149,12 @@ pub enum RenditionRefusal {
 impl std::fmt::Display for RenditionRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HdrEncodeUnderPreserve { transfer } => write!(
+                f,
+                "this rung re-encodes but declares Preserve, and the source is {transfer:?} HDR. \
+                 Preserve is only valid alongside a copy: encoding without a tone map would \
+                 emit HDR pixels into an SDR rendition"
+            ),
             Self::DolbyVisionCannotBeTranscoded { verdict } => write!(
                 f,
                 "refusing to re-encode this rung: {verdict}. A visibly wrong rendition is \
@@ -408,7 +426,7 @@ fn decide_rung(
                 };
             }
             let resolution = (video.width.unwrap_or(0), video.height.unwrap_or(0));
-            let args = build_rendition_args(&plan, rendition, None, input_path, output_path);
+            let args = build_rendition_args(&plan, rendition, None, None, input_path, output_path);
             return RenditionOutcome::Encode {
                 plan,
                 args,
@@ -465,11 +483,11 @@ fn decide_rung(
             }
         }
         HdrVerdict::Hdr { transfer } => {
-            debug_assert_eq!(
-                rendition.dynamic_range,
-                DynamicRangeTreatment::ToneMapToSdr,
-                "an encoding rung must target SDR; Preserve is only valid with CopyOnly"
-            );
+            if rendition.dynamic_range != DynamicRangeTreatment::ToneMapToSdr {
+                return RenditionOutcome::Refused {
+                    why: RenditionRefusal::HdrEncodeUnderPreserve { transfer },
+                };
+            }
             match ctx.tone_map_support {
                 ToneMapSupport::Unverified => {
                     return RenditionOutcome::CannotDecide {
@@ -498,6 +516,7 @@ fn decide_rung(
         &plan,
         rendition,
         tone_map_record.as_ref(),
+        crate::foundry::hdr::sdr_gamut_conversion(video),
         input_path,
         output_path,
     );
@@ -662,6 +681,11 @@ pub fn build_rendition_args(
     plan: &TranscodePlan,
     rendition: &Rendition,
     tone_map: Option<&ToneMap>,
+    // A BT.709 gamut conversion for a wide-gamut SDR source, from
+    // `crate::foundry::hdr::sdr_gamut_conversion`. Mutually exclusive with
+    // `tone_map`: the tone-map chain already converts primaries, and applying
+    // both would convert twice.
+    gamut: Option<&str>,
     input_path: &str,
     output_path: &str,
 ) -> Vec<String> {
@@ -718,6 +742,16 @@ pub fn build_rendition_args(
             let mut filters: Vec<String> = Vec::new();
             if let Some((w, h)) = scale {
                 filters.push(format!("scale={w}:{h}"));
+            }
+            // A wide-gamut SDR source needs its primaries brought to BT.709,
+            // and the tone-map chain is not running to do it. Only ever one of
+            // the two: `sdr_gamut_conversion` returns `None` for anything that
+            // is not SDR, so a tone-mapped source cannot also land here and be
+            // converted twice.
+            if tone_map.is_none() {
+                if let Some(g) = gamut {
+                    filters.push(g.to_string());
+                }
             }
             match tone_map {
                 Some(tm) => {
@@ -1138,12 +1172,24 @@ mod tests {
     fn the_hifi_rung_never_tone_maps_and_never_downmixes() {
         // Stated as a property of every possible hifi outcome on the content
         // the rung exists for.
-        for p in [uhd_hdr10(), dv_profile(8, 1), dv_profile(5, 0)] {
+        //
+        // The fixtures are in AVI deliberately. Opus caught this test at the
+        // FOUNDRY-03 gate: with the sources left in Matroska every case came
+        // back `Skip { AlreadyOptimal }`, the `if let Encode` body never ran,
+        // and the test passed while asserting nothing. It would have kept
+        // passing if hifi tone-mapped and downmixed on every encode. Forcing a
+        // container change gives the rung actual work to plan, so the
+        // assertions execute — and `encodes` below fails the test outright if
+        // that ever stops being true.
+        let mut encodes = 0;
+        for mut p in [uhd_hdr10(), dv_profile(8, 1), dv_profile(5, 0)] {
+            p.container = "avi".into();
             let out = rung(&p, RenditionName::HiFi, &ctx_available());
             if let RenditionOutcome::Encode {
                 tone_map, plan, args, ..
             } = &out
             {
+                encodes += 1;
                 assert!(tone_map.is_none(), "hifi must never tone-map: {out:?}");
                 assert!(plan.is_remux_only(), "hifi must never re-encode: {out:?}");
                 assert!(
@@ -1153,6 +1199,36 @@ mod tests {
                 assert!(!args.iter().any(|s| s == "-vf"), "{args:?}");
             }
         }
+        assert!(
+            encodes > 0,
+            "no fixture produced a hifi encode, so every assertion above was \
+             skipped and this test proved nothing"
+        );
+    }
+
+    /// Codex, at the FOUNDRY-03 gate: hifi's "never re-encodes" guarantee was
+    /// not structural. `Rendition`'s fields are public, so a caller can build
+    /// one that encodes while declaring `Preserve`. The old check was a
+    /// `debug_assert_eq!`, which is compiled OUT of release builds — so the
+    /// malformed config panicked in tests and, in production, quietly encoded
+    /// HDR pixels into an SDR rendition with no tone map.
+    ///
+    /// It is now a refusal, which behaves the same in both profiles.
+    #[test]
+    fn an_hdr_encode_that_declares_preserve_is_refused_not_asserted() {
+        let mut ladder = Ladder::default();
+        // A rung that encodes (web's treatment) but claims Preserve.
+        ladder.web.dynamic_range = DynamicRangeTreatment::Preserve;
+        let out = plan_rung(&uhd_hdr10(), &ladder, RenditionName::Web, SRC, &ctx_available()).outcome;
+        assert!(
+            matches!(
+                out,
+                RenditionOutcome::Refused {
+                    why: RenditionRefusal::HdrEncodeUnderPreserve { .. }
+                }
+            ),
+            "expected a refusal, got {out:?}"
+        );
     }
 
     #[test]
@@ -1341,6 +1417,95 @@ mod tests {
             .map(|w| w[1].clone())
             .expect("a tone-mapped rung must carry a filter chain");
         assert!(vf.contains(&tm.filter_chain), "recorded chain not in argv: {vf}");
+
+        // ...and the argv itself carries `desat=0`. Asserting `tm.desat == 0`
+        // above only proves the STRUCT says zero: if the filter chain were
+        // built without the parameter, ffmpeg would silently apply its default
+        // of 2 and every tone-mapped rendition would come out washed out,
+        // while both assertions above still passed. Flagged by codex at the
+        // FOUNDRY-03 gate as a test that could not fail.
+        assert!(
+            vf.contains("desat=0"),
+            "the tone-map chain actually passed to ffmpeg must set desat=0, \
+             otherwise ffmpeg's default of 2 washes the picture out: {vf}"
+        );
+        assert!(
+            !vf.contains("desat=2"),
+            "ffmpeg's washed-out default must never be emitted: {vf}"
+        );
+    }
+
+    /// Raised independently by codex and opus at the FOUNDRY-03 gate.
+    ///
+    /// `bt2020-10`/`bt2020-12` are SDR TRANSFER curves, so `classify_hdr`
+    /// correctly calls them SDR and no tone map is applied. But the transfer
+    /// is not the gamut: such a stream still carries BT.2020 PRIMARIES. The
+    /// encoder was emitting those pixels untouched and tagging nothing, so a
+    /// BT.709 client interprets wide-gamut values as if they were BT.709 and
+    /// the picture comes out visibly wrong.
+    ///
+    /// The HDR path never had this bug — its tone-map chain already contains
+    /// `zscale=primaries=bt709`. It was only the SDR path, which skipped the
+    /// filter entirely, that shipped the source gamut through unconverted.
+    #[test]
+    fn a_wide_gamut_sdr_source_is_converted_to_bt709() {
+        let mut v = vid("hevc", 3840, 2160, 60_000_000);
+        v.pix_fmt = Some("yuv420p10le".into());
+        // An SDR transfer curve...
+        v.color_transfer = Some("bt2020-10".into());
+        // ...on a wide-gamut container.
+        v.color_primaries = Some("bt2020".into());
+        let p = probe(vec![v], vec![aud(1, "aac", 6)]);
+
+        // Sanity: this really is classified SDR, so no tone map runs. If that
+        // ever changes this test is testing the wrong path and should fail
+        // loudly here rather than pass for the wrong reason.
+        assert_eq!(
+            crate::foundry::hdr::classify_hdr(&p.video[0]),
+            HdrVerdict::Sdr,
+            "fixture must exercise the SDR path"
+        );
+
+        let out = rung(&p, RenditionName::Web, &ctx_available());
+        let RenditionOutcome::Encode { tone_map, args, .. } = &out else {
+            panic!("expected an encode, got {out:?}");
+        };
+        assert!(tone_map.is_none(), "SDR must not be tone-mapped");
+
+        let vf = args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].clone())
+            .expect("a wide-gamut source must carry a filter chain");
+        assert!(
+            vf.contains("primaries=bt709"),
+            "a BT.2020 SDR source must be converted to BT.709, or clients \
+             render it oversaturated: {vf}"
+        );
+    }
+
+    /// The control: an ordinary BT.709 source must NOT get a gamut filter.
+    /// Converting BT.709 to BT.709 is wasted work, and a rule that fires on
+    /// everything would pass the test above while meaning nothing.
+    #[test]
+    fn an_ordinary_bt709_source_gets_no_gamut_conversion() {
+        let mut v = vid("hevc", 3840, 2160, 60_000_000);
+        v.color_transfer = Some("bt709".into());
+        v.color_primaries = Some("bt709".into());
+        let p = probe(vec![v], vec![aud(1, "aac", 6)]);
+        let out = rung(&p, RenditionName::Web, &ctx_available());
+        let RenditionOutcome::Encode { args, .. } = &out else {
+            panic!("expected an encode, got {out:?}");
+        };
+        let vf = args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].clone())
+            .unwrap_or_default();
+        assert!(
+            !vf.contains("primaries="),
+            "a BT.709 source needs no gamut conversion: {vf}"
+        );
     }
 
     #[test]

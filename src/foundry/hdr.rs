@@ -659,6 +659,44 @@ pub const TONE_MAP_DESAT: u32 = 0;
 /// has *not* been verified on the deployment host — see [`ToneMapSupport`],
 /// which is why ordering a tone-map is gated on a capability the planner
 /// refuses to assume.
+/// Wide-gamut primaries that a BT.709 client cannot interpret correctly.
+///
+/// These are *gamut* tags, deliberately independent of the transfer curve:
+/// `bt2020-10` and `bt2020-12` are SDR curves that nonetheless sit on BT.2020
+/// primaries, so a stream can need this conversion while needing no tone map
+/// at all.
+pub const WIDE_GAMUT_PRIMARIES: &[&str] = &["bt2020", "bt2020nc", "bt2020c", "smpte431", "smpte432"];
+
+/// The filter that brings wide-gamut SDR into BT.709.
+///
+/// Deliberately NOT part of [`tone_map`]'s chain — that chain already contains
+/// `zscale=primaries=bt709` and applies to HDR sources. This is the SDR-only
+/// case, which skips the tone-map chain entirely and would otherwise pass the
+/// source gamut straight through to the encoder untouched.
+pub const BT709_GAMUT_CHAIN: &str = "zscale=primaries=bt709:matrix=bt709:transfer=bt709";
+
+/// The gamut conversion an SDR rendition of this stream needs, if any.
+///
+/// `None` when the source is already BT.709, when the primaries are untagged
+/// (converting on a guess would be its own colour bug), or when the stream is
+/// not SDR — an HDR source gets its conversion from the tone-map chain, and
+/// applying both would convert twice.
+///
+/// Returning `None` for untagged primaries is a deliberate asymmetry with the
+/// rest of this module, where unknown refuses. Here "refuse" would mean
+/// "convert anyway", and mis-converting a BT.709 file is a visible error in
+/// the opposite direction. Leaving an untagged file alone is what every other
+/// tool does with it.
+pub fn sdr_gamut_conversion(stream: &VideoStream) -> Option<&'static str> {
+    if classify_hdr(stream) != HdrVerdict::Sdr {
+        return None;
+    }
+    let p = stream.color_primaries.as_deref()?.trim().to_ascii_lowercase();
+    WIDE_GAMUT_PRIMARIES
+        .contains(&p.as_str())
+        .then_some(BT709_GAMUT_CHAIN)
+}
+
 pub fn tone_map(transfer: HdrTransfer, algorithm: ToneMapAlgorithm) -> ToneMap {
     let peak_nits = transfer.nominal_peak_nits();
     let desat = TONE_MAP_DESAT;

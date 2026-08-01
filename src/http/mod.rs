@@ -240,6 +240,33 @@ fn ops_routes() -> Router<Arc<AppState>> {
         // deletes anything in the library. This is a LONG call — up to 24 real
         // encodes, 20 minutes each, 60 minutes for the whole run.
         .route("/foundry/validate", post(crate::web::dashboard::foundry_validate))
+        // SUBS-01: the subtitle system. Bearer-protected like the rest of this
+        // router — fetching touches an external provider, and applying an
+        // offset changes what a viewer sees.
+        //
+        // `propose` and `apply` are deliberately SEPARATE routes rather than
+        // one route with a flag: measuring a subtitle's timing and changing it
+        // must never be the same call with a different body.
+        .route(
+            "/subtitles/:media_item_id",
+            get(crate::subtitles::routes::list_subtitles),
+        )
+        .route(
+            "/subtitles/:media_item_id/fetch",
+            post(crate::subtitles::routes::fetch_from_provider),
+        )
+        .route(
+            "/subtitles/selection/:id/active",
+            post(crate::subtitles::routes::set_active),
+        )
+        .route(
+            "/subtitles/selection/:id/offset/propose",
+            post(crate::subtitles::routes::propose_offset),
+        )
+        .route(
+            "/subtitles/selection/:id/offset/apply",
+            post(crate::subtitles::routes::apply_offset),
+        )
 }
 
 /// MUSE-28/29: the linear tuner surface — HDHomeRun-emulation discovery

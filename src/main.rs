@@ -54,6 +54,7 @@ pub mod settings;
 mod shadow;
 mod snapshot;
 mod streaming;
+pub mod subtitles;
 #[cfg(test)]
 mod taste_golden_set;
 #[cfg(test)]

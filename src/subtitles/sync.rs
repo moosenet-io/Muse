@@ -185,9 +185,20 @@ pub struct OffsetProposal {
     pub confidence: Confidence,
     /// Normalized correlation at the peak, `[0.0, 1.0]`.
     pub peak_score: f64,
-    /// `(peak - best_rival) / peak` — how much the winning shift beat the best
-    /// genuinely-different alternative. This, not `peak_score`, is what
-    /// decides the confidence.
+    /// `(peak - background) / peak` measured on the correlation's SHAPE
+    /// series, where `background` is the MEDIAN score across every shift
+    /// searched — the level two signals of this density reach by coincidence.
+    ///
+    /// Confidence needs BOTH this and `peak_score`, and they answer different
+    /// questions: `peak_score` is absolute quality ("did enough of the
+    /// subtitle land on speech at all?") and this is localisation ("was that
+    /// shift meaningfully better than any other?"). A subtitle can score well
+    /// everywhere and locate nothing, which is high peak and low prominence.
+    ///
+    /// (An earlier revision documented a runner-up formula,
+    /// `(peak - best_rival) / peak`, and claimed prominence alone decided the
+    /// confidence. Neither was true of the code. Corrected at the SUBS-01
+    /// review gate — opus.)
     pub prominence: f64,
     /// The resolution the measurement was made at. A proposal is accurate to
     /// ±this; presenting `offset_ms` as exact would overstate it.
@@ -442,7 +453,9 @@ pub fn activity_grid(silences: &[SilenceSpan], duration_ms: i64) -> Vec<f32> {
     let mut grid = vec![1.0f32; bins];
     for span in silences {
         let first = (span.start_ms / BIN_MS).max(0) as usize;
-        let last = ((span.end_ms + BIN_MS - 1) / BIN_MS).max(0) as usize;
+        // Saturating: `end_ms` comes from ffmpeg's silencedetect output and is
+        // not bounded by anything this module controls. Codex, SUBS-01 gate.
+        let last = ((span.end_ms.saturating_add(BIN_MS - 1)) / BIN_MS).max(0) as usize;
         for bin in grid.iter_mut().take(last.min(bins)).skip(first.min(bins)) {
             *bin = 0.0;
         }
@@ -460,7 +473,8 @@ pub fn cues_to_activity_grid(cues: &[CueSpan], duration_ms: i64) -> Vec<f32> {
             continue;
         }
         let first = (cue.start_ms.max(0) / BIN_MS) as usize;
-        let last = ((cue.end_ms.max(0) + BIN_MS - 1) / BIN_MS) as usize;
+        // Saturating: cue timestamps come from a parsed subtitle file.
+        let last = ((cue.end_ms.max(0).saturating_add(BIN_MS - 1)) / BIN_MS) as usize;
         for bin in grid.iter_mut().take(last.min(bins)).skip(first.min(bins)) {
             *bin = 1.0;
         }
@@ -474,12 +488,30 @@ pub fn cues_to_activity_grid(cues: &[CueSpan], duration_ms: i64) -> Vec<f32> {
 pub struct Correlation {
     /// Best shift, in bins. Positive means the SUBTITLE must move later.
     pub best_shift_bins: i64,
-    /// Normalized score at the best shift, `[0.0, 1.0]`.
+    /// COVERAGE at the best shift, `[0.0, 1.0]`: the fraction of the
+    /// subtitle's total on-screen time that lands on speech. This is the
+    /// number `MIN_PEAK_SCORE` gates on, and it is normalized over the whole
+    /// subtitle so a shift that pushes half of it off the timeline cannot
+    /// report a perfect score on the remainder.
     pub peak_score: f64,
+    /// The correlation SHAPE at the best shift — the same overlap measured
+    /// only over comparable bins. Prominence is computed from this and from
+    /// [`Self::background_score`], which come from the same series.
+    pub shape_score: f64,
     /// The MEDIAN score across every shift searched — the level two signals of
     /// this density score against each other by coincidence. This is the
     /// baseline the peak has to beat to mean anything.
     pub background_score: f64,
+    /// The largest `|shift|` that was actually SCORED, which is not the same
+    /// as the largest that was requested.
+    ///
+    /// The overlap-fraction guard skips shifts that push too much of the
+    /// subtitle off the timeline, so the search can run out of evaluable room
+    /// well before the nominal `±max_shift_bins`. Judging "did the search run
+    /// out?" against the nominal edge therefore misses exactly the case it
+    /// exists to catch: a peak at the last EVALUATED shift with everything
+    /// beyond it unexamined. Raised by codex at the SUBS-01 gate.
+    pub evaluated_max_abs_shift_bins: i64,
 }
 
 impl Correlation {
@@ -488,10 +520,16 @@ impl Correlation {
     /// Clamped at zero: a peak at or below the background is not a peak, and a
     /// negative prominence would be a nonsense number to show an operator.
     pub fn prominence(&self) -> f64 {
-        if self.peak_score <= 0.0 {
+        // From the SHAPE series, not the coverage number. Both the peak and
+        // the background here come from `overlap / considered`, so they are
+        // measured against the same denominator. Mixing the coverage peak with
+        // this background would compare two different quantities and inflate
+        // the result — which is the direction that makes the detector look
+        // more certain than it is.
+        if self.shape_score <= 0.0 {
             return 0.0;
         }
-        ((self.peak_score - self.background_score) / self.peak_score).clamp(0.0, 1.0)
+        ((self.shape_score - self.background_score) / self.shape_score).clamp(0.0, 1.0)
     }
 }
 
@@ -505,8 +543,13 @@ impl Correlation {
 /// shifts that push most of the subtitle off the end of the timeline, where a
 /// handful of surviving bins could otherwise score a perfect 1.0.
 pub fn cross_correlate(audio: &[f32], subtitle: &[f32], max_shift_bins: i64) -> Correlation {
-    let mut scores: Vec<(i64, f64)> = Vec::new();
+    // (shift, shape score, coverage score) — see the comment at the push.
+    let mut scores: Vec<(i64, f64, f64)> = Vec::new();
+    let mut evaluated_max_abs: i64 = 0;
 
+    // Clamped before negation: `-i64::MIN` overflows, and `max_shift_bins`
+    // is caller-supplied. The bound is also far below any sane search width.
+    let max_shift_bins = max_shift_bins.clamp(0, 1_000_000);
     for shift in -max_shift_bins..=max_shift_bins {
         let mut overlap = 0.0f64;
         let mut considered = 0.0f64;
@@ -529,10 +572,29 @@ pub fn cross_correlate(audio: &[f32], subtitle: &[f32], max_shift_bins: i64) -> 
         if considered < active_subtitle_bins * 0.5 || considered == 0.0 {
             continue;
         }
-        scores.push((shift, overlap / considered));
+        // TWO normalizations, deliberately, because two different questions
+        // are being asked and sharing a denominator corrupts one of them.
+        //
+        // `overlap / considered` is the SHAPE of the correlation — how well
+        // the subtitle lines up with speech among the bins that are actually
+        // comparable at this shift. The background/prominence statistic is
+        // built from this series, and it has to be comparable across shifts:
+        // if edge shifts were penalised for falling off the timeline, the
+        // median would sag, and since prominence is
+        // `(peak - background) / peak`, a sagging background INFLATES
+        // prominence and makes every measurement look more decisive.
+        //
+        // `overlap / active_subtitle_bins` is the COVERAGE — the honest
+        // absolute answer to "how much of this subtitle's on-screen time
+        // landed on speech", which is the claim `MIN_PEAK_SCORE` gates on.
+        // Codex was right that the old code reported the first number as if
+        // it were the second: a shift discarding 49% of the subtitle could
+        // report a perfect 1.0 on the surviving 51%.
+        scores.push((shift, overlap / considered, overlap / active_subtitle_bins));
+        evaluated_max_abs = evaluated_max_abs.max(shift.abs());
     }
 
-    let Some(&(best_shift, peak)) = scores
+    let Some(&(best_shift, peak_shape, peak_coverage)) = scores
         .iter()
         // `total_cmp` rather than `partial_cmp().unwrap()`: a NaN score (from
         // a degenerate input) must not panic the detector.
@@ -541,7 +603,9 @@ pub fn cross_correlate(audio: &[f32], subtitle: &[f32], max_shift_bins: i64) -> 
         return Correlation {
             best_shift_bins: 0,
             peak_score: 0.0,
+            shape_score: 0.0,
             background_score: 0.0,
+            evaluated_max_abs_shift_bins: 0,
         };
     };
 
@@ -559,14 +623,18 @@ pub fn cross_correlate(audio: &[f32], subtitle: &[f32], max_shift_bins: i64) -> 
     // measurement a whole confidence rung on a statistic, not on evidence.
     // The median is the robust estimate of the typical level, so it is the
     // conservative choice, which is the one this module wants.
-    let mut sorted: Vec<f64> = scores.iter().map(|(_, score)| *score).collect();
+    let mut sorted: Vec<f64> = scores.iter().map(|(_, shape, _)| *shape).collect();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let background = sorted[sorted.len() / 2];
 
     Correlation {
         best_shift_bins: best_shift,
-        peak_score: peak,
+        // The honest absolute number, gated by MIN_PEAK_SCORE.
+        peak_score: peak_coverage,
+        // The comparable series the coincidence floor is measured against.
+        shape_score: peak_shape,
         background_score: background,
+        evaluated_max_abs_shift_bins: evaluated_max_abs,
     }
 }
 
@@ -615,7 +683,16 @@ pub fn propose_offset(
     // merely the closest we were allowed to get to it, and they would apply
     // it. A boundary hit means "the true offset is probably outside the range
     // I searched", which is a different statement, and it is made explicitly.
-    let at_search_boundary = correlation.best_shift_bins.abs() >= max_shift_bins - BOUNDARY_MARGIN_BINS;
+    // Judged against the range actually EVALUATED, not the range requested.
+    // The overlap guard can stop the search well short of ±max_shift_bins, and
+    // a peak sitting at the last evaluated shift means the same thing as one
+    // at the nominal edge: everything past it is unexamined, so the answer is
+    // a boundary, not a measurement. Codex, SUBS-01 gate.
+    let effective_edge = correlation
+        .evaluated_max_abs_shift_bins
+        .min(max_shift_bins);
+    let at_search_boundary = effective_edge > 0
+        && correlation.best_shift_bins.abs() >= effective_edge - BOUNDARY_MARGIN_BINS;
 
     let confidence = if at_search_boundary {
         Confidence::Inconclusive
@@ -1017,11 +1094,136 @@ mod tests {
             proposal.offset_ms.abs() <= MAX_SHIFT_MS,
             "the proposal must stay inside the searched range"
         );
-        assert_ne!(
+        // Inconclusive specifically, not merely "not High". Opus caught this
+        // at the SUBS-01 gate: `!= High` also accepts Low, and Low is offered
+        // to the operator as a one-click acceptance. An offset the detector
+        // never actually looked for must not be offered at all.
+        assert_eq!(
             proposal.confidence,
-            Confidence::High,
-            "an out-of-range offset must not masquerade as a confident in-range one: {}",
+            Confidence::Inconclusive,
+            "an out-of-range offset must be Inconclusive, not offered: {}",
             proposal.explanation
+        );
+    }
+
+    /// The case the old boundary test could not see.
+    ///
+    /// Opus: the 90s fixture above also fails `MIN_PEAK_SCORE`, so that test
+    /// would still pass with the boundary rule deleted entirely. This one
+    /// shifts by just under `MAX_SHIFT_MS`, where the correlation is still
+    /// strong — so the ONLY thing that can force Inconclusive is the boundary
+    /// rule itself.
+    #[test]
+    fn a_strong_peak_at_the_edge_of_the_search_is_inconclusive_not_reported() {
+        let silences = silences_leaving_speech(SPEECH, DURATION);
+        let near = MAX_SHIFT_MS - 200; // two bins inside the edge
+        let shifted: Vec<(i64, i64)> =
+            SPEECH.iter().map(|&(a, b)| (a + near, b + near)).collect();
+        let proposal = propose_offset(&silences, &cues(&shifted), DURATION).unwrap();
+        assert_eq!(
+            proposal.confidence,
+            Confidence::Inconclusive,
+            "a peak sitting at the edge of the searched range means the search ran out,              not that the offset was located (peak {}, prominence {}): {}",
+            proposal.peak_score,
+            proposal.prominence,
+            proposal.explanation
+        );
+        assert!(
+            proposal.explanation.contains("boundary"),
+            "the operator must be told WHY: {}",
+            proposal.explanation
+        );
+    }
+
+    /// Pins that prominence is computed from the SHAPE series.
+    ///
+    /// My first attempt at codex's coverage fix used one normalization for
+    /// both numbers, which dropped the background and pushed a deliberately
+    /// inconclusive fixture from prominence 0.06 to 0.25 — i.e. it made the
+    /// detector MORE certain, the one direction that must never happen by
+    /// accident. Mixing the coverage peak with the shape background is the
+    /// same error, so it is pinned here rather than left to fixtures where the
+    /// two happen to coincide.
+    #[test]
+    fn prominence_is_measured_against_the_series_its_background_came_from() {
+        // Coverage well below shape: half the subtitle left the timeline.
+        let c = Correlation {
+            best_shift_bins: 300,
+            peak_score: 0.45,  // coverage
+            shape_score: 0.90, // shape
+            background_score: 0.60,
+            evaluated_max_abs_shift_bins: 600,
+        };
+        // From shape: (0.90 - 0.60) / 0.90 = 0.3333...
+        assert!(
+            (c.prominence() - 1.0 / 3.0).abs() < 1e-9,
+            "prominence must come from shape_score, got {}",
+            c.prominence()
+        );
+        // Computing it from coverage would give (0.45-0.60)/0.45 -> clamped to
+        // 0.0, a different answer entirely. Asserting it is NOT that pins the
+        // choice rather than merely exercising it.
+        assert_ne!(c.prominence(), 0.0);
+    }
+
+    /// Pins that the boundary is judged against the range actually EVALUATED.
+    ///
+    /// The overlap-fraction guard skips shifts that push too much of the
+    /// subtitle off the timeline, so the search can stop well short of the
+    /// requested `±max_shift_bins`. Judging the boundary against the nominal
+    /// edge therefore misses a peak sitting at the last evaluated shift with
+    /// everything beyond it unexamined — which is codex's finding, and which
+    /// a test using a fixture that reaches the nominal edge cannot see.
+    #[test]
+    fn the_search_reports_how_far_it_actually_got_not_how_far_it_was_asked() {
+        // Subtitle active only in the last 40% of the timeline: shifting it
+        // far in either direction pushes more than half of it off, and those
+        // shifts are skipped rather than scored.
+        let audio = vec![1.0f32; 1000];
+        let mut subtitle = vec![0.0f32; 1000];
+        for b in subtitle.iter_mut().skip(600) {
+            *b = 1.0;
+        }
+        let c = cross_correlate(&audio, &subtitle, 900);
+        assert!(
+            c.evaluated_max_abs_shift_bins < 900,
+            "the guard must have trimmed the search for this fixture, otherwise the \
+             test cannot distinguish the evaluated edge from the requested one (got {})",
+            c.evaluated_max_abs_shift_bins
+        );
+        assert!(
+            c.evaluated_max_abs_shift_bins > 0,
+            "...but it must still have evaluated something"
+        );
+    }
+
+    /// Codex: the reported peak was `overlap / considered`, so a shift that
+    /// pushed most of the subtitle off the timeline could report a perfect
+    /// score on the fragment that remained. `peak_score` is the number
+    /// `MIN_PEAK_SCORE` gates on, and it must describe the WHOLE subtitle.
+    #[test]
+    fn the_reported_peak_describes_the_whole_subtitle_not_the_surviving_fragment() {
+        // A subtitle whose cues sit entirely in the last third of the
+        // programme. Shifted late, much of it leaves the timeline.
+        let audio = vec![1.0f32; 1000];
+        let mut subtitle = vec![0.0f32; 1000];
+        for b in subtitle.iter_mut().skip(600) {
+            *b = 1.0;
+        }
+        let c = cross_correlate(&audio, &subtitle, 600);
+        // Every bin of the audio is speech, so any surviving subtitle bin
+        // overlaps. The shape score can therefore be 1.0 — but the coverage
+        // must not be, because bins pushed past the end overlap nothing.
+        assert!(
+            c.peak_score <= 1.0 && c.peak_score > 0.0,
+            "coverage {} out of range",
+            c.peak_score
+        );
+        assert!(
+            c.peak_score <= c.shape_score + 1e-9,
+            "coverage ({}) can never exceed shape ({}) — it has the larger denominator",
+            c.peak_score,
+            c.shape_score
         );
     }
 
@@ -1181,13 +1383,17 @@ mod tests {
         let c = Correlation {
             best_shift_bins: 0,
             peak_score: 0.0,
+            shape_score: 0.0,
             background_score: 0.0,
+            evaluated_max_abs_shift_bins: 600,
         };
         assert_eq!(c.prominence(), 0.0);
         let c = Correlation {
             best_shift_bins: 0,
             peak_score: 0.5,
+            shape_score: 0.5,
             background_score: 0.9,
+            evaluated_max_abs_shift_bins: 600,
         };
         assert_eq!(
             c.prominence(),

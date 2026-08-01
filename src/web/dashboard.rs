@@ -2934,7 +2934,10 @@ pub async fn foundry_survey(
             .map(|f| f.absolute_path)
             .collect();
 
-    let policy = crate::foundry::policy::TranscodePolicy::default();
+    // Path A's policy, for the same reason the validator uses it: this
+    // endpoint reports what Path A WOULD do, so reporting the default's
+    // decisions would describe work that is not the work.
+    let policy = crate::foundry::policy::TranscodePolicy::direct_play_normalization();
     let summary = crate::foundry::survey::survey_files(&foundry, &policy, &candidates, limit);
 
     Ok(Json(json!({
@@ -3158,6 +3161,7 @@ pub async fn foundry_validate(
         hdr_only: q.hdr_only.unwrap_or(false),
     };
     let filter_is_unrestricted = filter.is_unrestricted();
+    let policy_reported = crate::foundry::policy::TranscodePolicy::direct_play_normalization();
     // Half the run deadline, so a targeted walk cannot consume the whole
     // budget before any encode happens.
     let probe_deadline = bounds.run_deadline / 2;
@@ -3268,7 +3272,19 @@ pub async fn foundry_validate(
         let (probed, probe_failures) =
             validate::probe_candidates(&foundry, &candidates, probe_budget, &filter, probe_deadline);
 
-        let policy = crate::foundry::policy::TranscodePolicy::default();
+        // PATH A's policy, not the default.
+        //
+        // The harness exists to answer "can Path A be trusted to rewrite this
+        // library", and it was answering it about a DIFFERENT policy. The
+        // default caps at 1080p / 12 Mbps / 8-bit, so validating with it meant
+        // every 4K file was downscaled to 1080p and forced to yuv420p — with
+        // no tone-map — during a run whose whole purpose was to prove 4K/HDR
+        // is handled safely. Caught by reading the live ffmpeg argv on a real
+        // Dolby Vision file, not from the code.
+        //
+        // direct_play_normalization (4K ceiling, 100 Mbps) was referenced only
+        // from tests and doc comments; nothing in production used it.
+        let policy = crate::foundry::policy::TranscodePolicy::direct_play_normalization();
         let run = validate::validate_sample(
             &foundry,
             &policy,
@@ -3326,6 +3342,17 @@ pub async fn foundry_validate(
                 "TARGETED: only files matching the filter were considered, so this \
                  result says NOTHING about the rest of the library"
             },
+        },
+        // WHICH policy was validated. Without this the report cannot be told
+        // apart from one run against a different policy, which is exactly the
+        // confusion that let the harness validate the wrong one unnoticed.
+        "policy": {
+            "name": "direct_play_normalization",
+            "max_width": policy_reported.max_width,
+            "max_height": policy_reported.max_height,
+            "max_video_bitrate_bps": policy_reported.max_video_bitrate_bps,
+            "note": "the policy PATH A uses. A run against TranscodePolicy::default() \
+                     would cap at 1080p and 8-bit and would NOT be evidence about Path A",
         },
         // Stated on every response, not just in the docs: this endpoint writes
         // only to scratch and the operator should be able to see that claim

@@ -308,9 +308,22 @@ pub struct SilenceSpan {
 pub fn extract_speech_activity(ffmpeg_bin: &str, media_path: &Path) -> Result<Vec<SilenceSpan>, SyncError> {
     let args = build_silencedetect_args(media_path);
 
-    let output = match Command::new(ffmpeg_bin).args(&args).output() {
+    // BOUNDED. `Command::output()` waits forever, so before this the declared
+    // FFMPEG_TIMEOUT_SECS was pure fiction: the constant existed, the
+    // `SyncError::Timeout` variant existed and was documented — and nothing in
+    // the crate could ever construct it. A silencedetect pass decodes a whole
+    // programme's audio off the library mount, so a stalled read wedges it the
+    // same way it wedged ffprobe (FOUNDRY-10, observed live).
+    let output = match crate::foundry::probe::spawn_with_timeout(
+        ffmpeg_bin,
+        &args,
+        std::time::Duration::from_secs(FFMPEG_TIMEOUT_SECS),
+    ) {
         Ok(out) => out,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(crate::foundry::probe::ProbeError::Timeout { secs }) => {
+            return Err(SyncError::Timeout { seconds: secs })
+        }
+        Err(crate::foundry::probe::ProbeError::ToolMissing { .. }) => {
             return Err(SyncError::ToolMissing {
                 binary: ffmpeg_bin.to_string(),
             })
@@ -322,7 +335,6 @@ pub fn extract_speech_activity(ffmpeg_bin: &str, media_path: &Path) -> Result<Ve
             })
         }
     };
-
     // silencedetect writes to stderr; that is where the report lives even on
     // a completely successful run.
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -779,6 +791,50 @@ pub fn cue_spans(text: &str, format: SubtitleFormat) -> Result<Vec<CueSpan>, sup
 
 #[cfg(test)]
 mod tests {
+
+    /// The declared timeout must be REACHABLE.
+    ///
+    /// Before FOUNDRY-14 it was not: `FFMPEG_TIMEOUT_SECS` existed,
+    /// `SyncError::Timeout` existed and was documented as "ffmpeg exceeded
+    /// FFMPEG_TIMEOUT_SECS" — and nothing in the crate could construct it,
+    /// because the call used `Command::output()`, which waits forever. A
+    /// safety property that reads as implemented and is not.
+    #[test]
+    fn the_declared_ffmpeg_timeout_is_actually_enforced() {
+        let body = include_str!("sync.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        assert!(
+            !body.contains(".output()"),
+            "silencedetect must not use Command::output(), which cannot time out"
+        );
+        assert!(
+            body.contains("spawn_with_timeout"),
+            "it must go through the bounded spawner"
+        );
+        // And the timeout must map to the variant that says so, not to a
+        // generic spawn failure — an operator needs to tell "the filesystem
+        // stalled" from "ffmpeg is broken".
+        assert!(
+            body.contains("SyncError::Timeout { seconds: secs }"),
+            "a timeout must surface as SyncError::Timeout"
+        );
+    }
+
+    #[test]
+    fn the_silencedetect_timeout_is_generous_enough_for_a_feature() {
+        // Decoding a 3-hour programme's audio is minutes, not seconds, so a
+        // tight ceiling would abandon honest work on long films.
+        assert!(
+            FFMPEG_TIMEOUT_SECS >= 600,
+            "too tight for a feature-length decode: {FFMPEG_TIMEOUT_SECS}s"
+        );
+        assert!(
+            FFMPEG_TIMEOUT_SECS <= 3600,
+            "so loose it stops being a bound: {FFMPEG_TIMEOUT_SECS}s"
+        );
+    }
     use super::*;
 
     /// Build synthetic silences that leave speech in the given ms ranges.

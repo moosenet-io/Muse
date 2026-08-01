@@ -61,23 +61,38 @@ async fn upsert_player(pool: &PgPool, player: &PlexPlayer) -> MuseResult<()> {
 /// "Living Room") to the `plex_clients.machine_identifier` MACT-02 needs to
 /// address a Companion stop command — Muse doesn't (yet) stamp the exact
 /// client id on `play_sessions` at ingest time, only the name Plex reported.
-/// Ties (two discovered clients sharing a name) resolve to the most
-/// recently seen one. Returns `None` on no match rather than erroring —
-/// callers report that as "no resolvable target", never a false success.
+///
+/// Review finding (MACT-02, codex, confirmed): `name` is neither unique nor
+/// stable (`plex_clients` rows are never deleted or freshness-checked), so
+/// a `LIMIT 1 ORDER BY last_seen_at DESC` tiebreak can silently relay a stop
+/// to an unrelated device — a renamed client, or two devices that happen to
+/// share a display name. For a mutation that interrupts a person mid-film,
+/// that ambiguity must be a refusal. This fetches at most 2 matching rows
+/// and returns [`crate::repo::AtMostOne::Ambiguous`] when there's more than
+/// one — the caller reports that distinctly from "no match at all"
+/// ([`crate::repo::AtMostOne::None`], "no resolvable target", never a false
+/// success either way).
+///
+/// TODO(S130-J): the real fix is for `play_sessions` to stamp the stable
+/// Plex client id directly at ingest (spec J's territory), so resolution
+/// never needs a name match — and this ambiguity can't arise — at all.
+/// This function is a temporary bridge, not the intended long-term design.
 pub async fn find_machine_identifier_by_name(
     pool: &PgPool,
     name: &str,
-) -> MuseResult<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(
+) -> MuseResult<crate::repo::AtMostOne<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT machine_identifier FROM plex_clients WHERE name = $1 \
-         ORDER BY last_seen_at DESC LIMIT 1",
+         ORDER BY last_seen_at DESC LIMIT 2",
     )
     .bind(name)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
     .map_err(MuseError::Database)?;
 
-    Ok(row.map(|(id,)| id))
+    Ok(crate::repo::at_most_one(
+        rows.into_iter().map(|(id,)| id).collect(),
+    ))
 }
 
 #[cfg(test)]

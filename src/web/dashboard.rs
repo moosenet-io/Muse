@@ -1659,13 +1659,24 @@ pub async fn get_session_history(
 //    `GET /api/sessions/live` reports (`plex_control::resolve_live_target`,
 //    which calls `repo::play_session::find_live_by_session_key`). A caller
 //    can never pass an arbitrary player target and have Muse relay a stop
-//    to it — Muse decides the target, not the request body.
+//    to it — Muse decides the target, not the request body. AND resolution
+//    is a REFUSAL, not a tiebreak, when it's ambiguous: both `session_key`
+//    (Plex reuses it) and the `plex_clients` display-name join this bridges
+//    through (see `plex_control::repo::find_machine_identifier_by_name`'s
+//    doc comment; `TODO(S130-J)` there for the real fix) are non-unique
+//    columns — more than one candidate is `409 Conflict`, never a silent
+//    "pick the newest one". A wrong-target stop is the whole failure mode
+//    this endpoint exists to prevent.
 // 2. The relay itself goes through `CastController::stop` — the ONE seam
 //    MUSE-22 built for driving playback, never a second HTTP path to Plex.
 // 3. Every failure mode reports what ACTUALLY happened
 //    (`TerminateSessionResponse`) — a `200` never implies a stream stopped
-//    when nothing was relayed, and an unconfigured/unresolvable target is a
-//    `503`, never an optimistic `200`.
+//    when nothing was relayed, an unconfigured/unresolvable target is a
+//    `503`, an ambiguous match is a `409`, and none of those is ever an
+//    optimistic `200`. `stopped: true` on a `200` means "the backend
+//    accepted the command and nothing since contradicted it" — see
+//    `TerminateSessionResponse::stopped`'s own doc comment for exactly
+//    what that does and doesn't establish.
 //
 // Auth is layered, not solely this handler's job: Terminus's `proxy_muse`
 // runs `enforce_viewer_role_gate` in front of this route on the
@@ -1686,9 +1697,17 @@ pub struct TerminateSessionBody {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TerminateSessionResponse {
-    /// Whether the backend actually reports the stream stopped. A
-    /// best-effort relay the player ignored (or a controller error) is
-    /// `false`, NEVER an optimistic `true` — see this section's module doc.
+    /// Whether the stop actually took, to the best of what Muse can
+    /// establish. Precisely: `false` on any `CastController::stop` error
+    /// (never an optimistic `true`), AND `false` if a follow-up timeline
+    /// poll shows the player still actively playing/paused/buffering (the
+    /// backend accepted the command but it plainly didn't take). `true`
+    /// otherwise -- which for `PlexControlClient` means "the PMS answered
+    /// 2xx to the stop request, and nothing since has contradicted it" --
+    /// NOT an independently-confirmed "the stream has fully ended" in every
+    /// case a poll is inconclusive or fails. See `terminate_session`'s
+    /// `Ok(())` arm for the exact reasoning. Never read this as a stronger
+    /// guarantee than that.
     pub stopped: bool,
     pub backend: &'static str,
     /// Whether the caller's `reason` (if any) was actually surfaced to the
@@ -1746,9 +1765,27 @@ pub async fn terminate_session(
                 "no live session for session_key {session_key}"
             )));
         }
+        // Review finding (MACT-02, codex, confirmed): `session_key` and the
+        // reported player display name are both non-unique columns. Never
+        // silently pick a candidate for a mutation with this blast radius
+        // -- refuse with a distinct 409 naming the ambiguity, rather than
+        // collapsing "there could be more than one" into "no target"'s 503
+        // or into a guessed success.
+        crate::plex_control::ResolveOutcome::AmbiguousSession => {
+            return Err(MuseError::Conflict(format!(
+                "more than one live session currently matches session_key {session_key}; \
+                 refusing to guess which one to stop"
+            )));
+        }
         crate::plex_control::ResolveOutcome::NoTarget => {
             return Err(MuseError::ServiceUnavailable(format!(
                 "session {session_key} is live but has no resolvable cast-control target"
+            )));
+        }
+        crate::plex_control::ResolveOutcome::AmbiguousTarget => {
+            return Err(MuseError::Conflict(format!(
+                "more than one discovered Plex client matches session {session_key}'s player \
+                 name; refusing to guess which device to stop"
             )));
         }
         crate::plex_control::ResolveOutcome::Resolved { machine_identifier } => {
@@ -1764,7 +1801,40 @@ pub async fn terminate_session(
     );
 
     let stopped = match controller.stop(&machine_identifier).await {
-        Ok(()) => true,
+        Ok(()) => {
+            // Review finding (MACT-02, codex, confirmed): `stop()` returning
+            // `Ok` means the backend ACCEPTED the command (for
+            // `PlexControlClient`, the PMS answered 2xx to the Companion
+            // stop request) -- it does NOT establish that playback actually
+            // ended. Strengthen the signal with a timeline poll (the same
+            // `CastController` seam) per this endpoint's own EDGE CASES
+            // ("player accepts but keeps playing -> stopped: false with the
+            // backend's own report"): if the player is STILL actively
+            // reporting playing/paused/buffering, the stop plainly didn't
+            // take, and we downgrade honestly rather than claim success. A
+            // poll failure, or any other/absent state, is not further proof
+            // of anything either way -- it's just not a disproof, so the
+            // accepted-command signal stands. See `stopped`'s doc comment
+            // on `TerminateSessionResponse` for the precise, honest
+            // semantics this leaves the field with.
+            match controller.poll_timeline(&machine_identifier).await {
+                Ok(poll)
+                    if matches!(
+                        poll.state.as_deref(),
+                        Some("playing") | Some("paused") | Some("buffering")
+                    ) =>
+                {
+                    tracing::warn!(
+                        session_key = %session_key,
+                        target = %machine_identifier,
+                        state = ?poll.state,
+                        "terminate_session: stop command accepted but timeline still active"
+                    );
+                    false
+                }
+                _ => true,
+            }
+        }
         Err(e) => {
             tracing::warn!(
                 session_key = %session_key,
@@ -2206,9 +2276,35 @@ mod mact02_terminate_tests {
     /// exactly what it's told to. `target` is recorded so a test can assert
     /// the resolved `machine_identifier` — not the session's `player`
     /// display name — is what actually got relayed.
+    /// Review finding (MACT-02, codex, confirmed): the earlier version of
+    /// this fake discarded `target` entirely, so the "success" test never
+    /// actually asserted *which* `machine_identifier` got the stop relayed
+    /// to it -- the whole point of the resolution seam. `stop_calls`
+    /// records every target `stop()` was actually invoked with.
     struct FakeController {
         fail: bool,
+        /// When `true`, `poll_timeline` reports the player is STILL
+        /// actively playing after `stop()` returned `Ok` -- exercises the
+        /// "command accepted but didn't take" downgrade in
+        /// `terminate_session`.
+        poll_still_playing: bool,
         backend: &'static str,
+        stop_calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeController {
+        fn new(fail: bool) -> Self {
+            FakeController {
+                fail,
+                poll_still_playing: false,
+                backend: "fake",
+                stop_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn stop_targets(&self) -> Vec<String> {
+            self.stop_calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -2231,7 +2327,8 @@ mod mact02_terminate_tests {
             Ok(())
         }
 
-        async fn stop(&self, _target: &str) -> MuseResult<()> {
+        async fn stop(&self, target: &str) -> MuseResult<()> {
+            self.stop_calls.lock().unwrap().push(target.to_string());
             if self.fail {
                 Err(MuseError::upstream("simulated stop failure"))
             } else {
@@ -2244,7 +2341,17 @@ mod mact02_terminate_tests {
         }
 
         async fn poll_timeline(&self, _target: &str) -> MuseResult<TimelinePoll> {
-            Err(MuseError::NotImplemented)
+            if self.poll_still_playing {
+                Ok(TimelinePoll {
+                    state: Some("playing".to_string()),
+                    rating_key: None,
+                    time_ms: None,
+                    duration_ms: None,
+                    raw: serde_json::json!({}),
+                })
+            } else {
+                Err(MuseError::NotImplemented)
+            }
         }
 
         fn backend_name(&self) -> &'static str {
@@ -2327,10 +2434,7 @@ mod mact02_terminate_tests {
         };
         let state = test_state(
             pool,
-            Some(Arc::new(FakeController {
-                fail: false,
-                backend: "fake",
-            })),
+            Some(Arc::new(FakeController::new(false))),
         );
 
         let key = format!("mact02-unknown-{}", uuid::Uuid::new_v4());
@@ -2387,10 +2491,7 @@ mod mact02_terminate_tests {
 
         let state = test_state(
             pool,
-            Some(Arc::new(FakeController {
-                fail: false,
-                backend: "fake",
-            })),
+            Some(Arc::new(FakeController::new(false))),
         );
 
         let err = terminate_session(State(state), Path(key), axum::body::Bytes::new())
@@ -2416,13 +2517,13 @@ mod mact02_terminate_tests {
         seed_live_session(&pool, &key, &player_name).await;
         seed_plex_client(&pool, &machine_id, &player_name).await;
 
-        let state = test_state(
-            pool,
-            Some(Arc::new(FakeController {
-                fail: false,
-                backend: "fake",
-            })),
-        );
+        // Keep the concrete `Arc<FakeController>` alongside the trait-object
+        // handle `test_state` takes, so the assertion below can inspect
+        // exactly which target `stop()` was invoked with -- not just that
+        // it succeeded (see `FakeController`'s doc comment: the earlier
+        // version of this test couldn't tell wrong-target from right-target).
+        let controller = Arc::new(FakeController::new(false));
+        let state = test_state(pool, Some(controller.clone() as Arc<dyn CastController>));
 
         let Json(resp) = terminate_session(State(state), Path(key), axum::body::Bytes::new())
             .await
@@ -2432,6 +2533,92 @@ mod mact02_terminate_tests {
         assert!(
             !resp.reason_delivered,
             "no reason was sent, and CastController::stop has no delivery channel anyway"
+        );
+        assert_eq!(
+            controller.stop_targets(),
+            vec![machine_id.clone()],
+            "stop() must be called with the resolved plex_clients.machine_identifier, \
+             never the session's player display name or anything else"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_accepted_but_still_playing_is_reported_stopped_false() {
+        let Some(pool) =
+            test_pool_or_skip("stop_accepted_but_still_playing_is_reported_stopped_false").await
+        else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("mact02-stillplaying-{suffix}");
+        let player_name = format!("Kitchen {suffix}");
+        let machine_id = format!("machine-{suffix}");
+        seed_live_session(&pool, &key, &player_name).await;
+        seed_plex_client(&pool, &machine_id, &player_name).await;
+
+        let mut controller = FakeController::new(false);
+        controller.poll_still_playing = true;
+        let state = test_state(pool, Some(Arc::new(controller)));
+
+        let Json(resp) = terminate_session(State(state), Path(key), axum::body::Bytes::new())
+            .await
+            .expect("an accepted-but-ignored stop is a 200, not an error response");
+        assert!(
+            !resp.stopped,
+            "a timeline poll that still shows the player active must downgrade \
+             stopped to false, never leave a command-accepted true unquestioned"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_session_key_is_409_never_a_silent_pick() {
+        let Some(pool) =
+            test_pool_or_skip("ambiguous_session_key_is_409_never_a_silent_pick").await
+        else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        // Same session_key, TWO separate open (stopped_at IS NULL) rows --
+        // the exact key-reuse hazard MACT-01's own doc comments describe.
+        let key = format!("mact02-dupkey-{suffix}");
+        seed_live_session(&pool, &key, &format!("Room A {suffix}")).await;
+        seed_live_session(&pool, &key, &format!("Room B {suffix}")).await;
+
+        let state = test_state(pool, Some(Arc::new(FakeController::new(false))));
+
+        let err = terminate_session(State(state), Path(key), axum::body::Bytes::new())
+            .await
+            .expect_err("an ambiguous session_key must not resolve to either candidate");
+        assert!(
+            matches!(err, MuseError::Conflict(_)),
+            "expected Conflict (409), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_plex_client_name_is_409_never_a_silent_pick() {
+        let Some(pool) =
+            test_pool_or_skip("ambiguous_plex_client_name_is_409_never_a_silent_pick").await
+        else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("mact02-duptarget-{suffix}");
+        let player_name = format!("Shared Name {suffix}");
+        seed_live_session(&pool, &key, &player_name).await;
+        // Two DIFFERENT discovered Plex clients sharing the same display
+        // name -- e.g. two Chromecasts nobody bothered to rename.
+        seed_plex_client(&pool, &format!("machine-a-{suffix}"), &player_name).await;
+        seed_plex_client(&pool, &format!("machine-b-{suffix}"), &player_name).await;
+
+        let state = test_state(pool, Some(Arc::new(FakeController::new(false))));
+
+        let err = terminate_session(State(state), Path(key), axum::body::Bytes::new())
+            .await
+            .expect_err("an ambiguous player-name match must not resolve to either device");
+        assert!(
+            matches!(err, MuseError::Conflict(_)),
+            "expected Conflict (409), got {err:?}"
         );
     }
 
@@ -2451,13 +2638,7 @@ mod mact02_terminate_tests {
         seed_live_session(&pool, &key, &player_name).await;
         seed_plex_client(&pool, &machine_id, &player_name).await;
 
-        let state = test_state(
-            pool,
-            Some(Arc::new(FakeController {
-                fail: true,
-                backend: "fake",
-            })),
-        );
+        let state = test_state(pool, Some(Arc::new(FakeController::new(true))));
 
         let Json(resp) = terminate_session(State(state), Path(key), axum::body::Bytes::new())
             .await

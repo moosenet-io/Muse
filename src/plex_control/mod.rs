@@ -37,12 +37,24 @@ pub enum ResolveOutcome {
     /// `session_key`. Covers both "Muse never saw this key" and
     /// "already stopped" — both are correctly `404`, no relay attempted.
     NotFound,
+    /// More than one currently-open `play_sessions` row matches this
+    /// `session_key` (Plex reuses the key; see
+    /// [`crate::repo::play_session::find_live_by_session_key`]'s doc
+    /// comment). Refused, never a silent pick of "the newest one" — a
+    /// mutation with this blast radius must not guess which live session
+    /// the caller meant. Reported `409`, distinct from `NotFound`'s `404`.
+    AmbiguousSession,
     /// The session is live, but Muse has no `plex_clients` row whose name
     /// matches the session's reported `player` — nowhere to send a stop.
     /// Same "never fabricate success" posture as no controller configured.
     NoTarget,
-    /// Resolved to a Companion `machine_identifier` — safe to relay a
-    /// `CastController::stop` to.
+    /// More than one `plex_clients` row shares the session's reported
+    /// `player` display name (see
+    /// [`repo::find_machine_identifier_by_name`]'s doc comment) — refused
+    /// for the same reason as `AmbiguousSession`, also `409`.
+    AmbiguousTarget,
+    /// Resolved to exactly one Companion `machine_identifier` — safe to
+    /// relay a `CastController::stop` to.
     Resolved { machine_identifier: String },
 }
 
@@ -56,11 +68,20 @@ pub enum ResolveOutcome {
 /// [`crate::repo::play_session::find_live_by_session_key`]'s doc comment
 /// for why an already-stopped session and an unknown key are
 /// indistinguishable here (both `NotFound`) — that's deliberate, not a gap.
+///
+/// Ambiguity at EITHER resolution step (more than one live row for the
+/// key, or more than one `plex_clients` row for the reported player name)
+/// is a refusal (`AmbiguousSession`/`AmbiguousTarget`), never a silent
+/// "pick the newest" — see [`crate::repo::AtMostOne`] and this function's
+/// two call sites below for why.
 pub async fn resolve_live_target(pool: &PgPool, session_key: &str) -> MuseResult<ResolveOutcome> {
-    let Some(row) =
-        crate::repo::play_session::find_live_by_session_key(pool, session_key).await?
-    else {
-        return Ok(ResolveOutcome::NotFound);
+    use crate::repo::AtMostOne;
+
+    let row = match crate::repo::play_session::find_live_by_session_key(pool, session_key).await?
+    {
+        AtMostOne::None => return Ok(ResolveOutcome::NotFound),
+        AtMostOne::Ambiguous => return Ok(ResolveOutcome::AmbiguousSession),
+        AtMostOne::One(row) => row,
     };
 
     let Some(player_name) = row.player.as_deref().filter(|s| !s.is_empty()) else {
@@ -68,7 +89,8 @@ pub async fn resolve_live_target(pool: &PgPool, session_key: &str) -> MuseResult
     };
 
     match repo::find_machine_identifier_by_name(pool, player_name).await? {
-        Some(machine_identifier) => Ok(ResolveOutcome::Resolved { machine_identifier }),
-        None => Ok(ResolveOutcome::NoTarget),
+        AtMostOne::None => Ok(ResolveOutcome::NoTarget),
+        AtMostOne::Ambiguous => Ok(ResolveOutcome::AmbiguousTarget),
+        AtMostOne::One(machine_identifier) => Ok(ResolveOutcome::Resolved { machine_identifier }),
     }
 }

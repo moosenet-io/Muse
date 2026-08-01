@@ -709,24 +709,40 @@ pub async fn list_history(pool: &PgPool, limit: i64) -> MuseResult<Vec<SessionJo
 /// Deliberately reuses [`SESSION_JOIN_SELECT`]'s `stopped_at IS NULL`
 /// liveness scope (same as [`list_live`]), so an already-stopped session
 /// (webhook/poller already recorded its end) or a `session_key` Muse never
-/// saw both resolve to `None` here — indistinguishable to the caller, both
-/// correctly `404` upstream. `session_key` has no uniqueness constraint
-/// (Plex reuses it across sessions — see [`SESSION_JOIN_SELECT`]'s doc
-/// comment), so this takes the newest open row for the key, same tiebreak
-/// as [`list_live`].
+/// saw both resolve to [`crate::repo::AtMostOne::None`] here —
+/// indistinguishable to the caller, both correctly `404` upstream.
+///
+/// `session_key` has NO uniqueness constraint (Plex reuses it across
+/// sessions — see [`SESSION_JOIN_SELECT`]'s doc comment on the reused-key
+/// hazard MACT-01 already had to account for in its own liveness join).
+/// Review finding (MACT-02, codex, confirmed): silently picking the newest
+/// open row via `LIMIT 1` is wrong for a MUTATION — for a *read* an
+/// arguable-newest row is a reasonable best-effort projection, but relaying
+/// a `stop` command based on a silent tiebreak risks terminating a
+/// DIFFERENT live session that happens to share the reused key. So this
+/// fetches at most 2 and returns [`crate::repo::AtMostOne::Ambiguous`] when
+/// there's more than one currently-open row for the key — the caller must
+/// refuse, not choose.
+///
+/// TODO(S130-J): the real fix is for `play_sessions` to stamp a stable
+/// per-session identifier at ingest (spec J's territory — it changes who
+/// writes this table) so a `session_key` collision can never actually
+/// resolve to the wrong row at all. This function is a temporary bridge,
+/// not the intended long-term design.
 pub async fn find_live_by_session_key(
     pool: &PgPool,
     session_key: &str,
-) -> MuseResult<Option<SessionJoinRow>> {
+) -> MuseResult<crate::repo::AtMostOne<SessionJoinRow>> {
     let sql = format!(
         "{SESSION_JOIN_SELECT} WHERE ps.stopped_at IS NULL AND ps.session_key = $1 \
-         ORDER BY ps.started_at DESC LIMIT 1"
+         ORDER BY ps.started_at DESC LIMIT 2"
     );
-    sqlx::query_as::<_, SessionJoinRow>(&sql)
+    let rows = sqlx::query_as::<_, SessionJoinRow>(&sql)
         .bind(session_key)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await
-        .map_err(MuseError::Database)
+        .map_err(MuseError::Database)?;
+    Ok(crate::repo::at_most_one(rows))
 }
 
 #[cfg(test)]

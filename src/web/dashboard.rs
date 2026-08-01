@@ -1687,6 +1687,36 @@ pub struct ValidateQuery {
     /// the size of the operator's own measured container survey. More probes
     /// means more distinct shapes to choose between; it costs one ffprobe each.
     pub probe_budget: Option<usize>,
+    /// Largest input to encode, in MiB. Default 2048 (2 GiB).
+    ///
+    /// The default deliberately EXCLUDES the 4K/HDR/DV tail, because the
+    /// original scratch filesystem could not hold those files' output. Raising
+    /// it is how that tail gets covered — and the coverage note in every
+    /// response is generated from whatever value is actually in force, so it
+    /// can never claim a ceiling the run did not use.
+    ///
+    /// Clamped to 1..=65536 MiB (64 GiB).
+    pub max_input_mb: Option<u64>,
+    /// Cumulative output budget for the whole run, in MiB. Default 6144 (6 GiB).
+    ///
+    /// Bounds cumulative work, not peak: each output is deleted as soon as it
+    /// is verified. Refused up front if the scratch filesystem does not
+    /// actually have this much free.
+    ///
+    /// Clamped to 1..=4194304 MiB (4 TiB).
+    pub budget_mb: Option<u64>,
+    /// Per-encode wall-clock ceiling, in seconds. Default 1200 (20 min).
+    ///
+    /// A 4K feature does not re-encode in 20 minutes on a CPU, so covering the
+    /// large tail needs this raised or every large file times out and is
+    /// reported as a FAILURE rather than a skip.
+    ///
+    /// Clamped to 60..=21600 (6 h).
+    pub encode_timeout_secs: Option<u64>,
+    /// Whole-run deadline, in seconds. Default 3600 (1 h).
+    ///
+    /// Clamped to 60..=86400 (24 h).
+    pub run_deadline_secs: Option<u64>,
 }
 
 /// `POST /ops/foundry/validate` — really encode a diverse sample to scratch,
@@ -1710,9 +1740,18 @@ pub async fn foundry_validate(
     // >2 GiB exclusion was disclosed only when a run succeeded, so a refusal
     // read as "nothing to report" when it actually meant the 4K/HDR/DV tail was
     // never going to be covered either way.
-    const COVERAGE_NOTE: &str = "files above max_input_bytes (2 GiB) are SKIPPED, never \
-         validated — that exclusion covers most of the 4K/HDR/DV tail, which is \
-         therefore NOT validated by this harness";
+    // Built from the bounds ACTUALLY in force for this run, not a fixed
+    // string. The note used to hardcode "2 GiB"; once the ceiling became an
+    // operator override that string would have kept claiming 2 GiB whatever
+    // the run used, and a report that misstates its own coverage reads as
+    // verified when it is not.
+    let bounds = validate::ValidationBounds::from_overrides(
+        q.max_input_mb,
+        q.budget_mb,
+        q.encode_timeout_secs,
+        q.run_deadline_secs,
+    );
+    let coverage_note = bounds.coverage_note();
 
 
     use crate::foundry::validate;
@@ -1722,7 +1761,7 @@ pub async fn foundry_validate(
         // are different facts, and a zero-count report would read as the second.
         return Ok(Json(json!({
             "ran": false,
-            "coverage": COVERAGE_NOTE,
+            "coverage": coverage_note,
             "reason": "foundry is not configured (MUSE_FOUNDRY_* unset) — nothing was validated",
         })));
     };
@@ -1733,7 +1772,7 @@ pub async fn foundry_validate(
         // produced and never verified, and an unverified success is a failure.
         return Ok(Json(json!({
             "ran": false,
-            "coverage": COVERAGE_NOTE,
+            "coverage": coverage_note,
             "reason": "ffmpeg and ffprobe must both be usable to validate an encode",
             "capabilities": {
                 "ffprobe": caps.ffprobe.summary(),
@@ -1745,7 +1784,7 @@ pub async fn foundry_validate(
     let Some(root) = state.config.library_root.clone() else {
         return Ok(Json(json!({
             "ran": false,
-            "coverage": COVERAGE_NOTE,
+            "coverage": coverage_note,
             "reason": "MUSE_LIBRARY_ROOT is not set — there is nothing to validate",
         })));
     };
@@ -1763,8 +1802,10 @@ pub async fn foundry_validate(
         // on this fleet a full scratch filesystem presents as unrelated
         // failures rather than as an obvious disk error. Raised at the
         // FOUNDRY-04 review gate.
-        let bounds_for_space = validate::ValidationBounds::default();
-        validate::check_free_space(&scratch, bounds_for_space.max_total_output_bytes)?;
+        // Against the budget this run actually asked for, not the default —
+        // otherwise raising the budget would skip the disk check that makes
+        // raising it safe.
+        validate::check_free_space(&scratch, bounds.max_total_output_bytes)?;
 
         let candidates: Vec<std::path::PathBuf> =
             crate::library::scan::walk_media_files(std::path::Path::new(&root))
@@ -1777,7 +1818,6 @@ pub async fn foundry_validate(
             validate::probe_candidates(&foundry, &candidates, probe_budget);
 
         let policy = crate::foundry::policy::TranscodePolicy::default();
-        let bounds = validate::ValidationBounds::default();
         let run = validate::validate_sample(
             &foundry,
             &policy,
@@ -1797,7 +1837,7 @@ pub async fn foundry_validate(
         Err(refusal) => {
             return Ok(Json(json!({
                 "ran": false,
-            "coverage": COVERAGE_NOTE,
+            "coverage": coverage_note,
                 "reason": refusal.to_string(),
             })))
         }

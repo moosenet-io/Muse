@@ -128,6 +128,60 @@ pub struct ValidationBounds {
     pub run_deadline: Duration,
 }
 
+impl ValidationBounds {
+    /// Build bounds from optional operator overrides, each clamped.
+    ///
+    /// Exists so the >2 GiB tail — the 4K/HDR/DV content, which the default
+    /// ceiling excludes entirely — can actually be validated once a scratch
+    /// filesystem large enough to hold it is available. Every bound is
+    /// clamped rather than trusted: an unbounded per-encode timeout on a
+    /// 24-file run is an unbounded run, and a budget larger than the disk is
+    /// refused separately by `check_free_space`.
+    ///
+    /// `None` for any field keeps that field's default, so a caller raising
+    /// only the size ceiling does not silently also change the timeouts.
+    pub fn from_overrides(
+        max_input_mb: Option<u64>,
+        budget_mb: Option<u64>,
+        encode_timeout_secs: Option<u64>,
+        run_deadline_secs: Option<u64>,
+    ) -> Self {
+        const MIB: u64 = 1024 * 1024;
+        let d = Self::default();
+        Self {
+            max_input_bytes: max_input_mb
+                .map(|m| m.clamp(1, 65_536) * MIB)
+                .unwrap_or(d.max_input_bytes),
+            max_total_output_bytes: budget_mb
+                .map(|m| m.clamp(1, 4_194_304) * MIB)
+                .unwrap_or(d.max_total_output_bytes),
+            per_encode_timeout: encode_timeout_secs
+                .map(|s| Duration::from_secs(s.clamp(60, 21_600)))
+                .unwrap_or(d.per_encode_timeout),
+            run_deadline: run_deadline_secs
+                .map(|s| Duration::from_secs(s.clamp(60, 86_400)))
+                .unwrap_or(d.run_deadline),
+            ..d
+        }
+    }
+
+    /// The coverage sentence for THIS run, generated from the bound actually
+    /// in force.
+    ///
+    /// The note used to be a hardcoded string naming 2 GiB. Once the ceiling
+    /// became configurable that string would have kept claiming 2 GiB whatever
+    /// the run used — a report that lies about its own coverage is worse than
+    /// one that omits it, because it reads as verified.
+    pub fn coverage_note(&self) -> String {
+        let gib = self.max_input_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        format!(
+            "files larger than {gib:.1} GiB were SKIPPED, never validated — this run does \
+             NOT cover them. 4K/HDR/Dolby Vision content is the large tail, so a ceiling \
+             below it means that content is unvalidated."
+        )
+    }
+}
+
 impl Default for ValidationBounds {
     fn default() -> Self {
         Self {
@@ -2003,6 +2057,62 @@ mod tests {
             TranscodeDecision::Transcode { args, .. } => args,
             other => panic!("expected a transcode plan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn overrides_are_clamped_and_absent_ones_keep_their_default() {
+        const MIB: u64 = 1024 * 1024;
+        let d = ValidationBounds::default();
+
+        // Absent fields must not be disturbed: raising only the size ceiling
+        // must not silently also change the timeouts.
+        let only_size = ValidationBounds::from_overrides(Some(8192), None, None, None);
+        assert_eq!(only_size.max_input_bytes, 8192 * MIB);
+        assert_eq!(only_size.max_total_output_bytes, d.max_total_output_bytes);
+        assert_eq!(only_size.per_encode_timeout, d.per_encode_timeout);
+        assert_eq!(only_size.run_deadline, d.run_deadline);
+
+        // Absurd values clamp rather than being honoured.
+        let huge = ValidationBounds::from_overrides(
+            Some(u64::MAX),
+            Some(u64::MAX),
+            Some(u64::MAX),
+            Some(u64::MAX),
+        );
+        assert_eq!(huge.max_input_bytes, 65_536 * MIB, "input ceiling clamps to 64 GiB");
+        assert_eq!(huge.max_total_output_bytes, 4_194_304 * MIB, "budget clamps to 4 TiB");
+        assert_eq!(huge.per_encode_timeout, Duration::from_secs(21_600));
+        assert_eq!(huge.run_deadline, Duration::from_secs(86_400));
+
+        // ...and zero clamps up, so a caller cannot disable a bound.
+        let zero = ValidationBounds::from_overrides(Some(0), Some(0), Some(0), Some(0));
+        assert_eq!(zero.max_input_bytes, MIB);
+        assert_eq!(zero.per_encode_timeout, Duration::from_secs(60));
+        assert_eq!(zero.run_deadline, Duration::from_secs(60));
+    }
+
+    /// The coverage sentence must describe THIS run.
+    ///
+    /// It used to be a fixed string naming 2 GiB. Once the ceiling became an
+    /// override, that string would have kept claiming 2 GiB whatever the run
+    /// actually used — a report that misstates its own coverage reads as
+    /// verified when it is not, which is worse than omitting the note.
+    #[test]
+    fn the_coverage_note_states_the_ceiling_actually_in_force() {
+        let low = ValidationBounds::from_overrides(Some(2048), None, None, None);
+        assert!(low.coverage_note().contains("than 2.0 GiB"), "{}", low.coverage_note());
+
+        let high = ValidationBounds::from_overrides(Some(32768), None, None, None);
+        let note = high.coverage_note();
+        assert!(note.contains("than 32.0 GiB"), "{note}");
+        // "than" anchors the match: "32.0 GiB" CONTAINS "2.0 GiB", so a bare
+        // substring check here passes for the wrong reason.
+        assert!(
+            !note.contains("than 2.0 GiB"),
+            "the note must not still be claiming the old ceiling: {note}"
+        );
+        // And it must keep naming what the exclusion COSTS, not just the number.
+        assert!(note.to_lowercase().contains("4k"), "{note}");
     }
 
     #[test]

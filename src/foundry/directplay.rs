@@ -441,6 +441,90 @@ impl DeletionDecision {
 /// far below any truncation worth worrying about.
 pub const DURATION_TOLERANCE_SECS: f64 = 1.0;
 
+/// Will the deletion gate refuse this file, decided BEFORE any encode runs?
+///
+/// Path A's promise is "optimize the file and remove the original". When
+/// `may_delete_original` refuses, the original stays — so the encode has cost
+/// a full re-encode and DOUBLED the disk for that title instead of reclaiming
+/// any. That is a legitimate outcome, but at ~16,000 items it is a large
+/// amount of work to discover only afterwards.
+///
+/// Several of the gate's refusals are predictable from the SOURCE and the PLAN
+/// alone, with no output to probe:
+///
+/// - the source is HDR or of UNDETERMINED dynamic range and the plan
+///   re-encodes video — the argv forces 8-bit `yuv420p` and applies no tone
+///   map, so the output cannot preserve either;
+/// - the source carries audio in a codec that can hide a format ffprobe cannot
+///   see, and the plan re-encodes audio;
+/// - the source is not fully described, which no encode can repair.
+///
+/// Returns the reasons it WILL refuse, empty when nothing is predictable.
+/// Deliberately CONSERVATIVE: it only claims refusals it can establish, so an
+/// empty result means "no refusal predicted", never "deletion is guaranteed".
+/// The gate itself remains the authority.
+///
+/// Observed live: an AV1 1080p 10-bit UNTAGGED episode was re-encoded for
+/// hours, then refused with `SourceDynamicRangeUnknown`. Untagged 10-bit is
+/// common in AV1 and anime web encodes, so this is not a rare tail.
+pub fn predicted_deletion_refusals(
+    source: &MediaProbe,
+    plan: &crate::foundry::plan::TranscodePlan,
+) -> Vec<String> {
+    use crate::foundry::plan::{AudioAction, VideoAction};
+    let mut out = Vec::new();
+
+    if source.data_stream_count > 0
+        || source.unindexed_stream_count > 0
+        || source.other_stream_count > 0
+    {
+        out.push(
+            "the source carries streams Foundry cannot describe, which no encode repairs"
+                .to_string(),
+        );
+    }
+
+    let re_encodes_video = matches!(plan.video, VideoAction::Encode { .. });
+    if re_encodes_video {
+        if let Some(v) = source.primary_video() {
+            match classify_hdr(v) {
+                HdrVerdict::Hdr { transfer } => out.push(format!(
+                    "the source is {transfer:?} HDR and this plan re-encodes video to 8-bit \
+                     with no tone map, so the output cannot preserve it"
+                )),
+                HdrVerdict::Unknown { why } => out.push(format!(
+                    "the source's dynamic range is undetermined ({why}) and this plan \
+                     re-encodes video, so the gate cannot be shown the range survived"
+                )),
+                HdrVerdict::Sdr => {}
+            }
+            if classify_dolby_vision(v).is_present() {
+                out.push(
+                    "the source carries Dolby Vision, which no re-encode preserves".to_string(),
+                );
+            }
+        }
+    }
+
+    if matches!(plan.audio, AudioAction::Encode { .. }) {
+        for a in &source.audio {
+            if let Some(u) = undetectable_formats()
+                .iter()
+                .find(|u| u.carried_by_codec.eq_ignore_ascii_case(a.codec.trim()))
+            {
+                out.push(format!(
+                    "audio stream {} is `{}`, which may carry {} — invisible to ffprobe, so a \
+                     re-encode cannot be shown to have preserved it",
+                    a.index, a.codec, u.name
+                ));
+                break;
+            }
+        }
+    }
+
+    out
+}
+
 /// **May the original be deleted?**
 ///
 /// The single most important rule in FOUNDRY-03. It refuses whenever the
@@ -1041,6 +1125,96 @@ mod tests {
              may_delete_original: {offenders:?}. Deleting a `.muse-superseded` \
              entry is the only permanent data loss in Foundry — call the gate \
              first, or exclude the module here with a stated reason."
+        );
+    }
+
+    /// The live case that motivated this.
+    ///
+    /// Silicon Valley S05E01: AV1, 1080p, 10-bit, NO color_transfer tag. AV1
+    /// is not an accepted codec so the planner correctly re-encodes — and the
+    /// argv forces 8-bit yuv420p — after which the gate refuses with
+    /// SourceDynamicRangeUnknown. Hours of CPU for an original that is then
+    /// kept. Predicting it needs no encode.
+    #[test]
+    fn an_untagged_ten_bit_source_that_will_be_re_encoded_is_predicted_undeletable() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut p = probe(vec![video("av1", 1920, 1080)], vec![audio(1, "aac", 2)]);
+        p.video[0].pix_fmt = Some("yuv420p10le".into());
+        p.video[0].color_transfer = None; // untagged: the ambiguous case
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        let predicted = predicted_deletion_refusals(&p, &plan);
+        assert!(
+            predicted.iter().any(|r| r.contains("undetermined")),
+            "an untagged 10-bit source that will be re-encoded must be predicted \
+             undeletable: {predicted:?}"
+        );
+    }
+
+    /// A file the gate WILL allow must predict nothing, or the number is
+    /// useless — a prediction that fires on everything tells an operator
+    /// nothing about which titles reclaim disk.
+    #[test]
+    fn an_ordinary_sdr_re_encode_predicts_no_refusal() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut p = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "aac", 2)]);
+        p.video[0].pix_fmt = Some("yuv420p".into());
+        p.video[0].color_transfer = Some("bt709".into());
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(
+            predicted_deletion_refusals(&p, &plan).is_empty(),
+            "a plain SDR re-encode reclaims disk and must not be flagged"
+        );
+    }
+
+    /// A COPY preserves everything, so even an HDR source predicts nothing.
+    /// Without this the prediction could be satisfied by keying on the source
+    /// alone and ignoring the plan.
+    #[test]
+    fn a_remux_of_an_hdr_source_predicts_no_refusal() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut p = probe(vec![video("hevc", 3840, 2160)], vec![audio(1, "aac", 2)]);
+        p.video[0].pix_fmt = Some("yuv420p10le".into());
+        p.video[0].color_transfer = Some("smpte2084".into());
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Copy,
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(
+            predicted_deletion_refusals(&p, &plan).is_empty(),
+            "a remux preserves HDR, so nothing should be predicted"
+        );
+    }
+
+    /// Object-bearing audio that will be re-encoded is predictable too.
+    #[test]
+    fn re_encoding_possibly_atmos_audio_is_predicted_undeletable() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let p = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "eac3", 6)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Copy,
+            audio: AudioAction::Encode { channels: vec![6] },
+            container: Container::Matroska,
+        };
+        let predicted = predicted_deletion_refusals(&p, &plan);
+        assert!(
+            predicted.iter().any(|r| r.contains("Atmos") || r.contains("invisible")),
+            "{predicted:?}"
         );
     }
 

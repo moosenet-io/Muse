@@ -36,6 +36,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::foundry::probe::MediaProbe;
 use crate::foundry::plan::{plan_transcode, TranscodeDecision, Undecidable};
 use crate::foundry::policy::TranscodePolicy;
 use crate::foundry::Foundry;
@@ -48,7 +49,17 @@ pub enum SurveyOutcome {
     /// Every policy dimension checked and passed.
     AlreadyOptimal,
     /// Would be rewritten, and why.
-    WouldTranscode { reasons: Vec<String> },
+    ///
+    /// `predicted_deletion_refusals` is what the deletion gate will say
+    /// AFTERWARDS, computed from the source and the plan without encoding
+    /// anything. When it is non-empty, Path A will spend a full re-encode and
+    /// then KEEP the original — doubling disk for that title instead of
+    /// reclaiming any. Legitimate, but at ~16,000 items it is a number an
+    /// operator needs BEFORE committing, not after.
+    WouldTranscode {
+        reasons: Vec<String>,
+        predicted_deletion_refusals: Vec<String>,
+    },
     /// Could not be judged, and why. NOT folded into "optimal" — see [`plan_transcode`].
     CannotDecide { why: String },
     /// ffprobe could not read the file at all.
@@ -158,11 +169,17 @@ impl Readiness {
 pub const DRY_RUN_OUTPUT_SENTINEL: &str = "/dev/null/muse-dry-run-never-executed";
 
 /// Classify one already-probed file. Pure, so every branch is testable without ffprobe.
-pub fn classify(decision: &TranscodeDecision) -> SurveyOutcome {
+///
+/// Takes the PROBE as well as the decision because the predicted deletion
+/// refusals are a function of the source, not only of the plan — the gate
+/// refuses on properties of the original that the plan never mentions.
+pub fn classify(probe: &MediaProbe, decision: &TranscodeDecision) -> SurveyOutcome {
     match decision {
         TranscodeDecision::AlreadyOptimal => SurveyOutcome::AlreadyOptimal,
-        TranscodeDecision::Transcode { reasons, .. } => SurveyOutcome::WouldTranscode {
+        TranscodeDecision::Transcode { reasons, plan, .. } => SurveyOutcome::WouldTranscode {
             reasons: reasons.iter().map(|r| format!("{r:?}")).collect(),
+            predicted_deletion_refusals:
+                crate::foundry::directplay::predicted_deletion_refusals(probe, plan),
         },
         TranscodeDecision::CannotDecide { why } => SurveyOutcome::CannotDecide {
             why: describe_undecidable(why),
@@ -201,7 +218,7 @@ pub fn survey_files(
                     &path.display().to_string(),
                     DRY_RUN_OUTPUT_SENTINEL,
                 );
-                summary.record(path, classify(&decision));
+                summary.record(path, classify(&probe, &decision));
             }
             // A probe failure is its OWN outcome, never folded into "optimal" or "cannot
             // decide" — those would attribute a tooling problem to the file or the policy.
@@ -228,6 +245,7 @@ mod tests {
     }
     fn transcode() -> SurveyOutcome {
         SurveyOutcome::WouldTranscode {
+            predicted_deletion_refusals: Vec::new(),
             reasons: vec!["BitrateAboveCeiling".into()],
         }
     }
@@ -307,7 +325,7 @@ mod tests {
         // an over-tight bitrate ceiling from a genuine backlog of bad files.
         let s = summary_of(&[transcode()]);
         match &s.files[0].outcome {
-            SurveyOutcome::WouldTranscode { reasons } => assert!(!reasons.is_empty()),
+            SurveyOutcome::WouldTranscode { reasons, .. } => assert!(!reasons.is_empty()),
             other => panic!("expected WouldTranscode, got {other:?}"),
         }
     }

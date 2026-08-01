@@ -76,7 +76,54 @@ async fn media_path(state: &AppState, media_item_id: i64) -> MuseResult<std::pat
             "media item {media_item_id} has no filesystem path recorded"
         )));
     }
-    Ok(path)
+    resolve_media_file(&path).ok_or_else(|| {
+        MuseError::NotFound(format!(
+            "media item {media_item_id}: no media file found at {}",
+            path.display()
+        ))
+    })
+}
+
+/// Resolve an item's recorded path to the actual media FILE.
+///
+/// `media_items.path` is a DIRECTORY for every row in this library — the
+/// release folder, e.g. `/srv/media/Movies/1984`, holding `1984.avi` beside
+/// artwork, `Thumbs.db` and a readme. SUBS-01 handed that directory straight to
+/// ffprobe, which exits 1 on it, so every embedded tier reported "unreadable"
+/// for the whole library. The failure was invisible in tests because every
+/// fixture used a file path.
+///
+/// Picks the LARGEST media file in the folder. Release folders routinely carry
+/// a sample or a trailer alongside the feature, and "largest" separates them
+/// reliably where "first alphabetically" does not. Non-recursive: a season
+/// folder's episodes are separate items with their own rows, and descending
+/// would make one episode's subtitles stand in for the season's.
+///
+/// A path that is already a file is returned unchanged, so this is correct for
+/// both layouts.
+fn resolve_media_file(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(path).ok()? {
+        let Ok(entry) = entry else { continue };
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        if !crate::library::scan::has_media_extension(&p) {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(b, _)| size > *b) {
+            best = Some((size, p));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Probe a media file through Foundry's path guard.
@@ -640,5 +687,93 @@ mod tests {
             "an image-based track must advertise that its timing cannot be adjusted"
         );
         assert!(value["why_this_tier"].as_str().unwrap().contains("exact"));
+    }
+}
+
+#[cfg(test)]
+mod media_file_resolution_tests {
+    use super::resolve_media_file;
+    use std::fs;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("muse-subs05-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    fn write(p: &std::path::Path, bytes: usize) {
+        fs::write(p, vec![b'x'; bytes]).expect("write fixture");
+    }
+
+    /// The bug this fixes: every `media_items.path` in this library is the
+    /// release DIRECTORY, and SUBS-01 handed it straight to ffprobe, which
+    /// exits 1 on a directory. The whole embedded tier reported "unreadable"
+    /// for all 1892 items, and no test caught it because every fixture was a
+    /// file path.
+    #[test]
+    fn a_release_directory_resolves_to_the_feature_file() {
+        let d = tmp("dir");
+        write(&d.join("1984.avi"), 5000);
+        write(&d.join("1984.jpg"), 100); // artwork, not media
+        write(&d.join("!!!READ_ME.txt"), 50);
+        assert_eq!(resolve_media_file(&d), Some(d.join("1984.avi")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Release folders routinely ship a sample alongside the feature. Picking
+    /// the first entry alphabetically would select "sample.mkv" over
+    /// "The.Movie.mkv"; size separates them reliably.
+    #[test]
+    fn the_largest_media_file_wins_over_a_sample() {
+        let d = tmp("sample");
+        write(&d.join("sample.mkv"), 100);
+        write(&d.join("The.Movie.2020.mkv"), 900_000);
+        assert_eq!(resolve_media_file(&d), Some(d.join("The.Movie.2020.mkv")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A path that is already a file must pass through unchanged, so this is
+    /// correct for both layouts rather than only the one this library uses.
+    #[test]
+    fn a_file_path_is_returned_unchanged() {
+        let d = tmp("file");
+        let f = d.join("movie.mkv");
+        write(&f, 10);
+        assert_eq!(resolve_media_file(&f), Some(f.clone()));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A folder with no media at all is None, not an arbitrary file — probing
+    /// a .txt would report "unreadable" and read as "this title has no
+    /// subtitles", which is the confusion the tri-state reporting exists to
+    /// prevent.
+    #[test]
+    fn a_directory_with_no_media_resolves_to_nothing() {
+        let d = tmp("nomedia");
+        write(&d.join("readme.txt"), 10);
+        write(&d.join("poster.jpg"), 10);
+        assert_eq!(resolve_media_file(&d), None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Non-recursive on purpose: a season folder's episodes are separate items
+    /// with their own rows, and descending would let one episode's subtitles
+    /// stand in for the whole season.
+    #[test]
+    fn resolution_does_not_descend_into_subdirectories() {
+        let d = tmp("nested");
+        fs::create_dir_all(d.join("Season 01")).expect("subdir");
+        write(&d.join("Season 01").join("S01E01.mkv"), 900_000);
+        assert_eq!(resolve_media_file(&d), None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_nonexistent_path_resolves_to_nothing() {
+        assert_eq!(
+            resolve_media_file(std::path::Path::new("/nonexistent-muse-subs05")),
+            None
+        );
     }
 }

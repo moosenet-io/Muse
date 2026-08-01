@@ -386,14 +386,20 @@ pub fn expectation_for(
             },
             AudioAction::Encode { channels: targets } => ExpectedAudio {
                 codec: "aac".to_string(),
-                // Read from the PLAN, not recomputed. `-ac` sets the channel
+                // Read from the PLAN, never recomputed. `-ac` sets the channel
                 // count exactly rather than capping it, and when this was
                 // derived independently here the argv and the expectation
                 // disagreed: the argv upmixed stereo to the 6-channel ceiling
-                // while this correctly expected 2. One number, read twice.
-                channels: targets.get(i).copied().unwrap_or(
-                    channels.min(policy.max_audio_channels),
-                ),
+                // while this correctly expected 2.
+                //
+                // A short vector REFUSES rather than falling back to a local
+                // `min(source, ceiling)`. The fallback was unreachable for a
+                // plan from `plan_transcode`, but `TranscodePlan`'s fields are
+                // public: a hand-built plan could omit an `-ac:a:N` from the
+                // argv while this quietly assumed a value, which is the exact
+                // two-derivations divergence this item exists to remove.
+                // Raised by codex, opus and free at the FOUNDRY-08 gate.
+                channels: *targets.get(i)?,
                 language: a.language.clone(),
             },
         });
@@ -1942,7 +1948,13 @@ mod tests {
         // And on the encode path, where the expected codec is the encoder's.
         let mut s = rich_source();
         s.audio[0].codec = "truehd".to_string();
-        let enc = expectation_for(&s, &encode_plan(None), &TranscodePolicy::default()).unwrap();
+        // `rich_source` has TWO audio streams, so the plan must state a target
+        // for both — a short vector now refuses rather than filling the gap.
+        let enc_plan = TranscodePlan {
+            audio: AudioAction::Encode { channels: vec![6, 2] },
+            ..encode_plan(None)
+        };
+        let enc = expectation_for(&s, &enc_plan, &TranscodePolicy::default()).unwrap();
         assert_eq!(enc.audio[0].codec, "aac");
         let mut out = rich_source();
         out.audio[0].codec = "ac3".to_string();
@@ -2044,6 +2056,33 @@ mod tests {
         assert_eq!(
             expect.audio[1].channels, 2,
             "a stereo track must stay stereo, not be inflated to the ceiling"
+        );
+
+        // Distinguishes "reads the plan" from "recomputes min(source, ceiling)".
+        // With source [8,2] and plan [6,2] both readings agree, so the
+        // assertions above cannot tell them apart — opus and free both said so
+        // at the FOUNDRY-08 gate, and they were right. A plan value that could
+        // NOT arise from min(source, ceiling) forces the distinction.
+        let odd = TranscodePlan {
+            audio: AudioAction::Encode { channels: vec![4, 1] },
+            ..encode_plan(None)
+        };
+        let e2 = expectation_for(&s, &odd, &TranscodePolicy::default()).unwrap();
+        assert_eq!(
+            (e2.audio[0].channels, e2.audio[1].channels),
+            (4, 1),
+            "the expectation must take the PLAN's numbers, not recompute its own"
+        );
+
+        // And a plan whose vector is shorter than the audio stream list
+        // REFUSES rather than filling the gap with a locally-derived value.
+        let short = TranscodePlan {
+            audio: AudioAction::Encode { channels: vec![6] },
+            ..encode_plan(None)
+        };
+        assert!(
+            expectation_for(&s, &short, &TranscodePolicy::default()).is_none(),
+            "a plan that does not state a target for every audio stream must refuse"
         );
         assert_eq!(
             expect.audio[0].language.as_deref(),

@@ -2328,10 +2328,17 @@ pub async fn foundry_validate(
     );
     let coverage_note = bounds.coverage_note();
     let filter = validate::CandidateFilter {
-        min_input_bytes: q.min_input_mb.map(|m| m * 1024 * 1024),
+        // Saturating: an operator-supplied u64 times 1 MiB overflows, and a
+        // WRAP yields a tiny floor that silently admits small files — the
+        // filter would then quietly stop targeting the tail it exists for.
+        // Opus and free, FOUNDRY-16 gate.
+        min_input_bytes: q.min_input_mb.map(|m| m.saturating_mul(1024 * 1024)),
         hdr_only: q.hdr_only.unwrap_or(false),
     };
     let filter_is_unrestricted = filter.is_unrestricted();
+    // Half the run deadline, so a targeted walk cannot consume the whole
+    // budget before any encode happens.
+    let probe_deadline = bounds.run_deadline / 2;
 
 
     use crate::foundry::validate;
@@ -2437,7 +2444,7 @@ pub async fn foundry_validate(
         let candidate_count = candidates.len();
 
         let (probed, probe_failures) =
-            validate::probe_candidates(&foundry, &candidates, probe_budget, &filter);
+            validate::probe_candidates(&foundry, &candidates, probe_budget, &filter, probe_deadline);
 
         let policy = crate::foundry::policy::TranscodePolicy::default();
         let run = validate::validate_sample(
@@ -2482,6 +2489,22 @@ pub async fn foundry_validate(
     let verdict = run.verdict();
     Ok(Json(json!({
         "ran": true,
+        // On the SUCCESS response above all. A targeted run's "all_verified"
+        // covers a deliberately narrow slice; an unrestricted run's spans the
+        // library's shapes. Reading the first as the second is the whole risk,
+        // and the success response is exactly where that misreading happens.
+        // Opus caught this missing at the FOUNDRY-16 gate.
+        "targeting": {
+            "min_input_mb": q.min_input_mb,
+            "hdr_only": q.hdr_only.unwrap_or(false),
+            "note": if filter_is_unrestricted {
+                "unrestricted: the diverse sample spans the library's shapes, which \
+                 under-represents the ~1% 4K/HDR tail by construction"
+            } else {
+                "TARGETED: only files matching the filter were considered, so this \
+                 result says NOTHING about the rest of the library"
+            },
+        },
         // Stated on every response, not just in the docs: this endpoint writes
         // only to scratch and the operator should be able to see that claim
         // next to the numbers it is asking them to trust.

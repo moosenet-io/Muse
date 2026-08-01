@@ -1610,6 +1610,41 @@ pub fn check_free_space(dir: &Path, needed: u64) -> Result<(), ValidationRefusal
 /// Returns the probes that succeeded (with their paths) and a count of the
 /// ones that did not. The probe failures are counted rather than dropped: a run
 /// where nothing could be probed must not report as a clean, empty validation.
+/// Why a probe walk stopped early, if it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStop {
+    /// Enough matches were collected. The normal, complete outcome.
+    BudgetFilled,
+    /// The probe phase ran out of wall clock. The sample is SHORTER than
+    /// requested, which is a materially different fact and must not be
+    /// reported as a complete one.
+    DeadlineReached,
+}
+
+/// Should the probe walk stop? Pure, so the composite rule is testable —
+/// `probe_candidates` needs a live `Foundry`, and when the deadline check was
+/// inline its mutation survived every test.
+///
+/// The deadline exists because a TARGETED walk visits every candidate: with a
+/// 120s probe timeout, ~25,000 entries is a worst case of hundreds of hours,
+/// and the run deadline was only consulted in the encode loop. A targeted run
+/// could therefore spend longer than its entire deadline before a single
+/// encode began.
+pub fn probe_stop_reason(
+    probed: usize,
+    budget: usize,
+    elapsed: Duration,
+    deadline: Duration,
+) -> Option<ProbeStop> {
+    if probed >= budget {
+        return Some(ProbeStop::BudgetFilled);
+    }
+    if elapsed >= deadline {
+        return Some(ProbeStop::DeadlineReached);
+    }
+    None
+}
+
 /// Which candidate indices to probe, and in what order.
 ///
 /// Named and separate so the CHOICE is testable — `probe_candidates` needs a
@@ -1634,7 +1669,15 @@ pub fn probe_candidates(
     candidates: &[PathBuf],
     probe_budget: usize,
     filter: &CandidateFilter,
+    // Wall-clock ceiling for the PROBE phase. A targeted walk visits every
+    // candidate, and with a 120s probe timeout ~25,000 entries is a worst case
+    // of hundreds of hours — the run deadline was only consulted in the encode
+    // loop, so a targeted run could spend longer than its whole deadline
+    // before a single encode began. Raised by opus and free at the FOUNDRY-16
+    // gate.
+    probe_deadline: Duration,
 ) -> (Vec<(PathBuf, MediaProbe)>, usize) {
+    let started = Instant::now();
     let mut probed = Vec::new();
     let mut failures = 0;
     // A restricted run walks the WHOLE candidate list rather than a stride
@@ -1644,7 +1687,19 @@ pub fn probe_candidates(
     // many files are looked at.
     let order: Vec<usize> = probe_order(candidates.len(), probe_budget, filter);
     for i in order {
-        if probed.len() >= probe_budget {
+        if let Some(stop) = probe_stop_reason(
+            probed.len(),
+            probe_budget,
+            started.elapsed(),
+            probe_deadline,
+        ) {
+            if stop == ProbeStop::DeadlineReached {
+                tracing::warn!(
+                    probed = probed.len(),
+                    "foundry/validate: probe phase hit its deadline; the sample is \
+                     SHORTER than requested and the run reports what it actually examined"
+                );
+            }
             break;
         }
         let path = &candidates[i];
@@ -2339,6 +2394,31 @@ mod tests {
         assert!(f.admits(&probe_with(Some(1), Some("arib-std-b67"), "yuv420p10le")));
         // Ordinary SDR is excluded — that is the point of the filter.
         assert!(!f.admits(&probe_with(Some(1), Some("bt709"), "yuv420p")));
+
+        // DOLBY VISION, which the test's own name claimed and did not check.
+        // Opus caught it at the FOUNDRY-16 gate: the assertions above are all
+        // transfer-based, so DV admission could break entirely and this test
+        // would stay green. A DV file whose TRANSFER is ordinary bt709 is the
+        // case that isolates it — admitted only via the DOVI signal.
+        let mut dv = probe_with(Some(1), Some("bt709"), "yuv420p");
+        dv.video[0].side_data = vec![crate::foundry::probe::StreamSideData {
+            kind: "DOVI configuration record".into(),
+            dv_profile: Some(5),
+            dv_bl_signal_compatibility_id: Some(0),
+            rpu_present: Some(true),
+            bl_present: Some(true),
+            el_present: Some(false),
+        }];
+        assert!(
+            crate::foundry::hdr::classify_dolby_vision(dv.primary_video().unwrap())
+                .is_present(),
+            "fixture must actually carry a DV signal"
+        );
+        assert!(
+            f.admits(&dv),
+            "a Dolby Vision file must be admitted even when its transfer looks SDR — \
+             profile 5 is the single most dangerous input in the library"
+        );
     }
 
     /// UNDETERMINED dynamic range is INCLUDED, deliberately.
@@ -2366,6 +2446,42 @@ mod tests {
         );
         // ...while untagged 8-bit is confidently SDR and is excluded.
         assert!(!f.admits(&probe_with(Some(1), None, "yuv420p")));
+    }
+
+    /// The probe walk must stop on EITHER limit, and the two are different
+    /// facts.
+    ///
+    /// A targeted walk visits every candidate; at a 120s probe timeout,
+    /// ~25,000 entries is hundreds of hours, and the run deadline was only
+    /// consulted in the ENCODE loop — so a targeted run could burn its whole
+    /// deadline before a single encode began. Raised by opus and free.
+    #[test]
+    fn the_probe_walk_stops_on_the_budget_or_the_deadline() {
+        let short = Duration::from_secs(10);
+        let long = Duration::from_secs(10_000);
+
+        // Neither limit reached: keep going.
+        assert_eq!(probe_stop_reason(5, 250, Duration::from_secs(1), long), None);
+
+        // Budget filled — the normal, complete outcome.
+        assert_eq!(
+            probe_stop_reason(250, 250, Duration::from_secs(1), long),
+            Some(ProbeStop::BudgetFilled)
+        );
+
+        // Deadline reached with the budget UNFILLED: a short sample, and a
+        // materially different fact from a complete one.
+        assert_eq!(
+            probe_stop_reason(3, 250, Duration::from_secs(11), short),
+            Some(ProbeStop::DeadlineReached)
+        );
+
+        // The budget takes precedence when both are hit, so a completed walk
+        // is never reported as truncated.
+        assert_eq!(
+            probe_stop_reason(250, 250, Duration::from_secs(11), short),
+            Some(ProbeStop::BudgetFilled)
+        );
     }
 
     /// A targeted run must walk EVERYTHING, not a stride.

@@ -446,8 +446,18 @@ fn is_dovi_record(d: &StreamSideData) -> bool {
 /// DOVI record gives the profile, and the codec tag gives presence without a
 /// profile. Presence without a profile is treated as hazardous, not as absence.
 pub fn classify_dolby_vision(stream: &VideoStream) -> DolbyVisionVerdict {
-    if let Some(d) = stream.side_data.iter().find(|d| is_dovi_record(d)) {
-        return classify_dovi_record(d);
+    // EVERY DOVI record, not the first. A stream carrying a profile 8 record
+    // followed by a profile 5 one used to classify as transcodable, because
+    // the refusal was never read — list order decided whether the original
+    // got deleted. Refusal wins regardless of position.
+    let strictest = stream
+        .side_data
+        .iter()
+        .filter(|d| is_dovi_record(d))
+        .map(classify_dovi_record)
+        .max_by_key(refusal_rank);
+    if let Some(v) = strictest {
+        return v;
     }
     if let Some(tag) = stream.codec_tag.as_deref() {
         let t = tag.trim().to_ascii_lowercase();
@@ -456,6 +466,23 @@ pub fn classify_dolby_vision(stream: &VideoStream) -> DolbyVisionVerdict {
         }
     }
     DolbyVisionVerdict::NotDetected
+}
+
+/// How strongly a verdict refuses, so the strictest of several DOVI records
+/// can be selected. Only the ORDER matters, not the numbers.
+///
+/// Deliberately total rather than a `transcodable`/`not transcodable` split:
+/// among refusals, `Profile5NoFallback` is the one whose reason is certain, so
+/// it is the message the operator should see when a stream carries several.
+fn refusal_rank(v: &DolbyVisionVerdict) -> u8 {
+    match v {
+        DolbyVisionVerdict::NotDetected => 0,
+        DolbyVisionVerdict::BaseLayerViewable { .. } => 1,
+        DolbyVisionVerdict::SignalledWithoutProfile { .. } => 2,
+        DolbyVisionVerdict::UnknownProfile { .. } => 3,
+        DolbyVisionVerdict::BaseLayerNotViewable { .. } => 4,
+        DolbyVisionVerdict::Profile5NoFallback => 5,
+    }
 }
 
 /// The profile/compatibility rules, split out so each branch is directly
@@ -713,6 +740,48 @@ mod tests {
             bl_present: Some(true),
             el_present: Some(false),
         }
+    }
+
+    /// Codex flagged this during the FOUNDRY-03 review gate, and it is real.
+    ///
+    /// `classify_dolby_vision` took the FIRST DOVI record it found. A stream
+    /// carrying more than one — profile 8 first, profile 5 second — therefore
+    /// classified as `BaseLayerViewable` and was transcodable, because the
+    /// refusal sitting in the second record was never read.
+    ///
+    /// ffprobe realistically emits one record per stream, so this is not a
+    /// shape seen in this library today. It is fixed anyway: the whole point
+    /// of the DV rules is that a refusal wins, and "wins unless it happens to
+    /// be listed second" is not that. Order must not decide whether a file is
+    /// destroyed.
+    #[test]
+    fn a_refusal_wins_no_matter_where_it_sits_among_several_dovi_records() {
+        let viewable = dovi(Some(8), Some(1));
+        let refused = dovi(Some(5), Some(0));
+
+        // The dangerous ordering: the permissive record is seen first.
+        let mut s = VideoStream::default();
+        s.side_data = vec![viewable.clone(), refused.clone()];
+        assert_eq!(
+            classify_dolby_vision(&s),
+            DolbyVisionVerdict::Profile5NoFallback,
+            "a profile 5 record must refuse even when a viewable record precedes it"
+        );
+        assert!(!classify_dolby_vision(&s).base_layer_is_transcodable());
+
+        // ...and the reverse order agrees, so the answer does not depend on it.
+        let mut s2 = VideoStream::default();
+        s2.side_data = vec![refused, viewable.clone()];
+        assert_eq!(classify_dolby_vision(&s2), DolbyVisionVerdict::Profile5NoFallback);
+
+        // A lone viewable record is still transcodable — the fix must not
+        // simply refuse everything, which would pass the assertions above.
+        let mut s3 = VideoStream::default();
+        s3.side_data = vec![viewable];
+        assert!(
+            classify_dolby_vision(&s3).base_layer_is_transcodable(),
+            "the fix must not turn every DV file into a refusal"
+        );
     }
 
     // --- bit depth ---------------------------------------------------------

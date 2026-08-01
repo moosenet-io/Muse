@@ -3100,6 +3100,20 @@ pub async fn foundry_reap(
         // Stated on every response: a dry run must never be mistakable for a
         // real one when the numbers are read later.
         "mutation_enabled": run.mutation_enabled,
+        // Separate from the above so a request that ASKED to mutate and was
+        // refused by the global gate is distinguishable from one that never
+        // asked. Without this an operator cannot tell "I forgot ?mutate=true"
+        // from "the deployment forbids it".
+        "globally_permitted": run.globally_permitted,
+        "gate_note": if !run.globally_permitted {
+            "MUSE_FOUNDRY_ENABLE_MUTATION is closed, so NOTHING can be deleted by this \
+             deployment regardless of ?mutate"
+        } else if !run.mutation_enabled {
+            "the global gate is open but this request did not pass ?mutate=true, so \
+             nothing was deleted"
+        } else {
+            "BOTH gates are open: this request DELETED backups the gate allowed"
+        },
         "retention_secs": run.retention_secs,
         // Coverage, so "examined: 0" can be told apart from "I could not
         // look". On the one endpoint that can permanently delete data, those

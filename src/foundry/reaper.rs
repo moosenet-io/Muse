@@ -148,9 +148,14 @@ pub struct ReapedFile {
 #[derive(Debug, Clone, Default)]
 pub struct ReapRun {
     pub files: Vec<ReapedFile>,
-    /// True only when deletion was actually enabled. Reported on every response
-    /// so a dry run can never be mistaken for a real one.
+    /// True only when deletion was actually enabled — which requires BOTH the
+    /// global gate and this request's `mutate`. Reported on every response so
+    /// a dry run can never be mistaken for a real one.
     pub mutation_enabled: bool,
+    /// Whether MUSE_FOUNDRY_ENABLE_MUTATION is open. Reported separately so a
+    /// request that asked to mutate and was refused by the GLOBAL gate can be
+    /// told apart from one that never asked.
+    pub globally_permitted: bool,
     pub retention_secs: u64,
     pub bytes_reclaimed: u64,
     /// Directories successfully listed across every root.
@@ -508,9 +513,26 @@ pub fn reap(foundry: &Foundry, retention: Duration, mutate: bool) -> ReapRun {
     // is a second place the allowed-roots list could be derived, and the
     // reaper must walk exactly the roots the guard would permit.
     let cfg = foundry.config();
+
+    // BOTH switches, not just the request's.
+    //
+    // The reaper previously honoured only `mutate` from the query string, so
+    // `?mutate=true` deleted backups even with MUSE_FOUNDRY_ENABLE_MUTATION
+    // unset. An operator who has deliberately closed the global gate — and who
+    // reads "mutation_enabled=false" in the startup log — would reasonably
+    // believe nothing in the library can be destroyed. One query parameter
+    // made that false.
+    //
+    // The two switches are independent on purpose: the global gate says "this
+    // deployment may modify the library at all", and `mutate` says "this
+    // particular request intends to". Deleting requires both, which is what
+    // "two deliberate steps" was always meant to mean.
+    let globally_permitted = cfg.enable_mutation;
+    let mutate = mutate && globally_permitted;
     let lock_dir = cfg.work_dir.clone();
     let mut run = ReapRun {
         mutation_enabled: mutate,
+        globally_permitted,
         retention_secs: retention.as_secs(),
         ..Default::default()
     };
@@ -1023,6 +1045,56 @@ mod tests {
             "retention must measure the BACKUP's age ({age:?}), not the inherited mtime"
         );
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Deleting requires BOTH gates, not just the request's.
+    ///
+    /// The reaper honoured only `mutate` from the query string, so
+    /// `?mutate=true` deleted backups even with MUSE_FOUNDRY_ENABLE_MUTATION
+    /// unset. An operator who has deliberately closed the global gate — and
+    /// who reads `mutation_enabled=false` in the startup log — would
+    /// reasonably believe nothing in the library can be destroyed. One query
+    /// parameter made that false.
+    #[test]
+    fn deleting_requires_the_global_gate_as_well_as_the_request() {
+        let body = include_str!("reaper.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+
+        assert!(
+            body.contains("let mutate = mutate && globally_permitted;"),
+            "the request's mutate flag must be ANDed with the global gate"
+        );
+        // ...and the global gate must come from the config, not be assumed.
+        assert!(
+            body.contains("let globally_permitted = cfg.enable_mutation;"),
+            "the global gate must be read from the Foundry's own configuration"
+        );
+        // The deletion itself is still additionally gated on the verdict.
+        assert!(
+            body.contains("if mutate && outcome == ReapOutcome::WouldDelete"),
+            "deletion must still require the gate's own Allow"
+        );
+    }
+
+    /// The truth table, stated so a future change cannot quietly widen it.
+    #[test]
+    fn the_two_gates_compose_as_an_and_not_an_or() {
+        // (global, request) -> may delete
+        let cases = [
+            ((false, false), false),
+            ((false, true), false), // the case that was broken
+            ((true, false), false),
+            ((true, true), true),
+        ];
+        for ((global, request), expected) in cases {
+            assert_eq!(
+                request && global,
+                expected,
+                "global={global} request={request} must yield {expected}"
+            );
+        }
     }
 
     /// The module must contain exactly ONE deletion call site, and it must be

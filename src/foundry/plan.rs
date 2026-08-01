@@ -76,11 +76,22 @@ pub enum VideoAction {
     Encode { scale: Option<(u32, u32)> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioAction {
     Copy,
     /// Re-encode every audio stream to the policy's audio target.
-    Encode,
+    /// Re-encode to AAC, with the EXACT output channel count for each audio
+    /// stream, in stream order and already clamped to the policy ceiling.
+    ///
+    /// Carried here rather than recomputed by the argv builder because `-ac`
+    /// sets the channel count EXACTLY — it is not a ceiling. The builder used
+    /// to emit `-ac <ceiling>` unconditionally, which UPMIXED every stereo
+    /// source to fake 5.1 while `expectation_for` correctly expected 2. Two
+    /// places deriving the same number disagreed; now there is one number and
+    /// both read it.
+    ///
+    /// Found by the FOUNDRY-04 validation harness against the live library.
+    Encode { channels: Vec<u32> },
 }
 
 /// A specific, checked policy violation. An enum rather than a `String` so a
@@ -565,7 +576,18 @@ pub fn plan_transcode(
             VideoAction::Copy
         },
         audio: if encode_audio {
-            AudioAction::Encode
+            AudioAction::Encode {
+                // `min`, never the bare ceiling: see the variant's docs.
+                channels: probe
+                    .audio
+                    .iter()
+                    .map(|a| {
+                        a.channels
+                            .unwrap_or(policy.max_audio_channels)
+                            .min(policy.max_audio_channels)
+                    })
+                    .collect(),
+            }
         } else {
             AudioAction::Copy
         },
@@ -676,16 +698,21 @@ pub fn build_transcode_args(
         }
     }
 
-    match plan.audio {
+    match &plan.audio {
         AudioAction::Copy => {
             push(&mut a, "-c:a");
             push(&mut a, "copy");
         }
-        AudioAction::Encode => {
+        AudioAction::Encode { channels } => {
             push(&mut a, "-c:a");
             push(&mut a, "aac");
-            push(&mut a, "-ac");
-            a.push(policy.max_audio_channels.to_string());
+            // PER-STREAM. A single global `-ac` forces every track to one
+            // number, so a 5.1 feature and a 2.0 commentary cannot both be
+            // right. Each stream states its own already-clamped count.
+            for (i, ch) in channels.iter().enumerate() {
+                a.push(format!("-ac:a:{i}"));
+                a.push(ch.to_string());
+            }
         }
     }
 
@@ -1132,7 +1159,7 @@ mod tests {
             panic!("expected a transcode");
         };
         assert_eq!(plan.video, VideoAction::Copy, "conforming video must be stream-copied");
-        assert_eq!(plan.audio, AudioAction::Encode);
+        assert!(matches!(plan.audio, AudioAction::Encode { .. }));
         assert!(reasons.contains(&TranscodeReason::AudioCodecNotAccepted {
             stream_index: 1,
             found: "truehd".into()
@@ -1144,7 +1171,83 @@ mod tests {
         }));
         assert!(args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "copy"));
         assert!(args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "aac"));
-        assert!(args.windows(2).any(|w| w[0] == "-ac" && w[1] == "6"));
+        assert!(args.windows(2).any(|w| w[0] == "-ac:a:0" && w[1] == "6"));
+    }
+
+    /// Found by the FOUNDRY-04 validation harness on the LIVE library, not in
+    /// review: 5 of 8 attempted encodes failed with "channel count is Some(6),
+    /// expected 2".
+    ///
+    /// The argv emitted `-ac <policy.max_audio_channels>` unconditionally, and
+    /// `-ac` sets the output channel count EXACTLY — it is not a ceiling. So a
+    /// stereo source was UPMIXED to fake 5.1: bigger file, no added
+    /// information, and under Path A the real original would then have been
+    /// deleted. `expectation_for` computed `min(source, ceiling)` and was
+    /// right, which is the only reason verification caught it.
+    #[test]
+    fn a_stereo_source_is_never_upmixed_to_the_channel_ceiling() {
+        let p = probe("avi", vec![vid("mpeg4", 720, 480, Some(1_500_000))], vec![aud(1, "mp3", 2)]);
+        let TranscodeDecision::Transcode { args, plan, .. } = decide(&p) else {
+            panic!("a stereo mp3 avi must be transcoded");
+        };
+        assert_eq!(plan.audio, AudioAction::Encode { channels: vec![2] });
+
+        // The argv must ask for 2, not the ceiling of 6.
+        let ac: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| a.starts_with("-ac") && *i + 1 < args.len())
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert!(!ac.is_empty(), "an audio encode must state a channel count: {args:?}");
+        for v in &ac {
+            assert_eq!(
+                v.as_str(),
+                "2",
+                "a 2-channel source must stay 2-channel, not be upmixed: {args:?}"
+            );
+        }
+    }
+
+    /// The other direction still has to work: a source ABOVE the ceiling is
+    /// downmixed to it. Without this, "never upmix" could be satisfied by
+    /// dropping the flag entirely and letting 8-channel audio through.
+    #[test]
+    fn a_source_above_the_ceiling_is_still_downmixed() {
+        let p = probe("avi", vec![vid("mpeg4", 720, 480, Some(1_500_000))], vec![aud(1, "truehd", 8)]);
+        let TranscodeDecision::Transcode { args, plan, .. } = decide(&p) else {
+            panic!("expected a transcode");
+        };
+        assert_eq!(plan.audio, AudioAction::Encode { channels: vec![6] });
+        assert!(
+            args.windows(2).any(|w| w[0].starts_with("-ac") && w[1] == "6"),
+            "8ch must be downmixed to the 6ch ceiling: {args:?}"
+        );
+    }
+
+    /// Per-stream, not global: a file with a 5.1 main track and a 2.0
+    /// commentary must keep both at their own counts. A single global `-ac`
+    /// forces every track to one number, which is how the upmix bug could
+    /// otherwise survive in a subtler form.
+    #[test]
+    fn each_audio_stream_keeps_its_own_channel_count() {
+        let p = probe(
+            "avi",
+            vec![vid("mpeg4", 720, 480, Some(1_500_000))],
+            vec![aud(1, "ac3", 6), aud(2, "mp3", 2)],
+        );
+        let TranscodeDecision::Transcode { plan, args, .. } = decide(&p) else {
+            panic!("expected a transcode");
+        };
+        assert_eq!(plan.audio, AudioAction::Encode { channels: vec![6, 2] });
+        assert!(
+            args.windows(2).any(|w| w[0] == "-ac:a:0" && w[1] == "6"),
+            "stream 0 must stay 5.1: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-ac:a:1" && w[1] == "2"),
+            "stream 1 must stay stereo, not be upmixed to match stream 0: {args:?}"
+        );
     }
 
     #[test]
@@ -1276,7 +1379,7 @@ mod tests {
         let plan = TranscodePlan {
             video_stream_index: 0,
             video: VideoAction::Encode { scale: Some((1920, 1080)) },
-            audio: AudioAction::Encode,
+            audio: AudioAction::Encode { channels: vec![2] },
             container: Container::Matroska,
         };
         assert_eq!(
@@ -1289,7 +1392,7 @@ mod tests {
                 "-c:v", "libx264", "-crf", "20", "-preset", "medium",
                 "-pix_fmt", "yuv420p", "-vf", "scale=1920:1080",
                 "-maxrate", "12000000", "-bufsize", "24000000",
-                "-c:a", "aac", "-ac", "6",
+                "-c:a", "aac", "-ac:a:0", "2",
                 "-c:s", "copy",
                 "-c:t", "copy",
                 "-f", "matroska", "/work/out.mkv",
@@ -1335,7 +1438,7 @@ mod tests {
         let plan = TranscodePlan {
             video_stream_index: 0,
             video: VideoAction::Encode { scale: None },
-            audio: AudioAction::Encode,
+            audio: AudioAction::Encode { channels: vec![2] },
             container: Container::Mp4,
         };
         let args = build_transcode_args(&plan, &TranscodePolicy::default(), "/in.mkv", "/out.mp4");
@@ -1349,7 +1452,7 @@ mod tests {
     fn subtitles_are_always_copied_never_dropped_or_burned_in() {
         for (video, audio) in [
             (VideoAction::Copy, AudioAction::Copy),
-            (VideoAction::Encode { scale: None }, AudioAction::Encode),
+            (VideoAction::Encode { scale: None }, AudioAction::Encode { channels: vec![2] }),
         ] {
             let plan = TranscodePlan {
                 video_stream_index: 0,
@@ -1390,7 +1493,7 @@ mod tests {
         let plan = TranscodePlan {
             video_stream_index: 0,
             video: VideoAction::Encode { scale: None },
-            audio: AudioAction::Encode,
+            audio: AudioAction::Encode { channels: vec![2] },
             container: Container::Matroska,
         };
         let args = build_transcode_args(&plan, &policy, "/i", "/o");
@@ -1398,7 +1501,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w[0] == "-preset" && w[1] == "veryfast"));
         assert!(args.windows(2).any(|w| w[0] == "-maxrate" && w[1] == "4000000"));
         assert!(args.windows(2).any(|w| w[0] == "-bufsize" && w[1] == "8000000"));
-        assert!(args.windows(2).any(|w| w[0] == "-ac" && w[1] == "2"));
+        assert!(args.windows(2).any(|w| w[0] == "-ac:a:0" && w[1] == "2"));
     }
 
     #[test]

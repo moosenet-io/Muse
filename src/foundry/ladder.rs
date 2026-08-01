@@ -399,7 +399,7 @@ fn decide_rung(
         // --- the hifi rung: remux or nothing -------------------------------
         VideoTreatment::CopyOnly => {
             let re_encodes_video = matches!(plan.video, VideoAction::Encode { .. });
-            let re_encodes_audio = plan.audio == crate::foundry::plan::AudioAction::Encode;
+            let re_encodes_audio = matches!(plan.audio, crate::foundry::plan::AudioAction::Encode { .. });
             if re_encodes_video || re_encodes_audio {
                 return RenditionOutcome::Refused {
                     why: RenditionRefusal::HifiWouldRequireReEncoding {
@@ -779,16 +779,28 @@ pub fn build_rendition_args(
         }
     }
 
-    match plan.audio {
+    match &plan.audio {
         crate::foundry::plan::AudioAction::Copy => {
             push(&mut a, "-c:a");
             push(&mut a, "copy");
         }
-        crate::foundry::plan::AudioAction::Encode => {
+        crate::foundry::plan::AudioAction::Encode { channels } => {
             push(&mut a, "-c:a");
             push(&mut a, "aac");
-            push(&mut a, "-ac");
-            a.push(rendition.audio.max_channels().to_string());
+            // Per-stream and already clamped, exactly as Path A does it.
+            // This builder previously emitted one global `-ac <ceiling>`,
+            // which is the SAME upmix bug FOUNDRY-08 fixed on Path A: `-ac`
+            // sets the count exactly, so a stereo track fed to a 5.1 rung was
+            // inflated to fake surround. Caught by codex at the FOUNDRY-08
+            // gate — Path A's tests could not see it.
+            //
+            // `plan_transcode` clamped these to the RENDITION's policy (the
+            // rung's own ceiling), because `decide_rung` plans with
+            // `rendition.as_policy()`.
+            for (i, ch) in channels.iter().enumerate() {
+                a.push(format!("-ac:a:{i}"));
+                a.push(ch.to_string());
+            }
             if let Some(bps) = rendition.audio.encode_bitrate_bps() {
                 push(&mut a, "-b:a");
                 a.push(bps.to_string());
@@ -1802,14 +1814,14 @@ mod tests {
         assert!(mobile.windows(2).any(|w| w[0] == "-preset" && w[1] == "veryfast"));
         assert!(mobile.windows(2).any(|w| w[0] == "-vf" && w[1] == "scale=640:360"));
         assert!(mobile.windows(2).any(|w| w[0] == "-maxrate" && w[1] == "1200000"));
-        assert!(mobile.windows(2).any(|w| w[0] == "-ac" && w[1] == "2"));
+        assert!(mobile.windows(2).any(|w| w[0] == "-ac:a:0" && w[1] == "2"));
         assert!(mobile.windows(2).any(|w| w[0] == "-b:a" && w[1] == "160000"));
 
         assert!(tv.windows(2).any(|w| w[0] == "-crf" && w[1] == "20"), "{tv:?}");
         assert!(tv.windows(2).any(|w| w[0] == "-maxrate" && w[1] == "8000000"));
         assert!(tv.windows(2).any(|w| w[0] == "-bufsize" && w[1] == "16000000"));
         assert!(
-            tv.windows(2).any(|w| w[0] == "-ac" && w[1] == "6"),
+            tv.windows(2).any(|w| w[0] == "-ac:a:0" && w[1] == "6"),
             "the tv rung keeps 5.1 rather than downmixing: {tv:?}"
         );
         assert!(tv.windows(2).any(|w| w[0] == "-b:a" && w[1] == "384000"));

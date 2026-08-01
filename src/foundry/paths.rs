@@ -76,6 +76,36 @@ impl ResolvedPath {
         self.0
     }
 
+    /// Mint a `ResolvedPath` for a file this process created in its own scratch
+    /// directory. **Read-only use only** — it is deliberately NOT a
+    /// [`MutablePath`], so it cannot be handed to anything that mutates.
+    ///
+    /// ## Why this is not a hole in the guard
+    ///
+    /// The guard's invariant is "this path lies inside a configured allowed
+    /// root". Foundry's scratch directory is required by safety rail 3 to be
+    /// *outside* every allowed root and on a different filesystem — so the
+    /// guard would refuse it, correctly, and there is no root the harness could
+    /// legitimately add to make it pass (adding the scratch dir as an allowed
+    /// root is precisely the thing rail 3 forbids).
+    ///
+    /// So the narrow capability is: **read back a file this process just wrote,
+    /// at a path this process generated, in a directory it verified.** The path
+    /// is a `muse-foundry-validate-<uuid>` name joined onto a checked scratch
+    /// directory; no component of it comes from the library, from a probe, or
+    /// from a request. The one consumer is
+    /// [`crate::foundry::validate::probe_scratch_file`], which runs ffprobe on
+    /// it, and `pub(in crate::foundry)` keeps that reachable only from inside
+    /// the module.
+    ///
+    /// Not canonicalized, deliberately: the caller has just created the file at
+    /// exactly this path, and canonicalizing would only introduce a failure
+    /// mode (a scratch mount that is itself a symlink) with nothing to gain —
+    /// this value is never compared against a root.
+    pub(in crate::foundry) fn for_process_owned_scratch(path: &Path) -> Self {
+        Self(path.to_path_buf())
+    }
+
     /// A lossy display form for logs and error messages.
     ///
     /// Foundry-internal like the rest. A reviewer noted that a display string

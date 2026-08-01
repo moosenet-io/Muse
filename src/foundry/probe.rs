@@ -387,6 +387,64 @@ pub fn run_ffprobe_with_timeout(
     parse_probe_json(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Most output this will hold from one child, per stream.
+///
+/// **8 MiB.** ffprobe's JSON tops out in the tens of KB (measured: the largest
+/// in this library is ~71 KB), and ffmpeg at `-loglevel error` is near-silent,
+/// so honest output never approaches this.
+///
+/// It exists because "near-silent" is not "silent": a pathological input can
+/// make ffmpeg emit a decode error per frame, and a 6-hour encode has millions
+/// of frames. Reading that to completion in memory is unbounded growth driven
+/// by the contents of an untrusted media file — across 16,000 items, one such
+/// file is enough.
+const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Drain a pipe to EOF, keeping at most [`MAX_CAPTURED_BYTES`].
+///
+/// Keeps draining after the cap rather than stopping, but NOT for the reason
+/// it first appears. Stopping early does not deadlock — returning from this
+/// function drops the pipe, which closes the read end, and the child then dies
+/// of SIGPIPE. (An earlier version of this comment claimed deadlock; that was
+/// wrong, and mutation testing showed it: the "stop at the cap" mutant did not
+/// hang, it changed how the child DIED.)
+///
+/// The actual reason is that a child killed by SIGPIPE reports a signal exit
+/// rather than its real status, so a merely-verbose encode would be
+/// indistinguishable from a genuinely failed one. Draining to EOF lets the
+/// child finish and be judged on what it actually did.
+///
+/// Keeps the HEAD, not the tail: ffmpeg's first error is the one that explains
+/// the failure, and the ten-thousandth is a consequence of it.
+fn drain_capped(pipe: Option<&mut impl std::io::Read>) -> Vec<u8> {
+    let mut kept: Vec<u8> = Vec::new();
+    let Some(p) = pipe else { return kept };
+    let mut chunk = [0u8; 64 * 1024];
+    let mut truncated = false;
+    loop {
+        match p.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                // `room` alone enforces the cap — saturating so it is 0 once
+                // full. A guarding `if` around this was redundant, which
+                // mutation testing correctly reported as an equivalent mutant.
+                let room = MAX_CAPTURED_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+                if n > room {
+                    truncated = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if truncated {
+        kept.extend_from_slice(
+            b"\n[muse: output truncated at 8 MiB; the child kept writing and was still drained]\n",
+        );
+    }
+    kept
+}
+
 /// Spawn a process, wait for it with a deadline, and kill it if the deadline
 /// passes. Returns its captured output.
 ///
@@ -427,20 +485,8 @@ pub fn spawn_with_timeout(
     // FOUNDRY-10 gate.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = out_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let err_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let out_thread = std::thread::spawn(move || drain_capped(out_pipe.as_mut()));
+    let err_thread = std::thread::spawn(move || drain_capped(err_pipe.as_mut()));
 
     let start = std::time::Instant::now();
     let status = loop {
@@ -1460,6 +1506,72 @@ mod tests {
         assert!(
             got.is_ok(),
             "a process that finishes immediately must not be affected: {got:?}"
+        );
+    }
+
+    /// The cap bounds MEMORY without breaking the DRAIN.
+    ///
+    /// Those two requirements pull against each other: stopping the read at
+    /// the cap would bound memory and immediately reintroduce the pipe
+    /// deadlock, because the child blocks once the pipe fills and nobody is
+    /// reading. So the drain must continue and only the RETENTION stops.
+    /// Raised as "technically unbounded" by opus and free at the FOUNDRY-13
+    /// gate.
+    #[test]
+    fn a_child_that_floods_its_output_is_capped_but_still_drained() {
+        // 20 MiB, well past the 8 MiB cap and vastly past the 64 KiB pipe.
+        let args = vec![
+            "-c".to_string(),
+            "head -c 20971520 /dev/zero | tr '\\0' 'x'".to_string(),
+        ];
+        let start = std::time::Instant::now();
+        let got = spawn_with_timeout("sh", &args, Duration::from_secs(60));
+        let waited = start.elapsed();
+
+        let out = got.expect("a flooding child must COMPLETE, not deadlock");
+        assert!(
+            out.stdout.len() <= MAX_CAPTURED_BYTES + 200,
+            "memory must be bounded, kept {} bytes",
+            out.stdout.len()
+        );
+        assert!(
+            out.stdout.len() >= MAX_CAPTURED_BYTES,
+            "...but the cap's worth must actually be retained: {}",
+            out.stdout.len()
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("output truncated"),
+            "truncation must be STATED, not silent — otherwise a caller reads a partial \
+             capture as the whole output"
+        );
+        assert!(
+            waited < Duration::from_secs(30),
+            "the child must not have blocked: {waited:?}"
+        );
+        // The property that actually distinguishes draining-to-EOF from
+        // stopping at the cap: a child whose pipe is closed early dies of
+        // SIGPIPE and reports a SIGNAL exit, so a merely-verbose encode would
+        // be indistinguishable from a failed one. Draining lets it finish and
+        // be judged on what it did.
+        assert!(
+            out.status.success(),
+            "the child must exit normally, not be killed by SIGPIPE from an early stop: {:?}",
+            out.status
+        );
+    }
+
+    /// The head is kept, not the tail: ffmpeg's FIRST error explains the
+    /// failure; the ten-thousandth is a consequence of it.
+    #[test]
+    fn the_retained_capture_is_the_head_of_the_stream() {
+        let args = vec![
+            "-c".to_string(),
+            "printf 'FIRSTLINE\\n'; head -c 12582912 /dev/zero | tr '\\0' 'z'".to_string(),
+        ];
+        let out = spawn_with_timeout("sh", &args, Duration::from_secs(60)).expect("completes");
+        assert!(
+            out.stdout.starts_with(b"FIRSTLINE"),
+            "the beginning of the output must survive truncation"
         );
     }
 

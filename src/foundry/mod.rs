@@ -154,6 +154,33 @@ impl Foundry {
             "foundry: registered"
         );
 
+        // Sweep staging files left by a process that died mid-encode.
+        //
+        // `discard_staged` runs after the encode returns, which never happens
+        // if the process is killed first — a deploy, a crash, an OOM, or an
+        // operator cancelling a run all leave a full-size partial encode
+        // behind, permanently. At 16,000 items that accumulates until the
+        // scratch filesystem fills, which then presents as unrelated encode
+        // failures.
+        //
+        // Registration is the right moment: it happens once per process, and a
+        // file older than twice the encode ceiling provably cannot belong to a
+        // live encode, so this is safe even with another Muse running.
+        if let Some(work_dir) = config.work_dir.as_deref() {
+            let report = forge::sweep_orphaned_staging(work_dir, config.encode_timeout);
+            if report.removed > 0 || report.failed > 0 || report.unreadable {
+                tracing::info!(
+                    examined = report.examined,
+                    removed = report.removed,
+                    failed = report.failed,
+                    kept = report.kept_live_or_unknown,
+                    bytes_reclaimed = report.bytes_reclaimed,
+                    unreadable = report.unreadable,
+                    "foundry: swept orphaned staging files"
+                );
+            }
+        }
+
         Some(Self { config, guard })
     }
 

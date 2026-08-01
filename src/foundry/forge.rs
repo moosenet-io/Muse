@@ -124,6 +124,7 @@
 //! is the single `Command::new(ffmpeg)` call and nothing else.
 
 use std::os::unix::io::AsRawFd;
+use std::time::{Duration, SystemTime};
 use std::path::{Path, PathBuf};
 
 use crate::foundry::capability::{self, Capabilities};
@@ -1602,6 +1603,102 @@ fn skip_for_lock_error(e: &SwapError) -> Option<SkipReason> {
     }
 }
 
+/// Remove staging files left behind by a process that died mid-encode.
+///
+/// Nothing cleans these up today. `discard_staged` runs after
+/// `run_encode_and_swap` returns — which never happens if the process is killed
+/// first. A deploy, a crash, an OOM, or an operator cancelling a run all leave
+/// a full-size partial encode in the work dir, permanently.
+///
+/// At 16,000 items, interruptions are not hypothetical: this session alone
+/// cancelled several runs by hand, each leaving ~20 GB behind that had to be
+/// removed manually. The accumulation eventually fills the scratch filesystem,
+/// which then presents as unrelated encode failures.
+///
+/// ## Why age, and why THIS age
+///
+/// A staging file cannot be distinguished from a live one by inspection — a
+/// concurrent encode's file looks identical. But a live encode is bounded by
+/// `encode_timeout`, so anything older than that ceiling **plus a margin**
+/// provably does not belong to a running encode: the encode that created it
+/// would already have been killed by its own deadline.
+///
+/// That makes the rule safe without needing to know what else is running, and
+/// it is why the threshold is derived from the timeout rather than being an
+/// arbitrary "24 hours".
+///
+/// Never touches anything outside the work dir, and only files matching the
+/// staging name shapes — a stray operator file in the work dir is left alone.
+pub fn sweep_orphaned_staging(work_dir: &Path, encode_timeout: Duration) -> SweepReport {
+    let mut report = SweepReport::default();
+    // Double the ceiling: generous enough that clock skew or a slow unlink
+    // cannot make a live encode look orphaned.
+    let min_age = encode_timeout.saturating_mul(2);
+
+    let Ok(entries) = std::fs::read_dir(work_dir) else {
+        report.unreadable = true;
+        return report;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Only the shapes forge itself creates.
+        let is_staging = name.starts_with("muse-foundry-") || name.starts_with(INFLIGHT_PREFIX);
+        if !is_staging || !path.is_file() {
+            continue;
+        }
+        report.examined += 1;
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| SystemTime::now().duration_since(t).ok());
+        match age {
+            Some(a) if a >= min_age => {
+                let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        report.removed += 1;
+                        report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
+                        tracing::info!(
+                            path = %path.display(),
+                            age_secs = a.as_secs(),
+                            "foundry: removed an orphaned staging file from a dead encode"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e,
+                            "foundry: could not remove an orphaned staging file");
+                        report.failed += 1;
+                    }
+                }
+            }
+            // Too young, or an unreadable mtime. Both are KEPT: an unknown age
+            // cannot be shown to be orphaned, and deleting a live encode's
+            // staging file would corrupt a running swap.
+            _ => report.kept_live_or_unknown += 1,
+        }
+    }
+    report
+}
+
+/// What one orphan sweep did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SweepReport {
+    pub examined: usize,
+    pub removed: usize,
+    pub failed: usize,
+    /// Kept because they are younger than the ceiling, or their age could not
+    /// be read. An unknown age is never treated as old.
+    pub kept_live_or_unknown: usize,
+    pub bytes_reclaimed: u64,
+    /// The work dir itself could not be listed, so this sweep established
+    /// nothing.
+    pub unreadable: bool,
+}
+
 /// Detect tooling using the configured binary names.
 pub(in crate::foundry) fn detect_capabilities(cfg: &FoundryConfig) -> Capabilities {
     capability::detect(&cfg.ffprobe_bin, &cfg.ffmpeg_bin, &cfg.handbrake_bin)
@@ -2850,6 +2947,78 @@ mod tests {
             std::time::Duration::from_secs(60),
             "zero clamps UP so the ceiling cannot be disabled"
         );
+    }
+
+    /// Orphaned staging files must be removed, and live ones must not be.
+    ///
+    /// Nothing cleaned these up. `discard_staged` runs after the encode
+    /// returns, which never happens if the process is killed first — so a
+    /// deploy, crash, OOM, or cancelled run leaves a full-size partial encode
+    /// behind permanently. This session cancelled several runs by hand, each
+    /// leaving ~20 GB that had to be removed manually; at 16,000 items that
+    /// fills the scratch filesystem and then presents as unrelated encode
+    /// failures.
+    #[test]
+    fn an_orphaned_staging_file_is_swept_but_a_live_one_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-sweep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let ceiling = Duration::from_secs(60);
+        let old = SystemTime::now() - Duration::from_secs(10_000); // > 2x ceiling
+
+        // An orphan: a staging file older than twice the encode ceiling, so it
+        // provably cannot belong to a running encode.
+        let orphan = dir.join("muse-foundry-deadjob.mkv");
+        fs::write(&orphan, vec![b'x'; 4096]).unwrap();
+        let ft = fs::FileTimes::new().set_modified(old).set_accessed(old);
+        fs::File::options().write(true).open(&orphan).unwrap().set_times(ft).unwrap();
+
+        // A LIVE one: same shape, but recent.
+        let live = dir.join("muse-foundry-runningjob.mkv");
+        fs::write(&live, b"y").unwrap();
+
+        // ...and an inflight-prefixed orphan, the other shape forge creates.
+        let inflight = dir.join(format!("{INFLIGHT_PREFIX}-dead.part"));
+        fs::write(&inflight, b"z").unwrap();
+        fs::File::options().write(true).open(&inflight).unwrap().set_times(ft).unwrap();
+
+        // A file forge did NOT create must be left completely alone, however old.
+        let operators_file = dir.join("operator-notes.txt");
+        fs::write(&operators_file, b"do not delete").unwrap();
+        fs::File::options().write(true).open(&operators_file).unwrap().set_times(ft).unwrap();
+        let _ = fs::set_permissions(&operators_file, fs::Permissions::from_mode(0o644));
+
+        let report = sweep_orphaned_staging(&dir, ceiling);
+
+        assert!(!orphan.exists(), "the orphan must be removed");
+        assert!(!inflight.exists(), "the inflight orphan must be removed too");
+        assert!(live.exists(), "a LIVE encode's staging file must survive");
+        assert!(
+            operators_file.exists(),
+            "a file forge did not create must never be touched, however old"
+        );
+        assert_eq!(report.removed, 2);
+        assert_eq!(report.kept_live_or_unknown, 1, "the live one");
+        assert_eq!(report.examined, 3, "only forge-shaped files are examined");
+        assert!(report.bytes_reclaimed >= 4096);
+        assert!(!report.unreadable);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable work dir establishes nothing and must say so, rather than
+    /// reporting a clean sweep of zero files.
+    #[test]
+    fn a_work_dir_that_cannot_be_listed_reports_that_it_established_nothing() {
+        let report = sweep_orphaned_staging(
+            Path::new("/nonexistent-muse-sweep-dir"),
+            Duration::from_secs(60),
+        );
+        assert!(report.unreadable, "an unlistable work dir must be reported");
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.examined, 0);
     }
 
     #[test]

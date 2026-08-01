@@ -446,6 +446,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         })
     }
 
@@ -581,6 +582,7 @@ mod tests {
                 tmdb: None,
                 embed: None,
                 download: None,
+                cast_controller: None,
             })
         }
 

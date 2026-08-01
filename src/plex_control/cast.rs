@@ -37,6 +37,16 @@ pub trait CastController: Send + Sync {
 
     /// Poll transport/playback state for `target`.
     async fn poll_timeline(&self, target: &str) -> MuseResult<TimelinePoll>;
+
+    /// Short, stable name for the transport this controller drives (e.g.
+    /// `"plex"`), reported in MACT-02's `terminate` response so a caller
+    /// knows which backend actually handled (or failed to handle) the
+    /// relay. A default-provided method (not a hard requirement on every
+    /// implementer) so adding it doesn't ripple through every existing
+    /// `CastController` impl.
+    fn backend_name(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 #[async_trait]
@@ -69,6 +79,10 @@ impl CastController for PlexControlClient {
 
     async fn poll_timeline(&self, target: &str) -> MuseResult<TimelinePoll> {
         PlexControlClient::timeline_poll(self, target).await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "plex"
     }
 }
 

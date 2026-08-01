@@ -145,6 +145,7 @@ fn no_upstream_state_with_config(pool: sqlx::PgPool, config: Config) -> Arc<AppS
         tmdb: None,
         embed: None,
         download: None,
+        cast_controller: None,
     })
 }
 

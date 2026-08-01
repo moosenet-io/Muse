@@ -57,6 +57,74 @@ async fn upsert_player(pool: &PgPool, player: &PlexPlayer) -> MuseResult<()> {
     Ok(())
 }
 
+/// Best-effort resolution from a `play_sessions.player` display name (e.g.
+/// "Living Room") to the `plex_clients.machine_identifier` MACT-02 needs to
+/// address a Companion stop command — Muse doesn't (yet) stamp the exact
+/// client id on `play_sessions` at ingest time, only the name Plex reported.
+///
+/// Review finding, cycle 1 (MACT-02, codex, confirmed): `name` is neither
+/// unique nor stable, so a `LIMIT 1 ORDER BY last_seen_at DESC` tiebreak can
+/// silently relay a stop to an unrelated device — a renamed client, or two
+/// devices that happen to share a display name. Fixed by fetching at most 2
+/// matching rows and refusing (returning ambiguous) when there's more than
+/// one, rather than picking.
+///
+/// Review finding, cycle 2 (codex, confirmed): uniqueness alone isn't
+/// enough — `plex_clients` rows are never pruned, so *exactly one* match
+/// can be an OBSOLETE row while the session actually belongs to a
+/// newly-connected client sharing that name. `fresh_within_secs` bounds how
+/// stale a match's `last_seen_at` may be before it's trusted
+/// (`Config::terminate_target_fresh_within_secs`,
+/// `MUSE_TERMINATE_TARGET_FRESH_SECS`). A name that matches only STALE rows
+/// is [`crate::repo::FreshnessLookup::StaleOnly`] — a refusal distinct from
+/// both "no match at all" and "ambiguous", never a silent promotion to
+/// "the only one, so it must be right".
+///
+/// TODO(S130-J): the real fix is for `play_sessions` to stamp the stable
+/// Plex client id directly at ingest (spec J's territory), so resolution
+/// never needs a name match — and neither the ambiguity nor the staleness
+/// hazard can arise — at all. This function is a temporary bridge, not the
+/// intended long-term design; the freshness window above is the defensible
+/// mitigation until then, not a substitute for it.
+pub async fn find_machine_identifier_by_name(
+    pool: &PgPool,
+    name: &str,
+    fresh_within_secs: u64,
+) -> MuseResult<crate::repo::FreshnessLookup<String>> {
+    let fresh_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT machine_identifier FROM plex_clients \
+         WHERE name = $1 AND last_seen_at >= now() - make_interval(secs => $2) \
+         ORDER BY last_seen_at DESC LIMIT 2",
+    )
+    .bind(name)
+    .bind(fresh_within_secs as f64)
+    .fetch_all(pool)
+    .await
+    .map_err(MuseError::Database)?;
+
+    let fresh_rows: Vec<String> = fresh_rows.into_iter().map(|(id,)| id).collect();
+
+    // Only pay for the "does ANY match exist, fresh or not" check when
+    // there were zero fresh rows -- a fresh match (one, or ambiguously
+    // many) never needs it.
+    let any_match_exists = if fresh_rows.is_empty() {
+        let (exists,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM plex_clients WHERE name = $1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .map_err(MuseError::Database)?;
+        exists
+    } else {
+        false
+    };
+
+    Ok(crate::repo::classify_with_freshness(
+        fresh_rows,
+        any_match_exists,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -182,6 +182,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         }
     }
 
@@ -240,6 +241,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         });
 
         // The handler itself has no fallible path (it always returns

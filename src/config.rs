@@ -608,6 +608,27 @@ pub struct Config {
     /// make a genuinely-live session flap to `stale` between polls.
     pub session_active_grace_secs: u64,
 
+    // --- MACT-02 (Plane MUSE #122): POST /api/sessions/:session_key/terminate ---
+    /// How stale (seconds since `plex_clients.last_seen_at`) a discovered
+    /// Companion client is allowed to be before `terminate_session` still
+    /// trusts a name match against it (`MUSE_TERMINATE_TARGET_FRESH_SECS`).
+    /// Review finding (MACT-02 cycle 2, codex, confirmed): `plex_clients`
+    /// rows are never pruned, so *exactly one* name match being "unique" is
+    /// not "current" — an obsolete row can be the only match while the
+    /// session actually belongs to a newly-connected device sharing that
+    /// display name. A name match older than this window is treated as a
+    /// refusal (a distinct outcome from "no match at all"), never a silent
+    /// pick, until spec J removes the need for name-based resolution
+    /// entirely (see the `TODO(S130-J)` markers in `src/plex_control/`).
+    /// Behavioral config, not a secret — same posture as
+    /// `session_active_grace_secs` above. No established discovery
+    /// cadence exists yet to derive a sharper default from (MUSE-22's
+    /// `upsert_players` has no scheduled caller as of this item), so this
+    /// defaults conservatively short (5 minutes) rather than long — biasing
+    /// toward refusal over a stale guess, consistent with "refuse when it
+    /// cannot be sure" being safer than "guess and hope".
+    pub terminate_target_fresh_within_secs: u64,
+
     // --- MUSEX-CAP-SEC-01 (Plane TERM #399): endpoint auth ---
     /// Bearer token required on the sensitive/mutating HTTP surface (see
     /// `crate::http::auth`) — `MUSE_API_TOKEN`, <secret-manager>-materialized at
@@ -781,6 +802,11 @@ impl Config {
                 (poll_secs * 3).max(60)
             }),
 
+            terminate_target_fresh_within_secs: env_u64(
+                "MUSE_TERMINATE_TARGET_FRESH_SECS",
+                300,
+            ),
+
             api_token: env_opt("MUSE_API_TOKEN"),
             auth_disabled: env_opt("MUSE_AUTH_DISABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -944,6 +970,7 @@ impl Default for Config {
             kg_taste_neighbor_threshold: 0.5,
             kg_viz_watch_history_limit: 200,
             session_active_grace_secs: 60,
+            terminate_target_fresh_within_secs: 300,
             api_token: None,
             auth_disabled: false,
         }

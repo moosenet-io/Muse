@@ -195,6 +195,27 @@ async fn main() -> anyhow::Result<()> {
         "qbittorrent download client initialized"
     );
 
+    // MACT-02 (Plane MUSE #122): the `CastController` `POST
+    // /api/sessions/:session_key/terminate` relays a resolved stop
+    // through. Same degrade posture as every other optional integration
+    // above -- `None` when `PLEX_URL`/`PLEX_TOKEN` aren't configured, and
+    // the handler answers `503` rather than fabricating a `200`.
+    let cast_controller: Option<Arc<dyn crate::plex_control::CastController>> =
+        match crate::plex_control::PlexControlClient::from_config(&config) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "plex control client not configured; session terminate will answer 503"
+                );
+                None
+            }
+        };
+    tracing::info!(
+        cast_controller_configured = cast_controller.is_some(),
+        "cast controller initialized"
+    );
+
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
@@ -205,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         tmdb: tmdb_client,
         embed: embed_client,
         download: download_client,
+        cast_controller,
     });
 
     // Best-effort migration attempt at startup. This is a scaffold: if the DB

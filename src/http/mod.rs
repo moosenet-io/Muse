@@ -73,6 +73,15 @@ pub struct AppState {
     /// `crate::acquisition::fulfill_request`'s "download client
     /// unavailable" path).
     pub download: Option<crate::download::qbit::QbitClient>,
+    /// MACT-02 (Plane MUSE #122): the transport `POST
+    /// /api/sessions/:session_key/terminate` relays a resolved stop through
+    /// — the same `CastController` seam MUSE-22 defined, driven today by
+    /// `PlexControlClient`. `None` when `PLEX_URL`/`PLEX_TOKEN` aren't
+    /// configured; the handler answers `503` rather than fabricating a
+    /// `200` when there is nothing to relay to. `Arc<dyn ...>` (not the
+    /// concrete `PlexControlClient`) so tests can inject a fake controller
+    /// without a live Plex server.
+    pub cast_controller: Option<Arc<dyn crate::plex_control::CastController>>,
 }
 
 /// Timeout for the `/health` DB probe — health must never hang/500 just

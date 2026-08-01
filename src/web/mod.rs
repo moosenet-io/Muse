@@ -135,4 +135,16 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         // as every other per-account viewing-activity read in this group.
         .route("/api/sessions/live", get(dashboard::get_live_sessions))
         .route("/api/sessions/history", get(dashboard::get_session_history))
+        // MACT-02 (Plane MUSE #122): the one mutation in this group — stop
+        // a live stream. Protected for the same CAP-SEC-03 reason as
+        // `/api/sessions/live` above, AND because it's a mutation with
+        // real-world blast radius (see `dashboard::terminate_session`'s doc
+        // comment). Terminus's `proxy_muse` layers `enforce_viewer_role_gate`
+        // in front of this at the Constellation-web boundary — a viewer's
+        // POST never reaches this handler at all; this bearer gate is the
+        // second, independent layer.
+        .route(
+            "/api/sessions/:session_key/terminate",
+            post(dashboard::terminate_session),
+        )
 }

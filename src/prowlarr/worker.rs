@@ -658,6 +658,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         };
 
         let summary = run_tick(&state).await.expect("run_tick should succeed");

@@ -66,7 +66,7 @@ Deep pages written alongside specific spec items, kept as-is:
 
 - [Architecture at a glance](reference/architecture-at-a-glance.md)
 - [Running](reference/running.md)
-- [HTTP API surface (24 routes)](reference/http-api-surface-24-routes.md)
+- [HTTP API surface (25 routes)](reference/http-api-surface-25-routes.md)
 - [Acquisition domain schema (MUSEM-01)](reference/acquisition-domain-schema-musem-01.md)
 - [Release-decision engine](reference/release-decision-engine.md)
 - [Acquisition orchestrator + request lifecycle (MUSEM-05)](reference/acquisition-orchestrator-request-lifecycle-musem-05.md)

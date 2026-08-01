@@ -688,6 +688,7 @@ mod tests {
             tmdb: None,
             embed: None,
             download: None,
+            cast_controller: None,
         });
 
         let channels = list_channels_handler(State(state.clone()))

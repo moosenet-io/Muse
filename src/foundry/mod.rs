@@ -48,8 +48,12 @@
 
 pub mod capability;
 pub mod config;
+pub mod directplay;
 pub mod forge;
+pub mod hdr;
+pub mod ladder;
 pub mod paths;
+pub mod rendition;
 pub mod survey;
 pub mod plan;
 pub mod policy;
@@ -57,6 +61,16 @@ pub mod probe;
 
 pub use capability::{Capabilities, ToolReport, ToolState};
 pub use config::FoundryConfig;
+// FOUNDRY-03. Path A: the ingest-normalization deletion rule and its
+// diagnostics. Path B: the on-demand rendition ladder.
+pub use directplay::{
+    may_delete_original, DeletionBlocker, DeletionDecision, DirectPlayBlocker, NormalizationOutcome,
+};
+pub use hdr::{
+    classify_dolby_vision, classify_hdr, DolbyVisionVerdict, HdrVerdict, ToneMap, ToneMapSupport,
+};
+pub use ladder::{plan_ladder, LadderContext, RenditionDecision, RenditionOutcome};
+pub use rendition::{Ladder, Rendition, RenditionName, RenditionRequest};
 pub use forge::{ForgeStatus, RewriteRecord, SkipReason};
 pub use paths::{PathError, PathGuard, ResolvedPath};
 pub use plan::{TranscodeDecision, TranscodePlan, TranscodeReason, Undecidable};

@@ -740,6 +740,7 @@ mod tests {
             bitrate_bps: bitrate,
             pix_fmt: Some("yuv420p".to_string()),
             attached_pic: false,
+            ..VideoStream::default()
         }
     }
 

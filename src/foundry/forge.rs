@@ -1578,6 +1578,7 @@ mod tests {
                 bitrate_bps: Some(5_000_000),
                 pix_fmt: Some("yuv420p".to_string()),
                 attached_pic: false,
+                ..VideoStream::default()
             }],
             audio: (0..audio)
                 .map(|i| AudioStream {

@@ -404,6 +404,8 @@ pub fn spawn_with_timeout(
     args: &[String],
     timeout: Duration,
 ) -> Result<std::process::Output, ProbeError> {
+    use std::io::Read;
+
     let mut child = Command::new(bin)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -412,14 +414,64 @@ pub fn spawn_with_timeout(
         .spawn()
         .map_err(|e| classify_probe_spawn_error(bin, &e))?;
 
+    // Drain both pipes on their OWN threads, starting immediately.
+    //
+    // This is not tidiness, it is the difference between working and
+    // deadlocking. A pipe holds ~64 KB; once full, the child BLOCKS on write
+    // until someone reads. Waiting for exit before reading therefore hangs on
+    // any child whose output exceeds the buffer — and ffprobe with
+    // `-show_chapters` on a large MKV comfortably does. That hang would then
+    // be reported as a timeout, i.e. a perfectly good file failing because of
+    // how we read it. `Command::output()` drains concurrently for exactly this
+    // reason; a hand-rolled poll loop has to do it too. Raised by codex at the
+    // FOUNDRY-10 gate.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
+                    // One last look before giving up: the child can exit
+                    // between the `try_wait` above and this check, and
+                    // reporting a completed probe as a timeout would discard a
+                    // good result. Codex and opus both flagged the race.
+                    //
+                    // DELIBERATELY UNTESTED: the window is a few microseconds
+                    // wide and cannot be hit deterministically, so a test for
+                    // it would be flaky rather than informative — and mutation
+                    // testing confirms removing this line kills nothing. It is
+                    // kept as a cheap safety net, not as covered behaviour.
+                    // Its absence costs a good probe being reported as a
+                    // timeout, which downstream treats as a SKIP, never as a
+                    // verdict about the file.
+                    if let Ok(Some(status)) = child.try_wait() {
+                        break status;
+                    }
                     let _ = child.kill();
-                    let _ = child.try_wait();
+                    // Best-effort reap. A child in uninterruptible D-state
+                    // ignores SIGKILL until its I/O returns, so this may not
+                    // succeed and the process may linger for the run's
+                    // lifetime — bounded by the number of stalls, not by the
+                    // number of files. The point is not that the child dies;
+                    // it is that WE stop waiting on it.
+                    let _ = child.wait();
                     return Err(ProbeError::Timeout { secs: timeout.as_secs() });
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -431,11 +483,11 @@ pub fn spawn_with_timeout(
                 })
             }
         }
-    }
+    };
 
-    child
-        .wait_with_output()
-        .map_err(|e| classify_probe_spawn_error(bin, &e))
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 /// Classify a spawn failure. Split out and pure so the missing-binary
@@ -1375,9 +1427,15 @@ mod tests {
             matches!(got, Err(ProbeError::Timeout { .. })),
             "expected a timeout, got {got:?}"
         );
+        // Tight bound. Codex: `< 10s` would pass with a materially broken
+        // multi-second deadline, so it did not test the number it names.
         assert!(
-            waited < Duration::from_secs(10),
-            "the caller must stop waiting near the deadline, waited {waited:?}"
+            waited < Duration::from_secs(3),
+            "must stop waiting NEAR the 300ms deadline, waited {waited:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(250),
+            "...and must actually wait for it rather than returning at once: {waited:?}"
         );
         // And the message must not read as a verdict about the file.
         let msg = got.unwrap_err().to_string();
@@ -1392,6 +1450,38 @@ mod tests {
         assert!(
             got.is_ok(),
             "a process that finishes immediately must not be affected: {got:?}"
+        );
+    }
+
+    /// The regression codex caught: piping without draining DEADLOCKS.
+    ///
+    /// A pipe holds ~64 KB. If the reader waits for exit before reading, any
+    /// child producing more than that blocks on write and never exits — and
+    /// the poll loop then reports a TIMEOUT for a perfectly good file. ffprobe
+    /// with `-show_chapters` on a large MKV comfortably exceeds 64 KB, so this
+    /// would have misreported real library files as stalled.
+    ///
+    /// 2 MiB is far enough past the buffer that a non-draining implementation
+    /// cannot pass by luck, and the generous deadline means a failure here is
+    /// the deadlock rather than slowness.
+    #[test]
+    fn a_child_that_writes_more_than_a_pipe_buffer_does_not_deadlock() {
+        let args = vec![
+            "-c".to_string(),
+            // 2 MiB on stdout and a chunk on stderr, so both pipes are exercised.
+            "head -c 2097152 /dev/zero | tr '\\0' 'x'; head -c 200000 /dev/zero | tr '\\0' 'e' >&2"
+                .to_string(),
+        ];
+        let start = std::time::Instant::now();
+        let got = spawn_with_timeout("sh", &args, Duration::from_secs(60));
+        let waited = start.elapsed();
+
+        let out = got.expect("a large-output child must complete, not deadlock");
+        assert_eq!(out.stdout.len(), 2_097_152, "all of stdout must be captured");
+        assert_eq!(out.stderr.len(), 200_000, "all of stderr must be captured");
+        assert!(
+            waited < Duration::from_secs(30),
+            "completing this should take moments, not approach the deadline: {waited:?}"
         );
     }
 

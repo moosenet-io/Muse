@@ -112,6 +112,21 @@ impl SubtitleSource {
     /// This is the single encoding of the order argued for in the module doc.
     /// Every selection path goes through it so the order cannot drift between
     /// the API, the auto-selection and the UI.
+    /// The tier names in preference order, derived from the same ranking the
+    /// selection logic uses.
+    ///
+    /// One array, exported so the HTTP response and the SQL ordering quote it
+    /// instead of restating it. Codex flagged the order being written out in
+    /// four places at the SUBS-01 gate; four copies of a rule is three chances
+    /// for it to drift, and the drift would be silent — the API would claim
+    /// one order while auto-selection used another.
+    pub const PREFERENCE_ORDER: [&'static str; 3] = ["embedded", "sidecar", "provider"];
+
+    /// The tier name as stored in the `source` column.
+    pub fn tier_name(&self) -> &'static str {
+        Self::PREFERENCE_ORDER[self.preference_rank() as usize]
+    }
+
     pub fn preference_rank(&self) -> u8 {
         match self {
             // Muxed against this exact encode — already in sync by

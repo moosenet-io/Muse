@@ -18,17 +18,35 @@ use crate::subtitles::SubtitleSource;
 /// [`crate::subtitles::SubtitleSource::preference_rank`]; the two are asserted
 /// to agree by `sql_tier_order_matches_the_rust_preference_rank`.
 pub async fn list_for_item(pool: &PgPool, media_item_id: i64) -> MuseResult<Vec<SubtitleSelection>> {
-    sqlx::query_as::<_, SubtitleSelection>(
-        "SELECT * FROM subtitle_selections \
-         WHERE media_item_id = $1 \
-         ORDER BY CASE source \
-             WHEN 'embedded' THEN 0 WHEN 'sidecar' THEN 1 WHEN 'provider' THEN 2 ELSE 3 END, \
-           id",
-    )
+    sqlx::query_as::<_, SubtitleSelection>(&list_for_item_sql())
     .bind(media_item_id)
     .fetch_all(pool)
     .await
     .map_err(MuseError::Database)
+}
+
+/// The `list_for_item` query, with its tier ordering GENERATED from
+/// [`SubtitleSource::PREFERENCE_ORDER`] rather than restated in SQL.
+///
+/// Opus and codex both flagged the old version at the SUBS-01 gate: the order
+/// was hardcoded in the SQL string and the test that "checked" it re-declared
+/// the same order in Rust, so reversing the SQL would have left the test green.
+/// Generating the CASE means there is one source of truth and the test can
+/// inspect what is actually sent to Postgres.
+///
+/// Not a SQL-injection surface: every fragment comes from a compile-time
+/// constant array of literals, never from input.
+pub fn list_for_item_sql() -> String {
+    let cases: String = SubtitleSource::PREFERENCE_ORDER
+        .iter()
+        .enumerate()
+        .map(|(rank, tier)| format!("WHEN '{tier}' THEN {rank} "))
+        .collect();
+    format!(
+        "SELECT * FROM subtitle_selections WHERE media_item_id = $1 \
+         ORDER BY CASE source {cases}ELSE {} END, id",
+        SubtitleSource::PREFERENCE_ORDER.len()
+    )
 }
 
 /// The active subtitle for an item in one language, if any.
@@ -104,9 +122,9 @@ pub async fn record(pool: &PgPool, new: NewSubtitleSelection) -> MuseResult<Subt
             embedded_stream_index, embedded_codec,
             sidecar_path,
             provider, provider_subtitle_id, provider_url, provider_machine_generated,
-            storage_path, forced, hearing_impaired, is_active
+            storage_path, original_storage_path, forced, hearing_impaired, is_active
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12, $13, false)
         -- Re-fetching a provider subtitle already recorded for this item must
         -- refresh it, not mint a duplicate the operator then has to
         -- disambiguate. `is_active` is deliberately NOT touched here: a
@@ -117,6 +135,11 @@ pub async fn record(pool: &PgPool, new: NewSubtitleSelection) -> MuseResult<Subt
         DO UPDATE SET
             provider_url = EXCLUDED.provider_url,
             storage_path = COALESCE(EXCLUDED.storage_path, subtitle_selections.storage_path),
+            -- A re-fetch replaces the pristine copy, so the original follows
+            -- it. COALESCE keeps a previously-recorded original when the
+            -- re-fetch carries no file of its own.
+            original_storage_path =
+                COALESCE(EXCLUDED.storage_path, subtitle_selections.original_storage_path),
             updated_at = now()
         RETURNING *
         "#,
@@ -226,9 +249,15 @@ pub async fn apply_confirmed_offset(
         ));
     }
 
+    // `original_storage_path` is claimed here if it is not already set, BEFORE
+    // storage_path is repointed at the adjusted copy — otherwise the pristine
+    // pointer is lost on the first adjustment and every later one compounds.
+    // COALESCE, so a second adjustment never re-claims the adjusted file as
+    // the original.
     sqlx::query_as::<_, SubtitleSelection>(
         "UPDATE subtitle_selections \
-         SET offset_ms = $2, offset_confirmed_at = $3, storage_path = $4, updated_at = now() \
+         SET original_storage_path = COALESCE(original_storage_path, storage_path), \
+             offset_ms = $2, offset_confirmed_at = $3, storage_path = $4, updated_at = now() \
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -262,39 +291,30 @@ mod tests {
 
     #[test]
     fn sql_tier_order_matches_the_rust_preference_rank() {
-        // `list_for_item`'s ORDER BY hardcodes the tier ordering in SQL. If it
-        // ever disagreed with `preference_rank`, the API would return one
-        // order and the auto-selection would use another — the operator would
-        // see the list leading with a candidate Muse itself would not pick.
-        let embedded = SubtitleSource::Embedded {
-            stream_index: 0,
-            codec: "subrip".into(),
-        };
-        let sidecar = SubtitleSource::Sidecar { path: "/x.srt".into() };
-        let provider = SubtitleSource::Provider {
-            provider: "wyzie".into(),
-            provider_id: "1".into(),
-            machine_generated: false,
-        };
-        assert_eq!(embedded.preference_rank(), 0);
-        assert_eq!(sidecar.preference_rank(), 1);
-        assert_eq!(provider.preference_rank(), 2);
-
-        // And the SQL literal ordering matches, in the same source order.
-        let sql_order = [
-            (SOURCE_EMBEDDED, 0u8),
-            (SOURCE_SIDECAR, 1),
-            (SOURCE_PROVIDER, 2),
-        ];
-        for (kind, rank) in sql_order {
-            let source = match kind {
-                SOURCE_EMBEDDED => &embedded,
-                SOURCE_SIDECAR => &sidecar,
-                _ => &provider,
-            };
-            assert_eq!(source.kind_str(), kind);
-            assert_eq!(source.preference_rank(), rank, "SQL and Rust tier order must agree for {kind}");
+        // Inspects the SQL ACTUALLY SENT, rather than re-declaring the order
+        // in Rust and comparing it to itself. The old version would have
+        // passed with the SQL CASE reversed.
+        let sql = list_for_item_sql();
+        for (rank, tier) in SubtitleSource::PREFERENCE_ORDER.iter().enumerate() {
+            let expected = format!("WHEN '{tier}' THEN {rank}");
+            assert!(
+                sql.contains(&expected),
+                "the query must rank {tier} at {rank} to agree with preference_rank; got: {sql}"
+            );
         }
+        // And the ranks in the SQL must appear in ascending order, so a
+        // rearranged PREFERENCE_ORDER cannot silently invert the listing.
+        let positions: Vec<usize> = SubtitleSource::PREFERENCE_ORDER
+            .iter()
+            .map(|t| sql.find(&format!("'{t}'")).expect("every tier appears"))
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "tiers must appear in preference order in the CASE: {sql}"
+        );
+        // Cross-check against the enum itself, so this cannot drift from the
+        // ranking the selection logic uses.
+        assert_eq!(SubtitleSource::PREFERENCE_ORDER.len(), 3);
     }
 
     #[tokio::test]

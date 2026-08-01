@@ -37,6 +37,12 @@ pub struct SubtitleSelection {
     pub provider_machine_generated: bool,
 
     pub storage_path: Option<String>,
+    /// The subtitle as first obtained, never rewritten by an adjustment.
+    ///
+    /// Every adjustment derives from this, so `offset_ms` stays absolute and
+    /// applying +1000ms then +2000ms yields +2000ms of shift rather than
+    /// +3000ms. See `adjustment_source_path`.
+    pub original_storage_path: Option<String>,
 
     /// The APPLIED offset. Only ever non-zero via an operator confirmation.
     pub offset_ms: i64,
@@ -98,6 +104,25 @@ impl SubtitleSelection {
         self.storage_path.as_deref().or(self.sidecar_path.as_deref())
     }
 
+    /// The text an adjustment must be computed FROM.
+    ///
+    /// Deliberately NOT [`Self::readable_path`], which prefers
+    /// `storage_path` — that is the currently-serving file, and after one
+    /// adjustment it is already shifted. Re-shifting it compounds: +1000ms
+    /// then +2000ms would put +3000ms of shift in a row recording 2000.
+    /// `offset_ms` is absolute, so the source must be immutable.
+    ///
+    /// Falls back to `storage_path` only when no original was recorded, which
+    /// is the pre-migration case for a row whose offset was already applied.
+    /// That fallback is the old compounding behaviour and is why the backfill
+    /// only claims rows with `offset_ms = 0`, where storage_path IS pristine.
+    pub fn adjustment_source_path(&self) -> Option<&str> {
+        self.original_storage_path
+            .as_deref()
+            .or(self.sidecar_path.as_deref())
+            .or(self.storage_path.as_deref())
+    }
+
     /// The text format, inferred from the stored path's extension or the
     /// embedded codec. `None` means Muse cannot re-time this subtitle.
     pub fn format(&self) -> Option<SubtitleFormat> {
@@ -134,4 +159,86 @@ pub struct NewSubtitleSelection {
     pub provider_url: Option<String>,
     pub forced: bool,
     pub hearing_impaired: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_row(storage: Option<&str>, original: Option<&str>) -> SubtitleSelection {
+        SubtitleSelection {
+            id: 1,
+            media_item_id: 7,
+            language: Some("en".into()),
+            source: "provider".into(),
+            embedded_stream_index: None,
+            embedded_codec: None,
+            sidecar_path: None,
+            provider: Some("wyzie".into()),
+            provider_subtitle_id: Some("x1".into()),
+            provider_url: None,
+            provider_machine_generated: false,
+            storage_path: storage.map(str::to_string),
+            original_storage_path: original.map(str::to_string),
+            offset_ms: 0,
+            offset_confirmed_at: None,
+            proposed_offset_ms: None,
+            proposed_confidence: None,
+            proposed_at: None,
+            forced: false,
+            hearing_impaired: false,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Codex, SUBS-01 gate: applying an offset twice compounded.
+    ///
+    /// After a +1000ms adjustment, `storage_path` points at the SHIFTED copy.
+    /// A later +2000ms request that read through `readable_path()` shifted
+    /// that already-shifted text again — the file held +3000ms while the row
+    /// recorded 2000. `offset_ms` is absolute, so every adjustment has to be
+    /// derived from the same pristine text.
+    #[test]
+    fn an_adjustment_is_always_derived_from_the_pristine_original() {
+        // The state after one adjustment: storage_path is the shifted copy,
+        // original_storage_path still points at the download.
+        let row = provider_row(
+            Some("/store/sel-1.en.+1000.srt"),
+            Some("/store/sel-1.en.original.srt"),
+        );
+        assert_eq!(
+            row.adjustment_source_path(),
+            Some("/store/sel-1.en.original.srt"),
+            "a second adjustment must start from the original, not the shifted copy"
+        );
+        // ...while the serving path is still the adjusted file.
+        assert_eq!(row.readable_path(), Some("/store/sel-1.en.+1000.srt"));
+    }
+
+    /// A sidecar's immutable original is the sidecar itself, which lives in
+    /// the read-only library and is never rewritten.
+    #[test]
+    fn a_sidecar_adjustment_derives_from_the_sidecar_not_the_adjusted_copy() {
+        let mut row = provider_row(Some("/store/adjusted.srt"), None);
+        row.source = "sidecar".into();
+        row.provider = None;
+        row.provider_subtitle_id = None;
+        row.sidecar_path = Some("/library/Movie/Movie.en.srt".into());
+        assert_eq!(
+            row.adjustment_source_path(),
+            Some("/library/Movie/Movie.en.srt")
+        );
+    }
+
+    /// The pre-migration fallback, stated rather than silent: a row adjusted
+    /// before `original_storage_path` existed has no recoverable original, so
+    /// it falls back to the old behaviour. The backfill deliberately claims
+    /// only unadjusted rows, where storage_path IS pristine.
+    #[test]
+    fn a_row_with_no_recorded_original_falls_back_rather_than_returning_none() {
+        let row = provider_row(Some("/store/only.srt"), None);
+        assert_eq!(row.adjustment_source_path(), Some("/store/only.srt"));
+    }
 }

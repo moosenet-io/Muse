@@ -112,10 +112,12 @@ pub async fn list_subtitles(
     // Probing goes through `Foundry`, not a bare ffprobe call, so the
     // allowed-roots path guard applies here exactly as it does everywhere else
     // that reads a library file.
+    let mut probed: Option<crate::foundry::probe::MediaProbe> = None;
     let (embedded, embedded_status) = match probe_media(&state, &path) {
         Ok(probe) => {
             let found = discover::embedded_from_probe(&probe);
             let count = found.len();
+            probed = Some(probe);
             (found, json!({ "ok": true, "count": count }))
         }
         Err(reason) => (
@@ -136,6 +138,52 @@ pub async fn list_subtitles(
     // --- Tier 3: provider (previously fetched rows only; this route never
     // calls the provider — see the `fetch` route). ---
     let recorded = repo::subtitle::list_for_item(&state.pool, media_item_id).await?;
+
+    // Reconcile persisted EMBEDDED selections against the file as it is NOW.
+    //
+    // A stream index is only meaningful against one particular file, and a
+    // title can be replaced by a quality upgrade whose stream layout differs.
+    // Serving the old index then means showing whatever subtitle happens to
+    // occupy it — the "Hungarian subtitles you never chose" failure. So a
+    // drifted selection is DEACTIVATED here rather than served, and the drift
+    // is reported so the operator can see why their choice went away.
+    //
+    // Only runs when the probe succeeded: if ffprobe is unavailable we cannot
+    // distinguish "the stream is gone" from "we could not look", and
+    // deactivating an operator's choice on the strength of a failed probe
+    // would be its own bug.
+    //
+    // codex, SUBS-01 gate: verify_embedded_selection existed and was correct
+    // but had no production caller, so nothing was ever invalidated.
+    let mut invalidated: Vec<Value> = Vec::new();
+    if let Some(probe) = probed.as_ref() {
+        for row in recorded.iter().filter(|r| r.is_active && r.source == "embedded") {
+            let (Some(idx), Some(codec)) = (row.embedded_stream_index, row.embedded_codec.as_deref())
+            else {
+                continue;
+            };
+            if let Err(drift) = discover::verify_embedded_selection(
+                probe,
+                idx as u32,
+                codec,
+                row.language.as_deref(),
+            ) {
+                repo::subtitle::invalidate(&state.pool, row.id).await?;
+                invalidated.push(json!({
+                    "selection_id": row.id,
+                    "stream_index": idx,
+                    "why": drift.to_string(),
+                }));
+            }
+        }
+    }
+    // Re-read only if something changed, so the response never shows a
+    // selection this request just deactivated.
+    let recorded = if invalidated.is_empty() {
+        recorded
+    } else {
+        repo::subtitle::list_for_item(&state.pool, media_item_id).await?
+    };
 
     let mut available: Vec<AvailableSubtitle> = Vec::new();
     available.extend(embedded);
@@ -159,7 +207,11 @@ pub async fn list_subtitles(
         "media_item_id": media_item_id,
         // The preference order, stated in the response so a UI does not have
         // to reimplement it (or drift from it).
-        "preference_order": ["embedded", "sidecar", "provider"],
+        "preference_order": super::SubtitleSource::PREFERENCE_ORDER,
+        // Selections deactivated by this request because the file no longer
+        // has the stream they named. Always present, so a UI can tell "nothing
+        // drifted" from "this response does not report drift".
+        "invalidated": invalidated,
         "tiers": {
             "embedded": embedded_status,
             "sidecar": sidecar_status,
@@ -498,7 +550,11 @@ pub async fn apply_offset(
     let format = selection.format().ok_or_else(|| {
         MuseError::BadRequest("subtitles: this subtitle's format cannot be re-timed".into())
     })?;
-    let source_path = selection.readable_path().ok_or_else(|| {
+    // The IMMUTABLE original, not the currently-serving file. Reading
+    // `readable_path()` here meant a second adjustment shifted the output of
+    // the first, so +1000ms then +2000ms produced +3000ms of shift while the
+    // row recorded 2000. Raised by codex at the SUBS-01 gate.
+    let source_path = selection.adjustment_source_path().ok_or_else(|| {
         MuseError::BadRequest("subtitles: this selection has no readable subtitle file to shift".into())
     })?;
 

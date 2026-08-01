@@ -237,7 +237,14 @@ impl FoundryConfig {
         // Every rail-3 problem is fatal once mutation is possible.
         out.extend(self.rail3_problems());
         // ...as is a root that should never have been addressable at all.
-        out.extend(forbidden_root_problems(&self.allowed_roots));
+        //
+        // guard_roots(), NOT allowed_roots: the WORK DIR is an addressable
+        // root too — the guard must be able to write its own scratch — so
+        // MUSE_FOUNDRY_WORK_DIR=/etc would otherwise be fully accepted. Rail 3
+        // does not catch it either: /etc is on a different device from the
+        // library and is not contained by it, so both existing checks pass.
+        // The first version of this guard covered only half the roots.
+        out.extend(forbidden_root_problems(&self.guard_roots()));
         out
     }
 
@@ -254,7 +261,7 @@ impl FoundryConfig {
             // A read-only Foundry pointed at `/` cannot destroy anything, but
             // the operator still needs to see the misconfiguration — refusing
             // to register would hide it from the status surface entirely.
-            out.extend(forbidden_root_problems(&self.allowed_roots));
+            out.extend(forbidden_root_problems(&self.guard_roots()));
         }
 
         if self.retention_days == 0 {
@@ -543,6 +550,36 @@ mod tests {
         }
         // Trailing slashes and `..` must not evade it.
         assert_eq!(forbidden_root_problems(&[PathBuf::from("/etc/")]).len(), 1);
+    }
+
+    /// The WORK DIR is an addressable root too, and must be guarded.
+    ///
+    /// `guard_roots()` is `allowed_roots` PLUS `work_dir`, because the guard
+    /// has to be able to write its own scratch. So a typo'd
+    /// `MUSE_FOUNDRY_WORK_DIR=/etc` makes /etc writable — and neither existing
+    /// check catches it: /etc is on a different device from an NFS library
+    /// (rail 3 passes) and is not contained by it (containment passes).
+    ///
+    /// The first version of this guard checked only `allowed_roots`, which was
+    /// half a fix.
+    #[test]
+    fn a_forbidden_work_dir_is_refused_not_just_a_forbidden_library_root() {
+        let mut c = cfg_with(Some("/srv/media"), true);
+        c.work_dir = Some(PathBuf::from("/etc"));
+        let fatal = c.fatal_errors();
+        assert!(
+            fatal.iter().any(|e| e.contains("system directory") && e.contains("/etc")),
+            "a work dir pointing at a system directory must be fatal: {fatal:?}"
+        );
+
+        // ...and a legitimate scratch is still accepted.
+        let mut ok = cfg_with(Some("/srv/media"), true);
+        ok.work_dir = Some(PathBuf::from("/mnt/muse-scratch"));
+        assert!(
+            !ok.fatal_errors().iter().any(|e| e.contains("system directory")),
+            "a real scratch dir must not be refused: {:?}",
+            ok.fatal_errors()
+        );
     }
 
     /// ...while a real media root is accepted. Without this the guard could be

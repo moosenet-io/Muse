@@ -458,12 +458,24 @@ pub const DURATION_TOLERANCE_SECS: f64 = 1.0;
 /// Dolby Atmos inside E-AC-3 (JOC) is **not detectable** from ffprobe stream
 /// output — an Atmos track and an ordinary 5.1 track are both reported as
 /// `eac3` with 6 channels (see
-/// [`crate::foundry::hdr::undetectable_formats`]). So any E-AC-3 stream that
-/// is not carried through byte-for-byte blocks deletion, on the grounds that
-/// it *might* have been Atmos. This is deliberately over-broad: it will refuse
-/// deletions for ordinary 5.1 E-AC-3 tracks that lost nothing. The cost of
-/// being wrong that way is a kept file; the cost of being wrong the other way
-/// is the operator's only Atmos mix.
+/// [`crate::foundry::hdr::undetectable_formats`]).
+///
+/// **Nothing available here proves a stream was copied rather than re-encoded.**
+/// ffprobe reports a re-encoded E-AC-3 6-channel track identically to the
+/// Atmos track it was made from, and JOC does not survive a re-encode. So the
+/// rule cannot be "detect the loss"; it is: for any codec on the undetectable
+/// list, a stream counts as reproduced only when *every probe-visible property*
+/// — codec, channel count and bitrate — is unchanged, and an absent bitrate on
+/// either side refuses. That is the strongest evidence obtainable from a probe.
+/// It is still evidence and not proof, which is why it errs toward keeping.
+///
+/// This is deliberately over-broad: it will refuse deletions for ordinary 5.1
+/// E-AC-3 tracks that lost nothing. The cost of being wrong that way is a kept
+/// file; the cost of being wrong the other way is the operator's only Atmos mix.
+///
+/// Codecs *not* on that list keep the loose rule (same codec, enough channels),
+/// because applying the strict one everywhere would make most of the library
+/// permanently undeletable and the gate would stop meaning anything.
 pub fn may_delete_original(
     source: &MediaProbe,
     normalization: &NormalizationOutcome,
@@ -559,6 +571,17 @@ pub fn may_delete_original(
         output.audio.iter().collect();
     let mut reproduced = 0usize;
     for a in &source.audio {
+        // A codec that may be hiding a format ffprobe cannot see gets the
+        // strict rule: same codec and enough channels is NOT enough, because a
+        // re-encoded E-AC-3 6-channel track looks exactly like the Atmos track
+        // it was made from. Nothing in the probe output distinguishes a copy
+        // from a re-encode, so the closest available stand-in is "every
+        // visible property is unchanged" — which is evidence, not proof, and
+        // is why this errs toward keeping the file.
+        let may_hide_object_audio = undetectable_formats()
+            .iter()
+            .any(|u| u.carried_by_codec.eq_ignore_ascii_case(a.codec.trim()));
+
         let found = unmatched_output.iter().position(|o| {
             o.codec.eq_ignore_ascii_case(&a.codec)
                 && match (a.channels, o.channels) {
@@ -567,6 +590,13 @@ pub fn may_delete_original(
                     // to match, so it does not.
                     _ => false,
                 }
+                && (!may_hide_object_audio
+                    || match (a.bitrate_bps, o.bitrate_bps) {
+                        (Some(src), Some(out)) => src == out,
+                        // An absent bitrate on either side is not evidence of
+                        // a copy. Unknown refuses.
+                        _ => false,
+                    })
         });
         match found {
             Some(i) => {
@@ -966,6 +996,117 @@ mod tests {
         let source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "eac3", 6)]);
         let output = source.clone();
         assert!(decide(&source, &NormalizationOutcome::Verified { output }).is_allowed());
+    }
+
+    /// `may_delete_original` currently has NO CALLER, and that is deliberate —
+    /// but it must not stay invisible.
+    ///
+    /// Nothing in Muse permanently deletes an original today. `forge`'s swap
+    /// hard-links the original to a sibling `.muse-superseded` name *before* it
+    /// releases the original name, so the bytes stay reachable; what looks like
+    /// a delete in `swap_verified_output` is one of two names being unlinked.
+    /// Permanent loss happens only when something removes that
+    /// `.muse-superseded` entry, and no such reaper exists yet.
+    ///
+    /// This gate is for that reaper. The failure mode worth guarding is someone
+    /// writing the reaper later and never finding this function — a gate with
+    /// no caller reads as "already handled". So: any module that both knows the
+    /// superseded suffix and removes files must also mention this gate.
+    #[test]
+    fn a_module_that_reaps_superseded_files_must_consult_the_deletion_gate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/foundry");
+        let mut offenders = Vec::new();
+        for e in std::fs::read_dir(&dir).expect("foundry sources must be readable") {
+            let p = e.expect("a readable dir entry").path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            // forge owns the swap itself and is covered by its own invariant
+            // tests (it keeps the original; it does not reap).
+            if name == "forge.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).expect("a readable source file");
+            let knows_the_backup = src.contains("muse-superseded");
+            let removes_files = src.contains("remove_file") || src.contains("remove_dir_all");
+            let consults_the_gate = src.contains("may_delete_original");
+            if knows_the_backup && removes_files && !consults_the_gate {
+                offenders.push(name);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these modules can reap a preserved original without consulting \
+             may_delete_original: {offenders:?}. Deleting a `.muse-superseded` \
+             entry is the only permanent data loss in Foundry — call the gate \
+             first, or exclude the module here with a stated reason."
+        );
+    }
+
+    /// Raised by all three reviewers at the FOUNDRY-03 gate, and correct.
+    ///
+    /// The docstring promised that an E-AC-3 stream "not carried through
+    /// byte-for-byte" blocks deletion. The code checked codec and channel
+    /// count. Those are not the same claim: a RE-ENCODED E-AC-3 6-channel
+    /// track has the same codec and the same channel count as the Atmos track
+    /// it was made from, and JOC does not survive a re-encode.
+    ///
+    /// ffprobe cannot tell a copied E-AC-3 stream from a re-encoded one — that
+    /// is the whole reason these formats are on the undetectable list. So the
+    /// rule cannot be "prove it was re-encoded"; it has to be "refuse unless
+    /// every probe-visible property is unchanged", which is the strongest
+    /// evidence of a copy available here and still not proof.
+    #[test]
+    fn a_reencoded_eac3_track_of_the_same_shape_does_not_count_as_reproduced() {
+        let source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "eac3", 6)]);
+
+        // Same codec, same channel count — the old match — but re-encoded to a
+        // different bitrate. Under the old rule this was "reproduced" and the
+        // original could be deleted, taking the only Atmos mix with it.
+        let mut out = source.clone();
+        out.audio[0].bitrate_bps = Some(384_000);
+        let mut src = source.clone();
+        src.audio[0].bitrate_bps = Some(768_000);
+
+        let d = decide(&src, &NormalizationOutcome::Verified { output: out });
+        assert!(!d.is_allowed(), "a re-encoded E-AC-3 track must block: {d:?}");
+
+        // ...and it must say WHY, naming the format that may have been lost,
+        // not just "a stream did not match".
+        assert!(
+            format!("{d:?}").contains("PossiblyObjectBearingAudioLost"),
+            "must name the unrecoverable format: {d:?}"
+        );
+    }
+
+    /// The other half: an unknown bitrate is not evidence of a copy either.
+    #[test]
+    fn an_eac3_track_with_an_unknown_bitrate_cannot_be_shown_to_be_a_copy() {
+        let source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "eac3", 6)]);
+        let mut src = source.clone();
+        src.audio[0].bitrate_bps = Some(768_000);
+        let mut out = source.clone();
+        out.audio[0].bitrate_bps = None; // muxer wrote no bitrate
+        assert!(
+            !decide(&src, &NormalizationOutcome::Verified { output: out }).is_allowed(),
+            "unknown must refuse, not pass"
+        );
+    }
+
+    /// An ordinary codec that hides nothing keeps the loose rule — otherwise
+    /// this change would quietly make most of the library undeletable.
+    #[test]
+    fn a_reencoded_aac_track_still_counts_as_reproduced() {
+        let source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 6)]);
+        let mut src = source.clone();
+        src.audio[0].bitrate_bps = Some(320_000);
+        let mut out = source.clone();
+        out.audio[0].bitrate_bps = Some(128_000);
+        assert!(
+            decide(&src, &NormalizationOutcome::Verified { output: out }).is_allowed(),
+            "AAC carries no undetectable format; the strict rule must not apply"
+        );
     }
 
     #[test]

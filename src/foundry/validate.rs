@@ -1524,6 +1524,11 @@ mod tests {
                 bitrate_bps: Some(2_500_000),
                 pix_fmt: Some("yuv420p".into()),
                 attached_pic: false,
+                // FOUNDRY-03 added colour/DV fields. Defaulted here rather
+                // than enumerated: this fixture exercises sampling and the
+                // encode gate, and an SDR untagged stream is the ordinary
+                // shape for that. The colour paths have their own tests.
+                ..VideoStream::default()
             }],
             audio: acodecs
                 .iter()

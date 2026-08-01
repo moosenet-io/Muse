@@ -39,7 +39,17 @@ pub struct LibraryGridRow {
 }
 
 /// Owned titles, newest-added first. `limit` caps the grid page.
-pub async fn library_grid(pool: &PgPool, limit: i64) -> MuseResult<Vec<LibraryGridRow>> {
+/// MUSE #112: `kind` filters server-side so a Movies or TV page fetches only its own rows.
+///
+/// Filtering in the browser would still ship every row over the wire and still be bounded by the
+/// same LIMIT — so a library with more titles than the cap would show an arbitrary slice of the
+/// requested kind, and "all your movies" would silently mean "the movies among the first N of
+/// everything". A NULL kind keeps the mixed view.
+pub async fn library_grid(
+    pool: &PgPool,
+    limit: i64,
+    kind: Option<&str>,
+) -> MuseResult<Vec<LibraryGridRow>> {
     sqlx::query_as::<_, LibraryGridRow>(
         r#"
         SELECT
@@ -56,11 +66,15 @@ pub async fn library_grid(pool: &PgPool, limit: i64) -> MuseResult<Vec<LibraryGr
             mi.added_at AS added_at
         FROM media_items mi
         JOIN media_metadata mm ON mm.id = mi.media_metadata_id
+        -- $2 NULL => every kind. Compared as text so the caller passes the DB vocabulary
+        -- ('movie'/'show') without this layer owning an enum mapping.
+        WHERE ($2::text IS NULL OR mm.kind::text = $2)
         ORDER BY mi.added_at DESC NULLS LAST, mi.id DESC
         LIMIT $1
         "#,
     )
     .bind(limit)
+    .bind(kind)
     .fetch_all(pool)
     .await
     .map_err(MuseError::Database)

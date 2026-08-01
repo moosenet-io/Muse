@@ -123,7 +123,42 @@ pub struct AttachmentStream {
     pub filename: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// One entry of ffprobe's per-stream `side_data_list`.
+///
+/// FOUNDRY-03 added this, and it is the *only* place Dolby Vision is visible.
+/// A DV file's `codec_name` is plain `hevc` and its `profile` is plain
+/// `Main 10` — nothing in the ordinary stream fields distinguishes it from an
+/// HDR10 file. The DV profile number lives here, in the `DOVI configuration
+/// record` side-data entry, and without it a planner cannot tell a
+/// transcodable profile 8 from a profile 5 that renders green and purple when
+/// its RPU is dropped.
+///
+/// `kind` is kept as the raw, un-normalized `side_data_type` string because it
+/// is ffprobe's own vocabulary and it has drifted across versions; matching is
+/// done case-insensitively by the consumers rather than by mapping to a closed
+/// enum here, so a side-data type this fleet has never seen is carried through
+/// and reported rather than silently discarded.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamSideData {
+    /// ffprobe's `side_data_type`, e.g. `"DOVI configuration record"`,
+    /// `"Mastering display metadata"`, `"Content light level metadata"`.
+    pub kind: String,
+    /// `dv_profile` from a DOVI configuration record. 5 is the dangerous one.
+    pub dv_profile: Option<u32>,
+    /// `dv_bl_signal_compatibility_id`: what the *base layer* is on its own.
+    /// 0 = nothing (profile 5's "there is no fallback"), 1 = HDR10, 2 = SDR,
+    /// 4 = HLG. This is the field that decides whether a tone-map is possible,
+    /// so it is carried separately rather than inferred from the profile.
+    pub dv_bl_signal_compatibility_id: Option<u32>,
+    /// Whether an RPU (the per-frame Dolby metadata) is present.
+    pub rpu_present: Option<bool>,
+    /// Whether a base layer is present.
+    pub bl_present: Option<bool>,
+    /// Whether an enhancement layer is present (profile 7's second layer).
+    pub el_present: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoStream {
     /// The stream's absolute index within the file, as ffprobe reported it.
     /// Absolute (not the `v:0` relative form) because the transcode argv maps
@@ -135,6 +170,37 @@ pub struct VideoStream {
     pub height: Option<u32>,
     pub bitrate_bps: Option<u64>,
     pub pix_fmt: Option<String>,
+    /// ffprobe's `profile`, lowercased — e.g. `"main 10"`, `"high"`.
+    ///
+    /// Load-bearing for bit depth when `pix_fmt` is absent, and *not*
+    /// load-bearing for Dolby Vision: a DV file reports an ordinary HEVC
+    /// profile here. Anyone reaching for this to detect DV is reaching for the
+    /// wrong field — see [`StreamSideData`].
+    pub profile: Option<String>,
+    /// ffprobe's `codec_tag_string`, lowercased — e.g. `"hvc1"`, `"dvh1"`,
+    /// `"dvhe"`.
+    ///
+    /// The `dvh1`/`dvhe` tags are a *second*, independent DV signal, and they
+    /// matter because they can be present when the DOVI side-data record is
+    /// not (an MP4 whose `dvcC` box ffprobe did not surface as side data).
+    /// A tag with no record tells us the file is Dolby Vision but not which
+    /// profile — which is exactly the state that must fail closed rather than
+    /// be assumed benign.
+    pub codec_tag: Option<String>,
+    /// `color_transfer`, lowercased — `"smpte2084"` (PQ/HDR10),
+    /// `"arib-std-b67"` (HLG), `"bt709"` (SDR), or absent.
+    ///
+    /// This is the primary HDR signal. Absent is *common* and does not mean
+    /// SDR — see [`crate::foundry::hdr::classify_hdr`] for the inference that
+    /// is drawn from it, and the one that deliberately is not.
+    pub color_transfer: Option<String>,
+    /// `color_primaries`, lowercased — `"bt2020"` for wide gamut.
+    pub color_primaries: Option<String>,
+    /// `color_space`, lowercased — e.g. `"bt2020nc"`.
+    pub color_space: Option<String>,
+    /// ffprobe's `side_data_list` for this stream. Empty when ffprobe reported
+    /// none — which, importantly, is not proof that the file carries none.
+    pub side_data: Vec<StreamSideData>,
     /// True for embedded cover art (`disposition.attached_pic`).
     ///
     /// This flag is load-bearing and is why [`MediaProbe::video`] is filtered.
@@ -352,9 +418,45 @@ struct RawStream {
     #[serde(default)]
     pix_fmt: Option<String>,
     #[serde(default)]
+    profile: Option<serde_json::Value>,
+    #[serde(default)]
+    codec_tag_string: Option<String>,
+    #[serde(default)]
+    color_transfer: Option<String>,
+    #[serde(default)]
+    color_primaries: Option<String>,
+    #[serde(default)]
+    color_space: Option<String>,
+    #[serde(default)]
+    side_data_list: Vec<RawSideData>,
+    #[serde(default)]
     disposition: Option<RawDisposition>,
     #[serde(default)]
     tags: Option<RawTags>,
+}
+
+/// One `side_data_list` entry.
+///
+/// Every DV field is `Option<serde_json::Value>` for the same reason the
+/// bitrates are: ffprobe renders `dv_profile` as a bare number in some builds
+/// and as a string in others, and a concrete `u32` here would make an entire
+/// probe fail to deserialize — turning a Dolby Vision file into
+/// `MalformedOutput`, i.e. into a file we know nothing about, which is the one
+/// state where a naive planner is most likely to do damage.
+#[derive(Debug, Deserialize)]
+struct RawSideData {
+    #[serde(default)]
+    side_data_type: Option<String>,
+    #[serde(default)]
+    dv_profile: Option<serde_json::Value>,
+    #[serde(default)]
+    dv_bl_signal_compatibility_id: Option<serde_json::Value>,
+    #[serde(default)]
+    rpu_present_flag: Option<serde_json::Value>,
+    #[serde(default)]
+    bl_present_flag: Option<serde_json::Value>,
+    #[serde(default)]
+    el_present_flag: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,6 +524,34 @@ fn as_f64(v: &Option<serde_json::Value>) -> Option<f64> {
 
 fn as_u32(v: &Option<serde_json::Value>) -> Option<u32> {
     as_u64(v).and_then(|n| u32::try_from(n).ok())
+}
+
+/// Read an ffprobe boolean-ish flag: `1`/`0`, or the strings `"1"`/`"0"`.
+///
+/// `None` when the flag was absent or unreadable, and every caller must treat
+/// that as "we do not know" rather than as `false`. A missing `rpu_present_flag`
+/// read as `false` would turn a Dolby Vision stream into an ordinary HDR10 one.
+fn as_flag(v: &Option<serde_json::Value>) -> Option<bool> {
+    match v.as_ref()? {
+        serde_json::Value::Bool(b) => Some(*b),
+        _ => as_u64(v).map(|n| n != 0),
+    }
+}
+
+/// Normalize a descriptive ffprobe string field: trim, lowercase, and fold
+/// ffprobe's several spellings of "I could not determine this" into `None`.
+///
+/// `"unknown"` is the one that matters. ffprobe writes it into `color_transfer`
+/// and `color_primaries` for most SDR H.264 files, and a consumer that compared
+/// it against a known-SDR list would find no match and treat the file as having
+/// an *unrecognized* transfer — which is a different, more alarming state than
+/// "not stated". Both are unknowns and both must land in the same place.
+fn normalize_descriptor(v: &Option<String>) -> Option<String> {
+    let s = v.as_ref()?.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "unknown" || s == "n/a" || s == "reserved" {
+        return None;
+    }
+    Some(s)
 }
 
 /// Parse `ffprobe -print_format json -show_format -show_streams` output.
@@ -492,7 +622,34 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
                     width: as_u32(&s.width),
                     height: as_u32(&s.height),
                     bitrate_bps: as_u64(&s.bit_rate),
-                    pix_fmt: s.pix_fmt.clone(),
+                    pix_fmt: normalize_descriptor(&s.pix_fmt),
+                    profile: normalize_descriptor(&match &s.profile {
+                        // ffprobe renders `profile` as a string for most
+                        // codecs but as a bare integer for a few (and for
+                        // unrecognized ones). Both are read; neither is
+                        // allowed to fail the whole document.
+                        Some(serde_json::Value::String(p)) => Some(p.clone()),
+                        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                        _ => None,
+                    }),
+                    codec_tag: normalize_descriptor(&s.codec_tag_string),
+                    color_transfer: normalize_descriptor(&s.color_transfer),
+                    color_primaries: normalize_descriptor(&s.color_primaries),
+                    color_space: normalize_descriptor(&s.color_space),
+                    side_data: s
+                        .side_data_list
+                        .iter()
+                        .map(|d| StreamSideData {
+                            kind: d.side_data_type.clone().unwrap_or_default(),
+                            dv_profile: as_u32(&d.dv_profile),
+                            dv_bl_signal_compatibility_id: as_u32(
+                                &d.dv_bl_signal_compatibility_id,
+                            ),
+                            rpu_present: as_flag(&d.rpu_present_flag),
+                            bl_present: as_flag(&d.bl_present_flag),
+                            el_present: as_flag(&d.el_present_flag),
+                        })
+                        .collect(),
                     attached_pic,
                 });
             }
@@ -883,6 +1040,175 @@ mod tests {
         );
     }
 
+    // --- FOUNDRY-03: colour, bit depth and Dolby Vision ---------------------
+
+    #[test]
+    fn an_sdr_h264_file_reports_no_hdr_or_dv_signal_at_all() {
+        // The 99% case in this library. Every FOUNDRY-03 field must come back
+        // empty rather than defaulted to something that reads as a signal.
+        let p = h264_mkv();
+        let v = p.primary_video().unwrap();
+        assert_eq!(v.color_transfer, None);
+        assert_eq!(v.color_primaries, None);
+        assert_eq!(v.codec_tag, None);
+        assert_eq!(v.profile, None);
+        assert!(v.side_data.is_empty());
+    }
+
+    #[test]
+    fn hdr10_colour_tags_are_parsed_and_lowercased() {
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "hevc", "codec_type": "video",
+                  "profile": "Main 10", "codec_tag_string": "hvc1",
+                  "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le",
+                  "color_space": "bt2020nc", "color_transfer": "smpte2084",
+                  "color_primaries": "bt2020" }
+            ],
+            "format": { "format_name": "matroska,webm", "duration": "7200.0" }
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        let v = p.primary_video().unwrap();
+        assert_eq!(v.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(v.color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(v.color_space.as_deref(), Some("bt2020nc"));
+        assert_eq!(v.profile.as_deref(), Some("main 10"), "normalized for matching");
+        assert_eq!(v.pix_fmt.as_deref(), Some("yuv420p10le"));
+        assert!(v.side_data.is_empty(), "HDR10 alone carries no DOVI record");
+    }
+
+    #[test]
+    fn ffprobes_literal_unknown_is_an_absent_descriptor_not_an_unrecognized_one() {
+        // ffprobe writes "unknown" into the colour fields for most SDR H.264.
+        // Carried through verbatim it would fail to match any known-SDR name
+        // and read as an unrecognized transfer — a scarier state than "not
+        // stated", and a different one, for the same underlying fact.
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "h264", "codec_type": "video",
+                  "color_transfer": "unknown", "color_primaries": "unknown",
+                  "color_space": "unknown", "codec_tag_string": "" }
+            ],
+            "format": { "format_name": "mp4" }
+        }"#;
+        let v = parse_probe_json(json).unwrap().video.remove(0);
+        assert_eq!(v.color_transfer, None);
+        assert_eq!(v.color_primaries, None);
+        assert_eq!(v.color_space, None);
+        assert_eq!(v.codec_tag, None);
+    }
+
+    #[test]
+    fn a_dolby_vision_profile_5_stream_is_visible_only_in_its_side_data() {
+        // THE fixture this module was extended for. Note what the ordinary
+        // fields say: codec `hevc`, profile `Main 10` — identical to an HDR10
+        // file. The only thing that distinguishes it is the DOVI record, and
+        // `dv_bl_signal_compatibility_id: 0` is the field that says "this base
+        // layer is not viewable on its own".
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "hevc", "codec_type": "video",
+                  "profile": "Main 10", "codec_tag_string": "dvh1",
+                  "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le",
+                  "side_data_list": [
+                    { "side_data_type": "DOVI configuration record",
+                      "dv_version_major": 1, "dv_version_minor": 0,
+                      "dv_profile": 5, "dv_level": 6,
+                      "rpu_present_flag": 1, "bl_present_flag": 1,
+                      "el_present_flag": 0,
+                      "dv_bl_signal_compatibility_id": 0 }
+                  ] }
+            ],
+            "format": { "format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "7200.0" }
+        }"#;
+        let v = parse_probe_json(json).unwrap().video.remove(0);
+        assert_eq!(v.codec, "hevc", "the codec name gives nothing away");
+        assert_eq!(v.profile.as_deref(), Some("main 10"), "nor does the profile");
+        assert_eq!(v.codec_tag.as_deref(), Some("dvh1"));
+        assert_eq!(v.side_data.len(), 1);
+        let d = &v.side_data[0];
+        assert_eq!(d.kind, "DOVI configuration record");
+        assert_eq!(d.dv_profile, Some(5));
+        assert_eq!(d.dv_bl_signal_compatibility_id, Some(0));
+        assert_eq!(d.rpu_present, Some(true));
+        assert_eq!(d.el_present, Some(false));
+    }
+
+    #[test]
+    fn dv_side_data_parses_whether_its_numbers_are_rendered_as_strings() {
+        // ffprobe builds differ on this within one document, and a hard u32
+        // field would turn a Dolby Vision file into MalformedOutput — i.e.
+        // into a file we know nothing at all about, which is the worst state
+        // to be in for exactly this content.
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "hevc", "codec_type": "video",
+                  "side_data_list": [
+                    { "side_data_type": "DOVI configuration record",
+                      "dv_profile": "8", "dv_bl_signal_compatibility_id": "1",
+                      "rpu_present_flag": "1", "el_present_flag": "0" }
+                  ] }
+            ],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let v = parse_probe_json(json).unwrap().video.remove(0);
+        assert_eq!(v.side_data[0].dv_profile, Some(8));
+        assert_eq!(v.side_data[0].dv_bl_signal_compatibility_id, Some(1));
+        assert_eq!(v.side_data[0].rpu_present, Some(true));
+        assert_eq!(v.side_data[0].el_present, Some(false));
+    }
+
+    #[test]
+    fn an_absent_dv_flag_is_unknown_not_false() {
+        // A missing `rpu_present_flag` read as `false` would demote a Dolby
+        // Vision stream to an ordinary HDR10 one.
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "hevc", "codec_type": "video",
+                  "side_data_list": [ { "side_data_type": "DOVI configuration record" } ] }
+            ],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let v = parse_probe_json(json).unwrap().video.remove(0);
+        assert_eq!(v.side_data[0].rpu_present, None);
+        assert_eq!(v.side_data[0].dv_profile, None);
+        assert_eq!(v.side_data[0].dv_bl_signal_compatibility_id, None);
+    }
+
+    #[test]
+    fn side_data_types_we_do_not_model_are_carried_not_discarded() {
+        // HDR10 static metadata arrives this way on some builds. Foundry has
+        // no rule for it yet, and dropping unrecognized side data would mean a
+        // future rule could never see it.
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "hevc", "codec_type": "video",
+                  "side_data_list": [
+                    { "side_data_type": "Mastering display metadata" },
+                    { "side_data_type": "Content light level metadata" }
+                  ] }
+            ],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let v = parse_probe_json(json).unwrap().video.remove(0);
+        assert_eq!(v.side_data.len(), 2);
+        assert_eq!(v.side_data[0].kind, "Mastering display metadata");
+        assert_eq!(v.side_data[1].kind, "Content light level metadata");
+        assert_eq!(v.side_data[0].dv_profile, None);
+    }
+
+    #[test]
+    fn a_numeric_profile_field_does_not_fail_the_document() {
+        // ffprobe emits a bare integer here for codecs whose profile names it
+        // does not know.
+        let json = r#"{
+            "streams": [ { "index": 0, "codec_name": "vp9", "codec_type": "video", "profile": 2 } ],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let v = parse_probe_json(json).unwrap().video.remove(0);
+        assert_eq!(v.profile.as_deref(), Some("2"));
+    }
+
     #[test]
     fn malformed_output_is_an_error_never_an_empty_probe() {
         // The core honesty rule: a probe that did not parse must not become a
@@ -944,5 +1270,84 @@ mod tests {
         assert!(out.ends_with("(truncated)"));
         // ...and a short one is passed through untouched.
         assert_eq!(truncate_for_log("  boom  "), "boom");
+    }
+
+    /// Captured VERBATIM from `ffprobe 5.1.9-0+deb12u1` on the deployment host
+    /// (<host>), running `-show_streams -select_streams v:0` against a real
+    /// Dolby Vision title in the library. Only irrelevant keys were dropped;
+    /// every value below is exactly what the deployment host emits.
+    ///
+    /// This exists because every other DV test in this file uses a fixture
+    /// someone WROTE. That proves the classifier is self-consistent, not that
+    /// it matches reality — and the whole DV refusal rests on ffprobe actually
+    /// emitting `side_data_list` under `-show_streams`, which is a real
+    /// build-dependent question and not a thing the code can assert about
+    /// itself. It does emit it. If a host upgrade ever stops, this test is
+    /// what notices, rather than a profile 5 file being silently tone-mapped.
+    const LIVE_DOLBY_VISION_STREAM: &str = r#"{
+      "streams": [{
+        "index": 0,
+        "codec_name": "hevc",
+        "codec_long_name": "H.265 / HEVC (High Efficiency Video Coding)",
+        "profile": "Main 10",
+        "codec_type": "video",
+        "codec_tag_string": "[0][0][0][0]",
+        "codec_tag": "0x0000",
+        "width": 3832, "height": 2068,
+        "coded_width": 3832, "coded_height": 2072,
+        "has_b_frames": 4,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "958:517",
+        "pix_fmt": "yuv420p10le",
+        "level": 150,
+        "color_range": "tv",
+        "color_space": "bt2020nc",
+        "color_transfer": "smpte2084",
+        "color_primaries": "bt2020",
+        "chroma_location": "topleft",
+        "refs": 1,
+        "side_data_list": [{
+          "side_data_type": "DOVI configuration record",
+          "dv_version_major": 1, "dv_version_minor": 0,
+          "dv_profile": 8, "dv_level": 6,
+          "rpu_present_flag": 1, "el_present_flag": 0, "bl_present_flag": 1,
+          "dv_bl_signal_compatibility_id": 1
+        }]
+      }]
+    }"#;
+
+    #[test]
+    fn a_real_dolby_vision_stream_from_the_deployment_host_parses_end_to_end() {
+        let p = parse_probe_json(LIVE_DOLBY_VISION_STREAM).expect("live capture must parse");
+        let v = p.primary_video().expect("a video stream");
+
+        // The DOVI record survives the round trip. If `side_data` came back
+        // empty here, DV detection would fall through to the codec tag —
+        // which, as the next assertion shows, is not available on this file.
+        let d = v
+            .side_data
+            .iter()
+            .find(|d| d.kind == "DOVI configuration record")
+            .expect("the DOVI record ffprobe actually emitted");
+        assert_eq!(d.dv_profile, Some(8));
+        assert_eq!(d.dv_bl_signal_compatibility_id, Some(1));
+
+        // MKV renders an absent codec tag as this literal, NOT as an empty
+        // string. So on this file the tag fallback carries no DV signal, and
+        // detection rests entirely on the side-data record above. It must also
+        // not be mistaken FOR a tag that means something.
+        assert_ne!(
+            v.codec_tag.as_deref(),
+            Some("dvh1"),
+            "the placeholder tag must not be read as a real DV tag"
+        );
+
+        // The colour metadata is genuine HDR10 PQ/BT.2020.
+        assert_eq!(v.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(v.color_primaries.as_deref(), Some("bt2020"));
+
+        // Real 4K releases are cropped, not 3840x2160. A resolution rule that
+        // assumes the nominal frame size misfiles this one.
+        assert_eq!((v.width, v.height), (Some(3832), Some(2068)));
     }
 }

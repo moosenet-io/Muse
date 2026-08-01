@@ -236,6 +236,57 @@ impl Default for TranscodePolicy {
 }
 
 impl TranscodePolicy {
+    /// FOUNDRY-03 — the **ingest normalization** target: "will this direct
+    /// play", rather than "is this file wasteful".
+    ///
+    /// ## Why this is a constructor and not a new type
+    /// The compatibility half of direct play is *already* what
+    /// [`TranscodePolicy::default`] encodes, and re-expressing it as a parallel
+    /// struct would create two places for the accepted-codec lists to drift
+    /// apart. Concretely, these fields are already direct-play criteria and are
+    /// reused unchanged:
+    ///
+    /// - `acceptable_video_codecs` — H.264 direct-plays everywhere; the codecs
+    ///   *not* in the list (mpeg4, vc1, vp9, av1) are exactly the ones that
+    ///   make a server decode.
+    /// - `acceptable_audio_codecs` — AAC/AC-3/E-AC-3 pass through; TrueHD, DTS
+    ///   and FLAC are the formats that force a server-side audio transcode.
+    /// - `acceptable_containers` / `output_container` — AVI, WMV and FLV force
+    ///   a remux at least.
+    ///
+    /// ## What differs, and why
+    /// Two of the default's ceilings are **size** judgements, not
+    /// compatibility ones, and applying them on ingest would destroy quality
+    /// for a reason unrelated to direct play:
+    ///
+    /// - **Resolution ceiling raised to 3840x2160.** A 4K client direct-plays
+    ///   4K. Downscaling a 4K source to 1080p on the way in — and then, on
+    ///   Path A, *deleting the original* — is an irreversible quality loss
+    ///   imposed to solve a problem (bandwidth) that is per-session and is not
+    ///   a property of the file. Sources above 4K are still capped, because
+    ///   nothing in this fleet displays 8K.
+    /// - **Bitrate ceiling raised to 100 Mbps.** Same reasoning: a high
+    ///   bitrate never prevents direct play, it only costs bandwidth. The
+    ///   ceiling is kept rather than removed so that a genuinely pathological
+    ///   file (an uncompressed or intra-only remux) is still caught.
+    ///
+    /// The audio channel ceiling is **kept at 6**: a 7.1 or object-based track
+    /// is a real direct-play blocker on most clients in this fleet, which is
+    /// the original field's own stated justification.
+    ///
+    /// This policy is the input to the ordinary [`crate::foundry::plan`] /
+    /// [`crate::foundry::forge`] path — Path A reuses that machinery whole and
+    /// adds nothing to it but this target and the deletion rule in
+    /// [`crate::foundry::directplay`].
+    pub fn direct_play_normalization() -> Self {
+        Self {
+            max_width: 3840,
+            max_height: 2160,
+            max_video_bitrate_bps: 100_000_000,
+            ..Self::default()
+        }
+    }
+
     /// The effective video-bitrate ceiling: the stated maximum plus the
     /// tolerance slack.
     ///
@@ -333,6 +384,40 @@ mod tests {
         assert_eq!(p.max_audio_channels, 6);
         assert_eq!(p.acceptable_containers, vec![Container::Matroska, Container::Mp4]);
         assert_eq!(p.output_container, Container::Matroska);
+    }
+
+    #[test]
+    fn the_normalization_target_relaxes_only_the_size_ceilings() {
+        // Path A's criterion is "will this direct play", which is a
+        // COMPATIBILITY question. The compatibility fields must be the
+        // default's, byte for byte — two copies of the accepted-codec lists is
+        // two places for them to drift.
+        let d = TranscodePolicy::default();
+        let n = TranscodePolicy::direct_play_normalization();
+        assert_eq!(n.acceptable_video_codecs, d.acceptable_video_codecs);
+        assert_eq!(n.acceptable_audio_codecs, d.acceptable_audio_codecs);
+        assert_eq!(n.acceptable_containers, d.acceptable_containers);
+        assert_eq!(n.output_container, d.output_container);
+        assert_eq!(n.encode_video, d.encode_video);
+        assert_eq!(
+            n.max_audio_channels, 6,
+            "7.1 and object audio really are direct-play blockers, so this ceiling stays"
+        );
+
+        // ...and relaxes exactly the two that are size judgements.
+        assert_eq!((n.max_width, n.max_height), (3840, 2160));
+        assert_eq!(n.max_video_bitrate_bps, 100_000_000);
+    }
+
+    #[test]
+    fn normalization_does_not_downscale_4k_because_a_4k_client_direct_plays_4k() {
+        // Path A DELETES THE ORIGINAL. Downscaling on the way in would make
+        // that deletion an irreversible quality loss imposed for a bandwidth
+        // reason that is per-session and not a property of the file.
+        let n = TranscodePolicy::direct_play_normalization();
+        assert_eq!(scale_to_fit(3840, 2160, n.max_width, n.max_height), (3840, 2160));
+        // 8K is still capped: nothing in this fleet displays it.
+        assert_eq!(scale_to_fit(7680, 4320, n.max_width, n.max_height), (3840, 2160));
     }
 
     #[test]

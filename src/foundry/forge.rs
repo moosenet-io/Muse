@@ -860,7 +860,7 @@ impl std::fmt::Display for SwapError {
 /// concurrently only for one result to be discarded, and the window in which
 /// another Muse worker could replace the source covers probe-through-swap
 /// instead of the swap alone.
-struct SwapLock {
+pub(in crate::foundry) struct SwapLock {
     /// Held open for the lifetime of the lock: closing the descriptor is what
     /// releases the `flock`, so this field is load-bearing despite never being
     /// read.
@@ -874,14 +874,26 @@ impl SwapLock {
     /// path.** A single swap can touch three names — `Movie.avi`,
     /// `Movie.avi.muse-superseded` and `Movie.mkv` — and locking only one of
     /// them would let a second worker converting the same title from a
-    /// different container proceed concurrently. The stem is what those names
-    /// share, so it is the correct granularity.
+    /// different container proceed concurrently. Keying on the stem makes
+    /// `Movie.avi -> Movie.mkv` and `Movie.avi -> Movie.mp4` collide, which is
+    /// the case that matters.
+    ///
+    /// One correction to an earlier version of this comment, which claimed the
+    /// stem is "what those names share": it is NOT shared by the
+    /// `.muse-superseded` name. `file_stem` strips only the LAST extension, so
+    /// `Movie.mkv` has stem `Movie` while `Movie.mkv.muse-superseded` has stem
+    /// `Movie.mkv` — a different key entirely. Callers that want to exclude a
+    /// swap must therefore key on the DESTINATION path, as this function's own
+    /// caller does. `reaper` locks on the replacement (live) path for exactly
+    /// this reason; keying on the backup's own path would have been a lock
+    /// that excluded nothing. Found by a FOUNDRY-12 test that failed on its
+    /// first run.
     ///
     /// The lockfile lives in the **work dir**, not the library: a lockfile in
     /// the library would be scratch state inside the media tree, which safety
     /// rail 3 exists to prevent, and the library may be mounted read-only
     /// (it is on <host> today — `MUSE_LIBRARY_ROOT=/srv/media` is `ro`).
-    fn acquire(lock_dir: &Path, target: &Path) -> Result<Self, SwapError> {
+    pub(in crate::foundry) fn acquire(lock_dir: &Path, target: &Path) -> Result<Self, SwapError> {
         use sha2::{Digest, Sha256};
         use std::os::unix::ffi::OsStrExt;
 

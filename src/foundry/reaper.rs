@@ -74,6 +74,17 @@ pub enum ReapOutcome {
     /// The two names resolve to the same inode, i.e. the swap never completed
     /// its unlink. Deleting here would delete the live file.
     SameInodeAsReplacement,
+    /// A `forge` swap currently holds the lock covering this title, so a swap
+    /// is in flight on it right now.
+    ///
+    /// The mid-swap window is exactly when a backup must not be touched: forge
+    /// hard-links the original to the backup name BEFORE it has finished
+    /// putting the replacement in place, so for a moment both names exist and
+    /// the replacement is not yet verified. Retention normally covers this (a
+    /// just-created backup is minutes old), but `retention_days=0` is an
+    /// accepted override, and a rule that only holds for the default is not a
+    /// rule. Taking the same lock forge takes closes it outright.
+    SwapInFlight,
     /// The path could not be inspected at all.
     CouldNotInspect { detail: String },
 }
@@ -113,6 +124,11 @@ impl std::fmt::Display for ReapOutcome {
                 f,
                 "kept: the backup and the live file are the SAME inode, so the swap never \
                  released the original name — deleting would destroy the live file"
+            ),
+            Self::SwapInFlight => write!(
+                f,
+                "kept: a Foundry swap currently holds the lock for this title, so the \
+                 replacement may not be in place yet"
             ),
             Self::CouldNotInspect { detail } => write!(f, "kept: could not inspect ({detail})"),
         }
@@ -344,6 +360,32 @@ pub fn decide_one(
     }
 }
 
+/// Take the swap lock that covers this backup's title, if a lock dir exists.
+///
+/// Named and separate so the KEY CHOICE is testable. The choice is the whole
+/// point: forge keys its lock on the DESTINATION path, and `file_stem` strips
+/// only the last extension — `Movie.mkv` has stem `Movie`, while
+/// `Movie.mkv.muse-superseded` has stem `Movie.mkv`. Keying on the backup's
+/// own path therefore produces a different key and a lock that excludes
+/// nothing at all. Mutation testing caught that an inline version of this was
+/// unverified.
+///
+/// `Ok(None)` means no lock was needed (no work dir, so forge cannot swap).
+/// `Err(())` means a swap holds it.
+#[allow(clippy::result_unit_err)]
+pub fn acquire_title_lock(
+    lock_dir: Option<&Path>,
+    superseded: &Path,
+) -> Result<Option<crate::foundry::forge::SwapLock>, ()> {
+    let (Some(dir), Some(target)) = (lock_dir, replacement_of(superseded)) else {
+        return Ok(None);
+    };
+    match crate::foundry::forge::SwapLock::acquire(dir, &target) {
+        Ok(l) => Ok(Some(l)),
+        Err(_) => Err(()),
+    }
+}
+
 /// Re-verify, then unlink. **The only deletion in Muse.**
 ///
 /// The gate's verdict was formed from probes that take seconds on a 4K file.
@@ -411,6 +453,7 @@ pub fn reap(foundry: &Foundry, retention: Duration, mutate: bool) -> ReapRun {
     // is a second place the allowed-roots list could be derived, and the
     // reaper must walk exactly the roots the guard would permit.
     let cfg = foundry.config();
+    let lock_dir = cfg.work_dir.clone();
     let mut run = ReapRun {
         mutation_enabled: mutate,
         retention_secs: retention.as_secs(),
@@ -420,6 +463,38 @@ pub fn reap(foundry: &Foundry, retention: Duration, mutate: bool) -> ReapRun {
     let probe = |p: &Path| foundry.probe_file(p);
     for root in &cfg.allowed_roots {
         for superseded in find_superseded(root) {
+            // Take the SAME lock a swap takes, for the whole decide+delete of
+            // this title. Keyed on directory + file stem, so it covers
+            // `Movie.avi`, `Movie.avi.muse-superseded` and `Movie.mkv`
+            // together — which is the point: a swap converting a container
+            // touches all three, and locking only one name would let a reap
+            // proceed alongside it.
+            //
+            // Non-blocking: if a swap holds it, this title is skipped and
+            // reported, not waited on. A reap is entirely retryable, and a
+            // reaper that blocked behind swaps would stall the whole pass.
+            // Keyed on the REPLACEMENT (live) path, because that is the path
+            // forge keys on — it locks its destination. Locking the backup's
+            // own path would use a different key: `file_stem` strips only the
+            // LAST extension, so `Movie.mkv` has stem `Movie` while
+            // `Movie.mkv.muse-superseded` has stem `Movie.mkv`. Two different
+            // keys means no exclusion at all. Caught by the test below, which
+            // failed on the first attempt.
+            let _lock = match acquire_title_lock(lock_dir.as_deref(), &superseded) {
+                Ok(l) => l,
+                Err(()) => {
+                    run.files.push(ReapedFile {
+                        superseded_path: superseded.display().to_string(),
+                        replacement_path: replacement_of(&superseded)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        bytes: std::fs::metadata(&superseded).ok().map(|m| m.len()),
+                        outcome: ReapOutcome::SwapInFlight,
+                    });
+                    continue;
+                }
+            };
+
             let (outcome, replacement, bytes) = decide_one(&probe, &superseded, retention);
 
             let outcome = if mutate && outcome == ReapOutcome::WouldDelete {
@@ -494,6 +569,94 @@ mod tests {
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|p| p.extension().unwrap() == SUPERSEDED_EXT));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A reap must not proceed on a title a swap is currently working on.
+    ///
+    /// forge hard-links the original to the backup name BEFORE the replacement
+    /// is in place and verified, so mid-swap both names exist and the
+    /// replacement is not yet trustworthy. Retention normally covers this — a
+    /// just-created backup is minutes old — but `retention_days=0` is an
+    /// accepted override, and a rule that only holds for the default value is
+    /// not a rule.
+    ///
+    /// The lock is keyed on directory + file stem, so a swap holding
+    /// `Movie.mkv` must also exclude a reap of `Movie.mkv.muse-superseded`.
+    /// That shared-stem behaviour is the property under test.
+    #[test]
+    fn a_swap_holding_the_lock_excludes_a_reap_of_the_same_title() {
+        use crate::foundry::forge::SwapLock;
+        let work = tmp("lockwork");
+        let lib = tmp("locklib");
+        let live = lib.join("Movie.mkv");
+        let sup = lib.join("Movie.mkv.muse-superseded");
+        fs::write(&live, b"x").unwrap();
+        fs::write(&sup, b"y").unwrap();
+
+        // A swap takes the lock on the LIVE (destination) name.
+        let held = SwapLock::acquire(&work, &live).expect("first acquire must succeed");
+
+        // A reap must key on the SAME path to be excluded. This is the trap
+        // the first version of this test exposed: keying on the backup's own
+        // path uses a DIFFERENT key, because `file_stem` strips only the last
+        // extension — `Movie.mkv` -> `Movie`, `Movie.mkv.muse-superseded` ->
+        // `Movie.mkv`. That would have been a lock that excluded nothing.
+        let reap_target = replacement_of(&sup).expect("a backup has a replacement path");
+        assert_eq!(reap_target, live, "the reaper must lock the live name");
+        assert!(
+            SwapLock::acquire(&work, &reap_target).is_err(),
+            "a reap must be excluded while a swap holds the title"
+        );
+
+        // ...and keying on the backup path instead would NOT exclude, which is
+        // exactly why the reaper must not do that.
+        assert!(
+            SwapLock::acquire(&work, &sup).is_ok(),
+            "sanity: the backup path is a different lock key, hence the rule above"
+        );
+
+        drop(held);
+        assert!(
+            SwapLock::acquire(&work, &reap_target).is_ok(),
+            "the lock must be released when the swap finishes"
+        );
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&lib);
+    }
+
+    /// The reaper's own lock acquisition, not just `SwapLock`'s semantics.
+    ///
+    /// An earlier version made this choice inline and a mutation that keyed on
+    /// the BACKUP path — a lock excluding nothing — survived every test. The
+    /// choice is now named, so it is the thing under test.
+    #[test]
+    fn the_reaper_locks_the_live_title_not_the_backups_own_path() {
+        use crate::foundry::forge::SwapLock;
+        let work = tmp("acqwork");
+        let lib = tmp("acqlib");
+        let live = lib.join("Movie.mkv");
+        let sup = lib.join("Movie.mkv.muse-superseded");
+        fs::write(&live, b"x").unwrap();
+        fs::write(&sup, b"y").unwrap();
+
+        // A swap holds the live title...
+        let held = SwapLock::acquire(&work, &live).expect("swap takes the lock");
+        // ...so the reaper's acquisition must be REFUSED.
+        assert!(
+            acquire_title_lock(Some(&work), &sup).is_err(),
+            "the reaper must be excluded while a swap holds this title"
+        );
+        drop(held);
+        // Released: now it succeeds.
+        assert!(
+            acquire_title_lock(Some(&work), &sup).is_ok(),
+            "the reaper must proceed once the swap finishes"
+        );
+        // No lock dir: nothing to race with, so no lock is needed.
+        assert!(matches!(acquire_title_lock(None, &sup), Ok(None)));
+
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&lib);
     }
 
     /// Symlinks are never followed, and never collected.

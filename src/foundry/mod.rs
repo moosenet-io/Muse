@@ -50,6 +50,7 @@ pub mod capability;
 pub mod config;
 pub mod forge;
 pub mod paths;
+pub mod survey;
 pub mod plan;
 pub mod policy;
 pub mod probe;

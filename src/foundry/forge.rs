@@ -1447,10 +1447,30 @@ fn run_encode_and_swap(
     // --- 1. encode ---------------------------------------------------------
     // The ONE process spawn on this path. Everything above and below it is
     // pure or is ordinary filesystem work.
-    let status = Command::new(&cfg.ffmpeg_bin)
-        .args(args)
-        .output()
-        .map_err(|e| format!("spawning ffmpeg `{}`: {e}", cfg.ffmpeg_bin))?;
+    // Bounded, because `Command::output()` is not.
+    //
+    // This is the PRODUCTION encode — the one that rewrites library files —
+    // and it runs while holding the swap lock for the title. An ffmpeg wedged
+    // on a stalled NFS read therefore blocked this swap forever AND kept the
+    // title locked against every future pass, with no way to tell that from
+    // "still encoding". The probe path had exactly this defect (FOUNDRY-10/12)
+    // and it was observed live; there is no reason to think the encoder is
+    // immune when it reads from the same mount.
+    //
+    // The ceiling is deliberately generous — a 4K feature is legitimately
+    // hours on a CPU — so it never fires on honest work, only on a wedge.
+    let status = crate::foundry::probe::spawn_with_timeout(
+        &cfg.ffmpeg_bin,
+        args,
+        cfg.encode_timeout,
+    )
+    .map_err(|e| match e {
+        crate::foundry::probe::ProbeError::Timeout { secs } => format!(
+            "ffmpeg did not finish within {secs}s and was abandoned — the encode is \
+             incomplete and NOTHING was swapped; the original is untouched"
+        ),
+        other => format!("spawning ffmpeg `{}`: {other}", cfg.ffmpeg_bin),
+    })?;
 
     if !status.status.success() {
         return Err(format!(
@@ -2717,6 +2737,7 @@ mod tests {
 
     fn cfg_for(t: &Tmp, ffprobe: &str, ffmpeg: &str) -> FoundryConfig {
         FoundryConfig {
+            encode_timeout: std::time::Duration::from_secs(6 * 60 * 60),
             allowed_roots: vec![t.lib()],
             work_dir: Some(t.work()),
             enable_mutation: true,
@@ -2734,6 +2755,76 @@ mod tests {
     /// was learned about the file at all. The distinction matters at
     /// 16,000-item scale, where transient stalls are certain and a pile of
     /// "failures" would obscure the real ones.
+    /// The production encode must be bounded.
+    ///
+    /// It rewrites library files AND holds the title's swap lock while it
+    /// runs, so an ffmpeg wedged on a stalled NFS read blocked that swap
+    /// forever and kept the title locked against every future pass —
+    /// indistinguishable from "still encoding". `Command::output()` has no
+    /// timeout; this was found by auditing for the same defect after it was
+    /// observed live in the probe path.
+    #[test]
+    fn the_production_encode_is_bounded_by_a_configured_ceiling() {
+        let src = include_str!("forge.rs");
+        let body = src.split("#[cfg(test)]").next().expect("a non-test body");
+        assert!(
+            !body.contains(".output()"),
+            "the production encode must not use Command::output(), which cannot time out"
+        );
+        assert!(
+            body.contains("spawn_with_timeout"),
+            "it must go through the bounded spawner"
+        );
+        assert!(
+            body.contains("cfg.encode_timeout"),
+            "the ceiling must come from configuration, not be hardcoded at the call site"
+        );
+    }
+
+    /// A timeout must say that nothing was swapped. An operator reading
+    /// "ffmpeg timed out" needs to know the library is untouched, not wonder
+    /// whether a half-written file replaced their title.
+    #[test]
+    fn an_encode_timeout_says_the_original_is_untouched() {
+        // The NON-TEST body only. Searching the whole file matches this
+        // assertion's own literal, so the test would pass by finding itself —
+        // caught by a mutation that removed the production string and left
+        // this test green.
+        let body = include_str!("forge.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        assert!(
+            body.contains("NOTHING was swapped; the original is untouched"),
+            "the timeout message must state that the library was not modified"
+        );
+    }
+
+    /// Default 6h, clamped. Generous enough that honest 4K work never trips
+    /// it, bounded enough that a wedge cannot last a day.
+    #[test]
+    fn the_encode_ceiling_defaults_generously_and_is_clamped() {
+        let cfg = crate::config::Config::default();
+        let f = FoundryConfig::from_config(&cfg);
+        assert_eq!(f.encode_timeout, std::time::Duration::from_secs(6 * 60 * 60));
+
+        let mut absurd = crate::config::Config::default();
+        absurd.foundry_encode_timeout_secs = Some(u64::MAX);
+        assert_eq!(
+            FoundryConfig::from_config(&absurd).encode_timeout,
+            std::time::Duration::from_secs(24 * 60 * 60),
+            "clamped to a day"
+        );
+
+        let mut zero = crate::config::Config::default();
+        zero.foundry_encode_timeout_secs = Some(0);
+        assert_eq!(
+            FoundryConfig::from_config(&zero).encode_timeout,
+            std::time::Duration::from_secs(60),
+            "zero clamps UP so the ceiling cannot be disabled"
+        );
+    }
+
     #[test]
     fn a_probe_timeout_is_a_retryable_skip_not_a_file_failure() {
         let reason = SkipReason::ProbeTimedOut { secs: 120 };

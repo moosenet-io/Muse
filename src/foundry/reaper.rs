@@ -202,11 +202,29 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Age of a file, or `None` when it cannot be determined.
+/// Age of a preserved original, measured from its **ctime**, or `None` when it
+/// cannot be determined.
+///
+/// NOT mtime, and this is the whole point. `forge` creates the backup with
+/// `hard_link`, and a hard link shares the inode — so the backup inherits the
+/// ORIGINAL's mtime, which is the download date and is routinely years old.
+/// Measuring retention from mtime would have made every backup instantly
+/// eligible, silently reducing a 14-day window to no window at all. Raised by
+/// opus and free at the FOUNDRY-05 gate.
+///
+/// ctime is updated when the link is created (the link count changes), so it
+/// is the moment the backup came into existence. It is also not settable by
+/// `touch`/`cp -p`/rsync, which mtime is — relevant because this value gates a
+/// deletion.
+///
+/// A clock that has gone backwards yields `None` (via `duration_since`), which
+/// the caller treats as "not old enough" rather than as zero age.
 fn age_of(p: &Path) -> Option<Duration> {
-    let md = std::fs::metadata(p).ok()?;
-    let mtime = md.modified().ok()?;
-    SystemTime::now().duration_since(mtime).ok()
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(p).ok()?;
+    let ctime = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(u64::try_from(md.ctime()).ok()?))?;
+    SystemTime::now().duration_since(ctime).ok()
 }
 
 /// Decide one preserved original. **Never deletes** — the decision and the
@@ -326,6 +344,63 @@ pub fn decide_one(
     }
 }
 
+/// Re-verify, then unlink. **The only deletion in Muse.**
+///
+/// The gate's verdict was formed from probes that take seconds on a 4K file.
+/// In that window the replacement can be removed, renamed, or replaced by
+/// another process — and if it is, this backup became the last copy of the
+/// title AFTER the gate said it was safe. So the two facts that make deletion
+/// survivable are re-checked immediately before the unlink, against the same
+/// paths, with nothing in between:
+///
+/// 1. the replacement still exists, and
+/// 2. it is still a DIFFERENT inode from the backup.
+///
+/// Cheap (two stats) next to what it prevents. Raised by opus and free at the
+/// FOUNDRY-05 gate.
+///
+/// This is not a claim to have closed the TOCTOU race — nothing short of
+/// holding the directory can — only to have narrowed it from "the length of
+/// two ffprobes" to "the length of two stats".
+fn delete_verified(superseded: &Path, replacement: Option<&Path>) -> ReapOutcome {
+    let Some(replacement) = replacement else {
+        return ReapOutcome::CouldNotInspect {
+            detail: "no replacement path to re-verify against".to_string(),
+        };
+    };
+    if !replacement.is_file() {
+        return ReapOutcome::ReplacementMissing {
+            expected: replacement.display().to_string(),
+        };
+    }
+    match (
+        crate::foundry::forge::identity_of(superseded),
+        crate::foundry::forge::identity_of(replacement),
+    ) {
+        (Ok(a), Ok(b)) if a == b => return ReapOutcome::SameInodeAsReplacement,
+        (Err(e), _) | (_, Err(e)) => {
+            return ReapOutcome::CouldNotInspect {
+                detail: format!("re-verification before deletion failed: {e}"),
+            }
+        }
+        _ => {}
+    }
+    match std::fs::remove_file(superseded) {
+        Ok(()) => {
+            tracing::info!(
+                path = %superseded.display(),
+                replacement = %replacement.display(),
+                "foundry reaper: deleted a preserved original after the gate allowed it \
+                 and the replacement was re-verified"
+            );
+            ReapOutcome::Deleted
+        }
+        Err(e) => ReapOutcome::CouldNotInspect {
+            detail: format!("deletion failed: {e}"),
+        },
+    }
+}
+
 /// Run one reap pass over the configured allowed roots.
 ///
 /// `mutate` is the second of the two deliberate steps: with it false — the
@@ -348,19 +423,11 @@ pub fn reap(foundry: &Foundry, retention: Duration, mutate: bool) -> ReapRun {
             let (outcome, replacement, bytes) = decide_one(&probe, &superseded, retention);
 
             let outcome = if mutate && outcome == ReapOutcome::WouldDelete {
-                match std::fs::remove_file(&superseded) {
-                    Ok(()) => {
-                        run.bytes_reclaimed = run.bytes_reclaimed.saturating_add(bytes.unwrap_or(0));
-                        tracing::info!(
-                            path = %superseded.display(),
-                            "foundry reaper: deleted a preserved original after the gate allowed it"
-                        );
-                        ReapOutcome::Deleted
-                    }
-                    Err(e) => ReapOutcome::CouldNotInspect {
-                        detail: format!("deletion failed: {e}"),
-                    },
+                let deleted = delete_verified(&superseded, replacement.as_deref());
+                if deleted == ReapOutcome::Deleted {
+                    run.bytes_reclaimed = run.bytes_reclaimed.saturating_add(bytes.unwrap_or(0));
                 }
+                deleted
             } else {
                 outcome
             };
@@ -524,23 +591,109 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// A dry run must not remove anything, and must say so.
+    /// The mutate branch, tested for real rather than re-implemented.
+    ///
+    /// Opus caught the first version at the gate: it never called the deletion
+    /// path at all, it restated the condition in the test and asserted on
+    /// that. It would have passed with the real branch broken, and left the
+    /// only code that destroys data uncovered.
     #[test]
-    fn a_dry_run_deletes_nothing_and_reports_that_it_was_a_dry_run() {
-        let d = tmp("dryrun");
+    fn the_delete_path_removes_the_backup_and_leaves_the_replacement() {
+        let d = tmp("delete");
+        let live = d.join("Movie.mkv");
+        let sup = d.join("Movie.mkv.muse-superseded");
+        fs::write(&live, b"the replacement").unwrap();
+        fs::write(&sup, b"the original").unwrap();
+
+        assert_eq!(delete_verified(&sup, Some(&live)), ReapOutcome::Deleted);
+        assert!(!sup.exists(), "the backup must be gone");
+        assert!(live.exists(), "the replacement must be untouched");
+        assert_eq!(fs::read(&live).unwrap(), b"the replacement");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The race the re-verification exists for: the replacement disappears
+    /// between the gate allowing and the unlink. Deleting then would destroy
+    /// the last copy of the title.
+    #[test]
+    fn a_replacement_that_vanishes_after_the_gate_allowed_stops_the_deletion() {
+        let d = tmp("race");
         let live = d.join("Movie.mkv");
         let sup = d.join("Movie.mkv.muse-superseded");
         fs::write(&live, b"x").unwrap();
-        fs::write(&sup, b"y").unwrap();
-        // `reap` is the impure edge (it needs a live Foundry), so the dry-run
-        // guarantee is asserted on the same branch `reap` takes: a decision of
-        // WouldDelete with mutation disabled must leave the file alone.
-        let (outcome, _, _) = decide_one(&no_probe, &sup, Duration::ZERO);
-        let mutate = false;
-        let acted = mutate && outcome == ReapOutcome::WouldDelete;
-        assert!(!acted, "a dry run must never reach the deletion branch");
-        assert!(sup.exists(), "a dry run must not remove the backup");
-        assert!(live.exists());
+        fs::write(&sup, b"the only copy now").unwrap();
+
+        // Simulate the window: the gate has said WouldDelete, and now the
+        // replacement goes away before the unlink.
+        fs::remove_file(&live).unwrap();
+
+        let outcome = delete_verified(&sup, Some(&live));
+        assert!(
+            matches!(outcome, ReapOutcome::ReplacementMissing { .. }),
+            "got {outcome:?}"
+        );
+        assert!(sup.exists(), "the last copy must survive");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The other half of the race: the replacement is replaced by a hard link
+    /// to the backup itself, so unlinking would destroy the live file.
+    #[test]
+    fn a_replacement_that_becomes_the_same_inode_stops_the_deletion() {
+        let d = tmp("race-inode");
+        let live = d.join("Movie.mkv");
+        let sup = d.join("Movie.mkv.muse-superseded");
+        fs::write(&sup, b"x").unwrap();
+        fs::hard_link(&sup, &live).unwrap();
+
+        assert_eq!(
+            delete_verified(&sup, Some(&live)),
+            ReapOutcome::SameInodeAsReplacement
+        );
+        assert!(sup.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Retention must be measured from a clock the hard link does NOT inherit.
+    ///
+    /// `forge` creates the backup with `hard_link`, which shares the inode, so
+    /// the backup carries the ORIGINAL's mtime — the download date, routinely
+    /// years old. Measuring from mtime silently reduced a 14-day window to no
+    /// window at all. This fixture reproduces that exactly: an old mtime on a
+    /// freshly-linked file.
+    #[test]
+    fn retention_is_not_defeated_by_the_backups_inherited_mtime() {
+        let d = tmp("mtime");
+        let live = d.join("Movie.mkv");
+        fs::write(&live, b"x").unwrap();
+
+        // Backdate the original the way a real download would be.
+        let old = SystemTime::now() - Duration::from_secs(365 * 24 * 60 * 60);
+        let ft = fs::FileTimes::new().set_modified(old).set_accessed(old);
+        fs::File::options()
+            .write(true)
+            .open(&live)
+            .unwrap()
+            .set_times(ft)
+            .unwrap();
+
+        // Now make the backup the way forge does: a hard link.
+        let sup = d.join("Movie.mkv.muse-superseded");
+        fs::hard_link(&live, &sup).unwrap();
+
+        // The inherited mtime IS a year old...
+        let inherited = fs::metadata(&sup).unwrap().modified().unwrap();
+        assert!(
+            SystemTime::now().duration_since(inherited).unwrap() > Duration::from_secs(300 * 86_400),
+            "fixture must actually have an ancient mtime"
+        );
+
+        // ...but the backup was created just now, so retention must hold it.
+        let age = age_of(&sup).expect("ctime must be readable");
+        assert!(
+            age < Duration::from_secs(3600),
+            "retention must measure the BACKUP's age ({age:?}), not the inherited mtime"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -2144,6 +2144,33 @@ mod auth {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    // MACT-01 (Plane MUSE #121): `/api/sessions/live` and `/api/sessions/history`
+    // are per-account viewing-activity reads (CAP-SEC-03), gated identically to
+    // `/on_deck` above — a well-formed but tokenless request is rejected `401`
+    // before the handler (and therefore the pool) is ever reached.
+    #[tokio::test]
+    async fn sessions_live_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, body) = send(
+            app_no_db_with_config(with_token_config()),
+            get("/api/sessions/live"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Belt-and-suspenders: the 401 body must never carry a session list.
+        assert!(body.get("sessions").is_none());
+    }
+
+    #[tokio::test]
+    async fn sessions_history_without_token_is_401_and_never_reaches_the_handler() {
+        let (status, body) = send(
+            app_no_db_with_config(with_token_config()),
+            get("/api/sessions/history"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.get("sessions").is_none());
+    }
+
     #[tokio::test]
     async fn protected_route_with_wrong_token_is_401() {
         let (status, _) = send(

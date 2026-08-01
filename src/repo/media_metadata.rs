@@ -295,11 +295,30 @@ pub async fn find_needing_enrichment(
 ) -> MuseResult<Vec<MediaMetadata>> {
     sqlx::query_as::<_, MediaMetadata>(
         r#"
-        SELECT * FROM media_metadata
-        WHERE kind = $1
-          AND (tmdb_id IS NOT NULL OR tvdb_id IS NOT NULL OR imdb_id IS NOT NULL)
-          AND overview IS NULL
-        ORDER BY last_info_sync ASC NULLS FIRST, id
+        SELECT * FROM media_metadata mm
+        WHERE mm.kind = $1
+          AND (mm.tmdb_id IS NOT NULL OR mm.tvdb_id IS NOT NULL OR mm.imdb_id IS NOT NULL)
+          AND (
+                -- MUSE #114: `overview IS NULL` alone was the entire eligibility test, and it
+                -- silently disabled enrichment for the whole library. `arr::ingest` populates
+                -- `overview` for every title it upserts (1649 movies + 240 series here), so
+                -- every row failed this predicate and the pass reported
+                -- `metadata_resolve_ran=true metadata_resolved=0` every hour for months.
+                --
+                -- Overview and genres come from DIFFERENT sources: overview from *arr, genres
+                -- only from the provider enrichment this pass performs. So a title can have an
+                -- overview and no genres for ever, which is exactly why `genres` and
+                -- `media_metadata_genres` are both 0 rows — and why taste's genre_lean and the
+                -- Discover taste category have nothing to work with (MUSE #90).
+                --
+                -- The predicate now asks what enrichment actually SUPPLIES, rather than using
+                -- one field as a proxy for all of them.
+                mm.overview IS NULL
+                OR NOT EXISTS (
+                    SELECT 1 FROM media_metadata_genres g WHERE g.media_metadata_id = mm.id
+                )
+          )
+        ORDER BY mm.last_info_sync ASC NULLS FIRST, mm.id
         LIMIT $2
         "#,
     )
@@ -504,6 +523,14 @@ pub async fn search_by_title(pool: &PgPool, query: &str, limit: i64) -> MuseResu
 
 #[cfg(test)]
 mod tests {
+    /// A unique-enough suffix so repeated runs do not collide on (kind, tmdb_id).
+    fn uuid_like() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_else(|_| "0".to_string())
+    }
+
     use super::*;
 
     /// MUSEL-A2 persistence round-trip: seeds a `media_metadata` row (as
@@ -513,6 +540,62 @@ mod tests {
     /// `media_metadata_genres`. Gated on `MUSE_TEST_DATABASE_URL`: skips
     /// cleanly (never fails) when unset, matching every other live-DB test
     /// in this crate (see `maintenance::tests` for the same pattern).
+    #[tokio::test]
+    async fn a_title_with_an_overview_but_NO_GENRES_is_still_eligible_for_enrichment() {
+        // MUSE #114, the whole bug. The predicate was `overview IS NULL` alone, and
+        // `arr::ingest` fills `overview` for every title it upserts — so the entire library
+        // was permanently ineligible and the pass logged
+        // `metadata_resolve_ran=true metadata_resolved=0` every hour while `genres` and
+        // `media_metadata_genres` stayed at 0 rows.
+        //
+        // Overview and genres arrive from DIFFERENT sources, so one is not a proxy for the
+        // other. This asserts the case that was excluded: a fully-described title that has
+        // never had a genre linked.
+        let Ok(url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
+            eprintln!("MUSE_TEST_DATABASE_URL not set — skipping");
+            return;
+        };
+        let pool = PgPool::connect(&url).await.expect("connect");
+
+        let row = sqlx::query_as::<_, MediaMetadata>(
+            r#"INSERT INTO media_metadata (kind, tmdb_id, title, overview)
+               VALUES ('movie', $1, 'Has Overview No Genres', 'a full overview')
+               RETURNING *"#,
+        )
+        .bind(format!("test-{}", uuid_like()))
+        .fetch_one(&pool)
+        .await
+        .expect("insert");
+
+        let found = find_needing_enrichment(&pool, MediaKind::Movie, 500)
+            .await
+            .expect("query");
+        assert!(
+            found.iter().any(|m| m.id == row.id),
+            "a title with an overview but no linked genres MUST be eligible — it is the case \
+             that kept the whole library out of enrichment",
+        );
+
+        // And once it HAS a genre, it drops out again (so the pass converges instead of
+        // re-processing the library for ever).
+        ensure_genres_linked(&pool, row.id, &["Drama".to_string()])
+            .await
+            .expect("link");
+        let after = find_needing_enrichment(&pool, MediaKind::Movie, 500)
+            .await
+            .expect("query");
+        assert!(
+            !after.iter().any(|m| m.id == row.id),
+            "an enriched title must stop being a candidate, or the pass never converges",
+        );
+
+        sqlx::query("DELETE FROM media_metadata WHERE id = $1")
+            .bind(row.id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     #[tokio::test]
     async fn apply_enrichment_persists_merged_fields_onto_existing_row() {
         let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {

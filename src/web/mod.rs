@@ -128,4 +128,11 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         // exactly the per-account data this group exists to gate.
         .route("/on_deck", get(dashboard::get_on_deck))
         .route("/premiere", get(dashboard::get_premiere))
+        // MACT-01 (Plane MUSE #121): live + historical session activity.
+        // PROTECTED for the same reason `/on_deck` is (CAP-SEC-03) — a live
+        // session names which household account is watching what, right now
+        // (and history is the same fact over time), so it gets the same gate
+        // as every other per-account viewing-activity read in this group.
+        .route("/api/sessions/live", get(dashboard::get_live_sessions))
+        .route("/api/sessions/history", get(dashboard::get_session_history))
 }

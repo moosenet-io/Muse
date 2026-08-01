@@ -585,6 +585,20 @@ pub struct Config {
     /// own doc makes for its default).
     pub kg_viz_watch_history_limit: u64,
 
+    // --- MACT-01 (Plane MUSE #121): sessions/live and sessions/history ---
+    /// How stale (seconds since the newest `play_events` row for a session)
+    /// an open (`stopped_at IS NULL`) session is allowed to be before
+    /// `GET /api/sessions/live` reports it `state: "stale"` instead of
+    /// `"playing"`/`"paused"` (`MUSE_SESSION_ACTIVE_GRACE_SECS`). Behavioral
+    /// config, not a secret — plain env, no `SecretManager`/vault indirection
+    /// needed (S7 only gates secret-shaped values). Defaults to
+    /// `max(3 * ingest cadence, 60)`, where "ingest cadence" is the
+    /// configured/effective Plex poll interval
+    /// ([`Config::plex_poll_secs`], falling back to the poller's own 10s
+    /// default when unset) — so a slower-than-usual poll cadence doesn't
+    /// make a genuinely-live session flap to `stale` between polls.
+    pub session_active_grace_secs: u64,
+
     // --- MUSEX-CAP-SEC-01 (Plane TERM #399): endpoint auth ---
     /// Bearer token required on the sensitive/mutating HTTP surface (see
     /// `crate::http::auth`) — `MUSE_API_TOKEN`, <secret-manager>-materialized at
@@ -749,6 +763,13 @@ impl Config {
             kg_taste_neighbor_threshold: env_f32("MUSE_KG_TASTE_NEIGHBOR_THRESHOLD", 0.5),
             kg_viz_watch_history_limit: env_u64("MUSE_KG_VIZ_WATCH_HISTORY_LIMIT", 200),
 
+            session_active_grace_secs: env_u64("MUSE_SESSION_ACTIVE_GRACE_SECS", {
+                let poll_secs = env_opt("MUSE_PLEX_POLL_SECS")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(10);
+                (poll_secs * 3).max(60)
+            }),
+
             api_token: env_opt("MUSE_API_TOKEN"),
             auth_disabled: env_opt("MUSE_AUTH_DISABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -910,6 +931,7 @@ impl Default for Config {
             premiere_curator_budget: 6,
             kg_taste_neighbor_threshold: 0.5,
             kg_viz_watch_history_limit: 200,
+            session_active_grace_secs: 60,
             api_token: None,
             auth_disabled: false,
         }

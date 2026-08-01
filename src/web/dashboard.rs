@@ -40,6 +40,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -1364,6 +1365,288 @@ pub async fn get_premiere() -> (StatusCode, Json<Value>) {
     )
 }
 
+// ===========================================================================
+// Sessions (MACT-01, Plane MUSE #121) — GET /api/sessions/live + /history
+// ===========================================================================
+//
+// The missing read path over `play_sessions`, which the Plex poller and
+// webhook already populate. TWO separate routes, deliberately — they are two
+// sources (a derived live view vs. the permanent historical record), not one
+// route with a `?state=` filter, which would erase that distinction. Each
+// envelope carries an explicit `source` discriminator so the client can
+// label it and so a future flip of the live source (epic §8.8 spec J) is
+// visible rather than silent.
+//
+// `account_id` here is the MUSE account (`accounts.id`, the same id-space
+// the taste model uses) — never the constellation-web cookie session, which
+// carries roles (operator/viewer), not household members.
+//
+// Unlike the rest of this module, both handlers propagate query errors
+// (`MuseResult`) rather than failing open to an empty list — see
+// `get_stats`/`get_gaps`'s doc comments for why: a 2xx empty body renders as
+// the CLAIM "nobody is watching" / "no history", not the absence of one.
+
+const DEFAULT_HISTORY_LIMIT: i64 = 50;
+const MAX_HISTORY_LIMIT: i64 = 500;
+
+fn decision_kind_str(kind: crate::models::play_session::DecisionKind) -> &'static str {
+    use crate::models::play_session::DecisionKind;
+    match kind {
+        DecisionKind::DirectPlay => "direct_play",
+        DecisionKind::DirectStream => "direct_stream",
+        DecisionKind::Transcode => "transcode",
+        DecisionKind::Copy => "copy",
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionAccountOut {
+    pub id: Option<i64>,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionItemOut {
+    pub media_item_id: Option<i64>,
+    pub title: Option<String>,
+    pub year: Option<i32>,
+    pub kind: Option<&'static str>,
+    /// Present only for an episode-level session (`episode_id` resolved).
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+    pub episode_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionDecisionOut {
+    pub video_decision: Option<&'static str>,
+    pub audio_decision: Option<&'static str>,
+    pub transcode_decision: Option<&'static str>,
+    pub transcode_reason: Option<String>,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub audio_channels: Option<f32>,
+    pub video_resolution: Option<String>,
+    pub bitrate: Option<i32>,
+}
+
+impl From<&repo::play_session::SessionJoinRow> for SessionDecisionOut {
+    fn from(r: &repo::play_session::SessionJoinRow) -> Self {
+        SessionDecisionOut {
+            video_decision: r.video_decision.map(decision_kind_str),
+            audio_decision: r.audio_decision.map(decision_kind_str),
+            transcode_decision: r.transcode_decision.map(decision_kind_str),
+            transcode_reason: r.transcode_reason.clone(),
+            container: r.container.clone(),
+            video_codec: r.video_codec.clone(),
+            audio_codec: r.audio_codec.clone(),
+            audio_channels: r.audio_channels,
+            video_resolution: r.video_resolution.clone(),
+            bitrate: r.bitrate,
+        }
+    }
+}
+
+impl From<&repo::play_session::SessionJoinRow> for SessionAccountOut {
+    fn from(r: &repo::play_session::SessionJoinRow) -> Self {
+        SessionAccountOut {
+            id: r.account_id,
+            display_name: r.account_display_name.clone(),
+        }
+    }
+}
+
+impl From<&repo::play_session::SessionJoinRow> for SessionItemOut {
+    fn from(r: &repo::play_session::SessionJoinRow) -> Self {
+        SessionItemOut {
+            media_item_id: r.media_item_id,
+            title: r.title.clone(),
+            year: r.year,
+            kind: r.kind.map(kind_str),
+            season_number: r.season_number,
+            episode_number: r.episode_number,
+            episode_title: r.episode_title.clone(),
+        }
+    }
+}
+
+/// Scale `percent_complete` (a FRACTION in 0..1 despite the column name —
+/// MUSE #87) to a percentage, EXCEPT when `duration_ms` is null: per MACT-01's
+/// edge cases, an unknown duration means progress is genuinely unknown and
+/// must be omitted, never reported as `0%`.
+fn session_progress_pct(percent_complete: Option<f32>, duration_ms: Option<i64>) -> Option<f32> {
+    duration_ms?;
+    let pct = percent_complete? * 100.0;
+    Some((pct * 10.0).round() / 10.0)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveSessionOut {
+    pub session_id: i64,
+    pub session_key: Option<String>,
+    pub account: SessionAccountOut,
+    pub item: SessionItemOut,
+    pub poster_url: Option<String>,
+    pub backdrop_url: Option<String>,
+    pub view_offset_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_pct: Option<f32>,
+    pub player: Option<String>,
+    pub platform: Option<String>,
+    pub product: Option<String>,
+    pub device: Option<String>,
+    /// `"playing"` | `"paused"` | `"stale"` — see
+    /// `repo::play_session::classify_session_state`. An open-but-stale
+    /// session is reported here, never dropped, never `"playing"`.
+    pub state: repo::play_session::SessionPlayState,
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,
+    pub decision: SessionDecisionOut,
+}
+
+impl From<repo::play_session::LiveSession> for LiveSessionOut {
+    fn from(live: repo::play_session::LiveSession) -> Self {
+        let row = &live.row;
+        LiveSessionOut {
+            session_id: row.session_id,
+            session_key: row.session_key.clone(),
+            account: row.into(),
+            item: row.into(),
+            poster_url: row.media_metadata_id.map(poster_url),
+            backdrop_url: row.media_metadata_id.map(backdrop_url),
+            view_offset_ms: row.view_offset_ms,
+            duration_ms: row.duration_ms,
+            progress_pct: session_progress_pct(row.percent_complete, row.duration_ms),
+            player: row.player.clone(),
+            platform: row.platform.clone(),
+            product: row.product.clone(),
+            device: row.device.clone(),
+            state: live.state,
+            last_event_at: row.last_event_at,
+            started_at: row.started_at,
+            decision: row.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveSessionsResponse {
+    /// Discriminates this from a future `maestro-live` source (epic §8.8
+    /// spec J) — always `"muse-derived"` for this derived-view endpoint.
+    pub source: &'static str,
+    pub sessions: Vec<LiveSessionOut>,
+}
+
+/// `GET /api/sessions/live` — the derived live view: `stopped_at IS NULL`
+/// sessions passing the liveness rule (see
+/// `repo::play_session::classify_session_state`). `source: "muse-derived"`.
+///
+/// A true empty (`{"sessions": [], "source": "muse-derived"}`) is returned
+/// when no ingest is configured / nobody is watching — distinguishable from
+/// a degrade because a query FAILURE propagates as an error instead (see
+/// this section's module doc).
+/// Builds the actual envelope the handler serializes, factored out so a test
+/// can assert against the REAL `source` discriminator the handler emits
+/// (from an empty `Vec`, requiring no DB) instead of a hand-typed string
+/// that could drift from what `get_live_sessions` actually returns.
+fn build_live_sessions_response(
+    rows: Vec<repo::play_session::LiveSession>,
+) -> LiveSessionsResponse {
+    LiveSessionsResponse {
+        source: "muse-derived",
+        sessions: rows.into_iter().map(LiveSessionOut::from).collect(),
+    }
+}
+
+pub async fn get_live_sessions(
+    State(state): State<Arc<AppState>>,
+) -> MuseResult<Json<LiveSessionsResponse>> {
+    let grace_secs = state.config.session_active_grace_secs;
+    let rows = repo::play_session::list_live(&state.pool, grace_secs).await?;
+    Ok(Json(build_live_sessions_response(rows)))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistorySessionOut {
+    pub session_id: i64,
+    pub session_key: Option<String>,
+    pub account: SessionAccountOut,
+    pub item: SessionItemOut,
+    pub poster_url: Option<String>,
+    pub backdrop_url: Option<String>,
+    pub view_offset_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_pct: Option<f32>,
+    pub player: Option<String>,
+    pub platform: Option<String>,
+    pub product: Option<String>,
+    pub device: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub decision: SessionDecisionOut,
+}
+
+impl From<repo::play_session::SessionJoinRow> for HistorySessionOut {
+    fn from(row: repo::play_session::SessionJoinRow) -> Self {
+        HistorySessionOut {
+            session_id: row.session_id,
+            session_key: row.session_key.clone(),
+            account: (&row).into(),
+            item: (&row).into(),
+            poster_url: row.media_metadata_id.map(poster_url),
+            backdrop_url: row.media_metadata_id.map(backdrop_url),
+            view_offset_ms: row.view_offset_ms,
+            duration_ms: row.duration_ms,
+            progress_pct: session_progress_pct(row.percent_complete, row.duration_ms),
+            player: row.player.clone(),
+            platform: row.platform.clone(),
+            product: row.product.clone(),
+            device: row.device.clone(),
+            started_at: row.started_at,
+            decision: (&row).into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionHistoryQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistorySessionsResponse {
+    /// Always `"muse-history"` — Muse's PERMANENT role per MACT-01's spec;
+    /// this route does not change when spec J flips the live source.
+    pub source: &'static str,
+    pub sessions: Vec<HistorySessionOut>,
+}
+
+/// `GET /api/sessions/history?limit=` — Muse's permanent historical record
+/// over stopped sessions. Same projection as `/live`, `source: "muse-history"`.
+/// See [`build_live_sessions_response`] — same rationale, for history.
+fn build_history_sessions_response(
+    rows: Vec<repo::play_session::SessionJoinRow>,
+) -> HistorySessionsResponse {
+    HistorySessionsResponse {
+        source: "muse-history",
+        sessions: rows.into_iter().map(HistorySessionOut::from).collect(),
+    }
+}
+
+pub async fn get_session_history(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SessionHistoryQuery>,
+) -> MuseResult<Json<HistorySessionsResponse>> {
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let rows = repo::play_session::list_history(&state.pool, limit).await?;
+    Ok(Json(build_history_sessions_response(rows)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,6 +1796,215 @@ mod tests {
         assert_eq!(body["tracked_as"], "MUSE #86");
         // Must NOT look like a successful empty payload.
         assert!(body.get("items").is_none());
+    }
+}
+
+#[cfg(test)]
+mod mact01_sessions_tests {
+    use super::*;
+    use crate::models::play_session::DecisionKind;
+
+    /// MACT-01 AC: handlers are agnostic to who writes `play_sessions` — a
+    /// source-scan proof that neither this file's sessions section, nor the
+    /// repo layer it calls, references `tracker::poller` or keys behaviour on
+    /// `source = 'plex_poll'`. Mirrors the `no_playback_mutation_calls`
+    /// pattern in `tracker::interpret`.
+    #[test]
+    fn sessions_handlers_never_reference_tracker_poller_or_the_plex_poll_source() {
+        let dashboard_source = include_str!("dashboard.rs");
+        let section_start = dashboard_source
+            .find("// Sessions (MACT-01, Plane MUSE #121)")
+            .expect("MACT-01 sessions section marker must exist in dashboard.rs");
+        let section = &dashboard_source[section_start..];
+        // Stop at this test module itself so the FORBIDDEN strings appearing
+        // in comments *about* the rule (like this one) don't self-trigger.
+        let non_test_section = section.split("#[cfg(test)]").next().unwrap_or(section);
+
+        let repo_source = include_str!("../repo/play_session.rs");
+
+        const FORBIDDEN: &[&str] = &["tracker::poller", "poller::", "plex_poll"];
+        for pattern in FORBIDDEN {
+            assert!(
+                !non_test_section.contains(pattern),
+                "web::dashboard's MACT-01 sessions handlers must not reference {pattern:?}"
+            );
+            assert!(
+                !repo_source.contains(pattern),
+                "repo::play_session's MACT-01 queries must not reference {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_progress_pct_scales_the_stored_fraction_to_a_percentage() {
+        // MUSE #87's regression, re-pinned for the sessions projection.
+        assert_eq!(session_progress_pct(Some(0.48), Some(6_000_000)), Some(48.0));
+        assert_eq!(session_progress_pct(Some(1.0), Some(6_000_000)), Some(100.0));
+        assert_eq!(session_progress_pct(Some(0.0), Some(6_000_000)), Some(0.0));
+    }
+
+    #[test]
+    fn session_progress_pct_is_omitted_not_zero_when_duration_is_unknown() {
+        // MACT-01 edge case: an unknown duration means progress is unknown,
+        // never a fabricated `0%`.
+        assert_eq!(session_progress_pct(Some(0.48), None), None);
+        assert_eq!(session_progress_pct(None, Some(6_000_000)), None);
+        assert_eq!(session_progress_pct(None, None), None);
+    }
+
+    #[test]
+    fn decision_kind_str_passes_through_all_four_variants_verbatim() {
+        // MACT-01 AC: `copy`/`direct_stream`/`transcode` (and `direct_play`)
+        // must never collapse into a boolean "is transcoding" — assert each
+        // of the four persisted variants maps to its own distinct string.
+        assert_eq!(decision_kind_str(DecisionKind::DirectPlay), "direct_play");
+        assert_eq!(decision_kind_str(DecisionKind::DirectStream), "direct_stream");
+        assert_eq!(decision_kind_str(DecisionKind::Transcode), "transcode");
+        assert_eq!(decision_kind_str(DecisionKind::Copy), "copy");
+    }
+
+    /// Calls the SAME builder functions `get_live_sessions`/
+    /// `get_session_history` call ([`build_live_sessions_response`] /
+    /// [`build_history_sessions_response`]) rather than hand-constructing a
+    /// `LiveSessionsResponse`/`HistorySessionsResponse` literal — a
+    /// hand-typed literal would pass even if the handler's actual `source`
+    /// string drifted, since it never exercises the handler's own code.
+    #[test]
+    fn live_and_history_responses_carry_their_own_source_discriminator() {
+        let live = serde_json::to_value(build_live_sessions_response(Vec::new())).unwrap();
+        assert_eq!(live["source"], "muse-derived");
+        assert_eq!(live["sessions"], serde_json::json!([]));
+
+        let history = serde_json::to_value(build_history_sessions_response(Vec::new())).unwrap();
+        assert_eq!(history["source"], "muse-history");
+        assert_eq!(history["sessions"], serde_json::json!([]));
+    }
+
+    fn sample_join_row() -> repo::play_session::SessionJoinRow {
+        repo::play_session::SessionJoinRow {
+            session_id: 1,
+            account_id: Some(7),
+            account_display_name: Some("Alex".to_string()),
+            media_item_id: Some(42),
+            episode_id: None,
+            media_metadata_id: Some(99),
+            kind: Some(MediaKind::Movie),
+            title: Some("Arrival".to_string()),
+            year: Some(2016),
+            season_number: None,
+            episode_number: None,
+            episode_title: None,
+            session_key: Some("session-key-1".to_string()),
+            view_offset_ms: Some(1_000),
+            duration_ms: Some(6_000_000),
+            percent_complete: Some(0.48),
+            player: Some("Living Room".to_string()),
+            platform: Some("Plex Web".to_string()),
+            product: Some("Plex Web".to_string()),
+            device: Some("Chrome".to_string()),
+            started_at: Utc::now(),
+            last_event_type: Some("media.play".to_string()),
+            last_event_at: Some(Utc::now()),
+            video_decision: Some(DecisionKind::Transcode),
+            audio_decision: Some(DecisionKind::Copy),
+            transcode_decision: Some(DecisionKind::Transcode),
+            container: Some("mkv".to_string()),
+            video_codec: Some("hevc".to_string()),
+            audio_codec: Some("aac".to_string()),
+            audio_channels: Some(2.0),
+            video_resolution: Some("1080".to_string()),
+            bitrate: Some(8_000_000),
+            transcode_reason: Some("video codec unsupported by device".to_string()),
+        }
+    }
+
+    /// MACT-01 AC: `ip_address` is on `PlaySession`/`PlayEvent` but nothing
+    /// in the sessions read path selects it, holds it, or serializes it.
+    /// Proven both structurally (the row/output types below have no such
+    /// field, so this would fail to COMPILE if one were added) and by
+    /// asserting it is absent from the actual serialized JSON.
+    #[test]
+    fn ip_address_is_never_serialized_in_a_live_or_history_session() {
+        let live_out = LiveSessionOut::from(repo::play_session::LiveSession {
+            row: sample_join_row(),
+            state: repo::play_session::SessionPlayState::Playing,
+        });
+        let live_json = serde_json::to_value(&live_out).unwrap();
+        assert!(live_json.get("ip_address").is_none());
+        assert!(!serde_json::to_string(&live_json).unwrap().contains("ip_address"));
+
+        let history_out = HistorySessionOut::from(sample_join_row());
+        let history_json = serde_json::to_value(&history_out).unwrap();
+        assert!(history_json.get("ip_address").is_none());
+    }
+
+    #[test]
+    fn live_session_out_carries_the_classified_state_and_decision_block_verbatim() {
+        let out = LiveSessionOut::from(repo::play_session::LiveSession {
+            row: sample_join_row(),
+            state: repo::play_session::SessionPlayState::Stale,
+        });
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["state"], "stale");
+        assert_eq!(json["decision"]["video_decision"], "transcode");
+        assert_eq!(json["decision"]["audio_decision"], "copy");
+        assert_eq!(json["progress_pct"], 48.0);
+    }
+
+    /// MACT-01 edge case, asserted at the SERIALIZED shape (not just the
+    /// Rust `Option` value): `duration_ms: None` must make `progress_pct`
+    /// absent from the JSON body entirely, never present as `null`. A
+    /// dashboard client checking `"progress_pct" in body` (or any falsy/
+    /// nullish check that still sees the key) would otherwise be fooled by
+    /// a `null` that reads differently from a genuinely missing field.
+    #[test]
+    fn progress_pct_is_absent_from_the_serialized_body_not_null_when_duration_is_unknown() {
+        let mut row = sample_join_row();
+        row.duration_ms = None;
+
+        let live_json = serde_json::to_value(LiveSessionOut::from(repo::play_session::LiveSession {
+            row: row.clone(),
+            state: repo::play_session::SessionPlayState::Playing,
+        }))
+        .unwrap();
+        assert!(
+            live_json.as_object().unwrap().get("progress_pct").is_none(),
+            "progress_pct must be OMITTED, not serialized as null: {live_json}"
+        );
+
+        let history_json = serde_json::to_value(HistorySessionOut::from(row)).unwrap();
+        assert!(
+            history_json.as_object().unwrap().get("progress_pct").is_none(),
+            "progress_pct must be OMITTED, not serialized as null: {history_json}"
+        );
+    }
+
+    /// Same fail-open-proof pattern as
+    /// `the_new_dashboard_handlers_cannot_swallow_a_query_error_into_a_2xx`
+    /// above, for the two MACT-01 handlers — strengthened past a bare
+    /// `Fn(&AppState) -> T` (which unifies `T` with whatever the function
+    /// actually returns and therefore proves nothing about `MuseResult`
+    /// specifically): these helpers pin the closure's `Fut::Output` to
+    /// `MuseResult<Json<_>>`, so this fails to COMPILE if either handler's
+    /// signature ever changes to return a bare `Json<_>` (a fail-open).
+    fn assert_state_handler_returns_museresult<T, Fut, F>(_: F)
+    where
+        F: Fn(State<Arc<AppState>>) -> Fut,
+        Fut: std::future::Future<Output = MuseResult<Json<T>>>,
+    {
+    }
+
+    fn assert_state_query_handler_returns_museresult<T, Q, Fut, F>(_: F)
+    where
+        F: Fn(State<Arc<AppState>>, Query<Q>) -> Fut,
+        Fut: std::future::Future<Output = MuseResult<Json<T>>>,
+    {
+    }
+
+    #[test]
+    fn sessions_handlers_cannot_swallow_a_query_error_into_a_2xx() {
+        assert_state_handler_returns_museresult(get_live_sessions);
+        assert_state_query_handler_returns_museresult(get_session_history);
     }
 }
 

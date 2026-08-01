@@ -67,6 +67,7 @@ A fuller derived diagram, per-subsystem narrative, and the end-to-end request fl
 | `repo` | The sqlx query layer — the only place raw SQL lives (279 KG nodes, one module per table group) | [reference/repo](docs/reference/repo.md) |
 | `models` | Typed rows + `New*` insert structs for the arr-shaped core schema and the telemetry/taste layer | [reference/models](docs/reference/models.md) |
 | `tracker` | Native Plex playback tracker: webhook + session poller + idempotent session reconstruction | [reference/tracker](docs/reference/tracker.md) |
+| `web::dashboard` (sessions) | Read path over `play_sessions` — `GET /api/sessions/live` (derived, liveness-checked) + `GET /api/sessions/history` | [HTTP API surface](docs/reference/http-api-surface-24-routes.md) |
 | `arr` | Read-only multi-instance Radarr/Sonarr ingest + tiered request-safety classification | [reference/arr](docs/reference/arr.md) |
 | `prowlarr` | Polite, rate-limited indexer report-pull, release-name parsing, targeted search | [reference/prowlarr](docs/reference/prowlarr.md) |
 | `metadata` | Provider-agnostic metadata seam: TheTVDB v4 client + normalized provider shape | [reference/metadata](docs/reference/metadata.md) |

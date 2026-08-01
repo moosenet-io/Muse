@@ -52,6 +52,25 @@ default **off**, the same tiered-safety flag `arr::request::classify_tier` has a
 either off, `POST /requests` still persists the request — it just never reaches
 `acquisition::fulfill_request`.
 
+**Sessions (MACT-01, auth-gated — `Authorization: Bearer <MUSE_API_TOKEN>`)**
+- `GET /api/sessions/live` — the derived live view: `play_sessions` rows with `stopped_at IS NULL`
+  passing a liveness check (the newest matching `play_events` row must be within
+  `MUSE_SESSION_ACTIVE_GRACE_SECS`, default `max(3 × poll cadence, 60)` — an open-but-stale row is
+  reported `state: "stale"` with its `last_event_at`, never dropped and never shown as playing).
+  Envelope: `{source: "muse-derived", sessions: [...]}`. Per session: account (id + display name,
+  the Muse account — never the constellation-web cookie session), item (title/year/kind/
+  season+episode when applicable/`media_item_id`), same-origin poster/backdrop URLs, position/
+  duration/`progress_pct` (a real percentage; the field is OMITTED entirely — not present as
+  `null` — when `duration_ms` is unknown, never a fabricated `0%`), player/platform/product/device,
+  `state` (`"playing"`/`"paused"`/`"stale"`), and
+  the joined decision block (`video_decision`/`audio_decision`/`transcode_decision` emitted verbatim
+  — `direct_play`/`direct_stream`/`transcode`/`copy` — plus `transcode_reason`, container, codecs,
+  channels, resolution, bitrate). `ip_address` is never serialized. A query failure propagates as an
+  error rather than a false empty list.
+- `GET /api/sessions/history?limit=` — Muse's permanent historical record over stopped sessions
+  (`source: "muse-history"`), same per-session projection minus the liveness fields. `limit` defaults
+  to 50, capped at 500.
+
 **Linear tuner (HDHomeRun-emulation) + streaming**
 - `GET /discover.json` — HDHomeRun device descriptor.
 - `GET /lineup_status.json` — static scan status.

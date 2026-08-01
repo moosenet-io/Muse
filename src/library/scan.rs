@@ -52,7 +52,14 @@ use crate::repo;
 /// strips as a "known extension" plus the common remaining container types.
 pub const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "m4v", "mov", "wmv", "ts", "webm"];
 
-fn has_media_extension(path: &Path) -> bool {
+/// Whether a path has an extension the scanner treats as media.
+///
+/// `pub` so other modules resolving a release folder to its feature file use
+/// the SAME list the scanner does — two copies of this list would drift, and a
+/// subtitle lookup that disagreed with the scanner about what counts as media
+/// is exactly the kind of divergence nobody notices until a container is
+/// missing from one of them.
+pub fn has_media_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| MEDIA_EXTENSIONS.contains(&e.to_lowercase().as_str()))

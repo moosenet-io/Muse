@@ -611,10 +611,30 @@ const SESSION_JOIN_SELECT: &str = r#"
           -- event -- including one that predates this session even
           -- starting -- and falsely mark a dead session as live. Bound the
           -- correlation to this session's own lifetime: no earlier than
-          -- `started_at`, no later than `stopped_at` when the session has
-          -- one (an open session has no upper bound yet).
+          -- `started_at`, and on the upper edge:
+          --   * a STOPPED session bounds cleanly at its own `stopped_at`.
+          --   * an OPEN session (`stopped_at IS NULL`) has no `stopped_at`
+          --     to bound against -- and this feature deliberately KEEPS a
+          --     stale open row around (that's the whole point of the
+          --     `stale` state), so a second review pass confirmed such rows
+          --     are guaranteed to exist in practice. Without an upper bound
+          --     here, a later session reusing the SAME key would have its
+          --     fresh event picked up by the dead OLD row too (both rows'
+          --     correlated subqueries would see it), reporting the same
+          --     event as "playing" twice. So an open session's window ends
+          --     strictly before the next later session that reused its key
+          --     starts (or `infinity` if there is no later one).
           AND pe.received_at >= ps.started_at
-          AND (ps.stopped_at IS NULL OR pe.received_at <= ps.stopped_at)
+          AND (
+              (ps.stopped_at IS NOT NULL AND pe.received_at <= ps.stopped_at)
+              OR
+              (ps.stopped_at IS NULL AND pe.received_at < COALESCE(
+                  (SELECT MIN(ps2.started_at) FROM play_sessions ps2
+                    WHERE ps2.session_key = ps.session_key
+                      AND ps2.started_at > ps.started_at),
+                  'infinity'::timestamptz
+              ))
+          )
         -- `id DESC` as a deterministic tiebreak: two events can share the
         -- same `received_at` (timestamp granularity), and without a
         -- secondary key `ORDER BY received_at DESC LIMIT 1` picks between
@@ -827,10 +847,23 @@ mod mact01_tests {
 
         async fn test_pool_or_skip(test_name: &str) -> Option<PgPool> {
             let Ok(database_url) = std::env::var("MUSE_TEST_DATABASE_URL") else {
-                eprintln!(
-                    "MUSE_TEST_DATABASE_URL not set — skipping {test_name} \
-                     (expected in the default test run; this harness does not \
-                     require a live DB)"
+                // A plain `eprintln!` here is INVISIBLE in a normal `cargo
+                // test` run: libtest captures a PASSING test's stdout/stderr
+                // (only a FAILURE dumps it, or `--nocapture`), and this early
+                // return still reports the test as `ok` -- so the SQL this
+                // module exists to exercise can silently never run while the
+                // suite reads green. `print!`/`eprintln!` go through a
+                // thread-local hook libtest swaps out to capture; writing
+                // directly to the real stderr file descriptor via
+                // `std::io::stderr()` bypasses that hook entirely, so this
+                // line is genuinely visible in a default (no `--nocapture`)
+                // run, without changing pass/fail semantics or the in-tree
+                // skip-cleanly convention every other `db_gated` module uses.
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[db_gated SKIP] MUSE_TEST_DATABASE_URL not set — {test_name} did NOT run \
+                     against a live database (expected in the default test run)"
                 );
                 return None;
             };
@@ -1260,6 +1293,216 @@ mod mact01_tests {
             // The older session must never appear in `list_live` at all
             // (it's stopped) regardless of the key reuse.
             assert!(live.iter().all(|s| s.row.session_id != older_session.id));
+        }
+
+        /// Review finding (codex, confirmed — second pass): the first fix
+        /// bounded the correlation's upper edge only for a STOPPED session
+        /// (`<= ps.stopped_at`); an OPEN row (`stopped_at IS NULL`) had NO
+        /// upper bound at all. And this feature deliberately RETAINS stale
+        /// open rows (that's the entire point of the `stale` state), so an
+        /// old orphaned open row is exactly the shape guaranteed to exist in
+        /// practice: Plex reuses its `session_key` for a brand new session,
+        /// and the new session's fresh event would satisfy
+        /// `received_at >= old.started_at` with no upper bound to stop it,
+        /// so the dead OLD row picks it up too and reports `Playing`
+        /// alongside the genuinely live one.
+        ///
+        /// Proves the fix: an OLDER row that is STILL OPEN, a NEWER row
+        /// reusing the same `session_key`, and one fresh event belonging to
+        /// the newer session — the older row must be `Stale` and must NOT
+        /// claim the newer session's event.
+        #[tokio::test]
+        async fn older_still_open_row_does_not_claim_a_newer_same_key_sessions_event() {
+            let Some(pool) = test_pool_or_skip(
+                "older_still_open_row_does_not_claim_a_newer_same_key_sessions_event",
+            )
+            .await
+            else {
+                return;
+            };
+
+            let (account_id,): (i64,) = sqlx::query_as(
+                "INSERT INTO accounts (username, friendly_name, is_home_user, is_primary) \
+                 VALUES ('mact01-orphan-fixture', 'MACT01 Orphan Fixture', true, false) \
+                 RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("seed account");
+            let suffix = account_id;
+
+            let library = crate::repo::library::create(
+                &pool,
+                &NewLibrary {
+                    name: format!("mact01-orphan-lib-{suffix}"),
+                    kind: LibraryKind::Movie,
+                    root_folder: "/media/mact01-orphan-test".to_string(),
+                    source_arr_name: None,
+                    source_arr_url: None,
+                },
+            )
+            .await
+            .expect("create library");
+
+            let metadata = crate::repo::media_metadata::upsert_by_tmdb(
+                &pool,
+                &NewMediaMetadata {
+                    kind: MediaKind::Movie,
+                    tmdb_id: Some(format!("mact01-orphan-{suffix}")),
+                    tvdb_id: None,
+                    imdb_id: None,
+                    provider_ids: serde_json::json!({}),
+                    title: format!("MACT01 Orphan Fixture Film {suffix}"),
+                    sort_title: None,
+                    original_title: None,
+                    original_language: None,
+                    status: None,
+                    overview: None,
+                    studio: None,
+                    network: None,
+                    runtime_minutes: Some(100),
+                    year: Some(2021),
+                    images: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("upsert media_metadata");
+
+            let item = crate::repo::media_item::upsert(
+                &pool,
+                &NewMediaItem {
+                    library_id: library.id,
+                    media_metadata_id: metadata.id,
+                    path: format!("/media/mact01-orphan-test/film-{suffix}.mkv"),
+                    monitored: true,
+                    quality_profile_id: None,
+                    minimum_availability: None,
+                    plex_rating_key: Some(format!("mact01-orphan-rk-{suffix}")),
+                    added_at: None,
+                },
+            )
+            .await
+            .expect("upsert media_item");
+
+            let reused_key = format!("mact01-orphan-reused-key-{suffix}");
+            let now = Utc::now();
+
+            // The OLDER row: started 3h ago, NEVER stopped (an orphaned
+            // session — a crashed player, a missed stop event, exactly what
+            // the `stale` state exists to represent). Deliberately no event
+            // is inserted for it directly; the bug under test is whether it
+            // wrongly picks up the NEWER session's event below.
+            let older_open_session = upsert(
+                &pool,
+                &NewPlaySession {
+                    account_id: Some(account_id),
+                    media_item_id: Some(item.id),
+                    episode_id: None,
+                    session_key: Some(reused_key.clone()),
+                    tautulli_ref_id: None,
+                    started_at: now - chrono::Duration::hours(3),
+                    stopped_at: None,
+                    duration_ms: Some(6_000_000),
+                    watched_ms: Some(500_000),
+                    view_offset_ms: Some(500_000),
+                    percent_complete: Some(0.08),
+                    paused_counter: 0,
+                    paused_ms: 0,
+                    is_finished: false,
+                    is_abandoned: false,
+                    player: Some("Living Room".to_string()),
+                    platform: Some("Plex Web".to_string()),
+                    product: Some("Plex Web".to_string()),
+                    device: Some("Chrome".to_string()),
+                    ip_address: None,
+                    started_hour: None,
+                    started_dow: None,
+                    is_cinema_context: None,
+                },
+            )
+            .await
+            .expect("upsert older open (orphaned) session");
+
+            // The NEWER row: same reused `session_key`, started 5 minutes
+            // ago, also still open.
+            let newer_started_at = now - chrono::Duration::minutes(5);
+            let newer_session = upsert(
+                &pool,
+                &NewPlaySession {
+                    account_id: Some(account_id),
+                    media_item_id: Some(item.id),
+                    episode_id: None,
+                    session_key: Some(reused_key.clone()),
+                    tautulli_ref_id: None,
+                    started_at: newer_started_at,
+                    stopped_at: None,
+                    duration_ms: Some(6_000_000),
+                    watched_ms: Some(300_000),
+                    view_offset_ms: Some(300_000),
+                    percent_complete: Some(0.05),
+                    paused_counter: 0,
+                    paused_ms: 0,
+                    is_finished: false,
+                    is_abandoned: false,
+                    player: Some("Living Room".to_string()),
+                    platform: Some("Plex Web".to_string()),
+                    product: Some("Plex Web".to_string()),
+                    device: Some("Chrome".to_string()),
+                    ip_address: None,
+                    started_hour: None,
+                    started_dow: None,
+                    is_cinema_context: None,
+                },
+            )
+            .await
+            .expect("upsert newer open session reusing the key");
+
+            // ONE fresh event, belonging (in real life) to the NEWER
+            // session — it lands well after `newer_started_at`.
+            crate::repo::play_event::insert(
+                &pool,
+                &NewPlayEvent {
+                    source: "mact01_test".to_string(),
+                    event_type: "media.play".to_string(),
+                    account_ref: None,
+                    session_key: Some(reused_key.clone()),
+                    rating_key: Some(format!("mact01-orphan-rk-{suffix}")),
+                    view_offset_ms: Some(310_000),
+                    player: Some("Living Room".to_string()),
+                    platform: Some("Plex Web".to_string()),
+                    product: Some("Plex Web".to_string()),
+                    device: Some("Chrome".to_string()),
+                    ip_address: None,
+                    raw: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("insert fresh play_event");
+
+            let live = list_live(&pool, 60).await.expect("list_live");
+
+            let older_hit = live
+                .iter()
+                .find(|s| s.row.session_id == older_open_session.id)
+                .expect("the older orphaned session must still be reported (never dropped)");
+            // The bug: without an upper bound on an OPEN session's
+            // correlation window, this row would ALSO see the newer
+            // session's fresh event (received_at >= older.started_at holds,
+            // 3 hours is well within reach) and report `Playing`. It must
+            // instead see no event of its own and be `Stale`.
+            assert_eq!(
+                older_hit.row.last_event_at, None,
+                "the older, still-open orphaned row must not claim the newer \
+                 same-key session's event"
+            );
+            assert_eq!(older_hit.state, SessionPlayState::Stale);
+
+            let newer_hit = live
+                .iter()
+                .find(|s| s.row.session_id == newer_session.id)
+                .expect("the newer session must appear in list_live");
+            assert!(newer_hit.row.last_event_at.is_some());
+            assert_eq!(newer_hit.state, SessionPlayState::Playing);
         }
     }
 }

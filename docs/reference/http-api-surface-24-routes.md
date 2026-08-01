@@ -60,8 +60,9 @@ either off, `POST /requests` still persists the request — it just never reache
   Envelope: `{source: "muse-derived", sessions: [...]}`. Per session: account (id + display name,
   the Muse account — never the constellation-web cookie session), item (title/year/kind/
   season+episode when applicable/`media_item_id`), same-origin poster/backdrop URLs, position/
-  duration/`progress_pct` (a real percentage, `null` when `duration_ms` is unknown — never a
-  fabricated `0%`), player/platform/product/device, `state` (`"playing"`/`"paused"`/`"stale"`), and
+  duration/`progress_pct` (a real percentage; the field is OMITTED entirely — not present as
+  `null` — when `duration_ms` is unknown, never a fabricated `0%`), player/platform/product/device,
+  `state` (`"playing"`/`"paused"`/`"stale"`), and
   the joined decision block (`video_decision`/`audio_decision`/`transcode_decision` emitted verbatim
   — `direct_play`/`direct_stream`/`transcode`/`copy` — plus `transcode_reason`, container, codecs,
   channels, resolution, bitrate). `ip_address` is never serialized. A query failure propagates as an

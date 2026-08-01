@@ -233,6 +233,8 @@ fn ops_routes() -> Router<Arc<AppState>> {
         // before re-reading `/api/library*`. See
         // `crate::web::dashboard::trigger_library_scan`.
         .route("/library/scan", post(crate::web::dashboard::trigger_library_scan))
+        // FOUNDRY-02: report what transcoding WOULD do. Encodes nothing, writes nothing.
+        .route("/foundry/survey", post(crate::web::dashboard::foundry_survey))
 }
 
 /// MUSE-28/29: the linear tuner surface — HDHomeRun-emulation discovery

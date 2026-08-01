@@ -1585,3 +1585,89 @@ mod library_kind_tests {
         assert_eq!(normalize("movie;drop"), None);
     }
 }
+
+// ===========================================================================
+// FOUNDRY-02: transcode survey (dry run)
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SurveyQuery {
+    /// How many files to examine. Bounded so a survey cannot become an accidental
+    /// hours-long ffprobe sweep of the whole library on a shared host.
+    pub limit: Option<usize>,
+}
+
+/// `POST /ops/foundry/survey` — report what transcoding WOULD do. Encodes nothing.
+///
+/// This is the deliberate first wiring of MUSEF-02, which until now had no production caller at
+/// all: `optimize_file` existed and nothing invoked it, so the stage had never run and the first
+/// file it touched would have been a real one in the library.
+///
+/// The survey never calls `optimize_file`, so it cannot encode or replace anything even if
+/// `MUSE_FOUNDRY_ENABLE_MUTATION` is on. Turning execution on stays a separate, deliberate act.
+pub async fn foundry_survey(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SurveyQuery>,
+) -> MuseResult<Json<Value>> {
+    let Some(foundry) = crate::foundry::Foundry::from_config(&state.config) else {
+        // NOT an empty survey. "Foundry is not configured" and "nothing needs transcoding" are
+        // different facts, and a zero-count report would read as the second.
+        return Ok(Json(json!({
+            "ran": false,
+            "reason": "foundry is not configured (MUSE_FOUNDRY_* unset) — nothing was examined",
+        })));
+    };
+
+    let caps = foundry.capabilities();
+    let limit = q.limit.unwrap_or(25).clamp(1, 500);
+
+    // Candidates come from the same walker the library scanner uses, so the survey looks at
+    // exactly the files Muse considers media — not a second, divergent notion of "a video".
+    let Some(root) = state.config.library_root.clone() else {
+        // Same distinction as above: no root configured is not an empty library.
+        return Ok(Json(json!({
+            "ran": false,
+            "reason": "MUSE_LIBRARY_ROOT is not set — there is nothing to survey",
+        })));
+    };
+    let candidates: Vec<std::path::PathBuf> =
+        crate::library::scan::walk_media_files(std::path::Path::new(&root))
+            .into_iter()
+            .map(|f| f.absolute_path)
+            .collect();
+
+    let policy = crate::foundry::policy::TranscodePolicy::default();
+    let summary = crate::foundry::survey::survey_files(&foundry, &policy, &candidates, limit);
+
+    Ok(Json(json!({
+        "ran": true,
+        "dry_run": true,
+        "capabilities": {
+            "ffprobe": format!("{:?}", caps.ffprobe),
+            "ffmpeg": format!("{:?}", caps.ffmpeg),
+            "can_transcode": caps.can_transcode(),
+        },
+        "candidates_found": candidates.len(),
+        "examined": summary.examined,
+        "truncated": summary.truncated,
+        "counts": {
+            "already_optimal": summary.already_optimal,
+            "would_transcode": summary.would_transcode,
+            "cannot_decide": summary.cannot_decide,
+            "probe_failed": summary.probe_failed,
+        },
+        // A judgement about the SURVEY, not an instruction. `surveyed` means the counts are
+        // worth reading, never "go ahead and enable mutation".
+        "readiness": summary.readiness().as_str(),
+        "files": summary.files.iter().map(|f| json!({
+            "path": f.path,
+            "outcome": f.outcome.as_str(),
+            "detail": match &f.outcome {
+                crate::foundry::survey::SurveyOutcome::WouldTranscode { reasons } => json!(reasons),
+                crate::foundry::survey::SurveyOutcome::CannotDecide { why } => json!(why),
+                crate::foundry::survey::SurveyOutcome::ProbeFailed { error } => json!(error),
+                crate::foundry::survey::SurveyOutcome::AlreadyOptimal => Value::Null,
+            },
+        })).collect::<Vec<_>>(),
+    })))
+}

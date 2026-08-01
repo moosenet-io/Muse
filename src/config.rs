@@ -300,6 +300,39 @@ pub struct Config {
     /// `HandBrakeCLI` binary (a `PATH` name or an absolute path).
     pub foundry_handbrake_bin: Option<String>,
 
+    // --- SUBS-01: the subtitle system ---
+    /// Wyzie subtitle-provider API key (`WYZIE_KEY`).
+    ///
+    /// Wrapped in `QbitPassword` (S7) so a stray `{:?}` on this `Config` — or
+    /// on anything holding it — cannot print the credential; it is also
+    /// attached to requests through `reqwest`'s query builder and never
+    /// interpolated into a URL that could reach a log or an error body (see
+    /// `subtitles::wyzie`). Materialized into the process environment from
+    /// <secret-manager> at runtime, never a literal in source (S1/S7).
+    ///
+    /// `None` (the default) means the PROVIDER tier of the subtitle system is
+    /// unavailable — embedded and sidecar discovery are unaffected, and the
+    /// API reports "provider not configured" rather than "no subtitles
+    /// found". Same graceful-degrade posture as `tmdb_api_key`.
+    pub wyzie_key: Option<QbitPassword>,
+    /// Wyzie base URL override (`MUSE_WYZIE_BASE_URL`). `None` uses
+    /// `subtitles::wyzie::DEFAULT_BASE_URL`. Not secret-shaped (a host, not a
+    /// credential) — exists so a test (httpmock) or a proxy can point the
+    /// client elsewhere, the same seam `tvdb_base_url`/`trakt_base_url`
+    /// provide.
+    pub wyzie_base_url: Option<String>,
+    /// Where Muse writes subtitles it fetched or re-timed
+    /// (`MUSE_SUBTITLE_STORE_DIR`).
+    ///
+    /// Deliberately a SEPARATE directory from the library rather than a
+    /// sidecar written beside the media file. Two reasons: the library root is
+    /// treated as read-only everywhere else in this crate
+    /// (`library::sidecar`, `library::scan`), and an adjusted subtitle must
+    /// never be able to overwrite an original the operator may want back.
+    /// `None` means Muse cannot persist a fetched or adjusted subtitle and
+    /// says so, rather than falling back to writing into the library.
+    pub subtitle_store_dir: Option<String>,
+
     /// MUSE-12: how often the proactive-content generator worker wakes up
     /// to run all five generators for every account
     /// (`MUSE_PROACTIVE_TICK_INTERVAL_SECS`). Purely a wake cadence, not a
@@ -648,6 +681,11 @@ impl Config {
                 .and_then(|v| v.parse::<u32>().ok()),
             foundry_ffprobe_bin: env_opt("MUSE_FOUNDRY_FFPROBE_BIN"),
             foundry_handbrake_bin: env_opt("MUSE_FOUNDRY_HANDBRAKE_BIN"),
+            // SUBS-01. Read exactly like every other optional credential:
+            // from the environment at runtime, never a literal.
+            wyzie_key: env_opt("WYZIE_KEY").map(QbitPassword::from),
+            wyzie_base_url: env_opt("MUSE_WYZIE_BASE_URL"),
+            subtitle_store_dir: env_opt("MUSE_SUBTITLE_STORE_DIR").filter(|v| !v.trim().is_empty()),
 
             proactive_tick_interval_secs: env_u64("MUSE_PROACTIVE_TICK_INTERVAL_SECS", 3600),
 
@@ -831,6 +869,14 @@ impl Default for Config {
             foundry_retention_days: None,
             foundry_ffprobe_bin: None,
             foundry_handbrake_bin: None,
+
+            // SUBS-01 defaults are the SAFE values: no provider credential
+            // (so the provider tier is inert) and no store directory (so
+            // nothing can be written anywhere). A test that wants either opts
+            // in explicitly.
+            wyzie_key: None,
+            wyzie_base_url: None,
+            subtitle_store_dir: None,
             proactive_tick_interval_secs: 3600,
             maintenance_tick_secs: 1800,
             trending_tick_secs: 86400,

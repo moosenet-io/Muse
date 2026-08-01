@@ -35,6 +35,7 @@ pub mod proactive_item;
 pub mod quality;
 pub mod release;
 pub mod season;
+pub mod subtitle;
 pub mod taste;
 pub mod taste_divergence;
 pub mod taxonomy;

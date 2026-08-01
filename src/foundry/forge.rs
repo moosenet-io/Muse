@@ -376,20 +376,24 @@ pub fn expectation_for(
     // source count, and asserting nothing there would be the same silent gap
     // the planner's `UnknownAudioChannels` rule closes.
     let mut audio = Vec::with_capacity(source.audio.len());
-    for a in &source.audio {
+    for (i, a) in source.audio.iter().enumerate() {
         let channels = a.channels?;
-        audio.push(match plan.audio {
+        audio.push(match &plan.audio {
             AudioAction::Copy => ExpectedAudio {
                 codec: a.codec.clone(),
                 channels,
                 language: a.language.clone(),
             },
-            AudioAction::Encode => ExpectedAudio {
+            AudioAction::Encode { channels: targets } => ExpectedAudio {
                 codec: "aac".to_string(),
-                // `-ac N` sets the output channel count exactly, so a source
-                // already at or below the ceiling comes out unchanged and only
-                // a wider one is downmixed.
-                channels: channels.min(policy.max_audio_channels),
+                // Read from the PLAN, not recomputed. `-ac` sets the channel
+                // count exactly rather than capping it, and when this was
+                // derived independently here the argv and the expectation
+                // disagreed: the argv upmixed stereo to the 6-channel ceiling
+                // while this correctly expected 2. One number, read twice.
+                channels: targets.get(i).copied().unwrap_or(
+                    channels.min(policy.max_audio_channels),
+                ),
                 language: a.language.clone(),
             },
         });
@@ -1615,7 +1619,7 @@ mod tests {
         TranscodePlan {
             video_stream_index: 0,
             video: VideoAction::Encode { scale },
-            audio: AudioAction::Encode,
+            audio: AudioAction::Encode { channels: vec![2] },
             container: Container::Matroska,
         }
     }
@@ -2025,7 +2029,16 @@ mod tests {
         let mut s = rich_source();
         s.audio[0].channels = Some(8);
         s.audio[1].channels = Some(2);
-        let expect = expectation_for(&s, &encode_plan(None), &TranscodePolicy::default()).unwrap();
+        // The plan CARRIES the per-stream targets, already clamped by
+        // `plan_transcode`: 8ch -> the 6ch ceiling, 2ch stays 2ch. The
+        // expectation reads them rather than deriving its own, which is the
+        // whole point — when the two derived independently, the argv upmixed
+        // stereo to 6 while this expected 2.
+        let plan = TranscodePlan {
+            audio: AudioAction::Encode { channels: vec![6, 2] },
+            ..encode_plan(None)
+        };
+        let expect = expectation_for(&s, &plan, &TranscodePolicy::default()).unwrap();
         assert_eq!(expect.audio[0].codec, "aac");
         assert_eq!(expect.audio[0].channels, 6, "8ch must be downmixed to the ceiling");
         assert_eq!(

@@ -593,7 +593,13 @@ pub fn argv_writes_only_to(
         if a.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
             continue; // a negative number, e.g. "-1"
         }
-        if !READ_ONLY_OPTIONS.contains(&a.as_str()) {
+        // Per-stream specifiers (`-ac:a:0`, `-c:v`, `-b:a:1`) are the same
+        // option with a stream selector appended, so the allowlist is checked
+        // against the part before the first ':'. Still fail-closed: the BASE
+        // option must be listed, and an unknown base is refused whatever
+        // selector follows it.
+        let base = a.split(':').next().unwrap_or(a.as_str());
+        if !READ_ONLY_OPTIONS.contains(&a.as_str()) && !READ_ONLY_OPTIONS.contains(&base) {
             return Err(ArgvRefusal::OptionNotKnownReadOnly { option: a.clone() });
         }
     }
@@ -1008,7 +1014,7 @@ pub fn describe_plan(plan: &TranscodePlan) -> String {
     };
     let audio = match plan.audio {
         AudioAction::Copy => "audio: copy",
-        AudioAction::Encode => "audio: re-encode to aac",
+        AudioAction::Encode { .. } => "audio: re-encode to aac",
     };
     format!(
         "{video}; {audio}; container: {}{}",
@@ -2644,7 +2650,7 @@ mod tests {
             video: VideoAction::Encode {
                 scale: Some((1920, 1080)),
             },
-            audio: AudioAction::Encode,
+            audio: AudioAction::Encode { channels: vec![2] },
             ..remux
         };
         let d = describe_plan(&encode);

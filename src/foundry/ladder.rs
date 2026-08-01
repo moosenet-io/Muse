@@ -399,7 +399,7 @@ fn decide_rung(
         // --- the hifi rung: remux or nothing -------------------------------
         VideoTreatment::CopyOnly => {
             let re_encodes_video = matches!(plan.video, VideoAction::Encode { .. });
-            let re_encodes_audio = plan.audio == crate::foundry::plan::AudioAction::Encode;
+            let re_encodes_audio = matches!(plan.audio, crate::foundry::plan::AudioAction::Encode { .. });
             if re_encodes_video || re_encodes_audio {
                 return RenditionOutcome::Refused {
                     why: RenditionRefusal::HifiWouldRequireReEncoding {
@@ -784,7 +784,7 @@ pub fn build_rendition_args(
             push(&mut a, "-c:a");
             push(&mut a, "copy");
         }
-        crate::foundry::plan::AudioAction::Encode => {
+        crate::foundry::plan::AudioAction::Encode { .. } => {
             push(&mut a, "-c:a");
             push(&mut a, "aac");
             push(&mut a, "-ac");

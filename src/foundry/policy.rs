@@ -366,6 +366,69 @@ pub fn scale_to_fit(width: u32, height: u32, max_width: u32, max_height: u32) ->
 
 #[cfg(test)]
 mod tests {
+
+    /// Path A's policy must be the one production actually uses.
+    ///
+    /// It was not. `direct_play_normalization` — 4K ceiling, 100 Mbps, built
+    /// by FOUNDRY-03 precisely so Path A would not destroy 4K/HDR — was
+    /// referenced only from tests and doc comments. Both the validation
+    /// harness and the survey ran `TranscodePolicy::default()`, which caps at
+    /// 1080p and 12 Mbps.
+    ///
+    /// The consequence was not academic: a validation run on a real Dolby
+    /// Vision file was observed emitting
+    /// `-vf scale=1920:1036 -pix_fmt yuv420p` with no tone-map — downscaling
+    /// 4K and forcing 10-bit HDR to 8-bit, during a run whose entire purpose
+    /// was to prove 4K/HDR is handled safely.
+    #[test]
+    fn the_production_endpoints_use_path_as_policy_not_the_default() {
+        let dash = include_str!("../web/dashboard.rs");
+
+        // Scan the ASSIGNMENT SITES, not a "non-test section".
+        //
+        // dashboard.rs has four separate `#[cfg(test)]` modules and the
+        // production handlers sit AFTER the first one, so splitting on it
+        // hides exactly the code under test — my first version of this test
+        // did that and failed for the wrong reason. Matching the assignment
+        // is unambiguous and does not depend on module boundaries.
+        let sites: Vec<&str> = dash
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("let policy") && l.contains("TranscodePolicy::"))
+            .collect();
+
+        assert!(
+            !sites.is_empty(),
+            "expected to find the policy assignments; the scan is looking in the wrong place"
+        );
+        for site in &sites {
+            assert!(
+                site.contains("direct_play_normalization()"),
+                "every endpoint must use PATH A's policy. The default caps at 1080p/12Mbps/8-bit \
+                 and says nothing about what Path A would do — a validation run on a real Dolby \
+                 Vision file was observed emitting `-vf scale=1920:1036 -pix_fmt yuv420p` with no \
+                 tone-map because of exactly this. Offending site: {site}"
+            );
+        }
+    }
+
+    /// The two policies must actually DIFFER in the ways that matter, or the
+    /// test above is guarding a distinction without a difference.
+    #[test]
+    fn path_as_policy_differs_from_the_default_where_4k_is_concerned() {
+        let d = TranscodePolicy::default();
+        let a = TranscodePolicy::direct_play_normalization();
+        assert!(
+            a.max_width > d.max_width && a.max_height > d.max_height,
+            "Path A must not downscale 4K: default {}x{} vs path A {}x{}",
+            d.max_width, d.max_height, a.max_width, a.max_height
+        );
+        assert!(a.max_width >= 3840 && a.max_height >= 2160, "must admit 4K");
+        assert!(
+            a.max_video_bitrate_bps > d.max_video_bitrate_bps,
+            "a 4K file at the default 12 Mbps ceiling would be re-encoded needlessly"
+        );
+    }
     use super::*;
 
     #[test]

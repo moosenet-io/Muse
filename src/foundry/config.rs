@@ -236,6 +236,8 @@ impl FoundryConfig {
 
         // Every rail-3 problem is fatal once mutation is possible.
         out.extend(self.rail3_problems());
+        // ...as is a root that should never have been addressable at all.
+        out.extend(forbidden_root_problems(&self.allowed_roots));
         out
     }
 
@@ -249,6 +251,10 @@ impl FoundryConfig {
         // instead, and reporting them twice would be noise.
         if !self.enable_mutation {
             out.extend(self.rail3_problems());
+            // A read-only Foundry pointed at `/` cannot destroy anything, but
+            // the operator still needs to see the misconfiguration — refusing
+            // to register would hide it from the status surface entirely.
+            out.extend(forbidden_root_problems(&self.allowed_roots));
         }
 
         if self.retention_days == 0 {
@@ -389,6 +395,51 @@ fn parse_roots(raw: Option<&str>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Roots Foundry must never be pointed at, however it is configured.
+///
+/// A single typo in `MUSE_FOUNDRY_ALLOWED_ROOTS` — `/` instead of `/srv/media`,
+/// or `/srv` instead of `/srv/media` — would otherwise make a transcoder and a
+/// deletion engine addressable across the whole filesystem. Rail 3 does not
+/// catch it: with the work dir on a different device, `/` as a root passes
+/// every existing check.
+///
+/// A DENYLIST is the wrong shape for most safety questions, and it is the
+/// right one here: the set of paths that are catastrophic is small, well
+/// known, and stable, while the set of legitimate media roots is unbounded and
+/// site-specific. Refusing an unknown path would make Foundry unconfigurable.
+const FORBIDDEN_ROOTS: &[&str] = &[
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64",
+    "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var",
+];
+
+/// Configured roots that must never be addressed, with the reason.
+///
+/// Reported as FATAL when mutation is enabled (like rail 3) and as a warning
+/// otherwise: a read-only Foundry pointed at `/` can waste effort but cannot
+/// destroy anything, and refusing to register would remove the operator's
+/// ability to see the misconfiguration on the status surface.
+pub(in crate::foundry) fn forbidden_root_problems(roots: &[PathBuf]) -> Vec<String> {
+    let mut out = Vec::new();
+    for root in roots {
+        // Compare canonically where possible so `/srv/../` and a symlink to
+        // `/` are caught too, not just the literal spelling.
+        let resolved = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let as_str = resolved.to_string_lossy();
+        let trimmed = as_str.trim_end_matches('/');
+        let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+        if FORBIDDEN_ROOTS.contains(&normalized) {
+            out.push(format!(
+                "MUSE_FOUNDRY_ALLOWED_ROOTS contains `{}` (resolving to `{normalized}`), \
+                 which is a system directory. Foundry rewrites and deletes files inside \
+                 its allowed roots, so this would make the whole filesystem addressable \
+                 — almost certainly a typo for a media directory beneath it",
+                root.display()
+            ));
+        }
+    }
+    out
+}
+
 fn non_empty_or(v: Option<&str>, default: &str) -> String {
     v.map(str::trim)
         .filter(|s| !s.is_empty())
@@ -476,6 +527,57 @@ fn projected_path(p: &std::path::Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A typo must not point a deletion engine at the filesystem root.
+    ///
+    /// Rail 3 does NOT catch this: with the work dir on a different device,
+    /// `/` as an allowed root passes every other check. And the reaper deletes
+    /// inside allowed roots, so `MUSE_FOUNDRY_ALLOWED_ROOTS=/` would make the
+    /// whole filesystem addressable.
+    #[test]
+    fn system_directories_are_refused_as_allowed_roots() {
+        for bad in ["/", "/etc", "/usr", "/var", "/home", "/srv", "/boot"] {
+            let problems = forbidden_root_problems(&[PathBuf::from(bad)]);
+            assert_eq!(problems.len(), 1, "{bad} must be refused");
+            assert!(problems[0].contains("system directory"), "{}", problems[0]);
+        }
+        // Trailing slashes and `..` must not evade it.
+        assert_eq!(forbidden_root_problems(&[PathBuf::from("/etc/")]).len(), 1);
+    }
+
+    /// ...while a real media root is accepted. Without this the guard could be
+    /// satisfied by refusing everything.
+    #[test]
+    fn a_genuine_media_root_is_not_refused() {
+        for ok in ["/srv/media", "/mnt/library", "/data/movies", "/srv/media/TV"] {
+            assert!(
+                forbidden_root_problems(&[PathBuf::from(ok)]).is_empty(),
+                "{ok} must be allowed — refusing unknown paths would make Foundry \
+                 unconfigurable"
+            );
+        }
+    }
+
+    /// Fatal when mutation is on, a warning when it is off. A read-only
+    /// Foundry pointed at `/` wastes effort but cannot destroy anything, and
+    /// refusing to register would hide the mistake from the status surface.
+    #[test]
+    fn a_forbidden_root_is_fatal_with_mutation_and_a_warning_without() {
+        let hot = cfg_with(Some("/etc"), true);
+        assert!(
+            hot.fatal_errors().iter().any(|e| e.contains("system directory")),
+            "must be fatal once mutation is possible: {:?}",
+            hot.fatal_errors()
+        );
+
+        let cold = cfg_with(Some("/etc"), false);
+        assert!(cold.fatal_errors().is_empty(), "read-only cannot destroy anything");
+        assert!(
+            cold.warnings().iter().any(|w| w.contains("system directory")),
+            "...but the operator must still be told: {:?}",
+            cold.warnings()
+        );
+    }
     use super::*;
 
     #[test]

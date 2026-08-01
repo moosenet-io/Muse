@@ -199,6 +199,13 @@ pub enum SkipReason {
     /// outside the library to stage. (Registration refuses this combination —
     /// see `FoundryConfig::fatal_errors` — so this is defence in depth.)
     NoWorkDir,
+    /// A probe did not return within its deadline, so the file was never
+    /// judged. TRANSIENT and retryable — a stalled filesystem, not a bad file.
+    ///
+    /// Deliberately a skip rather than a failure: `Failed` reads as "something
+    /// is wrong with this file", and a later operator (or a later run) would
+    /// treat it as such. Nothing was learned about the file at all.
+    ProbeTimedOut { secs: u64 },
     /// The plan says the file already meets policy.
     AlreadyOptimal,
     /// Foundry could not judge the file.
@@ -225,6 +232,11 @@ impl std::fmt::Display for SkipReason {
             Self::ToolUnavailable { tool, detail } => {
                 write!(f, "required tool `{tool}` is not usable on this host: {detail}")
             }
+            Self::ProbeTimedOut { secs } => write!(
+                f,
+                "the probe did not return within {secs}s, so this file was never judged — \
+                 a stalled filesystem, not a bad file; retry it"
+            ),
             Self::MutationDisabled => write!(
                 f,
                 "Foundry's mutation gate is closed (MUSE_FOUNDRY_ENABLE_MUTATION) — \
@@ -1266,6 +1278,13 @@ pub(in crate::foundry) fn optimize_file(
                     tool: "ffprobe",
                     detail: format!("`{binary}` is not installed"),
                 },
+            }
+        }
+        // A stall says nothing about the file, so it must not be reported as
+        // the file having failed. FOUNDRY-10.
+        Err(ProbeError::Timeout { secs }) => {
+            return ForgeStatus::Skipped {
+                reason: SkipReason::ProbeTimedOut { secs },
             }
         }
         Err(e) => return ForgeStatus::Failed { reason: e.to_string() },
@@ -2694,6 +2713,25 @@ mod tests {
             ffmpeg_bin: ffmpeg.to_string(),
             handbrake_bin: "muse-foundry-absent-handbrake".to_string(),
         }
+    }
+
+    /// A stalled probe must be a SKIP, never a failure.
+    ///
+    /// `Failed` reads as "something is wrong with this file", and a later run
+    /// or operator would treat it that way — but a probe timeout means nothing
+    /// was learned about the file at all. The distinction matters at
+    /// 16,000-item scale, where transient stalls are certain and a pile of
+    /// "failures" would obscure the real ones.
+    #[test]
+    fn a_probe_timeout_is_a_retryable_skip_not_a_file_failure() {
+        let reason = SkipReason::ProbeTimedOut { secs: 120 };
+        let msg = reason.to_string();
+        assert!(msg.contains("120s"), "{msg}");
+        assert!(
+            msg.contains("not a bad file"),
+            "the message must not read as a verdict about the file: {msg}"
+        );
+        assert!(msg.contains("retry"), "it must say it is retryable: {msg}");
     }
 
     #[test]

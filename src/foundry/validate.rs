@@ -457,6 +457,17 @@ pub enum ArgvRefusal {
     /// Anything else means the source is being used as something other than a
     /// read-only input.
     SourceIsNotOnlyAnInput { input: String, occurrences: usize },
+    /// The argv contains an option that makes ffmpeg write somewhere other
+    /// than its final operand. Codex raised this at the FOUNDRY-04 gate:
+    /// checking the output operand and `-i` proves nothing about
+    /// `-passlogfile`, `-progress` or any other write-capable flag.
+    ///
+    /// Fail-CLOSED: this refuses any option not on an allowlist of flags known
+    /// to be read-only, rather than blocking a list of known-bad ones. A
+    /// denylist is wrong here for the usual reason — it is silent about the
+    /// option nobody thought of, which is precisely the one that writes to the
+    /// library.
+    OptionNotKnownReadOnly { option: String },
     /// An empty argv could not be checked at all, so it is refused.
     EmptyArgv,
 }
@@ -464,6 +475,12 @@ pub enum ArgvRefusal {
 impl std::fmt::Display for ArgvRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::OptionNotKnownReadOnly { option } => write!(
+                f,
+                "argv contains `{option}`, which is not on the allowlist of options this \
+                 harness knows cannot write outside its scratch file — refusing to spawn \
+                 rather than assuming it is harmless"
+            ),
             Self::OutputIsNotTheScratchFile { expected, found } => write!(
                 f,
                 "the ffmpeg output operand is `{found}`, not the scratch file `{expected}` — \
@@ -500,6 +517,24 @@ impl std::fmt::Display for ArgvRefusal {
 /// before it becomes a process.
 ///
 /// Fail closed on every axis: an argv it cannot fully account for is refused.
+/// Options this harness accepts in a generated ffmpeg argv.
+///
+/// An ALLOWLIST, deliberately. The rail's job is to guarantee ffmpeg cannot
+/// write anywhere but the scratch file, and a denylist of write-capable flags
+/// (`-passlogfile`, `-progress`, `-f segment`, ...) is only ever as complete as
+/// the last person's memory. Anything not named here is refused, so extending
+/// the encoder means extending this list on purpose.
+///
+/// Every entry is a flag `plan_transcode`/`build_rendition_args` actually emit.
+const READ_ONLY_OPTIONS: &[&str] = &[
+    "-hide_banner", "-loglevel", "-nostdin", "-y", "-i",
+    "-map", "-map_metadata", "-map_chapters",
+    "-c:v", "-c:a", "-c:s", "-c:t", "-c", "-crf", "-preset", "-vf", "-pix_fmt",
+    "-maxrate", "-bufsize", "-b:v", "-b:a", "-ac", "-ar", "-profile:v",
+    "-level", "-movflags", "-f", "-metadata", "-disposition",
+    "-max_muxing_queue_size", "-threads", "-sn", "-an", "-vn", "-dn",
+];
+
 pub fn argv_writes_only_to(
     args: &[String],
     input_path: &str,
@@ -545,6 +580,24 @@ pub fn argv_writes_only_to(
             occurrences,
         });
     }
+
+    // 4. No option may be one that writes outside the final operand. Checked
+    //     against an allowlist so an unrecognised flag refuses rather than
+    //     being assumed harmless. Only tokens that LOOK like options are
+    //     examined; values (codec names, paths, numbers) are not options, and
+    //     a negative number like `-1` is a value, not a flag.
+    for a in args.iter() {
+        if !a.starts_with('-') || a.len() < 2 {
+            continue;
+        }
+        if a.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+            continue; // a negative number, e.g. "-1"
+        }
+        if !READ_ONLY_OPTIONS.contains(&a.as_str()) {
+            return Err(ArgvRefusal::OptionNotKnownReadOnly { option: a.clone() });
+        }
+    }
+
 
     Ok(())
 }
@@ -1165,7 +1218,10 @@ fn fill_output(file: &mut ValidatedFile, out: &MediaProbe) {
     file.output_duration_secs = out.duration_secs;
     file.output_bytes = out.size_bytes;
     file.size_delta_bytes = match (out.size_bytes, file.input_bytes) {
-        (Some(o), Some(i)) => Some(o as i64 - i as i64),
+        // Saturating, not `as i64`. These sizes come from ffprobe on an
+        // arbitrary file; a value past i64::MAX wraps to a negative delta in
+        // release and panics in debug. Codex, FOUNDRY-04 gate.
+        (Some(o), Some(i)) => Some((o as i128 - i as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64),
         _ => None,
     };
 }
@@ -1332,6 +1388,15 @@ pub enum ValidationRefusal {
     ScratchUnusable { detail: String },
     /// ffprobe or ffmpeg is not usable on this host.
     ToolUnavailable { tool: &'static str, detail: String },
+    /// The scratch filesystem does not have room for the run's budget.
+    ///
+    /// Raised by codex and free at the FOUNDRY-04 gate: the 6 GiB budget was
+    /// reservation ACCOUNTING, not a statement about the disk. On a host with
+    /// ~13 GB free and a root filesystem shared with everything else, a run
+    /// that admits work it cannot store fills the disk — and per
+    /// `pvf1_vgscratch`, a full/failing filesystem here presents as bogus
+    /// compiler gates and systemctl EIO, not as an obvious disk error.
+    NotEnoughFreeSpace { available_bytes: u64, needed_bytes: u64 },
 }
 
 impl std::fmt::Display for ValidationRefusal {
@@ -1341,6 +1406,12 @@ impl std::fmt::Display for ValidationRefusal {
                 f,
                 "MUSE_FOUNDRY_WORK_DIR is not set, so there is nowhere outside the library to \
                  encode to — validation needs a scratch directory on a different filesystem"
+            ),
+            Self::NotEnoughFreeSpace { available_bytes, needed_bytes } => write!(
+                f,
+                "the scratch filesystem has {available_bytes} bytes free but this run's budget \
+                 needs {needed_bytes} — refusing to start rather than filling the disk partway \
+                 through and leaving the host in a state that looks like unrelated failures"
             ),
             Self::ScratchViolatesRail3 { problems } => write!(
                 f,
@@ -1388,6 +1459,50 @@ pub fn prepare_scratch_dir(foundry: &Foundry) -> Result<PathBuf, ValidationRefus
         detail: format!("{}: {e}", dir.display()),
     })?;
     Ok(dir)
+}
+
+/// Bytes free on the filesystem holding `dir`, or `None` if it cannot be read.
+///
+/// Shells out to `df` because Muse has no `libc` dependency and `std` exposes
+/// no `statvfs`. `None` means "could not determine", which the caller treats as
+/// a refusal rather than as "plenty" — the whole point is not to guess.
+pub fn free_bytes_for(dir: &Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("--output=avail")
+        .arg("-B1")
+        .arg(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Refuse a run whose budget the scratch filesystem cannot actually hold.
+///
+/// `needed` is the run's cumulative budget, not one file: a run admitted on
+/// per-file room alone can still fill the disk across twelve encodes.
+pub fn check_free_space(dir: &Path, needed: u64) -> Result<(), ValidationRefusal> {
+    let Some(available) = free_bytes_for(dir) else {
+        // Unreadable is not free. Refuse and say so.
+        return Err(ValidationRefusal::NotEnoughFreeSpace {
+            available_bytes: 0,
+            needed_bytes: needed,
+        });
+    };
+    if available < needed {
+        return Err(ValidationRefusal::NotEnoughFreeSpace {
+            available_bytes: available,
+            needed_bytes: needed,
+        });
+    }
+    Ok(())
 }
 
 /// Probe up to `probe_budget` candidates, spread across the whole list.
@@ -1882,6 +1997,87 @@ mod tests {
             TranscodeDecision::Transcode { args, .. } => args,
             other => panic!("expected a transcode plan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn free_space_is_read_from_the_real_filesystem() {
+        // A sanity check that the df parse works at all on this host — a
+        // silently-failing parse would make every run refuse, which is safe
+        // but useless, or (if it defaulted the other way) unsafe.
+        let got = free_bytes_for(Path::new("."));
+        assert!(got.is_some(), "df --output=avail must be parseable here");
+        assert!(got.unwrap() > 0, "the working filesystem reports no free space");
+    }
+
+    #[test]
+    fn a_budget_larger_than_the_disk_is_refused_before_anything_is_encoded() {
+        let huge = u64::MAX / 2;
+        let got = check_free_space(Path::new("."), huge);
+        assert!(
+            matches!(got, Err(ValidationRefusal::NotEnoughFreeSpace { .. })),
+            "got {got:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_filesystem_refuses_rather_than_assuming_room() {
+        // "Could not determine" is not "plenty". A path df cannot stat must
+        // refuse, or the check is worse than nothing: it would pass exactly in
+        // the situation where the disk state is unknown.
+        let got = check_free_space(Path::new("/nonexistent-muse-validate-probe"), 1024);
+        assert!(
+            matches!(
+                got,
+                Err(ValidationRefusal::NotEnoughFreeSpace {
+                    available_bytes: 0,
+                    ..
+                })
+            ),
+            "got {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_budget_that_fits_is_allowed() {
+        // The off state: without this the two tests above would pass against a
+        // function that refused unconditionally.
+        assert!(check_free_space(Path::new("."), 1).is_ok());
+    }
+
+    /// Codex, FOUNDRY-04 gate: checking the output operand and `-i` proves
+    /// nothing about an option that writes on its own account.
+    /// `-passlogfile` and `-progress` both take a path and both write to it.
+    #[test]
+    fn an_option_that_writes_on_its_own_account_is_refused() {
+        let scratch = Path::new("/scratch/v/out.mkv");
+        let dir = Path::new("/scratch/v");
+        for bad in [
+            vec!["-i", "/lib/a.mkv", "-passlogfile", "/lib/a", "/scratch/v/out.mkv"],
+            vec!["-i", "/lib/a.mkv", "-progress", "/lib/progress.txt", "/scratch/v/out.mkv"],
+            vec!["-i", "/lib/a.mkv", "-report", "/scratch/v/out.mkv"],
+        ] {
+            let argv: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            let got = argv_writes_only_to(&argv, "/lib/a.mkv", scratch, dir);
+            assert!(
+                matches!(got, Err(ArgvRefusal::OptionNotKnownReadOnly { .. })),
+                "{bad:?} must be refused, got {got:?}"
+            );
+        }
+    }
+
+    /// The allowlist must not be so broad it accepts anything, nor so narrow
+    /// it rejects the argv the encoder actually produces (covered by the test
+    /// below). A value that merely looks like a flag — a negative number — is
+    /// a value, not an option.
+    #[test]
+    fn a_negative_number_is_a_value_not_an_unknown_option() {
+        let scratch = Path::new("/scratch/v/out.mkv");
+        let dir = Path::new("/scratch/v");
+        let argv: Vec<String> = ["-i", "/lib/a.mkv", "-crf", "-1", "/scratch/v/out.mkv"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(argv_writes_only_to(&argv, "/lib/a.mkv", scratch, dir).is_ok());
     }
 
     #[test]

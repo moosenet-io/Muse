@@ -240,6 +240,10 @@ fn ops_routes() -> Router<Arc<AppState>> {
         // deletes anything in the library. This is a LONG call — up to 24 real
         // encodes, 20 minutes each, 60 minutes for the whole run.
         .route("/foundry/validate", post(crate::web::dashboard::foundry_validate))
+        // FOUNDRY-05: the ONLY endpoint that can permanently destroy library
+        // data. Dry-run unless ?mutate=true, and every candidate still has to
+        // pass may_delete_original.
+        .route("/foundry/reap", post(crate::web::dashboard::foundry_reap))
         // SUBS-01: the subtitle system. Bearer-protected like the rest of this
         // router — fetching touches an external provider, and applying an
         // offset changes what a viewer sees.

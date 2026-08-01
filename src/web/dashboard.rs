@@ -1732,6 +1732,75 @@ pub struct ValidateQuery {
 /// **This is a long call.** Up to `limit` real encodes, each capped at 20
 /// minutes, with a 60-minute ceiling on the whole run. It is dispatched onto a
 /// blocking thread so the encodes do not occupy an async worker for an hour.
+/// `POST /ops/foundry/reap` — remove `.muse-superseded` originals that the
+/// deletion gate allows.
+///
+/// **This is the only endpoint in Muse that can permanently destroy library
+/// data.** It is therefore two deliberate steps, not one: `mutate=true` is
+/// required to delete anything, and without it every allowed candidate is
+/// reported as `would_delete` and nothing is touched. The response always
+/// states which mode ran.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReapQuery {
+    /// Actually delete. Default **false**.
+    pub mutate: Option<bool>,
+    /// Retention window in days. Default 14. Clamped to 0..=3650, and 0 is
+    /// allowed only because a validated bulk migration may legitimately want
+    /// it — it is not the default and never becomes one.
+    pub retention_days: Option<u64>,
+}
+
+pub async fn foundry_reap(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ReapQuery>,
+) -> MuseResult<Json<Value>> {
+    use crate::foundry::reaper;
+
+    let Some(foundry) = crate::foundry::Foundry::from_config(&state.config) else {
+        return Ok(Json(json!({
+            "ran": false,
+            "reason": "foundry is not configured (MUSE_FOUNDRY_* unset) — nothing was reaped",
+        })));
+    };
+    if !foundry.capabilities().ffprobe.is_present() {
+        // Without ffprobe neither file can be re-probed, so the gate cannot be
+        // consulted — and a reaper that cannot consult the gate must not run
+        // at all rather than fall back to some weaker rule.
+        return Ok(Json(json!({
+            "ran": false,
+            "reason": "ffprobe is not usable, so the deletion gate cannot be consulted —                        refusing to reap rather than deleting on a weaker check",
+        })));
+    }
+
+    let mutate = q.mutate.unwrap_or(false);
+    let retention = std::time::Duration::from_secs(
+        q.retention_days.unwrap_or(14).clamp(0, 3650) * 24 * 60 * 60,
+    );
+    let run = tokio::task::spawn_blocking(move || reaper::reap(&foundry, retention, mutate))
+        .await
+        .map_err(|e| MuseError::Internal(anyhow::anyhow!("reap task failed: {e}")))?;
+
+    Ok(Json(json!({
+        "ran": true,
+        // Stated on every response: a dry run must never be mistakable for a
+        // real one when the numbers are read later.
+        "mutation_enabled": run.mutation_enabled,
+        "retention_secs": run.retention_secs,
+        "examined": run.files.len(),
+        "deleted": run.deleted(),
+        "would_delete": run.would_delete(),
+        "kept": run.kept(),
+        "bytes_reclaimed": run.bytes_reclaimed,
+        "files": run.files.iter().map(|f| json!({
+            "superseded": f.superseded_path,
+            "replacement": f.replacement_path,
+            "bytes": f.bytes,
+            "outcome": f.outcome.to_string(),
+            "deleted": f.outcome.deleted(),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
 pub async fn foundry_validate(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ValidateQuery>,

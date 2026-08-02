@@ -50,6 +50,33 @@ pub mod probe;
 /// via `PATH`, exactly as Foundry's own default is.
 const DEFAULT_FFPROBE_BIN: &str = "ffprobe";
 
+/// Bounds on `MUSE_PROBE_TIMEOUT_SECS`.
+///
+/// The floor is not decoration: `MUSE_PROBE_TIMEOUT_SECS=0` would time out
+/// every probe instantly, and downstream reads a `Timeout` as "unreadable" — a
+/// single mistyped env var would quietly mark a whole library unreadable while
+/// looking like a routine config change. The ceiling exists because a deadline
+/// of a week is indistinguishable from the unbounded wait this defence was
+/// built to remove.
+///
+/// One second, not a comfortable minimum: this is a guard against a
+/// meaningless value, not an opinion about how long a probe should get. An
+/// operator with a reason to set 2s is not second-guessed; an operator who set
+/// 0 by accident is. Out-of-range values CLAMP rather than fall back to the
+/// default, so someone who asked for more time gets as much as is allowed
+/// instead of silently getting the value they were trying to change.
+const MIN_PROBE_TIMEOUT_SECS: u64 = 1;
+const MAX_PROBE_TIMEOUT_SECS: u64 = 6 * 60 * 60;
+
+/// Bounds on `MUSE_PROBE_MAX_OUTPUT_BYTES`.
+///
+/// The floor is above any real ffprobe document (the largest measured in this
+/// library is ~71 KB), so a too-small cap cannot make every file report
+/// `OutputTooLarge`. The ceiling keeps the per-child memory bound meaningful:
+/// a cap of "as much as it sends" is not a cap.
+const MIN_PROBE_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_PROBE_MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+
 /// The shared media core: a resolved `ffprobe` binary, a **read-only** guard
 /// over the library root, and a snapshot of host tool capability.
 ///
@@ -74,6 +101,10 @@ pub struct MediaCore {
     /// Host tool detection, taken once when this value is constructed. See
     /// [`MediaCore::can_probe`] for what that does and does not mean.
     capabilities: capability::Capabilities,
+    /// Deadline for one probe. Resolved once, from config, at construction.
+    probe_timeout: std::time::Duration,
+    /// Capture cap for one probe stream. Resolved once, from config.
+    probe_max_output_bytes: usize,
 }
 
 // No `Debug` derive, for the same reason `FoundryConfig` has none: the
@@ -170,7 +201,61 @@ impl MediaCore {
             ffprobe_bin,
             library_guard,
             capabilities,
+            probe_timeout: std::time::Duration::from_secs(
+                cfg.probe_timeout_secs
+                    .map(|s| s.clamp(MIN_PROBE_TIMEOUT_SECS, MAX_PROBE_TIMEOUT_SECS))
+                    .unwrap_or(probe::PROBE_TIMEOUT.as_secs()),
+            ),
+            probe_max_output_bytes: cfg
+                .probe_max_output_bytes
+                .map(|b| b.clamp(MIN_PROBE_MAX_OUTPUT_BYTES, MAX_PROBE_MAX_OUTPUT_BYTES))
+                .unwrap_or(probe::MAX_CAPTURED_BYTES),
         }
+    }
+
+    /// The probe deadline in force, after clamping.
+    ///
+    /// **120 seconds by default, and that number was not chosen here.** The
+    /// S130-A spec text says 30s. It is stale: 120s was set against observed
+    /// behaviour — an NFS probe of a large MKV is seconds, a wedged one is
+    /// forever, and the deadline is there to catch the second case without
+    /// touching the first. Lowering it to 30s would start reporting slow-but-fine
+    /// files as `Timeout`, i.e. as unreadable, which is precisely the false
+    /// verdict `ProbeError::Timeout`'s own documentation says it must not
+    /// produce. An operator who wants 30s can set `MUSE_PROBE_TIMEOUT_SECS=30`;
+    /// nobody gets it by accident.
+    pub fn probe_timeout(&self) -> std::time::Duration {
+        self.probe_timeout
+    }
+
+    /// The per-stream capture cap in force, after clamping.
+    pub fn probe_max_output_bytes(&self) -> usize {
+        self.probe_max_output_bytes
+    }
+
+    /// Probe a library file **asynchronously**, with this core's configured
+    /// limits.
+    ///
+    /// This is the method the async consumers (MPRB-06 scan integration,
+    /// MPRB-07 backfill, Maestro) are meant to call, and it is the reason the
+    /// two knobs above exist: a limit nothing reads is not a limit. Stated
+    /// honestly, as MPRB-01 stated it for `MediaCore` itself — **this item adds
+    /// the method and its tests, not a caller.** Those land with the consumers.
+    ///
+    /// Takes a [`paths::ResolvedPath`] rather than a `&Path`, so a caller
+    /// cannot reach outside `MUSE_LIBRARY_ROOT` by forgetting to resolve.
+    #[allow(dead_code)]
+    pub(crate) async fn probe_async(
+        &self,
+        path: &paths::ResolvedPath,
+    ) -> Result<probe::MediaProbe, probe::ProbeError> {
+        probe::run_ffprobe_async(
+            &self.ffprobe_bin,
+            path,
+            self.probe_timeout,
+            self.probe_max_output_bytes,
+        )
+        .await
     }
 
     /// Whether this host can run `ffprobe` at all, as observed when this
@@ -364,6 +449,162 @@ mod tests {
                 .resolve_new_for_mutation(root.join("new.mkv"))
                 .unwrap_err(),
             paths::PathError::MutationDisabled,
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- S130-A MPRB-02: the operator-tunable probe limits ------------------
+
+    /// The default is **120 seconds**, and this test exists to keep it there.
+    ///
+    /// The S130-A spec section for MPRB-02 says 30s. That text is stale — 120s
+    /// was set against observed behaviour, and dropping to 30s would start
+    /// reporting slow-but-fine files as `Timeout`, which downstream treats as
+    /// unreadable. A number that was tuned and then silently lowered by a spec
+    /// nobody re-checked is exactly the regression this asserts against.
+    #[test]
+    fn the_probe_deadline_defaults_to_the_tuned_two_minutes() {
+        let core = MediaCore::from_config(&cfg_with(Some(ABSENT_BIN), None, None));
+        assert_eq!(core.probe_timeout(), std::time::Duration::from_secs(120));
+        assert_eq!(core.probe_max_output_bytes(), probe::MAX_CAPTURED_BYTES);
+    }
+
+    #[test]
+    fn an_operator_value_is_honoured_for_both_limits() {
+        let cfg = Config {
+            probe_timeout_secs: Some(45),
+            probe_max_output_bytes: Some(2 * 1024 * 1024),
+            ..cfg_with(Some(ABSENT_BIN), None, None)
+        };
+        let core = MediaCore::from_config(&cfg);
+        assert_eq!(core.probe_timeout(), std::time::Duration::from_secs(45));
+        assert_eq!(core.probe_max_output_bytes(), 2 * 1024 * 1024);
+    }
+
+    /// A nonsense value is clamped into range, never taken literally and never
+    /// silently swapped for the default.
+    #[test]
+    fn out_of_range_limits_clamp_at_both_ends() {
+        let low = MediaCore::from_config(&Config {
+            probe_timeout_secs: Some(0),
+            probe_max_output_bytes: Some(1),
+            ..cfg_with(Some(ABSENT_BIN), None, None)
+        });
+        assert_eq!(
+            low.probe_timeout(),
+            std::time::Duration::from_secs(MIN_PROBE_TIMEOUT_SECS),
+            "a zero deadline would report every file as unreadable"
+        );
+        assert_eq!(low.probe_max_output_bytes(), MIN_PROBE_MAX_OUTPUT_BYTES);
+
+        let high = MediaCore::from_config(&Config {
+            probe_timeout_secs: Some(u64::MAX),
+            probe_max_output_bytes: Some(usize::MAX),
+            ..cfg_with(Some(ABSENT_BIN), None, None)
+        });
+        assert_eq!(
+            high.probe_timeout(),
+            std::time::Duration::from_secs(MAX_PROBE_TIMEOUT_SECS),
+            "an effectively infinite deadline is the unbounded wait again"
+        );
+        assert_eq!(high.probe_max_output_bytes(), MAX_PROBE_MAX_OUTPUT_BYTES);
+    }
+
+    /// Writes an executable stub standing in for `ffprobe`. Same reason as in
+    /// `probe.rs`: ffprobe is installed on neither the dev box nor <host>.
+    ///
+    /// The stub answers `-version` immediately, and that is not decoration.
+    /// `MediaCore::from_config` runs `capability::detect`, which invokes the
+    /// configured binary with `-version` through a plain `Command::output()` —
+    /// no deadline at all. A stub that slept for every invocation therefore
+    /// blocked CONSTRUCTION for the full sleep, and the test looked like it was
+    /// measuring the probe deadline while actually measuring capability
+    /// detection. Matching the real tool's contract for both call shapes is what
+    /// keeps the stub an honest double.
+    ///
+    /// (That `Command::output()` is a real, pre-existing hazard of its own — a
+    /// wedged ffprobe on an NFS mount stalls startup — but it is capability
+    /// detection's, not MPRB-02's, and is left for its own item rather than
+    /// changed here as a drive-by.)
+    fn stub_bin(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("stub-ffprobe");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"-version\" ]; then\n    \
+                 echo 'ffprobe version 6.0-stub'; exit 0\n  fi\ndone\n{body}\n"
+            ),
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The configured CAP actually reaches the probe.
+    ///
+    /// A knob nothing reads is not a knob, and "it is passed through" is a
+    /// claim about a call site that only a call can settle. The stub writes
+    /// 4 MB: under the 8 MiB default it would succeed-then-fail-to-parse, so
+    /// `OutputTooLarge { cap: 256 KiB }` can only come from the CONFIGURED
+    /// value having been used.
+    #[tokio::test]
+    async fn the_configured_cap_reaches_the_probe() {
+        let root = temp_root("cfg-cap");
+        let bin = stub_bin(&root, "head -c 4000000 /dev/zero | tr '\\0' 'x'");
+        let file = root.join("a.mkv");
+        std::fs::write(&file, b"x").expect("write subject");
+
+        let core = MediaCore::from_config(&Config {
+            probe_max_output_bytes: Some(MIN_PROBE_MAX_OUTPUT_BYTES),
+            ..cfg_with(Some(&bin), None, Some(&root.to_string_lossy()))
+        });
+        let resolved = core.library_guard().resolve(&file).expect("inside the root");
+
+        match core.probe_async(&resolved).await {
+            Err(probe::ProbeError::OutputTooLarge { cap }) => {
+                assert_eq!(cap, MIN_PROBE_MAX_OUTPUT_BYTES);
+            }
+            other => panic!("expected the configured cap to fire, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The configured DEADLINE actually reaches the probe.
+    ///
+    /// The stub sleeps 30s. Under the 120s default this test would take 30
+    /// seconds and pass a probe; the timeout arriving in about a second is only
+    /// possible if the configured value was used.
+    #[tokio::test]
+    async fn the_configured_deadline_reaches_the_probe() {
+        let root = temp_root("cfg-timeout");
+        let bin = stub_bin(&root, "exec sleep 30");
+        let file = root.join("a.mkv");
+        std::fs::write(&file, b"x").expect("write subject");
+
+        let core = MediaCore::from_config(&Config {
+            probe_timeout_secs: Some(1),
+            ..cfg_with(Some(&bin), None, Some(&root.to_string_lossy()))
+        });
+        let resolved = core.library_guard().resolve(&file).expect("inside the root");
+
+        let start = std::time::Instant::now();
+        let got = core.probe_async(&resolved).await;
+        let waited = start.elapsed();
+
+        assert!(
+            matches!(got, Err(probe::ProbeError::Timeout { secs: 1 })),
+            "expected the configured 1s deadline, got {got:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the 120s default must not be what fired: {waited:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);

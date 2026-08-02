@@ -18,7 +18,7 @@
 > | Item | Plane | Status after verification |
 > |---|---|---|
 > | MPRB-01 | #137 | **MERGED** (`d84cac8`) |
-> | MPRB-02 | #139 | RESCOPED — timeout/cap/reap already shipped |
+> | MPRB-02 | #139 | **MERGED-READY** — rescoped and built; see the correction box on that item |
 > | MPRB-03 | #140 | **PARTIAL + STRUCTURAL CORRECTION — see the warning on that item before writing code** |
 > | MPRB-04 | #141 | PARTIAL — the survey walker exists and has already run over 16,221 files; ffprobe *is* installed |
 > | MPRB-05 | #142 | ACCURATE, but migration `0109` is taken — use **0113** |
@@ -321,6 +321,61 @@ edits probe behaviour — a move and a behaviour change in one diff is a review 
 ---
 
 ### MPRB-02: Harden the invocation — timeout, output cap, async-safety, retryability
+
+> ## ⚠ CORRECTED AFTER THE BUILD (2026-08-02) — READ BEFORE THE DESCRIPTION BELOW
+>
+> **The premise of this item was false, and this is the record of how.** The description says
+> `run_ffprobe` "has **no timeout, no output cap, and blocks the calling thread**". Two of those
+> three were already untrue when it was written: `PROBE_TIMEOUT` (120s), `run_ffprobe_with_timeout`,
+> `spawn_with_timeout` (spawn/poll/kill, no blocking `wait()` in the timeout path), `drain_capped`
+> (8 MiB, on **separate** stdout and stderr threads — the pipe-deadlock defence) and
+> `ProbeError::Timeout` had all shipped in S128 MUSEF-02 and FOUNDRY-10/13. The item was written
+> against a 948-line `probe.rs`; the file was 1,698 lines. Only "blocks the calling thread" was
+> true, and only in the sense that the defence is thread-based rather than async.
+>
+> This is the discovery that led to the staleness banner at the top of this spec. It is kept here,
+> at the item, because the banner is easy to skim past and this section is what an implementer
+> actually reads.
+>
+> **What MPRB-02 actually built (Plane #139, branch `MPRB-02-probe-hardening`):**
+> 1. `run_ffprobe_async` — `tokio::process`, `kill_on_drop(true)`, `tokio::time::timeout`, and on
+>    expiry `start_kill()` **then a bounded `wait()`** to reap. Plus `run_ffprobe_with_limits` (sync)
+>    and `MediaCore::probe_async`.
+> 2. `ProbeError::OutputTooLarge { cap }` — the drain truncated **silently**, so an over-cap probe
+>    surfaced downstream as `MalformedOutput`: our limit, reported as the file's malformed metadata.
+>    Both ffprobe paths now report the cap explicitly.
+> 3. `is_retryable()` / `state()` — one wildcard-free `match` each, as specified.
+> 4. The `--` terminator and a leading-dash refusal.
+> 5. `MUSE_PROBE_TIMEOUT_SECS` / `MUSE_PROBE_MAX_OUTPUT_BYTES` through `config.rs`.
+>
+> **Three corrections to the instructions below, each deliberate:**
+>
+> - **The 30s default in step 6 was NOT adopted. It stays 120 seconds.** 120s was tuned against
+>   observed behaviour (a real probe is milliseconds to seconds; the deadline exists for a wedged
+>   D-state read on a stalled mount). Lowering it would start reporting slow-but-fine files as
+>   `Timeout`, which downstream reads as *unreadable* — a false verdict about a file, which is
+>   precisely what `ProbeError::Timeout`'s own documentation forbids. An operator who wants 30s can
+>   now set it; nobody gets it by accident.
+> - **`OutputTooLarge` is terminal, not retryable** — the taxonomy in step 4 predates the variant and
+>   does not classify it. A flood repeats identically on a retry, and the cap will not move on its
+>   own.
+> - **Step 3's "give the synchronous path the same timeout and cap" applies to the ffprobe entry
+>   points only.** The generic `spawn_with_timeout` is shared with Foundry's encoder and the subtitle
+>   extractor, which judge a run by its **exit status**; making an over-cap capture an error there
+>   would turn a merely verbose encode into a failed one, and killing at the cap would make the
+>   child die of SIGPIPE and report a signal exit. That path keeps draining to EOF and annotating.
+>   A pinned regression test now says so.
+>
+> **The edge-case note "`-v quiet` already makes stdout JSON-only" is also stale**: PROBE-01 (#140)
+> changed the argv to `-v error` so a failure can say why. Stdout is still JSON-only.
+>
+> **Verified before relying on it, because that is how this item went wrong in the first place:**
+> `--` is honoured by ffprobe. Its options go through `parse_options()` in `fftools/cmdutils.c`,
+> which contains `if (opt[1] == '-' && opt[2] == '\0') { handleoptions = 0; continue; }` — checked in
+> the `n5.1` tag, the build on the deployment host (`5.1.9-0+deb12u1`), and on master. ffprobe is
+> installed on neither the dev box nor <host>, so **no test in this suite could have caught a `--`
+> that ffprobe rejected** — it would have failed every probe in production with the suite green.
+
 - **Priority:** Critical
 - **Labels:** muse, media, probe, reliability
 - **Agent:** claude

@@ -649,6 +649,57 @@ mod tests {
         }
     }
 
+    /// **The reaper's two gates must come from ONE source.**
+    ///
+    /// `reap()` refuses unless `mutate && globally_permitted`, where
+    /// `globally_permitted = cfg.enable_mutation`. The deletion itself also
+    /// resolves through the PathGuard, whose own mutation flag gates
+    /// `resolve_for_mutation`. Raised at the REAP-03 gate: if those two could
+    /// disagree, an armed run would pass its own check and then have every
+    /// deletion refused by the guard — reclaiming nothing while reporting a
+    /// successful run.
+    ///
+    /// Asserted structurally rather than behaviourally, and the reason is
+    /// itself worth recording: constructing a config whose `guard()` is both
+    /// ARMED and valid needs `work_dir` on a genuinely different device from
+    /// every allowed root (rail 3), plus paths that exist. A unit test cannot
+    /// conjure two filesystems, and faking it by relaxing the fatal-error rules
+    /// would test a configuration production refuses to register. Attempting
+    /// the behavioural version is what surfaced that — it failed twice, each
+    /// time for a real reason.
+    #[test]
+    fn the_guard_is_constructed_from_the_same_flag_the_reaper_gates_on() {
+        let src = include_str!("config.rs");
+        let body = src.split("#[cfg(test)]").next().expect("a non-test body");
+        assert!(
+            body.contains("PathGuard::new(self.guard_roots(), self.enable_mutation)"),
+            "the guard's mutation flag must BE cfg.enable_mutation — the same field \
+             the reaper reads as `globally_permitted` — not a separately computed value"
+        );
+
+        let reaper = include_str!("reaper.rs");
+        let reaper_body = reaper.split("#[cfg(test)]").next().expect("a non-test body");
+        assert!(
+            reaper_body.contains("let globally_permitted = cfg.enable_mutation;"),
+            "and the reaper must read that same field, so the two cannot drift"
+        );
+    }
+
+    /// Arming without a staging area is FATAL, not a warning — so a config in
+    /// that state yields no guard at all. Pinned because the test above
+    /// originally assumed it could build an armed guard from a bare config.
+    #[test]
+    fn mutation_without_a_work_dir_yields_no_guard() {
+        assert!(
+            cfg_with(Some("/srv/a"), true).guard().is_none(),
+            "there is nowhere outside the library to stage, so the gate must not open"
+        );
+        assert!(
+            cfg_with(Some("/srv/a"), false).guard().is_some(),
+            "a disarmed config is still a usable read-only guard"
+        );
+    }
+
     #[test]
     fn no_roots_means_unconfigured() {
         assert!(cfg_with(None, false).is_unconfigured());

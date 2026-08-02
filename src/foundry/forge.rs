@@ -199,6 +199,18 @@ pub enum SkipReason {
     /// outside the library to stage. (Registration refuses this combination —
     /// see `FoundryConfig::fatal_errors` — so this is defence in depth.)
     NoWorkDir,
+    /// The encode would run and the deletion gate would then REFUSE, so the
+    /// original would be kept and the title would use MORE disk rather than
+    /// reclaiming any.
+    ///
+    /// Opt-in via MUSE_FOUNDRY_SKIP_UNRECLAIMABLE=1, default OFF. Skipping is
+    /// not obviously right: the swap still puts a direct-playable file in the
+    /// library, which is half of what Path A is for. The other half —
+    /// reclaiming the original's space — is impossible for these titles, so
+    /// the operator is choosing between "direct play at double disk" and
+    /// "leave it alone". Measured on this library: 260 of 16,221 titles
+    /// (1.6%), led by TrueHD (114) and DTS (50).
+    UnreclaimableOriginal { predicted: Vec<String> },
     /// A probe did not return within its deadline, so the file was never
     /// judged. TRANSIENT and retryable — a stalled filesystem, not a bad file.
     ///
@@ -232,6 +244,13 @@ impl std::fmt::Display for SkipReason {
             Self::ToolUnavailable { tool, detail } => {
                 write!(f, "required tool `{tool}` is not usable on this host: {detail}")
             }
+            Self::UnreclaimableOriginal { predicted } => write!(
+                f,
+                "skipped: this encode would run and the deletion gate would then refuse, \
+                 so the original would be KEPT and this title would use more disk rather \
+                 than reclaiming any ({}). MUSE_FOUNDRY_SKIP_UNRECLAIMABLE is set",
+                predicted.join("; ")
+            ),
             Self::ProbeTimedOut { secs } => write!(
                 f,
                 "the probe did not return within {secs}s, so this file was never judged — \
@@ -1345,6 +1364,27 @@ pub(in crate::foundry) fn optimize_file(
         }
         TranscodeDecision::Transcode { plan, args, reasons } => (plan, args, reasons),
     };
+
+    // Would this encode reclaim anything? FOUNDRY-22 can tell from the source
+    // and the plan, before spending the CPU.
+    //
+    // Default OFF. The skip is a genuine trade, not a strict improvement: the
+    // swap still leaves a direct-playable file in the library, which is half
+    // of Path A's purpose. Only the other half — reclaiming the original's
+    // space — is impossible here. So the operator chooses between "direct play
+    // at double disk" and "leave it alone", and that choice is theirs.
+    if std::env::var("MUSE_FOUNDRY_SKIP_UNRECLAIMABLE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        let predicted =
+            crate::foundry::directplay::predicted_deletion_refusals(&source, &plan);
+        if !predicted.is_empty() {
+            return ForgeStatus::Skipped {
+                reason: SkipReason::UnreclaimableOriginal { predicted },
+            };
+        }
+    }
 
     // Both tools, not just the encoder: without ffprobe the result could be
     // produced but never verified, and an unverified success is a failure.
@@ -2842,6 +2882,52 @@ mod tests {
             ffmpeg_bin: ffmpeg.to_string(),
             handbrake_bin: "muse-foundry-absent-handbrake".to_string(),
         }
+    }
+
+    /// The skip is OPT-IN and must stay that way.
+    ///
+    /// It is a genuine trade, not a strict improvement: the swap still leaves
+    /// a direct-playable file in the library, which is half of Path A's
+    /// purpose. Only the reclaim half is impossible for these titles. Turning
+    /// it on by default would silently decide that for the operator.
+    ///
+    /// Measured: 260 of 16,221 titles (1.6%), led by TrueHD (114), DTS (50).
+    #[test]
+    fn skipping_unreclaimable_titles_is_opt_in_not_the_default() {
+        let body = include_str!("forge.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        assert!(
+            body.contains("MUSE_FOUNDRY_SKIP_UNRECLAIMABLE"),
+            "the behaviour must be reachable"
+        );
+        assert!(
+            body.contains(".unwrap_or(false)"),
+            "it must default to OFF — the current behaviour is preserved unless the \
+             operator opts in"
+        );
+        // ...and it must consult the PREDICTION rather than re-deriving a rule.
+        assert!(
+            body.contains("predicted_deletion_refusals(&source, &plan)"),
+            "the skip must use the same prediction the survey reports, or the two \
+             would disagree about which titles are affected"
+        );
+    }
+
+    /// The reason must say what was traded away, not just that it skipped.
+    #[test]
+    fn the_unreclaimable_skip_explains_the_tradeoff() {
+        let r = SkipReason::UnreclaimableOriginal {
+            predicted: vec!["audio stream 1 is `truehd`, which may carry Dolby Atmos".into()],
+        };
+        let msg = r.to_string();
+        assert!(msg.contains("more disk"), "{msg}");
+        assert!(msg.contains("truehd"), "it must carry the specific reason: {msg}");
+        assert!(
+            msg.contains("MUSE_FOUNDRY_SKIP_UNRECLAIMABLE"),
+            "and name the setting that caused it: {msg}"
+        );
     }
 
     /// A stalled probe must be a SKIP, never a failure.

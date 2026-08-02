@@ -3832,10 +3832,28 @@ pub async fn foundry_run_start(
         ),
     };
 
-    if run::global_handle().is_active() {
+    // Claim the slot HERE, not inside the spawned task. A read-then-spawn
+    // would let two requests both answer `started: true` while only one
+    // actually won the race — the loser's operator would be told a run began
+    // that never did. Holding the slot from the moment we answer removes that
+    // gap, and the guard releases it however the run ends, including a panic.
+    let Some(slot) = run::global_handle().claim() else {
         return Err(MuseError::BadRequest(
             "a run is already in flight; stop it or wait for it to finish".into(),
         ));
+    };
+
+    // The work dir is where each encode is staged. Without one there is nowhere
+    // outside the library to stage, and forge refuses every title — reported
+    // here as the configuration gap it is, rather than letting the run start
+    // and stop on a free-space floor of zero, which would misattribute a config
+    // problem to a full disk. Raised at the FOUNDRY-11 gate.
+    if state.config.foundry_work_dir.is_none() {
+        return Ok(Json(json!({
+            "started": false,
+            "reason": "MUSE_FOUNDRY_WORK_DIR is not set — there is nowhere outside the \
+                       library to stage an encode, so no run was started",
+        })));
     }
 
     let work_dir = state.config.foundry_work_dir.clone();
@@ -3887,20 +3905,20 @@ pub async fn foundry_run_start(
             "foundry run: candidates selected"
         );
 
-        match run::execute_run(
+        let report = run::execute_run(
             &foundry,
             &transcode_policy,
             &selected,
             &limits,
             work_dir.as_deref().map(std::path::Path::new),
             run::global_handle(),
-        ) {
-            Ok(report) => tracing::info!(
-                stop_reason = report.stop_reason.as_str(),
-                "foundry run: complete"
-            ),
-            Err(e) => tracing::warn!(?e, "foundry run: refused to start"),
-        }
+            slot,
+        );
+        tracing::info!(
+            stop_reason = report.stop_reason.as_str(),
+            completed = report.completed(),
+            "foundry run: complete"
+        );
     });
 
     Ok(Json(json!({

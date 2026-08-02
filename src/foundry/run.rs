@@ -335,12 +335,36 @@ pub enum TitleOutcome {
 pub fn drive_run<Obs, Proc>(
     limits: &RunLimits,
     candidates: &[PathBuf],
-    mut observe: Obs,
-    mut process: Proc,
+    observe: Obs,
+    process: Proc,
 ) -> RunReport
 where
     Obs: FnMut() -> RunObservation,
     Proc: FnMut(&std::path::Path) -> TitleOutcome,
+{
+    drive_run_with_progress(limits, candidates, observe, process, |_| {})
+}
+
+/// [`drive_run`], plus a hook called with the authoritative ledger after each
+/// title.
+///
+/// The hook exists so a status endpoint can show live progress WITHOUT keeping
+/// its own running totals. An earlier version had `execute_run` sum the same
+/// outcomes a second time to feed the progress snapshot; the two agreed, but
+/// two hand-maintained copies of one accounting will diverge on the next edit
+/// and the divergence would show up as an operator-visible wrong number during
+/// a destructive run. Raised at the FOUNDRY-11 gate.
+pub fn drive_run_with_progress<Obs, Proc, Prog>(
+    limits: &RunLimits,
+    candidates: &[PathBuf],
+    mut observe: Obs,
+    mut process: Proc,
+    mut on_progress: Prog,
+) -> RunReport
+where
+    Obs: FnMut() -> RunObservation,
+    Proc: FnMut(&std::path::Path) -> TitleOutcome,
+    Prog: FnMut(&RunLedger),
 {
     let mut ledger = RunLedger::default();
     let mut next = 0usize;
@@ -387,6 +411,8 @@ where
                 // having its streak wiped by files it never touched.
             }
         }
+
+        on_progress(&ledger);
     }
 }
 
@@ -455,6 +481,42 @@ impl RunHandle {
         self.cancel
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Claim the slot, receiving a guard that releases it **however the run
+    /// ends** — including a panic.
+    ///
+    /// The reason this is an RAII guard and not a matched claim/release pair:
+    /// `execute_run` calls into ffmpeg wrappers, path handling and probe
+    /// parsing, any of which can panic on a sufficiently strange file. A panic
+    /// unwinding past a bare `release()` would leave `active` set forever, and
+    /// because `spawn_blocking` catches the panic the process would survive in
+    /// a state where every future run is refused `AlreadyRunning` and the
+    /// status endpoint reports a phantom run in flight. Only a restart would
+    /// clear it. Raised at the FOUNDRY-11 gate by two reviewers independently.
+    ///
+    /// Claiming here rather than inside `execute_run` also removes a
+    /// time-of-check/time-of-use gap: the caller holds the slot from the moment
+    /// it decides to start, so it cannot report "started" and then lose the
+    /// race.
+    pub fn claim(&self) -> Option<RunSlot<'_>> {
+        self.try_claim().then(|| RunSlot { handle: self })
+    }
+}
+
+/// Proof that the caller holds the run slot, and the thing that gives it back.
+///
+/// Cannot be constructed outside this module, so `execute_run` taking one by
+/// value is a compile-time guarantee that a run has claimed the slot exactly
+/// once.
+#[derive(Debug)]
+pub struct RunSlot<'a> {
+    handle: &'a RunHandle,
+}
+
+impl Drop for RunSlot<'_> {
+    fn drop(&mut self) {
+        self.handle.release();
+    }
 }
 
 /// The exact phrase an operator must restate to start a run of this size.
@@ -517,22 +579,25 @@ pub fn execute_run(
     limits: &RunLimits,
     work_dir: Option<&std::path::Path>,
     handle: &RunHandle,
-) -> Result<RunReport, RunStartRefusal> {
-    if !handle.try_claim() {
-        return Err(RunStartRefusal::AlreadyRunning);
-    }
-
+    // Taken by value and dropped at the end of this function. The slot is
+    // released by `Drop`, so it is given back even if this unwinds.
+    _slot: RunSlot<'_>,
+) -> RunReport {
     let started = std::time::Instant::now();
     let mutation_enabled = foundry.mutation_enabled();
 
-    *handle.progress.lock().unwrap() = Some(RunProgress {
-        ledger: RunLedger::default(),
-        candidates_total: candidates.len(),
-        current: None,
-        stop_reason: None,
-    });
+    // `if let Ok` rather than `.unwrap()`: a poisoned lock (some earlier panic
+    // while holding it) must not take down the run as well.
+    if let Ok(mut g) = handle.progress.lock() {
+        *g = Some(RunProgress {
+            ledger: RunLedger::default(),
+            candidates_total: candidates.len(),
+            current: None,
+            stop_reason: None,
+        });
+    }
 
-    let report = drive_run(
+    let report = drive_run_with_progress(
         limits,
         candidates,
         || RunObservation {
@@ -579,24 +644,17 @@ pub fn execute_run(
             if let Ok(mut g) = handle.progress.lock() {
                 if let Some(p) = g.as_mut() {
                     p.current = None;
-                    match &outcome {
-                        TitleOutcome::Rewritten {
-                            bytes_before,
-                            bytes_after,
-                        } => {
-                            p.ledger.rewritten += 1;
-                            p.ledger.bytes_before_total =
-                                p.ledger.bytes_before_total.saturating_add(*bytes_before);
-                            p.ledger.bytes_after_total =
-                                p.ledger.bytes_after_total.saturating_add(*bytes_after);
-                        }
-                        TitleOutcome::Failed => p.ledger.failed += 1,
-                        TitleOutcome::Skipped => p.ledger.skipped += 1,
-                    }
-                    p.ledger.attempted += 1;
                 }
             }
             outcome
+        },
+        |ledger| {
+            // ONE source of truth: the driver's own ledger, copied verbatim.
+            if let Ok(mut g) = handle.progress.lock() {
+                if let Some(p) = g.as_mut() {
+                    p.ledger = ledger.clone();
+                }
+            }
         },
     );
 
@@ -607,8 +665,6 @@ pub fn execute_run(
             p.stop_reason = Some(report.stop_reason.clone());
         }
     }
-    handle.release();
-
     tracing::info!(
         stop_reason = report.stop_reason.as_str(),
         completed = report.completed(),
@@ -619,7 +675,7 @@ pub fn execute_run(
         unprocessed = report.candidates_unprocessed,
         "foundry run: finished"
     );
-    Ok(report)
+    report
 }
 
 #[cfg(test)]
@@ -1222,6 +1278,68 @@ mod tests {
             "a stale cancel would make the next run stop immediately with no \
              explanation an operator could distinguish from a broken run"
         );
+    }
+
+    /// **The bug two reviewers found independently.**
+    ///
+    /// `execute_run` calls into ffmpeg wrappers, path handling and probe
+    /// parsing, any of which can panic on a strange enough file. With a bare
+    /// `release()` at the end, an unwind would leave `active` set forever —
+    /// and because `spawn_blocking` catches the panic, the process would
+    /// survive in a state where every later run is refused and the status
+    /// endpoint reports a phantom run. Only a restart would clear it.
+    #[test]
+    fn a_panic_while_holding_the_slot_still_releases_it() {
+        let handle = RunHandle::new();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = handle.claim().expect("the slot is free");
+            assert!(handle.is_active());
+            panic!("an encode blew up");
+        }));
+
+        assert!(panicked.is_err(), "the panic must actually have happened");
+        assert!(
+            !handle.is_active(),
+            "the slot must be released on unwind, or every future run is refused \
+             until the process restarts"
+        );
+        assert!(handle.claim().is_some(), "and the next run can claim it");
+    }
+
+    #[test]
+    fn the_guard_releases_the_slot_on_a_normal_return_too() {
+        let handle = RunHandle::new();
+        {
+            let _slot = handle.claim().expect("free");
+            assert!(handle.is_active());
+        }
+        assert!(!handle.is_active());
+    }
+
+    #[test]
+    fn only_one_guard_can_exist_at_a_time() {
+        let handle = RunHandle::new();
+        let first = handle.claim();
+        assert!(first.is_some());
+        assert!(
+            handle.claim().is_none(),
+            "a second concurrent sweep would race for the work dir"
+        );
+        drop(first);
+        assert!(handle.claim().is_some());
+    }
+
+    /// A cancel requested during one run must not silently kill the next one.
+    #[test]
+    fn a_guard_release_clears_a_cancel_so_the_next_run_is_not_born_cancelled() {
+        let handle = RunHandle::new();
+        {
+            let _slot = handle.claim().expect("free");
+            handle.request_stop();
+        }
+        let _next = handle.claim().expect("free again");
+        assert!(!handle.cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

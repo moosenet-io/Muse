@@ -253,6 +253,11 @@ fn ops_routes() -> Router<Arc<AppState>> {
         // data. Dry-run unless ?mutate=true, and every candidate still has to
         // pass may_delete_original.
         .route("/foundry/reap", post(crate::web::dashboard::foundry_reap))
+        // FOUNDRY-26: Path B's trigger. Marks are the ONLY source of rendition
+        // candidates; the plan endpoint cannot see the library.
+        .route("/foundry/marks", post(crate::web::dashboard::foundry_mark))
+        .route("/foundry/marks/revoke", post(crate::web::dashboard::foundry_unmark))
+        .route("/foundry/renditions/plan", post(crate::web::dashboard::foundry_renditions_plan))
         // SUBS-01: the subtitle system. Bearer-protected like the rest of this
         // router — fetching touches an external provider, and applying an
         // offset changes what a viewer sees.

@@ -189,7 +189,58 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
     if stem.is_empty() {
         return None;
     }
-    Some(superseded.with_file_name(stem))
+    let same_name = superseded.with_file_name(stem);
+    if same_name.is_file() {
+        return Some(same_name);
+    }
+
+    // The swap may have CHANGED THE CONTAINER, in which case the replacement
+    // has a different extension and the name above no longer exists.
+    //
+    // This is not an edge case: converting `avi` to `mkv` is most of what
+    // Path A does on this library, so keying only on the original name meant
+    // the reaper could never reclaim anything Path A actually converted — it
+    // reported "the replacement does not exist, this backup is the ONLY copy"
+    // and kept the file forever. Every reaper test used same-name fixtures, so
+    // this was invisible until a real swap ran end to end.
+    //
+    // Resolution is by STEM, and is fail-closed on ambiguity: exactly one
+    // media sibling sharing the stem counts as the replacement. Two or more
+    // means we cannot tell which one superseded this backup, and guessing
+    // would risk deleting the last copy of a title.
+    // Every failure below falls back to `same_name` rather than to None.
+    //
+    // Returning None would discard the path entirely, and the caller would
+    // report "not a superseded name" — a confusing lie about a file that
+    // plainly is one. Falling back to the original name means the caller
+    // reports ReplacementMissing and KEEPS the backup, which is the correct
+    // outcome for "I could not work out what replaced this".
+    let (Some(dir), Some(base)) = (
+        superseded.parent(),
+        Path::new(stem).file_stem().and_then(|s| s.to_str()),
+    ) else {
+        return Some(same_name);
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Some(same_name);
+    };
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() || !crate::library::scan::has_media_extension(&p) {
+            continue;
+        }
+        if p.file_stem().and_then(|s| s.to_str()) == Some(base) {
+            matches.push(p);
+        }
+    }
+    match matches.as_slice() {
+        [only] => Some(only.clone()),
+        // None found, or several: return the same-name path so the caller
+        // reports ReplacementMissing and KEEPS the backup. Ambiguity must
+        // never resolve into a deletion.
+        _ => Some(same_name),
+    }
 }
 
 /// Every `.muse-superseded` file under `root`, recursively.
@@ -640,6 +691,85 @@ mod tests {
         assert_eq!(replacement_of(Path::new("/lib/Movie/Movie.mkv")), None);
         // Degenerate: nothing left after stripping.
         assert_eq!(replacement_of(Path::new("/lib/.muse-superseded")), None);
+    }
+
+    /// The bug a real end-to-end swap found in five seconds.
+    ///
+    /// Path A converts `avi` to `mkv`, so after the swap the backup is
+    /// `Movie.avi.muse-superseded` and the replacement is `Movie.mkv` — NOT
+    /// `Movie.avi`, which no longer exists by design. Keying only on the
+    /// original name made the reaper report "the replacement does not exist,
+    /// this backup is the ONLY copy" and keep the file forever, so nothing
+    /// Path A converted could ever reclaim disk.
+    ///
+    /// Every reaper test used same-name fixtures, which is why this survived
+    /// review, mutation testing, and a full dry run against the live library.
+    #[test]
+    fn a_container_changing_swap_still_resolves_its_replacement() {
+        let d = tmp("container-change");
+        let sup = d.join("Movie.avi.muse-superseded");
+        let replacement = d.join("Movie.mkv");
+        fs::write(&sup, b"original").unwrap();
+        fs::write(&replacement, b"converted").unwrap();
+        // The original .avi name is GONE, exactly as after a real swap.
+
+        assert_eq!(
+            replacement_of(&sup),
+            Some(replacement),
+            "the replacement must be found across a container change"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Same-container swaps must keep working — the common remux case.
+    #[test]
+    fn a_same_container_swap_resolves_to_the_identical_name() {
+        let d = tmp("same-container");
+        let sup = d.join("Movie.mkv.muse-superseded");
+        let replacement = d.join("Movie.mkv");
+        fs::write(&sup, b"original").unwrap();
+        fs::write(&replacement, b"remuxed").unwrap();
+        assert_eq!(replacement_of(&sup), Some(replacement));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Ambiguity must never resolve into a deletion.
+    ///
+    /// Two media files sharing the stem means we cannot tell which superseded
+    /// this backup. Picking one risks deleting the last copy of a title, so
+    /// the resolution falls back to the original name — which does not exist,
+    /// so the caller reports ReplacementMissing and KEEPS the backup.
+    #[test]
+    fn two_candidates_sharing_a_stem_do_not_resolve_to_either() {
+        let d = tmp("ambiguous");
+        let sup = d.join("Movie.avi.muse-superseded");
+        fs::write(&sup, b"original").unwrap();
+        fs::write(d.join("Movie.mkv"), b"one").unwrap();
+        fs::write(d.join("Movie.mp4"), b"two").unwrap();
+
+        let resolved = replacement_of(&sup).expect("some path");
+        assert_eq!(
+            resolved,
+            d.join("Movie.avi"),
+            "ambiguity must fall back to the non-existent original name, so the caller \
+             refuses rather than guessing which file superseded this backup"
+        );
+        assert!(!resolved.is_file(), "...and that path must not exist, forcing the refusal");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A stem match must still be MEDIA — a stray `Movie.txt` is not a
+    /// replacement, and treating it as one would allow deleting the only copy.
+    #[test]
+    fn a_non_media_sibling_is_not_mistaken_for_the_replacement() {
+        let d = tmp("nonmedia-sibling");
+        let sup = d.join("Movie.avi.muse-superseded");
+        fs::write(&sup, b"original").unwrap();
+        fs::write(d.join("Movie.txt"), b"notes").unwrap();
+        let resolved = replacement_of(&sup).expect("some path");
+        assert_eq!(resolved, d.join("Movie.avi"));
+        assert!(!resolved.is_file());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -1741,25 +1741,147 @@ mod tests {
         );
     }
 
-    /// Cover art is NOT a second video stream: the probe parser filters
-    /// `attached_pic` out, so an embedded poster — very common — must not be
-    /// predicted as a refusal. The over-report guard for the case above.
+    /// Cover art is NOT a second video stream — starting from real ffprobe
+    /// JSON, not from a hand-built fixture.
+    ///
+    /// The first version of this test built a one-video-stream fixture and
+    /// relied on `probe()` having pre-filtered, which made it a duplicate of
+    /// the `len == 1` case: it could not catch a parser regression that began
+    /// counting `attached_pic` streams. Raised at the FOUNDRY-30 gate.
+    ///
+    /// This matters more than the case it guards. An embedded poster is
+    /// extremely common, so counting cover art as a lost video stream would
+    /// predict a refusal for a large fraction of the library and understate
+    /// reclaimable disk across the whole run.
     #[test]
     fn embedded_cover_art_is_not_treated_as_a_lost_video_stream() {
         use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
-        // `probe()` builds the parsed view, in which cover art has already been
-        // excluded — so a poster-bearing file has exactly one video stream.
-        let source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+
+        // A file with one real video stream, an audio stream, and an embedded
+        // poster carried as an mjpeg stream with disposition.attached_pic=1 —
+        // exactly how ffprobe reports cover art.
+        let json = r#"{
+          "streams": [
+            {"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,
+             "pix_fmt":"yuv420p","disposition":{"attached_pic":0}},
+            {"index":1,"codec_type":"audio","codec_name":"aac","channels":2,
+             "disposition":{"attached_pic":0}},
+            {"index":2,"codec_type":"video","codec_name":"mjpeg","width":600,"height":900,
+             "disposition":{"attached_pic":1}}
+          ],
+          "format": {"format_name":"matroska,webm","duration":"5400.0","size":"4000000000"},
+          "chapters": []
+        }"#;
+
+        let source = crate::foundry::probe::parse_probe_json(json)
+            .expect("this is well-formed ffprobe output");
+        assert_eq!(
+            source.video.len(),
+            1,
+            "the parser must exclude attached_pic from the video list — if this \
+             fails, the prediction below would fire on every poster-bearing file"
+        );
+
         let plan = TranscodePlan {
             video_stream_index: 0,
             video: VideoAction::Encode { scale: None },
             audio: AudioAction::Copy,
             container: Container::Matroska,
         };
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        // It is NOT reported as a lost video stream...
         assert!(
-            predicted_deletion_refusals(&source, &plan).is_empty(),
-            "a single video stream plus filtered-out cover art predicts nothing"
+            !refusals.iter().any(|r| r.contains("video streams")),
+            "cover art must not be counted as a second video stream: {refusals:?}"
         );
+
+        // ...but it IS reported, via the undescribable-streams rule, because
+        // the parser records it in `other_stream_count` and the argv does not
+        // map it. The poster really is dropped by a rewrite, so refusing is
+        // correct — see the test below, which pins that the gate agrees.
+        assert!(
+            !refusals.is_empty(),
+            "an embedded poster is dropped by the rewrite, so deletion is refused"
+        );
+    }
+
+    /// **Every file with embedded cover art is un-reclaimable, and the gate is
+    /// right about it.**
+    ///
+    /// This is a policy consequence rather than a bug, and it is pinned here
+    /// because of its scale: an embedded poster is very common in an
+    /// *arr-populated library, and the argv maps only video/audio/subtitles/
+    /// attachments — never the artwork. So a rewrite genuinely loses it, the
+    /// gate genuinely cannot show the original was reproduced, and the original
+    /// is kept forever.
+    ///
+    /// The prediction and the gate AGREE here, which is the property that
+    /// matters: the survey reports these as un-reclaimable up front rather than
+    /// discovering it one encode at a time.
+    ///
+    /// Changing this means carrying the artwork through the rewrite, which is a
+    /// deliberate feature and an operator's call — not something to silence at
+    /// the gate.
+    #[test]
+    fn cover_art_makes_a_title_unreclaimable_and_the_gate_agrees() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut source = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "aac", 2)]);
+        // What the parser records for an embedded poster.
+        source.other_stream_count = 1;
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+
+        // The rewrite does not map the artwork, so the output has none.
+        let output = probe(vec![video("h264", 720, 480)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+        assert!(gate_refuses, "the dropped artwork cannot be shown reproduced");
+        assert_eq!(
+            gate_refuses, predicted,
+            "the survey must report this up front, not discover it per-encode"
+        );
+    }
+
+    /// Unknown source dimensions refuse whatever the plan does — including an
+    /// Encode with a known scale, where the OUTPUT dimensions are known and
+    /// only the source's are not. Raised at the FOUNDRY-30 gate: the earlier
+    /// test covered only the Copy path.
+    #[test]
+    fn unknown_source_dimensions_refuse_even_when_the_output_size_is_known() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut v = video("h264", 1920, 1080);
+        v.width = None;
+        let source = probe(vec![v], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode {
+                scale: Some((1920, 1080)),
+            },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+
+        // The encode produces a file with known dimensions.
+        let output = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+        assert!(
+            gate_refuses,
+            "the gate cannot compare against an unknown source size, so it refuses"
+        );
+        assert_eq!(gate_refuses, predicted);
     }
 
     /// Attachments survive only into Matroska. An acceptable MP4 source is kept

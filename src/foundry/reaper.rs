@@ -225,7 +225,23 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
         return Some(same_name);
     };
     let mut matches: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
+    // Entries this pass could not read. `flatten()` silently discarded these,
+    // which quietly broke the fail-closed contract below: the ambiguity rule
+    // only works if BOTH candidates are seen. A transient NFS error (ESTALE,
+    // EIO) dropping one of two same-stem files collapses the list from 2 to 1,
+    // and the survivor — which may not be the file that superseded this
+    // backup — then resolves cleanly and authorises a deletion.
+    //
+    // This is the same rule this codebase keeps relearning: "could not look"
+    // must not render as "not there". It is the seventh instance, and the
+    // first one found inside a function whose stated contract is
+    // fail-closed-on-ambiguity. Raised in the FOUNDRY-11 reaper audit.
+    let mut unreadable = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
         let p = entry.path();
         if !p.is_file() || !crate::library::scan::has_media_extension(&p) {
             continue;
@@ -234,6 +250,14 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
             matches.push(p);
         }
     }
+
+    if unreadable > 0 {
+        // Something in this directory could not be read, so the candidate list
+        // may be short. Refuse to resolve rather than trust a possibly-partial
+        // view; the caller reports ReplacementMissing and KEEPS the backup.
+        return Some(same_name);
+    }
+
     match matches.as_slice() {
         [only] => Some(only.clone()),
         // None found, or several: return the same-name path so the caller
@@ -332,7 +356,62 @@ fn age_of(p: &Path) -> Option<Duration> {
     let md = std::fs::symlink_metadata(p).ok()?;
     let ctime = SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs(u64::try_from(md.ctime()).ok()?))?;
-    SystemTime::now().duration_since(ctime).ok()
+    let age = SystemTime::now().duration_since(ctime).ok()?;
+    // An implausible age is not evidence of age. `age_of` failed CLOSED on an
+    // unreadable stat and on a backwards clock, but a ctime of 0 — or any
+    // nonsense past value — produced an age of decades that sails past every
+    // retention window. That is failing OPEN on exactly the input a broken
+    // filesystem or a mis-set clock produces.
+    //
+    // This is not hypothetical on the target fleet: the library is an NFSv3
+    // mount from a QNAP whose clock was measured running ~29 minutes behind
+    // this host (2026-08-02), so ctime here is a REMOTE server's notion of
+    // time compared against a LOCAL now. That skew is harmless against a
+    // multi-day window; a larger one would not be. Raised in the FOUNDRY-11
+    // reaper audit.
+    plausible_age(age)
+}
+
+/// The plausibility decision, separated from the stat that produced it.
+///
+/// Inline, this was untestable without a filesystem on which a ctime of 0 can
+/// be forced — and it showed: the first version of the ceiling had a test that
+/// only compared two constants, and deleting the check outright did not fail
+/// it. That is the fourth time in this codebase a decision inside a function
+/// needing real I/O has had a mutant survive.
+fn plausible_age(age: Duration) -> Option<Duration> {
+    (age <= MAX_PLAUSIBLE_AGE).then_some(age)
+}
+
+/// Beyond this, a reported age is a broken clock or a broken inode rather than
+/// an old file. Ten years is far past any retention an operator would set and
+/// far short of the ~56 years a zero ctime reports.
+const MAX_PLAUSIBLE_AGE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+/// **The retention window actually used, given what the deployment configured
+/// and what a request asked for.**
+///
+/// A request may only LENGTHEN the window, never shorten it.
+///
+/// The reaper took its retention purely from the caller: the endpoint hardcoded
+/// its own 14-day default, `cfg.retention_days` was never read by this module
+/// at all, and [`DEFAULT_RETENTION`] was dead code. So an operator could set
+/// `MUSE_FOUNDRY_RETENTION_DAYS=30`, see it confirmed in the startup log and on
+/// the status surface, and have it apply to nothing — while
+/// `?retention_days=0&mutate=true` reduced the window to zero and made every
+/// backup in a 16,000-item library deletable in a single call.
+///
+/// That is the same shape as the defect this module already documents fixing
+/// for `mutate` — "one query parameter made that false" — left open one field
+/// over. Raised in the FOUNDRY-11 reaper audit.
+///
+/// The configured value is a FLOOR, so the recoverability window a deployment
+/// promises cannot be revoked by a query string.
+pub fn effective_retention(configured: Duration, requested: Option<Duration>) -> Duration {
+    match requested {
+        Some(r) => r.max(configured),
+        None => configured,
+    }
 }
 
 /// Decide one preserved original. **Never deletes** — the decision and the
@@ -1037,6 +1116,91 @@ mod tests {
     }
 
     /// Retention is a real gate, not a label.
+    // --- the retention floor -----------------------------------------------
+
+    /// **The one-parameter disarm this floor exists to close.**
+    ///
+    /// `?retention_days=0&mutate=true` made every backup in the library
+    /// instantly deletable, regardless of what the deployment had configured.
+    #[test]
+    fn a_request_may_not_shorten_the_configured_retention_window() {
+        let configured = Duration::from_secs(30 * 24 * 60 * 60);
+        assert_eq!(
+            effective_retention(configured, Some(Duration::ZERO)),
+            configured,
+            "retention_days=0 must not revoke the deployment's recoverability window"
+        );
+        assert_eq!(
+            effective_retention(configured, Some(Duration::from_secs(24 * 60 * 60))),
+            configured,
+            "a shorter request is floored at the configured value"
+        );
+    }
+
+    #[test]
+    fn a_request_may_lengthen_the_retention_window() {
+        let configured = Duration::from_secs(14 * 24 * 60 * 60);
+        let longer = Duration::from_secs(90 * 24 * 60 * 60);
+        assert_eq!(effective_retention(configured, Some(longer)), longer);
+    }
+
+    #[test]
+    fn no_request_means_the_configured_window() {
+        let configured = Duration::from_secs(21 * 24 * 60 * 60);
+        assert_eq!(effective_retention(configured, None), configured);
+    }
+
+    /// A deployment that configured zero gets zero — the floor is the
+    /// deployment's choice, not a second opinion about it. `config.rs` already
+    /// warns at startup when retention is zero; that is the right place to
+    /// argue with the operator, not here.
+    #[test]
+    fn a_deployment_that_configured_zero_is_not_overridden_upward() {
+        assert_eq!(
+            effective_retention(Duration::ZERO, None),
+            Duration::ZERO
+        );
+    }
+
+    /// An implausible age is not evidence of age. A zero ctime reports ~56
+    /// years, which sails past every retention window — failing OPEN on exactly
+    /// the input a broken clock or a damaged inode produces.
+    #[test]
+    fn an_implausibly_old_age_is_rejected_rather_than_treated_as_very_old() {
+        let from_zero_ctime = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is after 1970");
+        assert_eq!(
+            plausible_age(from_zero_ctime),
+            None,
+            "a ctime of 0 must not make a backup eligible for deletion"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_age_is_accepted() {
+        let a_week = Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(plausible_age(a_week), Some(a_week));
+    }
+
+    /// The ceiling must still admit the longest retention the endpoint accepts,
+    /// or a legitimately old backup under a 10-year window would be rejected as
+    /// implausible and never reaped.
+    #[test]
+    fn the_ceiling_still_admits_the_longest_retention_the_endpoint_allows() {
+        let longest = Duration::from_secs(3650 * 24 * 60 * 60);
+        assert!(plausible_age(longest).is_some());
+    }
+
+    #[test]
+    fn the_boundary_itself_is_plausible() {
+        assert_eq!(plausible_age(MAX_PLAUSIBLE_AGE), Some(MAX_PLAUSIBLE_AGE));
+        assert_eq!(
+            plausible_age(MAX_PLAUSIBLE_AGE + Duration::from_secs(1)),
+            None
+        );
+    }
+
     #[test]
     fn a_backup_inside_the_retention_window_is_kept() {
         let d = tmp("young");

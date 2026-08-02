@@ -35,11 +35,25 @@ use crate::media::paths::ResolvedPath;
 /// Pure, so the exact argv is asserted in tests on a host with no `ffprobe`
 /// — the same posture as [`crate::streaming::ffmpeg::build_args`].
 ///
-/// `-v quiet` plus `-print_format json` means stdout is *only* JSON: any
-/// diagnostic noise would otherwise be interleaved into the document we are
-/// about to parse. `-show_format` gives the container/duration, `-show_streams`
-/// the per-stream detail, `-show_chapters` the chapter list; none is the
-/// default and all three are needed.
+/// `-v error` plus `-print_format json` means stdout is *only* JSON —
+/// ffprobe writes diagnostics to stderr, and [`spawn_with_timeout`] captures
+/// the two on separate pipes, so nothing this level emits can be interleaved
+/// into the document we are about to parse.
+///
+/// It is `error` and **not `quiet`**, and that is the whole point. `-v quiet`
+/// suppresses ffprobe's stderr entirely, which made
+/// [`ProbeError::ExitFailure`]'s `stderr` field always empty: every probe
+/// failure rendered as "...is not media: " — a dangling colon and no
+/// diagnostic. A full-library survey produced 7 such failures and not one of
+/// them said why. That violates this module's governing rule that ignorance
+/// must never render as absence: a failure that cannot state its cause is
+/// indistinguishable from one nobody looked into. At `-v error` those same
+/// files immediately name the real fault ("EBML header parsing failed"),
+/// while stdout stays clean JSON so parsing is unaffected.
+///
+/// `-show_format` gives the container/duration, `-show_streams` the per-stream
+/// detail, `-show_chapters` the chapter list; none is the default and all
+/// three are needed.
 ///
 /// `-show_chapters` is not optional decoration: the transcode argv promises
 /// `-map_chapters 0`, and a promise that is never checked is the class of
@@ -48,7 +62,7 @@ use crate::media::paths::ResolvedPath;
 pub fn build_ffprobe_args(file_path: &str) -> Vec<String> {
     vec![
         "-v".to_string(),
-        "quiet".to_string(),
+        "error".to_string(),
         "-print_format".to_string(),
         "json".to_string(),
         "-show_format".to_string(),
@@ -969,7 +983,7 @@ mod tests {
             build_ffprobe_args("/srv/media/Movies/A/A.mkv"),
             vec![
                 "-v",
-                "quiet",
+                "error",
                 "-print_format",
                 "json",
                 "-show_format",
@@ -977,6 +991,53 @@ mod tests {
                 "-show_chapters",
                 "/srv/media/Movies/A/A.mkv",
             ]
+        );
+    }
+
+    #[test]
+    fn a_probe_failure_renders_the_reason_ffprobe_gave_not_an_empty_colon() {
+        // The behaviour, not the wording: whatever ffprobe said about WHY the
+        // file failed has to survive into the message an operator reads.
+        //
+        // This is the pair of assertions that has to hold together. The argv
+        // must ask for stderr (`-v error`, never `-v quiet`), AND the rendering
+        // must carry what stderr contained. With `-v quiet` the first fails
+        // here and, live, the second is vacuously true against an empty string
+        // — which is exactly how 7 library failures came to render as
+        // "...is not media: " with nothing after the colon. Ignorance rendered
+        // as absence: unable to say why, and therefore indistinguishable from
+        // a failure nobody investigated.
+        let argv = build_ffprobe_args("/srv/media/Movies/Broken.mkv");
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-v" && w[1] == "error"),
+            "argv must ask ffprobe for its errors: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "quiet"),
+            "`-v quiet` silences the only diagnostic a failed probe can offer: {argv:?}"
+        );
+
+        // A real one, from a file this library actually holds.
+        let detail = "[matroska,webm @ 0x55d1] 0x00 at pos 0 (0x0) invalid as first byte \
+                      of an EBML number\n[matroska,webm @ 0x55d1] EBML header parsing failed";
+        let rendered = ProbeError::ExitFailure {
+            code: Some(1),
+            stderr: detail.to_string(),
+        }
+        .to_string();
+
+        assert!(
+            rendered.contains("EBML header parsing failed"),
+            "the captured stderr must reach the operator, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("invalid as first byte"),
+            "the whole diagnostic, not just its last line, got: {rendered}"
+        );
+        // And the failure mode that started this: nothing after the colon.
+        assert!(
+            !rendered.trim_end().ends_with(':'),
+            "a message ending in a bare colon says nothing at all: {rendered}"
         );
     }
 

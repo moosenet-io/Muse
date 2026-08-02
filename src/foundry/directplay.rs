@@ -647,10 +647,36 @@ pub fn predicted_deletion_refusals(
         }
     }
 
+    // Only the PRIMARY video stream is mapped. `build_transcode_args` emits a
+    // single `-map 0:{video_stream_index}`, so a source with more than one real
+    // video stream — multi-angle, or a second angle muxed in — loses every
+    // other one, and the gate refuses with `StreamsLost { kind: "video" }`.
+    // Raised at the FOUNDRY-30 gate; the planner has no pre-refusal for it, so
+    // it is reachable.
+    //
+    // Cover art does NOT count: the probe parser filters `attached_pic` streams
+    // out of its video list (see `MediaProbe::video`), which is also why the
+    // argv maps an ABSOLUTE stream index rather than `0:v:0`. Were that not so,
+    // this would fire on the very common case of an embedded poster.
+    if source.video.len() > 1 {
+        out.push(format!(
+            "the source has {} video streams and a rewrite maps only the primary one, so the \
+             others will be lost and the original cannot be shown to have been reproduced",
+            source.video.len()
+        ));
+    }
+
     // Attachments survive only into Matroska: the argv emits `-c:t copy` under
     // `container_holds_attachments`, which is Matroska alone. An already-
-    // acceptable MP4 source is kept as MP4, so its attachments are dropped and
-    // the gate refuses with `StreamsLost`. Raised at the FOUNDRY-30 gate.
+    // acceptable MP4 source is kept as MP4, so its attachments would be dropped
+    // and the gate would refuse with `StreamsLost`.
+    //
+    // In practice the planner refuses this combination first, with
+    // `Undecidable::AttachmentsCannotBeCarried` (plan.rs), so a plan reaching
+    // here with fonts and a non-Matroska target should not exist. This is kept
+    // as a consistency check rather than a live prediction: if that pre-refusal
+    // is ever relaxed, the prediction stays correct instead of silently
+    // under-reporting.
     //
     // Subtitles and chapters need no equivalent: the argv maps and copies them
     // unconditionally (`-map 0:s?`, `-map_chapters 0`, `-c:s copy`), so
@@ -1682,6 +1708,58 @@ mod tests {
 
         assert!(gate_refuses, "the gate refuses unknown dimensions");
         assert_eq!(gate_refuses, predicted, "prediction must agree with the gate");
+    }
+
+    /// A rewrite maps only the primary video stream, so a genuine second video
+    /// stream is lost and the gate refuses. Raised at the FOUNDRY-30 gate; the
+    /// planner has no pre-refusal for it.
+    #[test]
+    fn a_second_video_stream_is_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("h264", 1920, 1080), video("h264", 1920, 1080)],
+            vec![audio(1, "aac", 2)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+
+        // What the argv produces: one video stream.
+        let output = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        assert!(gate_refuses, "the gate refuses a lost video stream");
+        assert!(
+            refusals.iter().any(|r| r.contains("video streams")),
+            "the prediction must name the lost video streams: {refusals:?}"
+        );
+    }
+
+    /// Cover art is NOT a second video stream: the probe parser filters
+    /// `attached_pic` out, so an embedded poster — very common — must not be
+    /// predicted as a refusal. The over-report guard for the case above.
+    #[test]
+    fn embedded_cover_art_is_not_treated_as_a_lost_video_stream() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        // `probe()` builds the parsed view, in which cover art has already been
+        // excluded — so a poster-bearing file has exactly one video stream.
+        let source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(
+            predicted_deletion_refusals(&source, &plan).is_empty(),
+            "a single video stream plus filtered-out cover art predicts nothing"
+        );
     }
 
     /// Attachments survive only into Matroska. An acceptable MP4 source is kept

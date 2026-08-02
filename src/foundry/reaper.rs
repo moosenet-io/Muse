@@ -184,6 +184,54 @@ impl ReapRun {
 /// Returns `None` when the path does not carry the extension at all, which is
 /// how a caller's own mistake surfaces rather than being reinterpreted.
 pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
+    resolve_replacement(superseded).map(|(_, path)| path)
+}
+
+/// What a directory listing established about a backup's replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchVerdict {
+    /// Exactly one media sibling shares the stem, from a listing that was read
+    /// in full. The only verdict that may authorise a deletion.
+    Unique,
+    /// None found, or several — we cannot tell which file superseded this
+    /// backup.
+    Ambiguous,
+    /// The listing was incomplete, so the candidate set may be short.
+    Incomplete { unreadable: usize },
+}
+
+/// **Was the resolution trustworthy?** Pure, so it is testable.
+///
+/// The fail-closed ambiguity rule only works if every candidate was SEEN. A
+/// transient NFS error (ESTALE, EIO) dropping one of two same-stem files
+/// collapses the list from 2 to 1, and the survivor — which may not be the file
+/// that superseded this backup — would otherwise resolve cleanly and authorise
+/// deleting against the wrong replacement.
+///
+/// This is decided from the SAME listing that produced the matches, and that is
+/// the point. An earlier version checked completeness with a second, separate
+/// `read_dir`, which did not close the race — it moved it: a transient error
+/// hitting only the resolution read left the guard already satisfied. Raised at
+/// the REAP-01 gate. One read, one verdict.
+pub(crate) fn classify_matches(matches: &[PathBuf], unreadable: usize) -> MatchVerdict {
+    if unreadable > 0 {
+        return MatchVerdict::Incomplete { unreadable };
+    }
+    match matches.len() {
+        1 => MatchVerdict::Unique,
+        _ => MatchVerdict::Ambiguous,
+    }
+}
+
+/// The verdict for a backup's replacement lookup, for callers that need to
+/// tell "could not look" from "not there".
+///
+/// `replacement_of` collapses both into the same-name fallback, which is right
+/// for its callers that only need a path. [`decide_one`] needs the difference:
+/// reporting a partial listing as `ReplacementMissing` would state "this backup
+/// is the ONLY copy of the title" — a confident and false claim about a
+/// directory that simply could not be read.
+pub(crate) fn resolve_replacement(superseded: &Path) -> Option<(MatchVerdict, PathBuf)> {
     let name = superseded.file_name()?.to_str()?;
     let stem = name.strip_suffix(&format!(".{SUPERSEDED_EXT}"))?;
     if stem.is_empty() {
@@ -191,41 +239,27 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
     }
     let same_name = superseded.with_file_name(stem);
     if same_name.is_file() {
-        return Some(same_name);
+        // A same-name replacement needs no listing at all.
+        return Some((MatchVerdict::Unique, same_name));
     }
 
-    // The swap may have CHANGED THE CONTAINER, in which case the replacement
-    // has a different extension and the name above no longer exists.
-    //
-    // This is not an edge case: converting `avi` to `mkv` is most of what
-    // Path A does on this library, so keying only on the original name meant
-    // the reaper could never reclaim anything Path A actually converted — it
-    // reported "the replacement does not exist, this backup is the ONLY copy"
-    // and kept the file forever. Every reaper test used same-name fixtures, so
-    // this was invisible until a real swap ran end to end.
-    //
-    // Resolution is by STEM, and is fail-closed on ambiguity: exactly one
-    // media sibling sharing the stem counts as the replacement. Two or more
-    // means we cannot tell which one superseded this backup, and guessing
-    // would risk deleting the last copy of a title.
-    // Every failure below falls back to `same_name` rather than to None.
-    //
-    // Returning None would discard the path entirely, and the caller would
-    // report "not a superseded name" — a confusing lie about a file that
-    // plainly is one. Falling back to the original name means the caller
-    // reports ReplacementMissing and KEEPS the backup, which is the correct
-    // outcome for "I could not work out what replaced this".
     let (Some(dir), Some(base)) = (
         superseded.parent(),
         Path::new(stem).file_stem().and_then(|s| s.to_str()),
     ) else {
-        return Some(same_name);
+        return Some((MatchVerdict::Ambiguous, same_name));
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Some(same_name);
+        return Some((MatchVerdict::Ambiguous, same_name));
     };
+
     let mut matches: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
+    let mut unreadable = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
         let p = entry.path();
         if !p.is_file() || !crate::library::scan::has_media_extension(&p) {
             continue;
@@ -234,13 +268,16 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
             matches.push(p);
         }
     }
-    match matches.as_slice() {
-        [only] => Some(only.clone()),
-        // None found, or several: return the same-name path so the caller
-        // reports ReplacementMissing and KEEPS the backup. Ambiguity must
-        // never resolve into a deletion.
-        _ => Some(same_name),
-    }
+
+    let verdict = classify_matches(&matches, unreadable);
+    let path = match verdict {
+        MatchVerdict::Unique => matches[0].clone(),
+        // Ambiguous or incomplete: hand back the same-name path so a caller
+        // that only wants a path reports ReplacementMissing and KEEPS the
+        // backup.
+        _ => same_name,
+    };
+    Some((verdict, path))
 }
 
 /// Every `.muse-superseded` file under `root`, recursively.
@@ -332,7 +369,74 @@ fn age_of(p: &Path) -> Option<Duration> {
     let md = std::fs::symlink_metadata(p).ok()?;
     let ctime = SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs(u64::try_from(md.ctime()).ok()?))?;
-    SystemTime::now().duration_since(ctime).ok()
+    let age = SystemTime::now().duration_since(ctime).ok()?;
+    // An implausible age is not evidence of age. `age_of` failed CLOSED on an
+    // unreadable stat and on a backwards clock, but a ctime of 0 — or any
+    // nonsense past value — produced an age of decades that sails past every
+    // retention window. That is failing OPEN on exactly the input a broken
+    // filesystem or a mis-set clock produces.
+    //
+    // This is not hypothetical on the target fleet: the library is an NFSv3
+    // mount from a QNAP whose clock was measured running ~29 minutes behind
+    // this host (2026-08-02), so ctime here is a REMOTE server's notion of
+    // time compared against a LOCAL now. That skew is harmless against a
+    // multi-day window; a larger one would not be. Raised in the FOUNDRY-11
+    // reaper audit.
+    plausible_age(age)
+}
+
+/// The plausibility decision, separated from the stat that produced it.
+///
+/// Inline, this was untestable without a filesystem on which a ctime of 0 can
+/// be forced — and it showed: the first version of the ceiling had a test that
+/// only compared two constants, and deleting the check outright did not fail
+/// it. That is the fourth time in this codebase a decision inside a function
+/// needing real I/O has had a mutant survive.
+fn plausible_age(age: Duration) -> Option<Duration> {
+    (age <= MAX_PLAUSIBLE_AGE).then_some(age)
+}
+
+/// Beyond this, a reported age is a broken clock or a broken inode rather than
+/// an old file.
+///
+/// **25 years, deliberately not 10.** The first version used ten, which is
+/// exactly the longest retention the endpoint accepts (3650 days) — and
+/// deletion requires `retention < age <= MAX`, so at a maximum-length window
+/// the deletable band was EMPTY and the reaper was silently disarmed. Any
+/// backup older than the ceiling was also kept forever under any window. A
+/// ceiling that can collide with a configured window is a disarm, not a guard.
+/// Raised at the REAP-01 gate.
+///
+/// The bound has to sit in the gap between the longest legitimate window and
+/// the age a broken timestamp reports. A ctime of 0 currently reports ~56
+/// years and grows by a year every year, so 25 leaves headroom at both ends:
+/// well above the 10-year maximum retention, well below the epoch age.
+const MAX_PLAUSIBLE_AGE: Duration = Duration::from_secs(25 * 365 * 24 * 60 * 60);
+
+/// **The retention window actually used, given what the deployment configured
+/// and what a request asked for.**
+///
+/// A request may only LENGTHEN the window, never shorten it.
+///
+/// The reaper took its retention purely from the caller: the endpoint hardcoded
+/// its own 14-day default, `cfg.retention_days` was never read by this module
+/// at all, and [`DEFAULT_RETENTION`] was dead code. So an operator could set
+/// `MUSE_FOUNDRY_RETENTION_DAYS=30`, see it confirmed in the startup log and on
+/// the status surface, and have it apply to nothing — while
+/// `?retention_days=0&mutate=true` reduced the window to zero and made every
+/// backup in a 16,000-item library deletable in a single call.
+///
+/// That is the same shape as the defect this module already documents fixing
+/// for `mutate` — "one query parameter made that false" — left open one field
+/// over. Raised in the FOUNDRY-11 reaper audit.
+///
+/// The configured value is a FLOOR, so the recoverability window a deployment
+/// promises cannot be revoked by a query string.
+pub fn effective_retention(configured: Duration, requested: Option<Duration>) -> Duration {
+    match requested {
+        Some(r) => r.max(configured),
+        None => configured,
+    }
 }
 
 /// Decide one preserved original. **Never deletes** — the decision and the
@@ -347,7 +451,7 @@ pub fn decide_one(
     superseded: &Path,
     retention: Duration,
 ) -> (ReapOutcome, Option<PathBuf>, Option<u64>) {
-    let Some(replacement) = replacement_of(superseded) else {
+    let Some((verdict, replacement)) = resolve_replacement(superseded) else {
         return (
             ReapOutcome::CouldNotInspect {
                 detail: format!("{} is not a superseded name", superseded.display()),
@@ -356,6 +460,39 @@ pub fn decide_one(
             None,
         );
     };
+
+    // **Was the directory listing complete?**
+    //
+    // `replacement_of` resolves across a container change by matching stems,
+    // and refuses when it finds none or several — ambiguity must never resolve
+    // into a deletion. That rule only works if BOTH candidates were SEEN. A
+    // transient NFS error (ESTALE, EIO) dropping one of two same-stem files
+    // collapses the list from 2 to 1, and the survivor — which may not be the
+    // file that superseded this backup — then resolves cleanly and authorises
+    // deleting against the wrong replacement.
+    //
+    // Checked here rather than inside `replacement_of` so it can be reported as
+    // what it is. Folding it into that function produced `ReplacementMissing`,
+    // whose message states "this backup is the ONLY copy of the title" — a
+    // confident and FALSE claim when the truth is that a directory could not be
+    // read. Ignorance rendering as absence is the bug; ignorance rendering as a
+    // different specific certainty is the same bug wearing a hat.
+    // Decided from the SAME listing that produced `replacement`, so a
+    // transient error cannot satisfy a completeness guard and then corrupt the
+    // resolution. One read, one verdict.
+    if let MatchVerdict::Incomplete { unreadable } = verdict {
+        return (
+            ReapOutcome::CouldNotInspect {
+                detail: format!(
+                    "{unreadable} entr{} in the containing directory could not be read, so \
+                     the search for this backup's replacement may have missed a candidate",
+                    if unreadable == 1 { "y" } else { "ies" }
+                ),
+            },
+            None,
+            None,
+        );
+    }
 
     let bytes = std::fs::metadata(superseded).ok().map(|m| m.len());
 
@@ -1037,6 +1174,251 @@ mod tests {
     }
 
     /// Retention is a real gate, not a label.
+    /// The aggregator must treat "could not inspect" as KEPT and never as a
+    /// delete judgement — flagged as unverified at the REAP-01 gate.
+    ///
+    /// This does NOT assert `bytes_reclaimed`: that field is set by `reap`, so
+    /// a hand-built `ReapRun` could only assert its own fixture. An earlier
+    /// version of this test was named "...reclaims_nothing" and asserted no
+    /// such thing — a name writing a cheque the body did not cash, which is the
+    /// decorative-test failure this codebase keeps catching. The bytes rule is
+    /// pinned structurally by the test below instead.
+    #[test]
+    fn a_file_that_could_not_be_inspected_counts_as_kept_not_deleted() {
+        let run = ReapRun {
+            files: vec![
+                ReapedFile {
+                    superseded_path: "/lib/A.mkv.muse-superseded".into(),
+                    replacement_path: "/lib/A.mkv".into(),
+                    bytes: Some(1_000),
+                    outcome: ReapOutcome::CouldNotInspect {
+                        detail: "2 entries in the containing directory could not be read".into(),
+                    },
+                },
+                ReapedFile {
+                    superseded_path: "/lib/B.mkv.muse-superseded".into(),
+                    replacement_path: "/lib/B.mkv".into(),
+                    bytes: Some(2_000),
+                    outcome: ReapOutcome::Deleted,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(run.deleted(), 1);
+        assert_eq!(run.would_delete(), 1, "an uninspectable file is not deletable");
+        assert_eq!(run.kept(), 1, "it must be counted as kept, not vanish");
+        assert!(
+            !ReapOutcome::CouldNotInspect { detail: String::new() }.would_delete(),
+            "CouldNotInspect must never be a delete judgement"
+        );
+    }
+
+    /// `bytes_reclaimed` may only grow when a file was ACTUALLY deleted.
+    ///
+    /// Asserted against the source, in the same style as the existing
+    /// "must consult the deletion gate" test, because the property is about
+    /// where the accumulation sits rather than about any value a fixture can
+    /// hold: reporting reclaimed bytes for a file still on disk would tell an
+    /// operator the run freed space it did not free.
+    #[test]
+    fn reclaimed_bytes_are_only_counted_inside_the_actually_deleted_branch() {
+        let src = include_str!("reaper.rs");
+        let accum = src
+            .find("run.bytes_reclaimed = run.bytes_reclaimed.saturating_add(")
+            .expect("the accumulation site must exist");
+
+        // Walk back to the nearest enclosing condition and require it to be the
+        // one that establishes a real deletion.
+        let before = &src[..accum];
+        let guard = before
+            .rfind("if deleted == ReapOutcome::Deleted {")
+            .expect("bytes must only be counted once a deletion is CONFIRMED");
+        assert!(
+            !before[guard..].contains("\n        }\n"),
+            "the accumulation must still be inside that branch, not after it"
+        );
+    }
+
+    // --- resolution trustworthiness ----------------------------------------
+
+    fn m(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn exactly_one_candidate_from_a_complete_listing_resolves() {
+        assert_eq!(
+            classify_matches(&m(&["/lib/Movie/Movie.mkv"]), 0),
+            MatchVerdict::Unique
+        );
+    }
+
+    #[test]
+    fn no_candidates_or_several_are_ambiguous() {
+        assert_eq!(classify_matches(&m(&[]), 0), MatchVerdict::Ambiguous);
+        assert_eq!(
+            classify_matches(&m(&["/lib/M/M.mkv", "/lib/M/M.mp4"]), 0),
+            MatchVerdict::Ambiguous
+        );
+    }
+
+    /// **The collapse this guard exists to stop.**
+    ///
+    /// Two same-stem candidates would be Ambiguous and keep the backup. A
+    /// transient NFS error dropping one leaves a single match that looks
+    /// perfectly unique — and it may not be the file that superseded this
+    /// backup. An incomplete listing must never resolve, however tidy the
+    /// survivors look.
+    #[test]
+    fn a_single_candidate_from_an_incomplete_listing_does_not_resolve() {
+        assert_eq!(
+            classify_matches(&m(&["/lib/Movie/Movie.mkv"]), 1),
+            MatchVerdict::Incomplete { unreadable: 1 },
+            "one unreadable entry may have hidden the real replacement"
+        );
+    }
+
+    /// Incompleteness outranks even a clean-looking ambiguity count, because
+    /// the count itself is unreliable when entries were missed.
+    #[test]
+    fn incompleteness_outranks_the_match_count() {
+        assert_eq!(
+            classify_matches(&m(&[]), 3),
+            MatchVerdict::Incomplete { unreadable: 3 }
+        );
+        assert_eq!(
+            classify_matches(&m(&["/a/M.mkv", "/a/M.mp4"]), 2),
+            MatchVerdict::Incomplete { unreadable: 2 }
+        );
+    }
+
+    /// A complete listing with no errors must NOT be reported as incomplete —
+    /// the over-refusal guard. Every reap would otherwise report
+    /// CouldNotInspect and nothing would ever be reclaimed.
+    #[test]
+    fn a_complete_listing_is_never_reported_incomplete() {
+        for matches in [m(&[]), m(&["/a/M.mkv"]), m(&["/a/M.mkv", "/a/M.mp4"])] {
+            assert!(
+                !matches!(
+                    classify_matches(&matches, 0),
+                    MatchVerdict::Incomplete { .. }
+                ),
+                "a listing read in full is complete, whatever it contained"
+            );
+        }
+    }
+
+    // --- the retention floor -----------------------------------------------
+
+    /// **The one-parameter disarm this floor exists to close.**
+    ///
+    /// `?retention_days=0&mutate=true` made every backup in the library
+    /// instantly deletable, regardless of what the deployment had configured.
+    #[test]
+    fn a_request_may_not_shorten_the_configured_retention_window() {
+        let configured = Duration::from_secs(30 * 24 * 60 * 60);
+        assert_eq!(
+            effective_retention(configured, Some(Duration::ZERO)),
+            configured,
+            "retention_days=0 must not revoke the deployment's recoverability window"
+        );
+        assert_eq!(
+            effective_retention(configured, Some(Duration::from_secs(24 * 60 * 60))),
+            configured,
+            "a shorter request is floored at the configured value"
+        );
+    }
+
+    #[test]
+    fn a_request_may_lengthen_the_retention_window() {
+        let configured = Duration::from_secs(14 * 24 * 60 * 60);
+        let longer = Duration::from_secs(90 * 24 * 60 * 60);
+        assert_eq!(effective_retention(configured, Some(longer)), longer);
+    }
+
+    #[test]
+    fn no_request_means_the_configured_window() {
+        let configured = Duration::from_secs(21 * 24 * 60 * 60);
+        assert_eq!(effective_retention(configured, None), configured);
+    }
+
+    /// A deployment that configured zero gets zero — the floor is the
+    /// deployment's choice, not a second opinion about it. `config.rs` already
+    /// warns at startup when retention is zero; that is the right place to
+    /// argue with the operator, not here.
+    #[test]
+    fn a_deployment_that_configured_zero_is_not_overridden_upward() {
+        assert_eq!(
+            effective_retention(Duration::ZERO, None),
+            Duration::ZERO
+        );
+    }
+
+    /// An implausible age is not evidence of age. A zero ctime reports ~56
+    /// years, which sails past every retention window — failing OPEN on exactly
+    /// the input a broken clock or a damaged inode produces.
+    #[test]
+    fn an_implausibly_old_age_is_rejected_rather_than_treated_as_very_old() {
+        let from_zero_ctime = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is after 1970");
+        assert_eq!(
+            plausible_age(from_zero_ctime),
+            None,
+            "a ctime of 0 must not make a backup eligible for deletion"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_age_is_accepted() {
+        let a_week = Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(plausible_age(a_week), Some(a_week));
+    }
+
+    /// **The disarm this ceiling nearly caused.**
+    ///
+    /// Deletion needs `retention < age <= MAX_PLAUSIBLE_AGE`. With the ceiling
+    /// set equal to the longest retention the endpoint accepts, that band is
+    /// empty: nothing is ever both old enough and plausible, so a
+    /// maximum-length window silently disarms the reaper entirely.
+    ///
+    /// This asserts a file can actually be DELETABLE just past the longest
+    /// window — the capability — rather than that the window length is itself
+    /// a plausible age, which was the earlier test's mistake and told us
+    /// nothing.
+    #[test]
+    fn a_backup_just_past_the_longest_window_is_still_reapable() {
+        let longest_window = Duration::from_secs(3650 * 24 * 60 * 60);
+        let just_past = longest_window + Duration::from_secs(24 * 60 * 60);
+
+        let age = plausible_age(just_past)
+            .expect("a backup one day past a maximum-length window is not implausible");
+        assert!(
+            age >= longest_window,
+            "and it must still count as old enough to reap, or the longest \
+             configurable window disarms the reaper"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_leaves_headroom_above_the_longest_configurable_window() {
+        let longest_window = Duration::from_secs(3650 * 24 * 60 * 60);
+        assert!(
+            MAX_PLAUSIBLE_AGE > longest_window,
+            "a ceiling equal to the longest window leaves an empty deletable band"
+        );
+    }
+
+    #[test]
+    fn the_boundary_itself_is_plausible() {
+        assert_eq!(plausible_age(MAX_PLAUSIBLE_AGE), Some(MAX_PLAUSIBLE_AGE));
+        assert_eq!(
+            plausible_age(MAX_PLAUSIBLE_AGE + Duration::from_secs(1)),
+            None
+        );
+    }
+
     #[test]
     fn a_backup_inside_the_retention_window_is_kept() {
         let d = tmp("young");

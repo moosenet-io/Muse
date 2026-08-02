@@ -3381,8 +3381,18 @@ pub async fn foundry_reap(
     }
 
     let mutate = q.mutate.unwrap_or(false);
-    let retention = std::time::Duration::from_secs(
-        q.retention_days.unwrap_or(14).clamp(0, 3650) * 24 * 60 * 60,
+    // The DEPLOYMENT's retention is a floor; a request may only lengthen it.
+    //
+    // This previously read `q.retention_days.unwrap_or(14).clamp(0, 3650)`,
+    // which ignored `cfg.retention_days` entirely and permitted ZERO — so
+    // `?retention_days=0&mutate=true` revoked the whole recoverability window
+    // in one query parameter, for every backup in the library at once, while
+    // an operator who had configured 30 days would see that value confirmed on
+    // the status surface and applying to nothing.
+    let retention = crate::foundry::reaper::effective_retention(
+        std::time::Duration::from_secs(u64::from(foundry.retention_days()) * 24 * 60 * 60),
+        q.retention_days
+            .map(|d| std::time::Duration::from_secs(d.clamp(0, 3650) * 24 * 60 * 60)),
     );
     let run = tokio::task::spawn_blocking(move || reaper::reap(&foundry, retention, mutate))
         .await

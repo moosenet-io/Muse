@@ -1005,8 +1005,18 @@ impl Drop for SwapLock {
 // kept because it measurably helps and costs one syscall — do not "simplify"
 // it away on the assumption that close-is-enough.
 
-/// A file's identity on disk: the pair that survives a rename and changes on a
-/// replace. Used to detect a source swapped out from under a plan.
+/// A file's identity on disk: the device and inode number it currently
+/// occupies.
+///
+/// **This pair is only an identity for as long as the inode is still
+/// referenced.** It distinguishes two files that exist at the same instant —
+/// that is what [`reaper`](crate::foundry::reaper) uses it for, to tell a hard
+/// link from a distinct file. It does NOT survive a delete: once an inode's
+/// last reference goes away, most filesystems hand its *number* straight back
+/// out to the next file created. Comparing a number captured earlier against a
+/// number read later is therefore not a replacement check unless something
+/// kept the original inode alive in between. See [`SourcePin`], which is that
+/// something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileIdentity {
     pub dev: u64,
@@ -1014,6 +1024,10 @@ pub struct FileIdentity {
 }
 
 /// Read a path's [`FileIdentity`] without following symlinks.
+///
+/// Sound for comparing two paths that both exist right now. For "is this still
+/// the file I looked at earlier", use [`SourcePin`] instead — see the caveat on
+/// [`FileIdentity`].
 pub fn identity_of(p: &Path) -> std::io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::symlink_metadata(p)?;
@@ -1021,6 +1035,88 @@ pub fn identity_of(p: &Path) -> std::io::Result<FileIdentity> {
         dev: md.dev(),
         ino: md.ino(),
     })
+}
+
+/// A hold on the source file that makes its [`FileIdentity`] mean something
+/// across time.
+///
+/// # Why this type exists — a real defect, not a tidiness exercise
+///
+/// The swap's third TOCTOU guard captures the source's `(dev, ino)` before the
+/// probe and re-reads it after the encode, refusing if they differ. That was
+/// unsound on its own, and provably so: **an inode number is recycled as soon
+/// as the inode is released**. Delete a file and create another in its place
+/// and the replacement very often lands on the number the deleted file just
+/// vacated, at which point the guard compares equal for a completely different
+/// file and the swap proceeds — moving the *newer, unrelated* file aside under
+/// a `.muse-superseded` name and putting an encode of the OLD content at the
+/// library path. That is the exact corruption the guard was written to refuse.
+///
+/// Whether recycling happens is filesystem policy, which is what made the
+/// resulting test failure look like an order-dependent flake rather than a bug:
+///
+/// - `tmpfs` hands out inode numbers from a monotonically increasing counter
+///   and never reuses them, so on a `/tmp`-backed fixture the guard *appears*
+///   to work.
+/// - `ext4`, `xfs` and the NFS-exported storage the real library lives on all
+///   reuse freed numbers, and whether the just-freed one comes back depends on
+///   what else allocated an inode in between — so the same code passes alone
+///   and fails under a parallel suite.
+///
+/// # The fix, mechanically
+///
+/// Hold an open descriptor on the source for the whole probe → plan → encode →
+/// swap window. An inode with a live reference cannot be released, and a
+/// number cannot be recycled while its inode is still alive. With the pin held
+/// there is no file on that filesystem, anywhere, that can present the pinned
+/// number — so `(dev, ino)` stops being probabilistic and becomes a genuine
+/// identity. The descriptor is load-bearing despite never being read, exactly
+/// as [`SwapLock`]'s is.
+///
+/// # What it still does not catch
+///
+/// A rewrite *in place* of the same inode (`dd` over the file) leaves `dev` and
+/// `ino` unchanged and is not detected. That was equally true before this type
+/// existed; no acquisition path Muse drives writes that way — they all create a
+/// new file and rename it, which this does catch.
+pub(in crate::foundry) struct SourcePin {
+    /// Load-bearing: dropping this releases the inode and re-arms number
+    /// recycling. Never "simplify" it away because nothing reads it.
+    _file: std::fs::File,
+    identity: FileIdentity,
+}
+
+impl SourcePin {
+    /// Open and pin `p`, reporting the identity of the inode actually pinned.
+    ///
+    /// The identity is read from the descriptor rather than from the path, so
+    /// it cannot describe a different file than the one being held.
+    pub(in crate::foundry) fn pin(p: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        // O_NOFOLLOW: pin the named file, never something a symlink points at.
+        // Callers hand us an already-canonicalized `ResolvedPath`, so a symlink
+        // here means the path changed under the guard — refuse rather than
+        // pin the wrong inode. Read-only: the library is mounted `ro` on <host>.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(p)?;
+        let md = file.metadata()?;
+        Ok(Self {
+            _file: file,
+            identity: FileIdentity {
+                dev: md.dev(),
+                ino: md.ino(),
+            },
+        })
+    }
+
+    /// The identity of the pinned inode. Valid — in the sense of being
+    /// unforgeable by any other file — for as long as `self` is alive.
+    pub(in crate::foundry) fn identity(&self) -> FileIdentity {
+        self.identity
+    }
 }
 
 /// `fsync` a directory so a rename/link in it survives a power loss.
@@ -1070,9 +1166,11 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 /// # Ordering
 /// 1. `link(original -> superseded)` — atomically claims the backup name. From
 ///    here the original's inode has two names and cannot be lost.
-/// 2. Compare the linked inode against the identity captured before the probe.
-///    Best-effort detection that the file was not swapped out underneath the
-///    plan (see [`SwapLock`] for why it is best-effort and not a guarantee).
+/// 2. Compare the linked inode against the [`SourcePin`] taken before the
+///    probe. The pin is what makes this comparison mean anything: it keeps the
+///    probed inode alive, so its number cannot have been recycled by a
+///    replacement (see [`SourcePin`]). Still not a guarantee against an
+///    arbitrary external writer — see [`SwapLock`] for the residual race.
 /// 3. Put the new file at the destination, whichever of the two shapes applies:
 ///    - **destination == original** (container unchanged): `rename(new ->
 ///      final)`, which replaces the entry in one step. The original is already
@@ -1094,9 +1192,10 @@ fn swap_verified_output(
     original: &MutablePath,
     verified_new: &MutablePath,
     final_path: &MutablePath,
-    expected_identity: FileIdentity,
+    source_pin: &SourcePin,
     _lock: &SwapLock,
 ) -> Result<SwapRecord, SwapError> {
+    let expected_identity = source_pin.identity();
     let original_p = original.as_path();
     let final_p = final_path.as_path();
     let new_p = verified_new.as_path();
@@ -1287,14 +1386,17 @@ pub(in crate::foundry) fn optimize_file(
         };
     }
 
-    // Captured BEFORE the probe, so it covers the whole probe-plan-encode
-    // window: if anything replaces the file while we are working, the swap
-    // compares this against the inode it actually links and refuses.
-    let source_identity = match identity_of(resolved.as_path()) {
-        Ok(id) => id,
+    // Taken BEFORE the probe and held for the whole probe-plan-encode window:
+    // if anything replaces the file while we are working, the swap compares
+    // this against the inode it actually links and refuses. The *pin* (an open
+    // descriptor, not just a stat) is what makes that comparison sound — see
+    // `SourcePin`: without it the replacement can inherit the inode number and
+    // the check silently passes.
+    let source_pin = match SourcePin::pin(resolved.as_path()) {
+        Ok(p) => p,
         Err(e) => {
             return ForgeStatus::Failed {
-                reason: format!("could not read the source file's identity: {e}"),
+                reason: format!("could not pin the source file's identity: {e}"),
             }
         }
     };
@@ -1437,7 +1539,15 @@ pub(in crate::foundry) fn optimize_file(
 
     let bytes_before = source.size_bytes.unwrap_or(0);
     let result = run_encode_and_swap(
-        guard, cfg, policy, &resolved, &source, &plan, &args, &staged, source_identity,
+        guard,
+        cfg,
+        policy,
+        &resolved,
+        &source,
+        &plan,
+        &args,
+        &staged,
+        &source_pin,
         &lock,
     );
 
@@ -1481,7 +1591,7 @@ fn run_encode_and_swap(
     plan: &TranscodePlan,
     args: &[String],
     staged: &MutablePath,
-    source_identity: FileIdentity,
+    source_pin: &SourcePin,
     lock: &SwapLock,
 ) -> Result<CompletedSwap, String> {
     // --- 1. encode ---------------------------------------------------------
@@ -1594,7 +1704,7 @@ fn run_encode_and_swap(
 
     // The lock was taken by `optimize_file` before the encode and is held for
     // this whole call. See `SwapLock` for what it covers and what it does not.
-    match swap_verified_output(&original_mut, &inflight, &final_mut, source_identity, lock) {
+    match swap_verified_output(&original_mut, &inflight, &final_mut, source_pin, lock) {
         Ok(record) => Ok(CompletedSwap {
             final_path: record.final_path,
             superseded_path: record.superseded_path,
@@ -2347,12 +2457,12 @@ mod tests {
         fs::write(&original, b"ORIGINAL").unwrap();
         fs::write(&staged, b"NEW-VERIFIED").unwrap();
 
-        let id = identity_of(&original).unwrap();
+        let id = SourcePin::pin(&original).unwrap();
         let rec = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
-            id,
+            &id,
             &t.lock(&original),
         )
         .expect("the swap must succeed");
@@ -2377,12 +2487,12 @@ mod tests {
         fs::write(&original, b"O").unwrap();
         fs::write(&staged, b"N").unwrap();
 
-        let id = identity_of(&original).unwrap();
+        let id = SourcePin::pin(&original).unwrap();
         let rec = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(t.lib().join("Movie.mkv")).unwrap(),
-            id,
+            &id,
             &t.lock(&t.lib().join("Movie.mkv")),
         )
         .unwrap();
@@ -2467,13 +2577,13 @@ mod tests {
         let staged = t.lib().join(".muse-foundry-inflight-x.mkv");
         fs::write(&original, b"ORIGINAL").unwrap();
         fs::write(&staged, b"NEW-VERIFIED").unwrap();
-        let id = identity_of(&original).unwrap();
+        let id = SourcePin::pin(&original).unwrap();
 
         swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(t.lib().join("Movie.mkv")).unwrap(),
-            id,
+            &id,
             &t.lock(&t.lib().join("Movie.mkv")),
         )
         .expect("the conversion swap must succeed");
@@ -2505,12 +2615,12 @@ mod tests {
         fs::write(&bystander, b"SOMEONE-ELSES-FILE").unwrap();
         fs::write(&staged, b"NEW").unwrap();
 
-        let id = identity_of(&original).unwrap();
+        let id = SourcePin::pin(&original).unwrap();
         let err = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&bystander).unwrap(),
-            id,
+            &id,
             &t.lock(&bystander),
         )
         .unwrap_err();
@@ -2530,12 +2640,12 @@ mod tests {
         fs::write(t.lib().join("Movie.mkv.muse-superseded"), b"OLDER-ORIGINAL").unwrap();
         fs::write(&staged, b"NEW").unwrap();
 
-        let id = identity_of(&original).unwrap();
+        let id = SourcePin::pin(&original).unwrap();
         let err = swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
-            id,
+            &id,
             &t.lock(&original),
         )
         .unwrap_err();
@@ -2563,7 +2673,7 @@ mod tests {
         fs::write(&original, b"ORIGINAL").unwrap();
         fs::write(&staged, b"NEW").unwrap();
 
-        let id = identity_of(&original).unwrap();
+        let id = SourcePin::pin(&original).unwrap();
         let original_mut = g.resolve_for_mutation(&original).unwrap();
         let staged_mut = g.resolve_for_mutation(&staged).unwrap();
         let final_mut = g.resolve_new_for_mutation(&original).unwrap();
@@ -2571,7 +2681,7 @@ mod tests {
         fs::remove_file(&staged).unwrap();
 
         let err =
-            swap_verified_output(&original_mut, &staged_mut, &final_mut, id, &t.lock(&original))
+            swap_verified_output(&original_mut, &staged_mut, &final_mut, &id, &t.lock(&original))
                 .unwrap_err();
 
         assert!(matches!(err, SwapError::Io { .. }), "got {err:?}");
@@ -2779,6 +2889,20 @@ mod tests {
         // probed; if something replaced it in the meantime, applying that plan
         // would move a NEWER, unrelated file aside and replace it with an
         // encode of something else entirely.
+        //
+        // HISTORY — MUSE #148. This test was red in full-suite runs for the
+        // whole Foundry epic and was written off as "pre-existing" three times.
+        // It was not flaky and it was not wrong: it was correctly reporting
+        // that the guard did not work, and the *visibility* of that was what
+        // varied. The guard compared a bare `(dev, ino)` captured before the
+        // probe, and an inode NUMBER is recycled the moment its inode is
+        // released — so the replacement written on the next line could inherit
+        // the deleted file's number and compare equal. Whether it did depended
+        // on the filesystem under $TMPDIR (tmpfs never reuses numbers, ext4 and
+        // the real NFS library do) and on what else in a parallel suite
+        // allocated an inode in between. `SourcePin` fixes it at the root by
+        // holding the probed inode open, which makes recycling impossible. Do
+        // not weaken this back to `identity_of`.
         let t = Tmp::new("swap-changed");
         let g = t.guard();
         let original = t.lib().join("Movie.mkv");
@@ -2786,7 +2910,7 @@ mod tests {
         fs::write(&original, b"THE FILE WE PROBED").unwrap();
         fs::write(&staged, b"NEW").unwrap();
 
-        let stale_identity = identity_of(&original).unwrap();
+        let stale_pin = SourcePin::pin(&original).unwrap();
 
         // ...and now someone replaces it with a different inode.
         fs::remove_file(&original).unwrap();
@@ -2796,7 +2920,7 @@ mod tests {
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
-            stale_identity,
+            &stale_pin,
             &t.lock(&original),
         )
         .unwrap_err();
@@ -2813,6 +2937,52 @@ mod tests {
         assert!(
             !t.lib().join("Movie.mkv.muse-superseded").exists(),
             "and no backup name may be left behind after a refusal"
+        );
+    }
+
+    #[test]
+    fn the_source_pin_keeps_the_probed_inode_alive_after_it_is_unlinked() {
+        // The mechanism the test above depends on, asserted directly — and
+        // deliberately in a way that does not depend on the filesystem under
+        // $TMPDIR. Whether ext4 hands a freed inode number straight back is
+        // policy we cannot force from a test; that an inode with a live
+        // descriptor is NOT released is a kernel guarantee we can.
+        //
+        // So: the pin must still be reading the bytes of the file that was
+        // probed, after that file's last directory entry is gone. If it is,
+        // the inode has not been released, and a number that has not been
+        // released cannot have been recycled — which is the entire reason
+        // `swap_verified_output` may compare `(dev, ino)` across an encode.
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        let t = Tmp::new("pin-holds");
+        let probed = t.lib().join("Movie.mkv");
+        fs::write(&probed, b"THE FILE WE PROBED").unwrap();
+
+        let pin = SourcePin::pin(&probed).unwrap();
+        let pinned = pin.identity();
+
+        fs::remove_file(&probed).unwrap();
+
+        let mut held = pin._file.try_clone().unwrap();
+        let md = held.metadata().unwrap();
+        assert_eq!(
+            md.nlink(),
+            0,
+            "the probed file must really be unlinked — otherwise this proves nothing"
+        );
+        assert_eq!(
+            (md.dev(), md.ino()),
+            (pinned.dev, pinned.ino),
+            "the pin must still refer to the inode it reported"
+        );
+
+        let mut got = Vec::new();
+        held.read_to_end(&mut got).unwrap();
+        assert_eq!(
+            got, b"THE FILE WE PROBED",
+            "the pin must hold the probed inode open, not merely remember its number"
         );
     }
 
@@ -2849,13 +3019,13 @@ mod tests {
         let staged = t.lib().join(".inflight.mkv");
         fs::write(&original, b"ORIGINAL").unwrap();
         fs::write(&staged, b"NEW-VERIFIED").unwrap();
-        let id = identity_of(&original).unwrap();
+        let id = SourcePin::pin(&original).unwrap();
 
         swap_verified_output(
             &g.resolve_for_mutation(&original).unwrap(),
             &g.resolve_for_mutation(&staged).unwrap(),
             &g.resolve_new_for_mutation(&original).unwrap(),
-            id,
+            &id,
             &t.lock(&original),
         )
         .unwrap();

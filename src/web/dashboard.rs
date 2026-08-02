@@ -3097,6 +3097,156 @@ pub struct ReapQuery {
     pub retention_days: Option<u64>,
 }
 
+/// `POST /ops/foundry/marks` — mark a title for Path B renditions.
+///
+/// This is the ONLY way a rendition candidate comes into existence. The run
+/// endpoint below reads marks and nothing else; it has no access to a library
+/// listing. That is the operator's "only items I mark, never everything"
+/// constraint made structural rather than promised.
+#[derive(Debug, serde::Deserialize)]
+pub struct MarkBody {
+    /// `movie` | `season` | `show`.
+    pub scope: String,
+    /// Absolute path: a file for `movie`, a directory for `season`/`show`.
+    pub path: String,
+    /// Which rungs. Never defaulted to all four — that is the exact outcome
+    /// the operator asked to avoid.
+    pub rungs: Vec<String>,
+    pub marked_by: Option<String>,
+}
+
+pub async fn foundry_mark(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<MarkBody>,
+) -> MuseResult<Json<Value>> {
+    use crate::foundry::marks::MarkScope;
+    use crate::foundry::rendition::RenditionName;
+
+    let Some(scope) = MarkScope::parse(&body.scope) else {
+        return Err(MuseError::BadRequest(format!(
+            "unknown scope `{}` — expected movie, season or show. Refused rather than \
+             defaulted: a typo becoming `movie` would mark one file when a whole show \
+             was meant",
+            body.scope
+        )));
+    };
+    if body.rungs.is_empty() {
+        return Err(MuseError::BadRequest(
+            "no rungs given — a mark with no rungs would examine the title and produce \
+             nothing, which is indistinguishable from a bug"
+                .into(),
+        ));
+    }
+    let mut rungs = Vec::new();
+    for r in &body.rungs {
+        let Some(parsed) = RenditionName::parse(r) else {
+            return Err(MuseError::BadRequest(format!(
+                "unknown rung `{r}` — expected mobile, web, tv or hifi"
+            )));
+        };
+        rungs.push(parsed);
+    }
+
+    // The path must be inside an allowed root. Marking something outside the
+    // library would let a rendition run read a file the guard would refuse,
+    // which is the bypass the guard exists to prevent.
+    let Some(foundry) = crate::foundry::Foundry::from_config(&state.config) else {
+        return Err(MuseError::BadRequest(
+            "foundry is not configured, so a mark could not be acted on".into(),
+        ));
+    };
+    if foundry.probe_file(std::path::Path::new(&body.path)).is_err()
+        && !std::path::Path::new(&body.path).is_dir()
+    {
+        // A directory cannot be probed, so only a FILE mark is validated this
+        // way; a directory is checked at expansion time by the same guard.
+        return Err(MuseError::BadRequest(format!(
+            "{} is not a readable media file inside an allowed root",
+            body.path
+        )));
+    }
+
+    let id = crate::repo::rendition_mark::upsert(
+        &state.pool,
+        scope,
+        &body.path,
+        &rungs,
+        body.marked_by.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "marked": true,
+        "id": id,
+        "scope": scope.as_str(),
+        "path": body.path,
+        "rungs": rungs.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+        "note": "a mark is stored UNEXPANDED: a season covers episodes that arrive later",
+    })))
+}
+
+/// `DELETE /ops/foundry/marks` — revoke a mark.
+pub async fn foundry_unmark(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> MuseResult<Json<Value>> {
+    let Some(path) = body.get("path").and_then(|v| v.as_str()) else {
+        return Err(MuseError::BadRequest("path is required".into()));
+    };
+    let existed = crate::repo::rendition_mark::revoke(&state.pool, path).await?;
+    Ok(Json(json!({
+        "revoked": existed,
+        "path": path,
+        // Distinguishes "I revoked it" from "there was nothing to revoke", so
+        // an operator who mistypes a path is not told they succeeded.
+        "note": if existed { "the live mark was revoked" } else { "no live mark existed for that path" },
+    })))
+}
+
+/// `POST /ops/foundry/renditions/plan` — what the marks would produce.
+///
+/// Plans only; encodes nothing. Reports the EXPANDED file count per mark
+/// before any work happens, because a season mark that expands to four hundred
+/// episodes is something the operator should see rather than discover.
+pub async fn foundry_renditions_plan(
+    State(state): State<Arc<AppState>>,
+) -> MuseResult<Json<Value>> {
+    let (marks, unparseable) = crate::repo::rendition_mark::live(&state.pool).await?;
+
+    let mut per_mark = Vec::new();
+    let mut total_files = 0usize;
+    for m in &marks {
+        let (files, problem) = crate::foundry::marks::expand(m);
+        total_files += files.len();
+        per_mark.push(json!({
+            "id": m.id,
+            "scope": m.scope.as_str(),
+            "path": m.path,
+            "rungs": m.rungs.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            "files": files.len(),
+            // A mark producing nothing SAYS why — silence is indistinguishable
+            // from a mark that was never made.
+            "problem": problem.map(|p| p.to_string()),
+            "renditions_implied": files.len() * m.rungs.len(),
+        }));
+    }
+
+    Ok(Json(json!({
+        "ran": true,
+        "dry_run": true,
+        "marks": marks.len(),
+        "files_covered": total_files,
+        "renditions_implied": per_mark.iter()
+            .filter_map(|m| m.get("renditions_implied").and_then(|v| v.as_u64()))
+            .sum::<u64>(),
+        "per_mark": per_mark,
+        // Rows the database accepted but this build cannot read. Reported, not
+        // skipped silently: it means schema and code have diverged.
+        "unreadable_marks": unparseable,
+        "note": "candidates come ONLY from marks; this endpoint cannot see the library",
+    })))
+}
+
 pub async fn foundry_reap(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ReapQuery>,

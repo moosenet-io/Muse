@@ -392,6 +392,57 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    /// The structural guarantee, asserted across BOTH modules that could
+    /// break it.
+    ///
+    /// FOUNDRY-06 proved this module cannot enumerate the library. But the
+    /// endpoints and the repo layer are where a future change would most
+    /// naturally reach for "all titles" — so the guarantee is only real if it
+    /// holds there too.
+    #[test]
+    fn neither_the_repo_nor_the_endpoints_can_produce_an_unmarked_candidate() {
+        let repo = include_str!("../repo/rendition_mark.rs");
+        let repo_body = repo.split("#[cfg(test)]").next().unwrap_or(repo);
+        assert!(
+            !repo_body.contains("walk_media_files") && !repo_body.contains("library_root"),
+            "the marks repo must not be able to list the library"
+        );
+        // Every SELECT must itself be scoped to live marks. Counting
+        // occurrences was too weak — the UPDATE's own `revoked_at IS NULL`
+        // satisfied the count while the SELECT had none, so a mutation that
+        // made live() return REVOKED marks survived. Each SELECT is now
+        // inspected individually.
+        for (i, chunk) in repo_body.match_indices("SELECT") {
+            let stmt_end = repo_body[i..]
+                .find("\")")
+                .map(|e| i + e)
+                .unwrap_or(repo_body.len());
+            let stmt = &repo_body[i..stmt_end];
+            let _ = chunk;
+            assert!(
+                stmt.contains("revoked_at IS NULL"),
+                "a read that is not scoped to LIVE marks would resurrect consent the \
+                 operator withdrew. Offending statement: {stmt}"
+            );
+        }
+
+        // And the plan endpoint must derive candidates from marks alone.
+        let dash = include_str!("../web/dashboard.rs");
+        let plan_start = dash
+            .find("pub async fn foundry_renditions_plan")
+            .expect("the plan endpoint exists");
+        let plan = &dash[plan_start..plan_start + 2500];
+        assert!(
+            plan.contains("rendition_mark::live"),
+            "the plan must read marks"
+        );
+        assert!(
+            !plan.contains("walk_media_files"),
+            "the plan must NOT be able to enumerate the library — that is the whole \
+             constraint: renditions only for marked titles, never library-wide"
+        );
+    }
+
     /// A mark on a SYMLINK must be refused, not followed.
     ///
     /// Codex caught this at the gate. `Path::exists`, `is_file` and `read_dir`

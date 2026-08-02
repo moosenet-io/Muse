@@ -49,6 +49,19 @@ pub enum RenditionName {
 
 impl RenditionName {
     /// The machine-readable name, for API fields and logs.
+    /// Parse the value the UI sends. Unknown rungs are REFUSED, never
+    /// defaulted: a typo silently becoming `mobile` would produce a rendition
+    /// the operator did not ask for, at a quality they did not choose.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mobile" => Some(Self::Mobile),
+            "web" => Some(Self::Web),
+            "tv" => Some(Self::Tv),
+            "hifi" => Some(Self::HiFi),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mobile => "mobile",
@@ -596,6 +609,37 @@ impl RenditionRequest {
 
 #[cfg(test)]
 mod tests {
+
+    /// An unknown rung is REFUSED, never defaulted.
+    ///
+    /// A typo silently becoming `mobile` would produce a rendition the
+    /// operator did not ask for, at a quality they did not choose — and the
+    /// operator's whole constraint is that renditions are only what they
+    /// explicitly requested.
+    #[test]
+    fn an_unknown_rung_is_refused_rather_than_defaulted() {
+        assert_eq!(RenditionName::parse("mobile"), Some(RenditionName::Mobile));
+        assert_eq!(RenditionName::parse(" TV "), Some(RenditionName::Tv));
+        assert_eq!(RenditionName::parse("hifi"), Some(RenditionName::HiFi));
+        assert_eq!(RenditionName::parse("web"), Some(RenditionName::Web));
+        assert_eq!(RenditionName::parse("ultra"), None);
+        assert_eq!(RenditionName::parse(""), None);
+        assert_eq!(RenditionName::parse("4k"), None);
+    }
+
+    /// parse and as_str must round-trip, or a mark stored by one and read by
+    /// the other would silently change rung.
+    #[test]
+    fn every_rung_round_trips_through_its_string_form() {
+        for r in RenditionName::all() {
+            assert_eq!(
+                RenditionName::parse(r.as_str()),
+                Some(r),
+                "{} does not round-trip",
+                r.as_str()
+            );
+        }
+    }
     use super::*;
 
     // --- the defaults, asserted rather than described ----------------------

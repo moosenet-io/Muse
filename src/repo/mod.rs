@@ -30,6 +30,7 @@ pub mod quality;
 pub mod release;
 pub mod season;
 pub mod settings;
+pub mod rendition_mark;
 pub mod subtitle;
 pub mod taste;
 pub mod taste_divergence;

@@ -225,21 +225,13 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
         return Some(same_name);
     };
     let mut matches: Vec<PathBuf> = Vec::new();
-    // Entries this pass could not read. `flatten()` silently discarded these,
-    // which quietly broke the fail-closed contract below: the ambiguity rule
-    // only works if BOTH candidates are seen. A transient NFS error (ESTALE,
-    // EIO) dropping one of two same-stem files collapses the list from 2 to 1,
-    // and the survivor — which may not be the file that superseded this
-    // backup — then resolves cleanly and authorises a deletion.
-    //
-    // This is the same rule this codebase keeps relearning: "could not look"
-    // must not render as "not there". It is the seventh instance, and the
-    // first one found inside a function whose stated contract is
-    // fail-closed-on-ambiguity. Raised in the FOUNDRY-11 reaper audit.
-    let mut unreadable = 0usize;
+    // NOTE: unreadable entries are handled by `listing_is_complete`, called
+    // from `decide_one` — not here. This function's job is to resolve a name;
+    // refusing on a partial listing is a SAFETY decision, and it belongs where
+    // it can be reported as the distinct outcome it is rather than collapsing
+    // into "the replacement does not exist".
     for entry in entries {
         let Ok(entry) = entry else {
-            unreadable += 1;
             continue;
         };
         let p = entry.path();
@@ -249,13 +241,6 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
         if p.file_stem().and_then(|s| s.to_str()) == Some(base) {
             matches.push(p);
         }
-    }
-
-    if unreadable > 0 {
-        // Something in this directory could not be read, so the candidate list
-        // may be short. Refuse to resolve rather than trust a possibly-partial
-        // view; the caller reports ReplacementMissing and KEEPS the backup.
-        return Some(same_name);
     }
 
     match matches.as_slice() {
@@ -384,9 +369,21 @@ fn plausible_age(age: Duration) -> Option<Duration> {
 }
 
 /// Beyond this, a reported age is a broken clock or a broken inode rather than
-/// an old file. Ten years is far past any retention an operator would set and
-/// far short of the ~56 years a zero ctime reports.
-const MAX_PLAUSIBLE_AGE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+/// an old file.
+///
+/// **25 years, deliberately not 10.** The first version used ten, which is
+/// exactly the longest retention the endpoint accepts (3650 days) — and
+/// deletion requires `retention < age <= MAX`, so at a maximum-length window
+/// the deletable band was EMPTY and the reaper was silently disarmed. Any
+/// backup older than the ceiling was also kept forever under any window. A
+/// ceiling that can collide with a configured window is a disarm, not a guard.
+/// Raised at the REAP-01 gate.
+///
+/// The bound has to sit in the gap between the longest legitimate window and
+/// the age a broken timestamp reports. A ctime of 0 currently reports ~56
+/// years and grows by a year every year, so 25 leaves headroom at both ends:
+/// well above the 10-year maximum retention, well below the epoch age.
+const MAX_PLAUSIBLE_AGE: Duration = Duration::from_secs(25 * 365 * 24 * 60 * 60);
 
 /// **The retention window actually used, given what the deployment configured
 /// and what a request asked for.**
@@ -414,6 +411,18 @@ pub fn effective_retention(configured: Duration, requested: Option<Duration>) ->
     }
 }
 
+/// How many entries in a backup's directory could not be read, or `None` when
+/// the listing was complete.
+///
+/// A directory that cannot be OPENED is not reported here: `replacement_of`
+/// already falls back to the same-name path in that case, which refuses.
+fn incomplete_listing_for(superseded: &Path) -> Option<usize> {
+    let dir = superseded.parent()?;
+    let entries = std::fs::read_dir(dir).ok()?;
+    let unreadable = entries.filter(|e| e.is_err()).count();
+    (unreadable > 0).then_some(unreadable)
+}
+
 /// Decide one preserved original. **Never deletes** — the decision and the
 /// deletion are separate so the decision is testable without a filesystem that
 /// can lose data.
@@ -435,6 +444,36 @@ pub fn decide_one(
             None,
         );
     };
+
+    // **Was the directory listing complete?**
+    //
+    // `replacement_of` resolves across a container change by matching stems,
+    // and refuses when it finds none or several — ambiguity must never resolve
+    // into a deletion. That rule only works if BOTH candidates were SEEN. A
+    // transient NFS error (ESTALE, EIO) dropping one of two same-stem files
+    // collapses the list from 2 to 1, and the survivor — which may not be the
+    // file that superseded this backup — then resolves cleanly and authorises
+    // deleting against the wrong replacement.
+    //
+    // Checked here rather than inside `replacement_of` so it can be reported as
+    // what it is. Folding it into that function produced `ReplacementMissing`,
+    // whose message states "this backup is the ONLY copy of the title" — a
+    // confident and FALSE claim when the truth is that a directory could not be
+    // read. Ignorance rendering as absence is the bug; ignorance rendering as a
+    // different specific certainty is the same bug wearing a hat.
+    if let Some(unreadable) = incomplete_listing_for(superseded) {
+        return (
+            ReapOutcome::CouldNotInspect {
+                detail: format!(
+                    "{unreadable} entr{} in the containing directory could not be read, so \
+                     the search for this backup's replacement may have missed a candidate",
+                    if unreadable == 1 { "y" } else { "ies" }
+                ),
+            },
+            None,
+            None,
+        );
+    }
 
     let bytes = std::fs::metadata(superseded).ok().map(|m| m.len());
 
@@ -1183,13 +1222,38 @@ mod tests {
         assert_eq!(plausible_age(a_week), Some(a_week));
     }
 
-    /// The ceiling must still admit the longest retention the endpoint accepts,
-    /// or a legitimately old backup under a 10-year window would be rejected as
-    /// implausible and never reaped.
+    /// **The disarm this ceiling nearly caused.**
+    ///
+    /// Deletion needs `retention < age <= MAX_PLAUSIBLE_AGE`. With the ceiling
+    /// set equal to the longest retention the endpoint accepts, that band is
+    /// empty: nothing is ever both old enough and plausible, so a
+    /// maximum-length window silently disarms the reaper entirely.
+    ///
+    /// This asserts a file can actually be DELETABLE just past the longest
+    /// window — the capability — rather than that the window length is itself
+    /// a plausible age, which was the earlier test's mistake and told us
+    /// nothing.
     #[test]
-    fn the_ceiling_still_admits_the_longest_retention_the_endpoint_allows() {
-        let longest = Duration::from_secs(3650 * 24 * 60 * 60);
-        assert!(plausible_age(longest).is_some());
+    fn a_backup_just_past_the_longest_window_is_still_reapable() {
+        let longest_window = Duration::from_secs(3650 * 24 * 60 * 60);
+        let just_past = longest_window + Duration::from_secs(24 * 60 * 60);
+
+        let age = plausible_age(just_past)
+            .expect("a backup one day past a maximum-length window is not implausible");
+        assert!(
+            age >= longest_window,
+            "and it must still count as old enough to reap, or the longest \
+             configurable window disarms the reaper"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_leaves_headroom_above_the_longest_configurable_window() {
+        let longest_window = Duration::from_secs(3650 * 24 * 60 * 60);
+        assert!(
+            MAX_PLAUSIBLE_AGE > longest_window,
+            "a ceiling equal to the longest window leaves an empty deletable band"
+        );
     }
 
     #[test]

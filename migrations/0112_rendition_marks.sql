@@ -64,6 +64,21 @@ ALTER TABLE rendition_marks
         cardinality(rungs) >= 1
     );
 
+-- Rungs must be REAL rung names, by the same reasoning `scope` has a value
+-- check: a typo'd rung silently matches nothing at run time, which reads as
+-- "the mark did nothing" rather than as an error. Opus raised the
+-- inconsistency at the FOUNDRY-06 gate — the migration argued the case for
+-- `scope` and then did not apply it here.
+--
+-- `<@` also rejects ARRAY[NULL], which slips past a cardinality check with
+-- length 1.
+ALTER TABLE rendition_marks
+    DROP CONSTRAINT IF EXISTS rendition_marks_rung_values;
+ALTER TABLE rendition_marks
+    ADD CONSTRAINT rendition_marks_rung_values CHECK (
+        rungs <@ ARRAY['mobile', 'web', 'tv', 'hifi']::text[]
+    );
+
 -- One LIVE mark per path. Re-marking a path updates the existing row rather
 -- than stacking duplicates that would each expand to the same encodes.
 CREATE UNIQUE INDEX IF NOT EXISTS rendition_marks_one_live_per_path

@@ -92,6 +92,22 @@ pub enum ExpansionProblem {
     NoMediaUnder { path: String },
     /// The directory could not be listed.
     Unreadable { path: String, detail: String },
+    /// The marked path is itself a symlink.
+    ///
+    /// Refused rather than followed. `Path::exists`/`is_file` follow symlinks
+    /// and `read_dir` follows a directory symlink, so a mark on a link would
+    /// expand to its TARGET — encoding files outside anything the operator
+    /// marked, and potentially outside the library entirely. Raised by codex
+    /// at the FOUNDRY-06 gate; the symlink test only covered links found
+    /// INSIDE a marked directory, not the marked path itself.
+    MarkedPathIsSymlink { path: String },
+    /// Partially unreadable: some media was found, but a subdirectory could
+    /// not be listed, so the expansion is INCOMPLETE.
+    ///
+    /// Reported alongside the files rather than swallowed. Returning the
+    /// partial list with no problem would be the same absence-vs-ignorance
+    /// confusion this codebase has hit four times elsewhere.
+    PartiallyUnreadable { path: String, detail: String },
 }
 
 impl std::fmt::Display for ExpansionProblem {
@@ -105,6 +121,16 @@ impl std::fmt::Display for ExpansionProblem {
             Self::NoMediaUnder { path } => {
                 write!(f, "{path} contains no media files, so the mark produced nothing")
             }
+            Self::MarkedPathIsSymlink { path } => write!(
+                f,
+                "the marked path {path} is a symlink — refusing to follow it, because it \
+                 would expand to its target and encode files that were never marked"
+            ),
+            Self::PartiallyUnreadable { path, detail } => write!(
+                f,
+                "{path} was only PARTLY listed ({detail}) — the files found are real but \
+                 the expansion is incomplete, so titles may be missing"
+            ),
             Self::Unreadable { path, detail } => write!(
                 f,
                 "{path} could not be listed ({detail}) — this is NOT a statement that it \
@@ -125,6 +151,29 @@ impl std::fmt::Display for ExpansionProblem {
 /// own file; a directory scope yields the media beneath it and nothing else.
 pub fn expand(mark: &RenditionMark) -> (Vec<PathBuf>, Option<ExpansionProblem>) {
     let path = Path::new(&mark.path);
+
+    // symlink_metadata does NOT follow. Checked FIRST, because every test
+    // below (`exists`, `is_file`, `read_dir`) does follow, so a marked symlink
+    // would silently expand to its target.
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return (
+                Vec::new(),
+                Some(ExpansionProblem::MarkedPathIsSymlink {
+                    path: mark.path.clone(),
+                }),
+            )
+        }
+        Ok(_) => {}
+        Err(_) => {
+            return (
+                Vec::new(),
+                Some(ExpansionProblem::PathMissing {
+                    path: mark.path.clone(),
+                }),
+            )
+        }
+    }
 
     if !path.exists() {
         return (
@@ -157,15 +206,18 @@ pub fn expand(mark: &RenditionMark) -> (Vec<PathBuf>, Option<ExpansionProblem>) 
     out.sort();
 
     if let Some(detail) = unreadable {
-        if out.is_empty() {
-            return (
-                out,
-                Some(ExpansionProblem::Unreadable {
-                    path: mark.path.clone(),
-                    detail,
-                }),
-            );
-        }
+        // Both cases are reported. Returning a partial list with NO problem
+        // would say "here is what is under this mark" when part of it could
+        // not be read — the same absence-vs-ignorance confusion fixed four
+        // times elsewhere in this codebase. Opus, FOUNDRY-06 gate.
+        return (
+            out.clone(),
+            Some(if out.is_empty() {
+                ExpansionProblem::Unreadable { path: mark.path.clone(), detail }
+            } else {
+                ExpansionProblem::PartiallyUnreadable { path: mark.path.clone(), detail }
+            }),
+        );
     }
     if out.is_empty() {
         return (
@@ -338,6 +390,96 @@ mod tests {
         assert!(files[0].ends_with("Real.mkv"));
         let _ = fs::remove_dir_all(&inside);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// A mark on a SYMLINK must be refused, not followed.
+    ///
+    /// Codex caught this at the gate. `Path::exists`, `is_file` and `read_dir`
+    /// all follow symlinks, so a marked link would expand to its target —
+    /// encoding files never marked, potentially outside the library entirely.
+    /// The earlier symlink test covered links found INSIDE a marked directory
+    /// and named the property too broadly.
+    #[test]
+    fn a_mark_on_a_symlink_is_refused_rather_than_followed() {
+        let outside = tmp("sym-target");
+        let inside = tmp("sym-mark");
+        fs::write(outside.join("Elsewhere.mkv"), b"x").unwrap();
+
+        // A marked DIRECTORY symlink.
+        let dir_link = inside.join("linked-season");
+        std::os::unix::fs::symlink(&outside, &dir_link).unwrap();
+        let (files, problem) = expand(&mark(MarkScope::Season, &dir_link));
+        assert!(files.is_empty(), "must not expand through the link: {files:?}");
+        assert!(
+            matches!(problem, Some(ExpansionProblem::MarkedPathIsSymlink { .. })),
+            "{problem:?}"
+        );
+
+        // A marked FILE symlink.
+        let file_link = inside.join("linked-movie.mkv");
+        std::os::unix::fs::symlink(outside.join("Elsewhere.mkv"), &file_link).unwrap();
+        let (files, problem) = expand(&mark(MarkScope::Movie, &file_link));
+        assert!(files.is_empty(), "{files:?}");
+        assert!(
+            matches!(problem, Some(ExpansionProblem::MarkedPathIsSymlink { .. })),
+            "{problem:?}"
+        );
+
+        let _ = fs::remove_dir_all(&inside);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// A partially-readable directory must report BOTH the files it found and
+    /// the fact that it could not read everything.
+    ///
+    /// Returning the partial list with no problem would say "here is what is
+    /// under this mark" when part of it was never seen — the same
+    /// absence-vs-ignorance confusion fixed four times elsewhere. Opus.
+    #[test]
+    fn a_partially_unreadable_mark_reports_both_the_files_and_the_gap() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("partial");
+        fs::write(d.join("Visible.mkv"), b"x").unwrap();
+        let blocked = d.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join("Hidden.mkv"), b"x").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (files, problem) = expand(&mark(MarkScope::Show, &d));
+        let running_as_root = problem.is_none();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&d);
+
+        if running_as_root {
+            return; // root reads anything; the permission bit does not apply
+        }
+        assert!(!files.is_empty(), "the readable file must still be returned");
+        assert!(
+            matches!(problem, Some(ExpansionProblem::PartiallyUnreadable { .. })),
+            "an incomplete expansion must SAY it is incomplete: {problem:?}"
+        );
+    }
+
+    /// The wholly-unreadable case, which had no test at all. Opus.
+    #[test]
+    fn a_wholly_unreadable_mark_reports_unreadable_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("unreadable");
+        fs::write(d.join("Hidden.mkv"), b"x").unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (files, problem) = expand(&mark(MarkScope::Season, &d));
+        let running_as_root = !files.is_empty();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&d);
+
+        if running_as_root {
+            return;
+        }
+        assert!(
+            matches!(problem, Some(ExpansionProblem::Unreadable { .. })),
+            "must NOT read as 'contains no media': {problem:?}"
+        );
     }
 
     /// An unknown scope is refused, not defaulted. A typo that silently became

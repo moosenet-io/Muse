@@ -1174,11 +1174,17 @@ mod tests {
     }
 
     /// Retention is a real gate, not a label.
-    /// The aggregator must treat "could not inspect" as KEPT and as reclaiming
-    /// nothing — flagged as unverified at the REAP-01 gate, so pinned here
-    /// rather than argued.
+    /// The aggregator must treat "could not inspect" as KEPT and never as a
+    /// delete judgement — flagged as unverified at the REAP-01 gate.
+    ///
+    /// This does NOT assert `bytes_reclaimed`: that field is set by `reap`, so
+    /// a hand-built `ReapRun` could only assert its own fixture. An earlier
+    /// version of this test was named "...reclaims_nothing" and asserted no
+    /// such thing — a name writing a cheque the body did not cash, which is the
+    /// decorative-test failure this codebase keeps catching. The bytes rule is
+    /// pinned structurally by the test below instead.
     #[test]
-    fn a_file_that_could_not_be_inspected_counts_as_kept_and_reclaims_nothing() {
+    fn a_file_that_could_not_be_inspected_counts_as_kept_not_deleted() {
         let run = ReapRun {
             files: vec![
                 ReapedFile {
@@ -1205,6 +1211,32 @@ mod tests {
         assert!(
             !ReapOutcome::CouldNotInspect { detail: String::new() }.would_delete(),
             "CouldNotInspect must never be a delete judgement"
+        );
+    }
+
+    /// `bytes_reclaimed` may only grow when a file was ACTUALLY deleted.
+    ///
+    /// Asserted against the source, in the same style as the existing
+    /// "must consult the deletion gate" test, because the property is about
+    /// where the accumulation sits rather than about any value a fixture can
+    /// hold: reporting reclaimed bytes for a file still on disk would tell an
+    /// operator the run freed space it did not free.
+    #[test]
+    fn reclaimed_bytes_are_only_counted_inside_the_actually_deleted_branch() {
+        let src = include_str!("reaper.rs");
+        let accum = src
+            .find("run.bytes_reclaimed = run.bytes_reclaimed.saturating_add(")
+            .expect("the accumulation site must exist");
+
+        // Walk back to the nearest enclosing condition and require it to be the
+        // one that establishes a real deletion.
+        let before = &src[..accum];
+        let guard = before
+            .rfind("if deleted == ReapOutcome::Deleted {")
+            .expect("bytes must only be counted once a deletion is CONFIRMED");
+        assert!(
+            !before[guard..].contains("\n        }\n"),
+            "the accumulation must still be inside that branch, not after it"
         );
     }
 

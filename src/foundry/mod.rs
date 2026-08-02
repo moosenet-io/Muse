@@ -52,6 +52,7 @@ pub mod directplay;
 pub mod forge;
 pub mod hdr;
 pub mod ladder;
+pub mod marks;
 pub mod paths;
 pub mod rendition;
 pub mod survey;

@@ -195,17 +195,55 @@ fn describe_undecidable(why: &Undecidable) -> String {
 ///
 /// `optimize_file` is not called and is not reachable from here — that is the whole point, and
 /// it is why this is safe to run against a live library before the stage has ever executed.
+/// Why a survey stopped before examining everything it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurveyTruncation {
+    /// The wall-clock deadline passed.
+    DeadlineReached,
+}
+
+/// Should the survey stop now? Pure, so the rule is testable —
+/// `survey_files` needs a live `Foundry`, and when this check was inline a
+/// mutation that stopped RECORDING the truncation survived every test.
+///
+/// Recording it matters more than the stopping: a partial survey that reads as
+/// a complete one would understate the work a 16,221-title run entails, which
+/// is the number the operator is deciding on.
+pub fn survey_truncation(
+    elapsed: std::time::Duration,
+    deadline: std::time::Duration,
+) -> Option<SurveyTruncation> {
+    (elapsed >= deadline).then_some(SurveyTruncation::DeadlineReached)
+}
+
 pub fn survey_files(
     foundry: &Foundry,
     policy: &TranscodePolicy,
     candidates: &[PathBuf],
     limit: usize,
+    // Wall clock for the whole survey. A full-library pre-flight is now
+    // possible (the limit reaches 50,000), so it needs its own bound: 16,221
+    // probes at 0.17s is ~46 minutes normally, but a filesystem having a bad
+    // day turns that into something unbounded. Hitting the deadline reports
+    // what was ACTUALLY examined and marks the result truncated, which is a
+    // different fact from a completed survey.
+    deadline: std::time::Duration,
 ) -> SurveySummary {
+    let started = std::time::Instant::now();
     let mut summary = SurveySummary {
         truncated: candidates.len() > limit,
         ..Default::default()
     };
     for path in candidates.iter().take(limit) {
+        if let Some(reason) = survey_truncation(started.elapsed(), deadline) {
+            summary.truncated = true;
+            tracing::warn!(
+                examined = summary.examined,
+                reason = ?reason,
+                "foundry/survey: stopped early; the report covers only what was examined"
+            );
+            break;
+        }
         match foundry.probe_file(path) {
             Ok(probe) => {
                 // The output path is only used to BUILD the argv, which a survey never runs.
@@ -230,6 +268,60 @@ pub fn survey_files(
 
 #[cfg(test)]
 mod tests {
+
+    /// A time-truncated survey must be marked truncated, exactly like a
+    /// limit-truncated one.
+    ///
+    /// The survey can now cover the whole library (the limit reaches 50,000),
+    /// so it needs a wall-clock bound. The failure that matters is not the
+    /// stopping — it is a partial survey that reads as a complete one, which
+    /// would understate the work a 16,221-title run entails.
+    #[test]
+    fn the_deadline_rule_fires_exactly_at_the_deadline() {
+        use std::time::Duration;
+        assert_eq!(survey_truncation(Duration::from_secs(1), Duration::from_secs(60)), None);
+        assert_eq!(
+            survey_truncation(Duration::from_secs(60), Duration::from_secs(60)),
+            Some(SurveyTruncation::DeadlineReached),
+            "at the deadline, not only past it"
+        );
+        assert_eq!(
+            survey_truncation(Duration::from_secs(600), Duration::from_secs(60)),
+            Some(SurveyTruncation::DeadlineReached)
+        );
+    }
+
+    #[test]
+    fn a_survey_that_runs_out_of_time_is_marked_truncated() {
+        // Pure check of the flag's meaning: `truncated` is set by EITHER the
+        // limit or the deadline, and callers must not treat it as
+        // limit-specific.
+        let by_limit = SurveySummary { truncated: true, examined: 500, ..Default::default() };
+        let by_time = SurveySummary { truncated: true, examined: 37, ..Default::default() };
+        assert!(by_limit.truncated && by_time.truncated);
+        // ...and a complete survey is not truncated, or the flag means nothing.
+        let complete = SurveySummary { truncated: false, examined: 16_221, ..Default::default() };
+        assert!(!complete.truncated);
+    }
+
+    /// The clamp must actually permit a full-library pre-flight.
+    ///
+    /// The old ceiling was 500 — 3% of this library — so "survey before you
+    /// commit" could only ever mean "sample". The bound existed because an
+    /// unbounded survey could wedge on a stalled probe; ffprobe now has a
+    /// 120s timeout (FOUNDRY-10) and the survey has its own deadline.
+    #[test]
+    fn the_survey_limit_reaches_the_whole_library() {
+        let dash = include_str!("../web/dashboard.rs");
+        assert!(
+            dash.contains("q.limit.unwrap_or(25).clamp(1, 50_000)"),
+            "the survey must be able to cover all 16,221 candidates, not a 500-file sample"
+        );
+        assert!(
+            dash.contains("q.deadline_secs.unwrap_or(3600)"),
+            "...and a full-library survey needs its own wall-clock bound"
+        );
+    }
     use super::*;
 
     fn summary_of(outcomes: &[SurveyOutcome]) -> SurveySummary {

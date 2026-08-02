@@ -297,9 +297,9 @@ impl std::fmt::Display for ProbeError {
             ),
             Self::ToolMissing { binary } => write!(
                 f,
-                "ffprobe binary `{binary}` is not installed on this host — Foundry \
-                 cannot describe media files (set MUSE_FOUNDRY_FFPROBE_BIN, or \
-                 install ffmpeg)"
+                "ffprobe binary `{binary}` is not installed on this host — media \
+                 files cannot be described (set MUSE_PROBE_FFPROBE_BIN, or the \
+                 older MUSE_FOUNDRY_FFPROBE_BIN, or install ffmpeg)"
             ),
             Self::Spawn { binary, message } => {
                 write!(f, "could not spawn ffprobe binary `{binary}`: {message}")
@@ -342,8 +342,9 @@ fn truncate_for_log(s: &str) -> String {
 
 /// Actually invoke `ffprobe` on a guard-resolved path and parse the result.
 ///
-/// This is the **only** function in Foundry that spawns a probe process; every
-/// other probe-shaped operation goes through it. It takes a [`ResolvedPath`],
+/// This is the **only** function in the crate that spawns a probe process; every
+/// other probe-shaped operation goes through it — Foundry's included, via the
+/// re-export shim. It takes a [`ResolvedPath`],
 /// not a `&Path`, so "I forgot to validate this path" is a compile error rather
 /// than a review catch (see [`crate::media::paths`]).
 ///

@@ -3247,6 +3247,117 @@ pub async fn foundry_renditions_plan(
     })))
 }
 
+/// `POST /ops/foundry/optimize` — run Path A on EXPLICIT paths.
+///
+/// Until now `optimize_file` had no production caller at all: the full chain
+/// (probe -> plan -> encode -> verify -> swap) had never executed, in any test
+/// or in production. The three existing `optimize_file` tests exercise only
+/// refusal paths — absent tools, path outside roots — so the swap itself, the
+/// single most destructive operation in Muse, was also the least exercised.
+///
+/// This is the trigger, and it is deliberately the NARROWEST one that can
+/// prove the chain works:
+///
+/// - **Explicit paths only.** There is no sweep, no glob, no "optimize the
+///   library". A caller must name each file. That keeps the blast radius equal
+///   to what was typed, and means a 16,000-item run is something an operator
+///   builds deliberately rather than something one request can start.
+/// - **Both gates.** MUSE_FOUNDRY_ENABLE_MUTATION must be open AND the request
+///   must pass `confirm=<the exact path>`, restated. Same shape as the
+///   subtitle offset apply: measuring and changing are different acts.
+/// - **Bounded.** At most 8 paths per request.
+///
+/// The original is never destroyed by this: forge hard-links it to
+/// `<name>.muse-superseded` before releasing the original name. Reclaiming
+/// that space is the reaper's job and requires its own two gates.
+#[derive(Debug, serde::Deserialize)]
+pub struct OptimizeBody {
+    /// The files to optimize. Explicit, never a pattern.
+    pub paths: Vec<String>,
+    /// Must exactly equal the single path when one path is given — the
+    /// operator restating what they are about to rewrite.
+    pub confirm: Option<String>,
+}
+
+pub async fn foundry_optimize(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OptimizeBody>,
+) -> MuseResult<Json<Value>> {
+    if body.paths.is_empty() {
+        return Err(MuseError::BadRequest("no paths given".into()));
+    }
+    if body.paths.len() > 8 {
+        return Err(MuseError::BadRequest(format!(
+            "{} paths given; at most 8 per request. This endpoint is deliberately not a \
+             sweep — a large run is something an operator assembles deliberately, not \
+             something one request starts",
+            body.paths.len()
+        )));
+    }
+
+    let Some(foundry) = crate::foundry::Foundry::from_config(&state.config) else {
+        return Ok(Json(json!({
+            "ran": false,
+            "reason": "foundry is not configured — nothing was optimized",
+        })));
+    };
+
+    // The GLOBAL gate. Checked here as well as inside forge, because an
+    // operator reading this endpoint's response should be told plainly that
+    // the deployment forbids mutation rather than seeing per-file skips.
+    if !foundry.mutation_enabled() {
+        return Ok(Json(json!({
+            "ran": false,
+            "reason": "MUSE_FOUNDRY_ENABLE_MUTATION is closed — this deployment cannot \
+                       modify the library, so nothing was optimized",
+            "paths": body.paths,
+        })));
+    }
+
+    // The per-request gate: the operator restates the path. Only meaningful
+    // for a single path, so a multi-path request must be assembled knowingly.
+    if body.paths.len() == 1 {
+        match body.confirm.as_deref() {
+            Some(c) if c == body.paths[0] => {}
+            _ => {
+                return Err(MuseError::BadRequest(format!(
+                    "confirm must exactly restate the path being rewritten. Expected \
+                     confirm=\"{}\"",
+                    body.paths[0]
+                )))
+            }
+        }
+    } else if body.confirm.as_deref() != Some("MULTIPLE") {
+        return Err(MuseError::BadRequest(
+            "a multi-path request must pass confirm=MULTIPLE, so several files are never \
+             rewritten by a request that meant one"
+                .into(),
+        ));
+    }
+
+    let policy = crate::foundry::policy::TranscodePolicy::direct_play_normalization();
+    let paths = body.paths.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                let status = foundry.optimize_file(std::path::Path::new(&p), &policy);
+                (p, format!("{status:?}"))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| MuseError::Internal(anyhow::anyhow!("optimize task failed: {e}")))?;
+
+    Ok(Json(json!({
+        "ran": true,
+        "policy": "direct_play_normalization",
+        "results": results.iter().map(|(p, s)| json!({ "path": p, "status": s })).collect::<Vec<_>>(),
+        "note": "the original is preserved as <name>.muse-superseded; reclaiming that \
+                 space is the reaper's job and needs its own two gates",
+    })))
+}
+
 pub async fn foundry_reap(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ReapQuery>,

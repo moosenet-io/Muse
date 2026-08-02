@@ -258,6 +258,16 @@ fn ops_routes() -> Router<Arc<AppState>> {
         // FOUNDRY-27: Path A's trigger. Explicit paths only, both gates
         // required, at most 8 per request — deliberately not a sweep.
         .route("/foundry/optimize", post(crate::web::dashboard::foundry_optimize))
+        // FOUNDRY-11: the armed run. Protected like every other ops trigger.
+        .route(
+            "/foundry/run",
+            post(crate::web::dashboard::foundry_run_start)
+                .get(crate::web::dashboard::foundry_run_status),
+        )
+        .route(
+            "/foundry/run/stop",
+            post(crate::web::dashboard::foundry_run_stop),
+        )
         .route("/foundry/marks", post(crate::web::dashboard::foundry_mark))
         .route("/foundry/marks/revoke", post(crate::web::dashboard::foundry_unmark))
         .route("/foundry/renditions/plan", post(crate::web::dashboard::foundry_renditions_plan))

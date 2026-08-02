@@ -65,6 +65,7 @@ pub mod validate;
 pub mod plan;
 pub mod policy;
 pub mod reaper;
+pub mod run;
 
 // ---------------------------------------------------------------------------
 // The shared media core, re-exported under Foundry's old module paths.

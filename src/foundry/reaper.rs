@@ -1882,6 +1882,12 @@ mod tests {
             "the reaper must have exactly one deletion call site"
         );
         assert_eq!(body.matches("fs::remove_dir_all(").count(), 0);
+        // ...and no import that would let a second, unqualified deletion site
+        // hide from the count above. Raised at the REAP-03 gate.
+        assert!(
+            !body.contains("use std::fs::remove_file"),
+            "importing remove_file would let an unqualified call evade the one-site count"
+        );
         // And that one site must unlink a path the GUARD resolved, never a raw
         // one straight from the walk — confinement and the mutation gate are
         // the guard's job, and relying on a probe elsewhere to enforce them

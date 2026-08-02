@@ -322,6 +322,30 @@ pub struct Config {
     /// `foundry_ffmpeg_bin` avoids by reusing `MUSE_FFMPEG_PATH`.
     pub probe_ffprobe_bin: Option<String>,
 
+    // --- S130-A MPRB-02: operator-tunable probe limits ---
+    /// Wall-clock ceiling on ONE ffprobe invocation, in seconds
+    /// (`MUSE_PROBE_TIMEOUT_SECS`). `None` keeps `media::probe::PROBE_TIMEOUT`.
+    ///
+    /// **The default is 120s and stays 120s.** The S130-A spec text proposed
+    /// 30s; that text predates the value being tuned against real behaviour and
+    /// adopting it would be a silent regression, so it was not adopted — see
+    /// `crate::media::MediaCore::probe_timeout`.
+    ///
+    /// Exists so a host with a slower mount can be widened without a rebuild.
+    /// Clamped, not trusted: see `MediaCore` for the bounds and why an
+    /// unparseable or out-of-range value falls back rather than disabling the
+    /// deadline.
+    pub probe_timeout_secs: Option<u64>,
+    /// Most bytes captured from ONE ffprobe stream
+    /// (`MUSE_PROBE_MAX_OUTPUT_BYTES`). `None` keeps
+    /// `media::probe::MAX_CAPTURED_BYTES` (8 MiB).
+    ///
+    /// The knob exists because exceeding the cap is now a hard, named error
+    /// (`ProbeError::OutputTooLarge`) rather than a silent truncation: if a real
+    /// file ever legitimately needs more, the operator must be able to grant it
+    /// without a rebuild. Also clamped.
+    pub probe_max_output_bytes: Option<usize>,
+
     // --- SUBS-01: the subtitle system ---
     /// Wyzie subtitle-provider API key (`WYZIE_KEY`).
     ///
@@ -741,6 +765,11 @@ impl Config {
             foundry_ffprobe_bin: env_opt("MUSE_FOUNDRY_FFPROBE_BIN"),
             foundry_handbrake_bin: env_opt("MUSE_FOUNDRY_HANDBRAKE_BIN"),
             probe_ffprobe_bin: env_opt("MUSE_PROBE_FFPROBE_BIN"),
+            // Read here and nowhere else: `config.rs` is the crate's single env
+            // door (S7), so `media::probe` never calls `std::env::var` itself.
+            probe_timeout_secs: env_opt("MUSE_PROBE_TIMEOUT_SECS").and_then(|v| v.trim().parse().ok()),
+            probe_max_output_bytes: env_opt("MUSE_PROBE_MAX_OUTPUT_BYTES")
+                .and_then(|v| v.trim().parse().ok()),
             // SUBS-01. Read exactly like every other optional credential:
             // from the environment at runtime, never a literal.
             wyzie_key: env_opt("WYZIE_KEY").map(QbitPassword::from),
@@ -947,6 +976,10 @@ impl Default for Config {
             // so `MediaCore` falls back to Foundry's setting and then to
             // `ffprobe` on PATH.
             probe_ffprobe_bin: None,
+            // Unset means "use the compiled defaults" (120s / 8 MiB), not "no
+            // limit". `MediaCore` is what resolves them.
+            probe_timeout_secs: None,
+            probe_max_output_bytes: None,
 
             // SUBS-01 defaults are the SAFE values: no provider credential
             // (so the provider tier is inert) and no store directory (so
@@ -1215,6 +1248,39 @@ mod tests {
 
         std::env::remove_var("MUSE_API_TOKEN");
         std::env::remove_var("MUSE_AUTH_DISABLED");
+    }
+
+    /// S130-A MPRB-02: the two probe limits come through the crate's single env
+    /// door, and `media::probe` never reads the environment itself (S7).
+    ///
+    /// Also pins the UNSET case, which is the one that matters in production:
+    /// `None` means "use the compiled default", never "no limit". A reading that
+    /// turned an unset var into an unbounded probe would be the exact defence
+    /// this item exists to keep.
+    #[test]
+    #[serial]
+    fn mprb02_probe_limits_are_read_from_env_and_absent_when_unset() {
+        std::env::set_var("MUSE_PROBE_TIMEOUT_SECS", "45");
+        std::env::set_var("MUSE_PROBE_MAX_OUTPUT_BYTES", "1048576");
+
+        let cfg = Config::from_env();
+        assert_eq!(cfg.probe_timeout_secs, Some(45));
+        assert_eq!(cfg.probe_max_output_bytes, Some(1_048_576));
+
+        std::env::remove_var("MUSE_PROBE_TIMEOUT_SECS");
+        std::env::remove_var("MUSE_PROBE_MAX_OUTPUT_BYTES");
+
+        let cfg = Config::from_env();
+        assert_eq!(cfg.probe_timeout_secs, None);
+        assert_eq!(cfg.probe_max_output_bytes, None);
+
+        // A value that is not a number is not a limit. It falls back rather
+        // than panicking a boot, and rather than being read as zero — which for
+        // the deadline would time out every probe in the library.
+        std::env::set_var("MUSE_PROBE_TIMEOUT_SECS", "two minutes");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.probe_timeout_secs, None);
+        std::env::remove_var("MUSE_PROBE_TIMEOUT_SECS");
     }
 
     #[test]

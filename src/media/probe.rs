@@ -22,6 +22,18 @@
 //! planner downstream would read as "this file has no video" and act on. The
 //! same rule as the rest of the media core: an unobserved fact is reported as
 //! unobserved, not as a benign default.
+//!
+//! ## Two invocation paths, one parser (S130-A MPRB-02)
+//! [`run_ffprobe`] is synchronous and stays: Foundry's survey and validate loops
+//! are ordinary blocking code. [`run_ffprobe_async`] is for tokio callers, where
+//! parking a worker thread for up to the whole deadline costs every other task
+//! in the process, not just this probe. They share the argv builder, the
+//! path-shape guard, the limits and the parser; they differ only in how a child
+//! is waited on and killed, and in one deliberate respect — the async path stops
+//! reading at the output cap and reports it, while the synchronous generic
+//! spawner drains to EOF so its OTHER callers (the encoder, the subtitle
+//! extractor) can still judge a run by its exit status. Both report an over-cap
+//! ffprobe as [`ProbeError::OutputTooLarge`], never as a parse failure.
 
 use std::time::Duration;
 use std::process::Command;
@@ -59,6 +71,26 @@ use crate::media::paths::ResolvedPath;
 /// `-map_chapters 0`, and a promise that is never checked is the class of
 /// false claim this module exists to avoid. Chapters are not streams, so
 /// `-show_streams` does not report them.
+///
+/// ## The `--` terminator (S130-A MPRB-02)
+/// The path is preceded by a bare `--`, which ends option parsing: everything
+/// after it is a positional argument no matter what it starts with. Without it
+/// a file named `-loglevel` is read by ffprobe as an OPTION, not as the file to
+/// describe — and a scanned library is exactly where such a name turns up,
+/// because the filename comes from a release group, not from us. Passing the
+/// path as its own argv element (which this already did, and which
+/// `ffprobe_argv_puts_the_path_last_and_never_quotes_it` pins) defeats SHELL
+/// interpretation; it does nothing about ffprobe's own getopt-alike.
+///
+/// **Verified against ffprobe's actual parser, not assumed.** ffprobe options
+/// go through `parse_options()` in `fftools/cmdutils.c`, which contains
+/// `if (opt[1] == '-' && opt[2] == '\0') { handleoptions = 0; continue; }` —
+/// present in the `n5.1` tag, which is the ffprobe build on the deployment host
+/// (`5.1.9-0+deb12u1`), and still present on master. This mattered enough to
+/// check: ffprobe is installed on neither the dev box nor <host>, so no test in
+/// this suite can catch a terminator ffprobe would have rejected, and an
+/// unsupported `--` would have failed EVERY probe in production while the
+/// suite stayed green.
 pub fn build_ffprobe_args(file_path: &str) -> Vec<String> {
     vec![
         "-v".to_string(),
@@ -68,8 +100,43 @@ pub fn build_ffprobe_args(file_path: &str) -> Vec<String> {
         "-show_format".to_string(),
         "-show_streams".to_string(),
         "-show_chapters".to_string(),
+        // End of options. See the doc comment: this is load-bearing, and it is
+        // why the path below cannot be reinterpreted as a flag.
+        "--".to_string(),
         file_path.to_string(),
     ]
+}
+
+/// Refuse a path whose SHAPE could reach an argument parser as a flag.
+///
+/// [`ResolvedPath`] validates **location** — that a path lies inside an allowed
+/// root — and says nothing about how it looks. Those are different questions,
+/// and only one of them is answered by the guard.
+///
+/// Honest scope, because it would be easy to overclaim here: a `ResolvedPath`
+/// comes out of `std::fs::canonicalize`, so it is absolute and begins with `/`,
+/// and a leading dash is therefore **not reachable** through [`run_ffprobe`]
+/// today. This check is a fail-closed second line for the other two ways in —
+/// a future non-canonical or relative path source, and direct callers of
+/// [`build_ffprobe_args`], which is `pub`. It is deliberately paired with the
+/// `--` terminator rather than trusted instead of it: the terminator is the
+/// mechanism, and this is the assertion that the mechanism was not bypassed.
+///
+/// Reported as [`ProbeError::Spawn`] because that is the "we did not run the
+/// tool, and it is not the file's fault" bucket — and it is refused BEFORE
+/// spawn, so nothing is executed with an argv we do not trust.
+fn reject_flag_shaped_path(path: &str) -> Result<(), ProbeError> {
+    if path.starts_with('-') {
+        return Err(ProbeError::Spawn {
+            binary: "ffprobe".to_string(),
+            message: format!(
+                "refusing to probe a path that begins with `-` ({}): it would be read as an \
+                 option rather than a filename. Pass an absolute path",
+                truncate_for_log(path)
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// A parsed `ffprobe` description of one media file.
@@ -298,6 +365,94 @@ pub enum ProbeError {
     /// error, not as an empty probe, because "a file with zero streams" is not
     /// a thing the planner should ever be asked to reason about.
     NoStreams,
+    /// ffprobe wrote more than the capture cap allows, so the document we hold
+    /// is a PREFIX of what it said and cannot honestly be parsed.
+    ///
+    /// This variant exists because of what happened without it, which is the
+    /// exact class of fault this module was built to prevent. The drain capped
+    /// retention **silently**; the truncated JSON then failed to parse; and the
+    /// caller was handed [`ProbeError::MalformedOutput`] — an error that blames
+    /// the FILE's JSON for a limit WE imposed. The operator's correct response
+    /// to the two is opposite (re-mux a broken file vs. raise
+    /// `MUSE_PROBE_MAX_OUTPUT_BYTES`), so reporting one as the other sends them
+    /// at the wrong thing.
+    ///
+    /// `cap` is the limit that was actually in force, not the compiled default,
+    /// so the message names the number the operator can change.
+    OutputTooLarge { cap: usize },
+}
+
+/// The two states a failed probe can leave a file in, for the caller that has
+/// to decide what to do next.
+///
+/// Named rather than stringly-typed at the call site so the vocabulary is fixed
+/// in one place; `as_str()` is the wire/DB spelling and matches the
+/// `probe_failed` bucket [`crate::foundry::survey`] already reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeState {
+    /// We could not obtain an answer. Says nothing about the file.
+    Unreadable,
+    /// We obtained an answer and it was not usable. Says something about the
+    /// file, and re-running will say it again.
+    ProbeFailed,
+}
+
+impl ProbeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable",
+            Self::ProbeFailed => "probe_failed",
+        }
+    }
+}
+
+impl ProbeError {
+    /// Whether running the identical probe again could plausibly succeed.
+    ///
+    /// The line is drawn at **whether the tool produced a verdict**. A missing
+    /// binary, a spawn refusal and a timeout are all statements about THIS
+    /// HOST at THIS MOMENT — ffmpeg gets installed, a fork limit passes, an NFS
+    /// stall clears — so a retry is meaningful. A non-zero exit, an
+    /// unparseable document, a stream-less file and an over-cap flood are all
+    /// statements about the FILE (or about a limit that will not move on its
+    /// own); ffprobe already answered, and it will answer identically. Retrying
+    /// those is a loop that burns a worker on 16,000 items and never converges.
+    ///
+    /// # Exhaustive by construction
+    /// The `match` below has **no wildcard arm, deliberately**. A variant added
+    /// later must be classified by whoever adds it — with a `_` arm it would
+    /// silently inherit whichever bucket the wildcard named, which for a new
+    /// failure mode is a coin flip between "retry forever" and "give up on a
+    /// file that was fine". A compile error is the cheapest possible place to
+    /// discover that decision is owed.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::ToolMissing { .. } | Self::Spawn { .. } | Self::Timeout { .. } => true,
+            Self::ExitFailure { .. }
+            | Self::MalformedOutput { .. }
+            | Self::NoStreams
+            | Self::OutputTooLarge { .. } => false,
+        }
+    }
+
+    /// The state this failure leaves the file in.
+    ///
+    /// Tracks [`Self::is_retryable`] exactly — "we never got an answer" is
+    /// [`ProbeState::Unreadable`], "we got one and it was unusable" is
+    /// [`ProbeState::ProbeFailed`] — but is written as its own exhaustive,
+    /// wildcard-free `match` rather than derived from the boolean, so the two
+    /// can diverge later without one silently dragging the other with it.
+    pub fn state(&self) -> ProbeState {
+        match self {
+            Self::ToolMissing { .. } | Self::Spawn { .. } | Self::Timeout { .. } => {
+                ProbeState::Unreadable
+            }
+            Self::ExitFailure { .. }
+            | Self::MalformedOutput { .. }
+            | Self::NoStreams
+            | Self::OutputTooLarge { .. } => ProbeState::ProbeFailed,
+        }
+    }
 }
 
 impl std::fmt::Display for ProbeError {
@@ -332,6 +487,13 @@ impl std::fmt::Display for ProbeError {
                 "ffprobe reported a file with no streams at all — refusing to \
                  treat this as a describable media file"
             ),
+            Self::OutputTooLarge { cap } => write!(
+                f,
+                "ffprobe wrote more than the {cap}-byte capture cap, so what we hold is a \
+                 PREFIX of its output and was not parsed — this is OUR limit, not a \
+                 statement that the file's metadata is malformed (raise \
+                 MUSE_PROBE_MAX_OUTPUT_BYTES if a real file legitimately needs it)"
+            ),
         }
     }
 }
@@ -356,11 +518,16 @@ fn truncate_for_log(s: &str) -> String {
 
 /// Actually invoke `ffprobe` on a guard-resolved path and parse the result.
 ///
-/// This is the **only** function in the crate that spawns a probe process; every
-/// other probe-shaped operation goes through it — Foundry's included, via the
-/// re-export shim. It takes a [`ResolvedPath`],
-/// not a `&Path`, so "I forgot to validate this path" is a compile error rather
-/// than a review catch (see [`crate::media::paths`]).
+/// The **synchronous** probe entry point, and the one every blocking caller
+/// uses — Foundry's survey and validate loops included, via the shim. Async
+/// callers use [`run_ffprobe_async`] instead; MPRB-02 added it, so the older
+/// claim that this was the crate's ONLY probe spawner no longer holds and has
+/// been corrected here rather than left to rot.
+///
+/// Everything else about the shape is unchanged: it goes through the same argv
+/// builder, the same path-shape guard and the same parser as the async twin. It
+/// takes a [`ResolvedPath`], not a `&Path`, so "I forgot to validate this path"
+/// is a compile error rather than a review catch (see [`crate::media::paths`]).
 ///
 /// Read-only by construction: a `ResolvedPath` carries no mutation capability,
 /// and ffprobe with these arguments writes nothing.
@@ -394,20 +561,357 @@ pub fn run_ffprobe_with_timeout(
     path: &ResolvedPath,
     timeout: Duration,
 ) -> Result<MediaProbe, ProbeError> {
-    let args = build_ffprobe_args(&path.as_path().to_string_lossy());
-    let output = spawn_with_timeout(ffprobe_bin, &args, timeout)?;
+    run_ffprobe_with_limits(ffprobe_bin, path, timeout, MAX_CAPTURED_BYTES)
+}
 
-    if !output.status.success() {
-        return Err(ProbeError::ExitFailure {
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+/// [`run_ffprobe`] with both operator-tunable limits given explicitly.
+///
+/// Split from [`run_ffprobe_with_timeout`] rather than changing its signature
+/// because that function is already called with a deadline from elsewhere in
+/// the crate, and because the cap is a genuinely separate decision from the
+/// deadline. See [`MediaCore::probe`] for where the configured values come
+/// from.
+///
+/// Unlike the generic [`spawn_with_timeout`], an over-cap capture here is an
+/// ERROR rather than a truncation marker: what this function does next is parse
+/// the bytes as JSON, and a prefix of a JSON document is not a JSON document.
+/// Reporting that as `MalformedOutput` — which is what happened before MPRB-02
+/// — blames the file for our limit.
+pub fn run_ffprobe_with_limits(
+    ffprobe_bin: &str,
+    path: &ResolvedPath,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<MediaProbe, ProbeError> {
+    let file_path = path.as_path().to_string_lossy().into_owned();
+    reject_flag_shaped_path(&file_path)?;
+    let args = build_ffprobe_args(&file_path);
+    let captured = spawn_capturing(ffprobe_bin, &args, timeout, max_output_bytes)?;
+
+    if captured.over_cap() {
+        return Err(ProbeError::OutputTooLarge {
+            cap: max_output_bytes,
         });
     }
 
-    parse_probe_json(&String::from_utf8_lossy(&output.stdout))
+    if !captured.status.success() {
+        return Err(ProbeError::ExitFailure {
+            code: captured.status.code(),
+            stderr: String::from_utf8_lossy(&captured.stderr).into_owned(),
+        });
+    }
+
+    parse_probe_json(&String::from_utf8_lossy(&captured.stdout))
 }
 
-/// Most output this will hold from one child, per stream.
+// --- The async entry point (S130-A MPRB-02) --------------------------------
+
+/// Probe a file **without blocking a runtime thread**.
+///
+/// This is the entry point for every async caller — the scan integration, the
+/// backfill worker, and Maestro. The synchronous [`run_ffprobe`] is correct and
+/// stays (Foundry's survey/validate loops are ordinary blocking code), but it
+/// parks the calling thread for up to the whole timeout. Inside a tokio worker
+/// that is not merely slow: a handful of concurrently-stalled probes occupy
+/// worker threads that every other task in the process — HTTP handlers
+/// included — is waiting for. The mechanism it replaces is thread-based, which
+/// is the right defence for ONE file and the wrong one for a 16,000-item sweep.
+///
+/// `kill_on_drop(true)` is what makes cancellation safe: if the caller's task
+/// is dropped mid-probe (client disconnect, shutdown, `select!` losing a race),
+/// the child is killed rather than left running against the library forever.
+///
+/// The timeout path kills **and reaps**. See [`spawn_with_timeout_async`] for
+/// why the reap is not optional.
+pub async fn run_ffprobe_async(
+    ffprobe_bin: &str,
+    path: &ResolvedPath,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<MediaProbe, ProbeError> {
+    let file_path = path.as_path().to_string_lossy().into_owned();
+    reject_flag_shaped_path(&file_path)?;
+    let args = build_ffprobe_args(&file_path);
+    // No `over_cap` check here, deliberately: the async spawn helper stops at
+    // the cap and returns `OutputTooLarge` itself (there is no exit status to
+    // report alongside a child that never finished), so a `Captured` reaching
+    // this point is always a complete capture. The synchronous path is the
+    // opposite — it drains to EOF and hands the flag back — which is why
+    // `run_ffprobe_with_limits` checks and this does not.
+    let captured = spawn_with_timeout_async(ffprobe_bin, &args, timeout, max_output_bytes).await?;
+
+    if !captured.status.success() {
+        return Err(ProbeError::ExitFailure {
+            code: captured.status.code(),
+            stderr: String::from_utf8_lossy(&captured.stderr).into_owned(),
+        });
+    }
+
+    parse_probe_json(&String::from_utf8_lossy(&captured.stdout))
+}
+
+/// How long the timeout path waits for a killed child to be reaped.
+///
+/// A bounded wait, not an unbounded one, and the bound is the whole point: a
+/// child wedged in uninterruptible D-state does not die on SIGKILL until its
+/// I/O returns, so `wait()` without a ceiling would make the TIMEOUT PATH
+/// ITSELF hang — reintroducing exactly the failure this module exists to
+/// prevent. Five seconds is far longer than reaping an already-dead child takes
+/// and far shorter than any probe deadline. If it expires, `kill_on_drop`
+/// leaves the child with tokio's orphan reaper rather than with us.
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Spawn a child on the tokio runtime, drain both pipes concurrently, and kill
+/// **and reap** it if the deadline passes.
+///
+/// ## Why the reap is not optional
+/// A killed child that is never waited on stays in the process table as a
+/// zombie. The synchronous path accepts that (one zombie per STALL, bounded by
+/// stalls rather than by files) because a blocking `wait()` there would hang.
+/// The async path has no such excuse — `wait().await` parks a task, not a
+/// thread — and the async path is the one that runs 16,000 times. Unreaped, the
+/// leak is bounded by the container's pid limit, and when that is reached the
+/// worker cannot spawn ANYTHING: not ffprobe, not ffmpeg. The failure does not
+/// look like a probe bug, which is what makes it expensive.
+pub async fn spawn_with_timeout_async(
+    bin: &str,
+    args: &[String],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<Captured, ProbeError> {
+    spawn_with_timeout_async_reporting_pid(bin, args, timeout, max_output_bytes)
+        .await
+        .1
+}
+
+/// [`spawn_with_timeout_async`], additionally reporting the child's pid.
+///
+/// The pid exists for exactly one caller: the test that asserts no zombie is
+/// left behind. "We reaped it" is a claim about a process, and the only way to
+/// check a claim about a process is to look at that process — so the pid has to
+/// leave the function. It is returned even on the error paths, because the
+/// timeout path is the one whose reaping is under test.
+///
+/// Kept as a separate function so the production signature does not carry a
+/// diagnostic out-parameter, and so the test drives the SAME code production
+/// does rather than a parallel copy of it.
+async fn spawn_with_timeout_async_reporting_pid(
+    bin: &str,
+    args: &[String],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> (Option<u32>, Result<Captured, ProbeError>) {
+    let spawned = tokio::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Cancellation safety: if the caller's future is dropped, the child
+        // dies with it instead of outliving the request that asked for it.
+        .kill_on_drop(true)
+        .spawn();
+
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => return (None, Err(classify_probe_spawn_error(bin, &e))),
+    };
+    let pid = child.id();
+
+    // Both pipes are drained on their own TASKS, started before anything is
+    // awaited on the child. Same reason as the synchronous path: a pipe holds
+    // ~64 KB, and a child whose output exceeds that BLOCKS on write until
+    // someone reads. Waiting for exit first would hang on any large probe and
+    // then report it as a timeout — a good file failing because of how we read
+    // it.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let mut out_task = tokio::spawn(async move {
+        drain_capped_async(out_pipe.as_mut(), max_output_bytes).await
+    });
+    let mut err_task = tokio::spawn(async move {
+        drain_capped_async(err_pipe.as_mut(), max_output_bytes).await
+    });
+    // Either the child exited and we hold its status, or a drain hit the cap
+    // and there is no status to hold. Modelled as two cases rather than as a
+    // status plus a flag, so no code path can read a placeholder exit status as
+    // a real one.
+    enum Collected {
+        Exited(std::process::ExitStatus, Drained, Drained),
+        Capped,
+    }
+
+    let collect = async {
+        // The two drains are raced, NOT awaited in sequence.
+        //
+        // Sequencing them (`stdout.await; stderr.await`) would make a cap
+        // breach on stdout wait for the OTHER pipe before it could be reported.
+        // For every stub in this suite that costs nothing — dropping the
+        // over-cap pipe gives the child EPIPE, it dies, and stderr reaches EOF
+        // immediately — which is exactly why NO TEST HERE DISTINGUISHES THE TWO
+        // FORMS, and the sequential version was measured passing the same
+        // suite. Stated plainly rather than dressed up as a caught bug.
+        //
+        // It is kept as a race because the sequential form's correctness rests
+        // on the child dying when we stop reading, and the children this module
+        // exists to survive are the ones that do not: a process wedged in
+        // D-state, or one still holding stderr open. In that case the breach
+        // would surface at the deadline as a `Timeout` — the wrong verdict and
+        // the wrong operator action. Racing removes the dependency entirely,
+        // for a `select!`.
+        //
+        // (An earlier revision of this comment credited the race with fixing a
+        // 30-second test hang. That was wrong: the hang was `capability::detect`
+        // running the sleeping stub through a `Command::output()` with no
+        // deadline, and it was fixed in the test stub. Left recorded because a
+        // plausible-but-false attribution is worse than no comment.)
+        let mut stdout: Option<Drained> = None;
+        let mut stderr: Option<Drained> = None;
+        while stdout.is_none() || stderr.is_none() {
+            tokio::select! {
+                r = &mut out_task, if stdout.is_none() => {
+                    let d = r.unwrap_or_default();
+                    if d.over_cap { return Ok::<_, std::io::Error>(Collected::Capped); }
+                    stdout = Some(d);
+                }
+                r = &mut err_task, if stderr.is_none() => {
+                    let d = r.unwrap_or_default();
+                    if d.over_cap { return Ok(Collected::Capped); }
+                    stderr = Some(d);
+                }
+            }
+        }
+        let status = child.wait().await?;
+        Ok(Collected::Exited(
+            status,
+            stdout.expect("loop exits only when both are Some"),
+            stderr.expect("loop exits only when both are Some"),
+        ))
+    };
+
+    let outcome = tokio::time::timeout(timeout, collect).await;
+
+    match outcome {
+        Ok(Ok(Collected::Exited(status, stdout, stderr))) => (
+            pid,
+            Ok(Captured {
+                status,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
+                stdout_over_cap: false,
+                stderr_over_cap: false,
+            }),
+        ),
+        Ok(Ok(Collected::Capped)) => {
+            // The child is still running (or dying of SIGPIPE). Kill and reap
+            // it here for the same reason the timeout path does.
+            //
+            // The partial capture is DROPPED rather than returned: it is a
+            // prefix of a JSON document, and handing a prefix back as if it
+            // were output is how a truncation becomes a parse error blaming the
+            // file.
+            abandon_drains(&out_task, &err_task);
+            kill_and_reap(&mut child).await;
+            (
+                pid,
+                Err(ProbeError::OutputTooLarge {
+                    cap: max_output_bytes,
+                }),
+            )
+        }
+        Ok(Err(e)) => (
+            pid,
+            Err(ProbeError::Spawn {
+                binary: bin.to_string(),
+                message: format!("waiting for `{bin}`: {e}"),
+            }),
+        ),
+        Err(_elapsed) => {
+            abandon_drains(&out_task, &err_task);
+            kill_and_reap(&mut child).await;
+            (
+                pid,
+                Err(ProbeError::Timeout {
+                    secs: timeout.as_secs(),
+                }),
+            )
+        }
+    }
+}
+
+/// Abort the drain tasks, which is what actually RELEASES the pipes.
+///
+/// Killing the child is not sufficient: we kill the process we spawned, and a
+/// `sh -c "…"` stub — or any real tool that pipes internally — has
+/// grandchildren that inherit the same pipe write ends and outlive it. Dropping
+/// the `JoinHandle` would only DETACH those drain tasks, leaving them parked in
+/// `read` on a pipe nobody will close, for the lifetime of the runtime.
+///
+/// Aborting drops each task's future, which drops its `ChildStdout`/`ChildStderr`
+/// and closes the read end; anything still writing then gets EPIPE.
+/// `JoinHandle::abort` returns immediately — no awaiting a wedged reader.
+///
+/// **DELIBERATELY UNTESTED, and honestly so.** The observable is the lifetime of
+/// a detached task, which no assertion in this suite can read; removing these
+/// two aborts leaves the whole suite green. It is kept as bounded housekeeping
+/// on the failure path, not as covered behaviour, and it is documented that way
+/// rather than being given a test that would pass either way.
+fn abandon_drains<T: Send + 'static>(
+    out: &tokio::task::JoinHandle<T>,
+    err: &tokio::task::JoinHandle<T>,
+) {
+    out.abort();
+    err.abort();
+}
+
+/// Signal the child, then WAIT for it, so the kernel releases its slot.
+///
+/// `start_kill` only delivers the signal; it does not collect the exit status,
+/// and a child whose status is never collected is a zombie. The wait is bounded
+/// by [`REAP_GRACE`] so a D-state child cannot turn this into the hang it is
+/// here to prevent.
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(REAP_GRACE, child.wait()).await;
+}
+
+/// The async twin of [`drain_capped`], with one deliberate difference: it
+/// STOPS at the cap instead of draining on.
+///
+/// The synchronous drain keeps reading past the cap so the child dies of its
+/// own accord rather than of SIGPIPE, because its callers (Foundry's encoder)
+/// judge a run by its exit status and a SIGPIPE death would be indistinguishable
+/// from a real failure. This one has no such caller: an over-cap probe is
+/// already an error, the child is killed immediately afterwards, and its exit
+/// status is discarded. Continuing to read a flooding child would just spend
+/// unbounded time on output nobody will look at.
+async fn drain_capped_async(
+    pipe: Option<&mut (impl tokio::io::AsyncRead + Unpin)>,
+    cap: usize,
+) -> Drained {
+    use tokio::io::AsyncReadExt;
+
+    let mut drained = Drained::default();
+    let Some(p) = pipe else { return drained };
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match p.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(drained.bytes.len());
+                drained.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                if n > room {
+                    drained.over_cap = true;
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    drained
+}
+
+/// Most output this will hold from one child, per stream — the DEFAULT, now
+/// that `MUSE_PROBE_MAX_OUTPUT_BYTES` can override it (S130-A MPRB-02).
 ///
 /// **8 MiB.** ffprobe's JSON tops out in the tens of KB (measured: the largest
 /// in this library is ~71 KB), and ffmpeg at `-loglevel error` is near-silent,
@@ -418,9 +922,43 @@ pub fn run_ffprobe_with_timeout(
 /// of frames. Reading that to completion in memory is unbounded growth driven
 /// by the contents of an untrusted media file — across 16,000 items, one such
 /// file is enough.
-const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
 
-/// Drain a pipe to EOF, keeping at most [`MAX_CAPTURED_BYTES`].
+/// What one drained pipe yielded, and whether the cap cut it short.
+///
+/// `over_cap` is the whole point of this type existing: before MPRB-02 the
+/// drain returned a bare `Vec<u8>` and the fact that it had been cut was
+/// carried only by an advisory string appended to the bytes. Nothing downstream
+/// could act on it — the ffprobe path parsed the prefix as JSON and reported
+/// the resulting failure as [`ProbeError::MalformedOutput`], i.e. as the file's
+/// fault. A truncation has to be a VALUE the caller can branch on, not a note
+/// inside the data.
+#[derive(Debug, Default, Clone)]
+pub struct Drained {
+    pub bytes: Vec<u8>,
+    pub over_cap: bool,
+}
+
+/// A finished child: its status, its (possibly capped) output, and whether
+/// either stream hit the cap.
+#[derive(Debug)]
+pub struct Captured {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_over_cap: bool,
+    pub stderr_over_cap: bool,
+}
+
+impl Captured {
+    /// Whether EITHER stream was cut. Both matter: a flooding stderr can be the
+    /// only symptom, and it still means we are holding a partial record.
+    pub fn over_cap(&self) -> bool {
+        self.stdout_over_cap || self.stderr_over_cap
+    }
+}
+
+/// Drain a pipe to EOF, keeping at most `cap` bytes.
 ///
 /// Keeps draining after the cap rather than stopping, but NOT for the reason
 /// it first appears. Stopping early does not deadlock — returning from this
@@ -436,11 +974,14 @@ const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// Keeps the HEAD, not the tail: ffmpeg's first error is the one that explains
 /// the failure, and the ten-thousandth is a consequence of it.
-fn drain_capped(pipe: Option<&mut impl std::io::Read>) -> Vec<u8> {
-    let mut kept: Vec<u8> = Vec::new();
-    let Some(p) = pipe else { return kept };
+///
+/// Returns the cut as a FLAG ([`Drained::over_cap`]) rather than only as an
+/// appended note — see [`Drained`] for why that distinction is the whole of
+/// MPRB-02's second gap.
+fn drain_capped(pipe: Option<&mut impl std::io::Read>, cap: usize) -> Drained {
+    let mut drained = Drained::default();
+    let Some(p) = pipe else { return drained };
     let mut chunk = [0u8; 64 * 1024];
-    let mut truncated = false;
     loop {
         match p.read(&mut chunk) {
             Ok(0) => break,
@@ -448,21 +989,28 @@ fn drain_capped(pipe: Option<&mut impl std::io::Read>) -> Vec<u8> {
                 // `room` alone enforces the cap — saturating so it is 0 once
                 // full. A guarding `if` around this was redundant, which
                 // mutation testing correctly reported as an equivalent mutant.
-                let room = MAX_CAPTURED_BYTES.saturating_sub(kept.len());
-                kept.extend_from_slice(&chunk[..n.min(room)]);
+                let room = cap.saturating_sub(drained.bytes.len());
+                drained.bytes.extend_from_slice(&chunk[..n.min(room)]);
                 if n > room {
-                    truncated = true;
+                    drained.over_cap = true;
                 }
             }
             Err(_) => break,
         }
     }
-    if truncated {
-        kept.extend_from_slice(
-            b"\n[muse: output truncated at 8 MiB; the child kept writing and was still drained]\n",
-        );
-    }
-    kept
+    drained
+}
+
+/// The advisory note appended to a truncated capture by [`spawn_with_timeout`].
+///
+/// Kept for the callers that treat the capture as human-readable log text
+/// (Foundry's encoder, the subtitle extractor): to them the bytes ARE the
+/// report, and a report that ends mid-sentence with no explanation is a lie by
+/// omission. Callers that PARSE the bytes must use [`Drained::over_cap`]
+/// instead — a note inside a JSON document does not make it parseable.
+fn truncation_note(cap: usize) -> Vec<u8> {
+    format!("\n[muse: output truncated at {cap} bytes; the child kept writing and was still drained]\n")
+        .into_bytes()
 }
 
 /// Spawn a process, wait for it with a deadline, and kill it if the deadline
@@ -482,8 +1030,36 @@ pub fn spawn_with_timeout(
     args: &[String],
     timeout: Duration,
 ) -> Result<std::process::Output, ProbeError> {
-    use std::io::Read;
+    let captured = spawn_capturing(bin, args, timeout, MAX_CAPTURED_BYTES)?;
+    let mut stdout = captured.stdout;
+    let mut stderr = captured.stderr;
+    // The note goes back into the bytes for THESE callers only. They log the
+    // capture; they do not parse it. `run_ffprobe_with_limits` takes the other
+    // branch and reports `OutputTooLarge` instead.
+    if captured.stdout_over_cap {
+        stdout.extend_from_slice(&truncation_note(MAX_CAPTURED_BYTES));
+    }
+    if captured.stderr_over_cap {
+        stderr.extend_from_slice(&truncation_note(MAX_CAPTURED_BYTES));
+    }
+    Ok(std::process::Output {
+        status: captured.status,
+        stdout,
+        stderr,
+    })
+}
 
+/// [`spawn_with_timeout`] with an explicit cap, reporting truncation as a flag
+/// instead of folding an advisory note into the bytes.
+///
+/// This is where the process handling actually lives; `spawn_with_timeout` is
+/// the compatibility wrapper its existing log-consuming callers keep using.
+pub fn spawn_capturing(
+    bin: &str,
+    args: &[String],
+    timeout: Duration,
+    cap: usize,
+) -> Result<Captured, ProbeError> {
     let mut child = Command::new(bin)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -505,8 +1081,8 @@ pub fn spawn_with_timeout(
     // FOUNDRY-10 gate.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
-    let out_thread = std::thread::spawn(move || drain_capped(out_pipe.as_mut()));
-    let err_thread = std::thread::spawn(move || drain_capped(err_pipe.as_mut()));
+    let out_thread = std::thread::spawn(move || drain_capped(out_pipe.as_mut(), cap));
+    let err_thread = std::thread::spawn(move || drain_capped(err_pipe.as_mut(), cap));
 
     let start = std::time::Instant::now();
     let status = loop {
@@ -563,7 +1139,13 @@ pub fn spawn_with_timeout(
 
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
-    Ok(std::process::Output { status, stdout, stderr })
+    Ok(Captured {
+        status,
+        stdout_over_cap: stdout.over_cap,
+        stderr_over_cap: stderr.over_cap,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
 }
 
 /// Classify a spawn failure. Split out and pure so the missing-binary
@@ -977,6 +1559,12 @@ mod tests {
         parse_probe_json(H264_MKV).expect("the captured fixture must parse")
     }
 
+    /// MODIFIED by S130-A MPRB-02, and this is the ONLY pre-existing test in
+    /// this module that changed. The `--` element is a deliberate addition to
+    /// the argv contract (see [`build_ffprobe_args`]), so the exact-argv
+    /// assertion had to grow it. Nothing was weakened: it is still an exact
+    /// whole-vector equality, and the new element is asserted in its exact
+    /// position rather than the assertion being loosened to tolerate it.
     #[test]
     fn ffprobe_argv_asks_for_json_only_with_every_section() {
         assert_eq!(
@@ -989,9 +1577,33 @@ mod tests {
                 "-show_format",
                 "-show_streams",
                 "-show_chapters",
+                "--",
                 "/srv/media/Movies/A/A.mkv",
             ]
         );
+    }
+
+    /// The guard's actual job: the path cannot be read as an OPTION.
+    ///
+    /// A file named `-loglevel` is not hypothetical in a scanned library —
+    /// filenames come from release groups, not from us. Passing the path as its
+    /// own argv element (which the test above pins) stops the SHELL
+    /// reinterpreting it and does nothing about ffprobe's own option parser;
+    /// `--` is what stops that one.
+    #[test]
+    fn a_flag_shaped_filename_is_positional_because_of_the_terminator() {
+        let args = build_ffprobe_args("/srv/media/-loglevel");
+        let dashdash = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("the argv must carry an end-of-options terminator");
+        assert_eq!(
+            dashdash,
+            args.len() - 2,
+            "`--` must be immediately before the path, so nothing between them \
+             can be re-read as an option"
+        );
+        assert_eq!(args.last().unwrap(), "/srv/media/-loglevel");
     }
 
     #[test]
@@ -1761,5 +2373,353 @@ mod tests {
         // Real 4K releases are cropped, not 3840x2160. A resolution rule that
         // assumes the nominal frame size misfiles this one.
         assert_eq!((v.width, v.height), (Some(3832), Some(2068)));
+    }
+
+    // --- S130-A MPRB-02 -----------------------------------------------------
+
+    /// Every variant, listed by hand.
+    ///
+    /// Written as an explicit list rather than derived from anything, so it is
+    /// a SECOND statement of the taxonomy that has to agree with the first. A
+    /// list generated from the code under test would agree with it by
+    /// construction and prove nothing.
+    fn every_probe_error() -> Vec<ProbeError> {
+        vec![
+            ProbeError::ToolMissing {
+                binary: "ffprobe".into(),
+            },
+            ProbeError::Spawn {
+                binary: "ffprobe".into(),
+                message: "EAGAIN".into(),
+            },
+            ProbeError::Timeout { secs: 120 },
+            ProbeError::ExitFailure {
+                code: Some(1),
+                stderr: "moov atom not found".into(),
+            },
+            ProbeError::MalformedOutput {
+                message: "expected value".into(),
+            },
+            ProbeError::NoStreams,
+            ProbeError::OutputTooLarge { cap: 8 * 1024 * 1024 },
+        ]
+    }
+
+    /// The classification, asserted variant by variant.
+    ///
+    /// The property that matters is not "some are retryable" but that the two
+    /// buckets mean opposite things: retry a host problem, never retry a file
+    /// problem. Getting one wrong is not cosmetic — a retryable `ExitFailure`
+    /// is an infinite loop on a broken file, and a terminal `Timeout` writes
+    /// off a good file because an NFS mount hiccupped.
+    #[test]
+    fn every_probe_error_is_classified_by_whether_the_tool_gave_a_verdict() {
+        for e in every_probe_error() {
+            let (want_retry, want_state) = match &e {
+                ProbeError::ToolMissing { .. }
+                | ProbeError::Spawn { .. }
+                | ProbeError::Timeout { .. } => (true, ProbeState::Unreadable),
+                ProbeError::ExitFailure { .. }
+                | ProbeError::MalformedOutput { .. }
+                | ProbeError::NoStreams
+                | ProbeError::OutputTooLarge { .. } => (false, ProbeState::ProbeFailed),
+            };
+            assert_eq!(e.is_retryable(), want_retry, "is_retryable for {e:?}");
+            assert_eq!(e.state(), want_state, "state for {e:?}");
+        }
+    }
+
+    /// The two answers must not collapse into one: a taxonomy where everything
+    /// is retryable, or nothing is, would satisfy a per-variant check written
+    /// carelessly and is useless in practice.
+    #[test]
+    fn the_taxonomy_actually_splits_the_variants() {
+        let all = every_probe_error();
+        assert!(all.iter().any(|e| e.is_retryable()));
+        assert!(all.iter().any(|e| !e.is_retryable()));
+        assert!(all.iter().any(|e| e.state() == ProbeState::Unreadable));
+        assert!(all.iter().any(|e| e.state() == ProbeState::ProbeFailed));
+        assert_eq!(ProbeState::Unreadable.as_str(), "unreadable");
+        assert_eq!(ProbeState::ProbeFailed.as_str(), "probe_failed");
+    }
+
+    /// `is_retryable` and `state` must not disagree about the same error — they
+    /// are two views of one decision, and a caller that consults both must not
+    /// get contradictory advice.
+    #[test]
+    fn retryability_and_state_agree_for_every_variant() {
+        for e in every_probe_error() {
+            let expected = if e.is_retryable() {
+                ProbeState::Unreadable
+            } else {
+                ProbeState::ProbeFailed
+            };
+            assert_eq!(e.state(), expected, "{e:?}");
+        }
+    }
+
+    /// The message must name OUR limit and must not read as a verdict on the
+    /// file — that confusion is the entire reason this variant exists.
+    #[test]
+    fn the_over_cap_message_blames_the_cap_not_the_file() {
+        let msg = ProbeError::OutputTooLarge { cap: 8_388_608 }.to_string();
+        assert!(msg.contains("8388608"), "the message must name the cap: {msg}");
+        assert!(
+            msg.contains("MUSE_PROBE_MAX_OUTPUT_BYTES"),
+            "it must name the knob the operator can actually turn: {msg}"
+        );
+        assert!(
+            msg.contains("not a statement that the file's metadata is malformed"),
+            "it must not read as a verdict about the file: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_begins_with_a_dash_is_refused_before_spawn() {
+        let got = reject_flag_shaped_path("-loglevel");
+        match got {
+            Err(ProbeError::Spawn { message, .. }) => {
+                assert!(message.contains("begins with `-`"), "{message}");
+            }
+            other => panic!("a flag-shaped path must be refused, got {other:?}"),
+        }
+        // ...and an ordinary absolute path is untouched. Without this the guard
+        // could be satisfied by refusing everything.
+        assert!(reject_flag_shaped_path("/srv/media/Movies/-Weird- (2022).mkv").is_ok());
+    }
+
+    // --- The async entry point ---------------------------------------------
+    //
+    // These use STUB `ffprobe` scripts written to a temp dir. ffprobe is
+    // installed on neither the dev box nor <host>, so a test that needed the
+    // real binary would not run anywhere in this fleet — the same reason the
+    // parser is a pure function. A stub cannot tell us how ffprobe behaves; it
+    // tells us how OUR process handling behaves, which is what MPRB-02 changed.
+
+    fn temp_dir_for(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "muse-mprb02-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Write an executable `/bin/sh` stub standing in for `ffprobe`.
+    fn stub_ffprobe(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("stub-ffprobe");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A `ResolvedPath` for a real file under a real root, built through the
+    /// guard — never by weakening the guard, which is the property that makes
+    /// `ResolvedPath` worth taking as an argument at all.
+    fn resolved_in(dir: &std::path::Path, name: &str) -> ResolvedPath {
+        let file = dir.join(name);
+        std::fs::write(&file, b"not really a video").expect("write subject file");
+        crate::media::paths::PathGuard::new(vec![dir.to_str().unwrap()], false)
+            .resolve(&file)
+            .expect("the file is inside the root")
+    }
+
+    const STUB_JSON: &str = r#"{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080}],"format":{"format_name":"matroska,webm"}}"#;
+
+    /// The happy path, end to end through the production async entry point:
+    /// spawn, drain, exit, parse.
+    #[tokio::test]
+    async fn the_async_probe_parses_what_the_tool_wrote() {
+        let dir = temp_dir_for("async-ok");
+        let bin = stub_ffprobe(&dir, &format!("printf '%s' '{STUB_JSON}'"));
+        let path = resolved_in(&dir, "a.mkv");
+
+        let got = run_ffprobe_async(&bin, &path, Duration::from_secs(30), MAX_CAPTURED_BYTES)
+            .await
+            .expect("the stub's document must parse");
+        assert_eq!(got.container, "matroska,webm");
+        assert_eq!(got.primary_video().unwrap().width, Some(1920));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-zero exit is still an `ExitFailure`, not a timeout or a parse
+    /// error. Without this the async path could satisfy the tests above by
+    /// never distinguishing anything.
+    #[tokio::test]
+    async fn the_async_probe_reports_a_nonzero_exit_as_such() {
+        let dir = temp_dir_for("async-exit");
+        let bin = stub_ffprobe(&dir, "echo 'moov atom not found' >&2; exit 1");
+        let path = resolved_in(&dir, "a.mkv");
+
+        let got = run_ffprobe_async(&bin, &path, Duration::from_secs(30), MAX_CAPTURED_BYTES).await;
+        match got {
+            Err(ProbeError::ExitFailure { code, stderr }) => {
+                assert_eq!(code, Some(1));
+                assert!(stderr.contains("moov atom"), "{stderr}");
+            }
+            other => panic!("expected ExitFailure, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The child's pid, as `/proc` sees it: `None` once the entry is gone
+    /// (reaped and released), `Some('Z')` while it is a zombie.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Field 3, after the parenthesised comm — which can itself contain
+        // spaces and parentheses, so split at the LAST ')'.
+        let after = stat.rsplit_once(')')?.1;
+        after.split_whitespace().next()?.chars().next()
+    }
+
+    /// The timeout fires — and the corpse is collected.
+    ///
+    /// The kill alone is not enough. A killed child whose status is never
+    /// collected stays in the process table; at 16,000 items, a per-stall leak
+    /// walks into the container's pid limit, after which the worker can spawn
+    /// NOTHING and the symptom looks nothing like a probe bug. So this asserts
+    /// the OS's view of the pid, not our own bookkeeping.
+    #[tokio::test]
+    async fn an_async_timeout_kills_the_child_and_leaves_no_zombie() {
+        let start = std::time::Instant::now();
+        let (pid, got) = spawn_with_timeout_async_reporting_pid(
+            "sleep",
+            &["30".to_string()],
+            Duration::from_millis(300),
+            MAX_CAPTURED_BYTES,
+        )
+        .await;
+        let waited = start.elapsed();
+
+        assert!(
+            matches!(got, Err(ProbeError::Timeout { .. })),
+            "expected a timeout, got {got:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(3),
+            "must stop waiting NEAR the deadline, waited {waited:?}"
+        );
+
+        let pid = pid.expect("a spawned child has a pid");
+        #[cfg(target_os = "linux")]
+        {
+            // The assertion is that the pid is GONE, not merely "not a zombie".
+            // Absence is the only state that means both things happened: a
+            // living child would still be `S`, and a killed-but-uncollected one
+            // would be `Z`. Checking only for `Z` would be satisfied by a stub
+            // that was never killed at all.
+            //
+            // Polled, with a ceiling, because the timeout path kills and reaps
+            // and the last of that can land microseconds after the await
+            // returns; a `sleep 30` that was never killed survives thirty
+            // seconds and is not rescued by a two-second poll.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut last = proc_state(pid);
+            while last.is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                last = proc_state(pid);
+            }
+            assert_eq!(
+                last, None,
+                "pid {pid} is still in the process table as `{last:?}` — `Z` means it \
+                 was killed but never reaped, anything else means it was never killed"
+            );
+        }
+        let _ = pid;
+    }
+
+    /// A child that outruns the cap is reported AS a cap breach — the point
+    /// being what it is NOT reported as.
+    ///
+    /// Before MPRB-02 the drain truncated silently, the prefix failed to parse,
+    /// and the caller was told `MalformedOutput`: our limit, reported as the
+    /// file's malformed metadata. The operator's response to those two is
+    /// opposite, so the assertion below is as much about the error we must not
+    /// return as the one we must.
+    #[tokio::test]
+    async fn an_async_flood_is_reported_as_the_cap_not_as_malformed_json() {
+        let dir = temp_dir_for("async-flood");
+        // Valid JSON is never reached — the flood comes first, so a passing
+        // result cannot be an artefact of unparseable output.
+        let bin = stub_ffprobe(&dir, "head -c 4000000 /dev/zero | tr '\\0' 'x'");
+        let path = resolved_in(&dir, "a.mkv");
+
+        let cap = 512 * 1024;
+        let got = run_ffprobe_async(&bin, &path, Duration::from_secs(30), cap).await;
+        match got {
+            Err(ProbeError::OutputTooLarge { cap: reported }) => {
+                assert_eq!(reported, cap, "the error must name the cap in force");
+            }
+            Err(ProbeError::MalformedOutput { message }) => panic!(
+                "a truncation must not be reported as the file's parse failure: {message}"
+            ),
+            other => panic!("expected OutputTooLarge, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same rule on the synchronous ffprobe path, which parses JSON too and
+    /// had the identical mislabelling.
+    #[test]
+    fn a_sync_flood_is_reported_as_the_cap_not_as_malformed_json() {
+        let dir = temp_dir_for("sync-flood");
+        let bin = stub_ffprobe(&dir, "head -c 4000000 /dev/zero | tr '\\0' 'x'");
+        let path = resolved_in(&dir, "a.mkv");
+
+        let cap = 512 * 1024;
+        let got = run_ffprobe_with_limits(&bin, &path, Duration::from_secs(30), cap);
+        assert!(
+            matches!(got, Err(ProbeError::OutputTooLarge { cap: c }) if c == cap),
+            "expected OutputTooLarge, got {got:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cap must not fire on ordinary output — otherwise the two tests above
+    /// would be satisfied by an implementation that always reports a breach.
+    #[tokio::test]
+    async fn output_under_the_cap_is_not_reported_as_a_breach() {
+        let dir = temp_dir_for("async-under");
+        let bin = stub_ffprobe(&dir, &format!("printf '%s' '{STUB_JSON}'"));
+        let path = resolved_in(&dir, "a.mkv");
+
+        assert!(
+            run_ffprobe_async(&bin, &path, Duration::from_secs(30), 512 * 1024)
+                .await
+                .is_ok(),
+            "a small document must pass a 512 KiB cap"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generic `spawn_with_timeout` keeps its old behaviour: it drains to
+    /// EOF, lets the child exit on its own, and appends an advisory note.
+    ///
+    /// This is a REGRESSION guard on the refactor, not new behaviour. Foundry's
+    /// encoder and the subtitle extractor judge a run by its exit status, and a
+    /// child killed by SIGPIPE at the cap would report a signal exit — turning
+    /// a merely verbose encode into a failed one. Changing that while "adding a
+    /// cap error" would have been a silent regression in a different module.
+    #[test]
+    fn the_generic_spawn_still_drains_past_the_cap_and_only_annotates() {
+        let args = vec![
+            "-c".to_string(),
+            "head -c 9437184 /dev/zero | tr '\\0' 'x'".to_string(),
+        ];
+        let out = spawn_with_timeout("sh", &args, Duration::from_secs(60)).expect("completes");
+        assert!(out.status.success(), "the child must exit normally: {:?}", out.status);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("output truncated"));
     }
 }

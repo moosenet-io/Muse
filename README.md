@@ -136,6 +136,8 @@ independent of Foundry's mutation-capable guard: two guards, no shared state.
 | Variable | Default | What it does |
 |---|---|---|
 | `MUSE_PROBE_FFPROBE_BIN` | *(unset)* | Probe binary for the shared media core — a `PATH` name or an absolute path. **Precedence:** this, then `MUSE_FOUNDRY_FFPROBE_BIN`, then `ffprobe` on `PATH`. Falling back to Foundry's setting is deliberate, so an operator who already pointed Foundry at a custom build is not silently handed the system `ffprobe`. |
+| `MUSE_PROBE_TIMEOUT_SECS` | `120` | Wall-clock ceiling on ONE `ffprobe`. Clamped to 1s–6h; an unset or unparseable value keeps the default. The default is two minutes because a probe that legitimately takes seconds must not be reported as a `Timeout`, which downstream reads as *unreadable* — a lower value trades a real stall defence for false verdicts on slow-but-fine files. |
+| `MUSE_PROBE_MAX_OUTPUT_BYTES` | `8388608` (8 MiB) | Most bytes kept from one `ffprobe` stream. Clamped to 256 KiB–256 MiB. Exceeding it is a named error (`probe output too large`), **not** a silent truncation reported as malformed metadata — so if a real file ever needs more, raise this rather than treating the file as broken. |
 
 The library root itself is `MUSE_LIBRARY_ROOT` (see the library-scan
 configuration): a **read-only** mount. Unset leaves the media core's guard

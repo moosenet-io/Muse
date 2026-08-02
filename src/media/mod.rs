@@ -183,10 +183,16 @@ impl MediaCore {
         // The cost is a stale `false` until restart, which is why this is a
         // snapshot for *degradation decisions* and Foundry's on-demand
         // `Foundry::capabilities()` remains the operator-facing status surface.
+        //
+        // CAPDET-01: bounded. Each of those three spawns runs under
+        // `MUSE_CAPABILITY_TIMEOUT_SECS` (5s by default), because this call is
+        // on the startup path and a version probe that never returns used to
+        // take the whole process with it.
         let capabilities = capability::detect(
             &ffprobe_bin,
             &cfg.ffmpeg_path,
             cfg.foundry_handbrake_bin.as_deref().unwrap_or("HandBrakeCLI"),
+            capability::resolve_timeout(cfg.capability_timeout_secs),
         );
 
         if !capabilities.ffprobe.is_present() {
@@ -516,17 +522,18 @@ mod tests {
     ///
     /// The stub answers `-version` immediately, and that is not decoration.
     /// `MediaCore::from_config` runs `capability::detect`, which invokes the
-    /// configured binary with `-version` through a plain `Command::output()` —
-    /// no deadline at all. A stub that slept for every invocation therefore
-    /// blocked CONSTRUCTION for the full sleep, and the test looked like it was
-    /// measuring the probe deadline while actually measuring capability
+    /// configured binary with `-version`. A stub that slept for every
+    /// invocation therefore delayed CONSTRUCTION, and the test looked like it
+    /// was measuring the probe deadline while actually measuring capability
     /// detection. Matching the real tool's contract for both call shapes is what
     /// keeps the stub an honest double.
     ///
-    /// (That `Command::output()` is a real, pre-existing hazard of its own — a
-    /// wedged ffprobe on an NFS mount stalls startup — but it is capability
-    /// detection's, not MPRB-02's, and is left for its own item rather than
-    /// changed here as a drive-by.)
+    /// (That call used to be a bare `Command::output()` with no deadline at all,
+    /// so the delay was UNBOUNDED and a wedged ffprobe stalled startup outright.
+    /// CAPDET-01 fixed it: version probes now run under
+    /// `MUSE_CAPABILITY_TIMEOUT_SECS` and a hung tool is reported `Unusable`.
+    /// The stub still answers `-version` promptly, because a test about the
+    /// PROBE deadline should not spend the capability deadline first.)
     fn stub_bin(dir: &std::path::Path, body: &str) -> String {
         let path = dir.join("stub-ffprobe");
         std::fs::write(
@@ -608,6 +615,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- S130-A CAPDET-01: startup survives a wedged tool -------------------
+
+    /// **The item's whole point, asserted as termination.**
+    ///
+    /// `MediaCore::from_config` runs `capability::detect` on the startup path.
+    /// With the old bare `Command::output()`, a configured binary that hangs
+    /// instead of exiting hung the process here: no health endpoint, no log past
+    /// this line, and under a supervisor a restart loop that never converges.
+    ///
+    /// Constructed on its own thread and collected with `recv_timeout`, so a
+    /// regression FAILS this test instead of hanging the suite forever — a test
+    /// that can only hang is a test that cannot report. The stub sleeps 600s, so
+    /// nothing but the deadline can end this call.
+    #[test]
+    fn a_wedged_ffprobe_lets_startup_finish_instead_of_hanging_the_process() {
+        let root = temp_root("capdet-startup");
+        let bin = wedged_bin(&root);
+
+        let cfg = Config {
+            capability_timeout_secs: Some(1),
+            ..cfg_with(Some(&bin), None, None)
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(MediaCore::from_config(&cfg));
+        });
+        let core = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("startup must RETURN against a wedged tool, not wait on it");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(20),
+            "startup must be bounded by the version-probe deadline, took {waited:?}"
+        );
+        assert!(
+            !core.can_probe(),
+            "a tool that never answered is not evidence the host can probe"
+        );
+        match &core.capabilities().ffprobe.state {
+            capability::ToolState::Unusable { reason } => {
+                assert!(
+                    reason.contains("timeout"),
+                    "the reason must name the timeout; got {reason}"
+                );
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The version-probe deadline is its own knob with its own default, and it
+    /// is NOT the probe deadline: 5 seconds versus 120. Conflating them would
+    /// put two minutes of potential stall back on the startup path.
+    #[test]
+    fn the_version_probe_deadline_is_separate_from_the_probe_deadline() {
+        assert_eq!(
+            capability::resolve_timeout(None),
+            std::time::Duration::from_secs(capability::DEFAULT_CAPABILITY_TIMEOUT_SECS)
+        );
+        assert!(
+            capability::resolve_timeout(None)
+                < MediaCore::from_config(&cfg_with(Some(ABSENT_BIN), None, None)).probe_timeout(),
+            "a `-version` banner is milliseconds of work; it must not be given a \
+             file-probe's budget on the startup path"
+        );
+    }
+
+    /// A binary that never exits. `exec sleep`, so the process the deadline
+    /// kills IS the sleeper rather than a shell wrapping one.
+    fn wedged_bin(dir: &std::path::Path) -> String {
+        let path = dir.join("wedged-ffprobe");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 600\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+        path.to_string_lossy().into_owned()
     }
 
     /// Foundry's guard and the media core's guard share no state: the media

@@ -762,8 +762,11 @@ async fn spawn_with_timeout_async_reporting_pid(
         // (An earlier revision of this comment credited the race with fixing a
         // 30-second test hang. That was wrong: the hang was `capability::detect`
         // running the sleeping stub through a `Command::output()` with no
-        // deadline, and it was fixed in the test stub. Left recorded because a
-        // plausible-but-false attribution is worse than no comment.)
+        // deadline, and it was worked around in the test stub. Left recorded
+        // because a plausible-but-false attribution is worse than no comment.
+        // CAPDET-01 later fixed the cause: `capability::detect_tool` calls
+        // `spawn_with_timeout` like everything else here, so an unbounded
+        // version probe is no longer reachable from production either.)
         let mut stdout: Option<Drained> = None;
         let mut stderr: Option<Drained> = None;
         while stdout.is_none() || stderr.is_none() {

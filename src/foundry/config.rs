@@ -88,6 +88,14 @@ pub struct FoundryConfig {
     /// command is pure, reviewable and unit-tested, which a HandBrake preset
     /// name would not be.
     pub(in crate::foundry) handbrake_bin: String,
+    /// Ceiling on ONE tool version probe (CAPDET-01).
+    ///
+    /// Nothing to do with [`FoundryConfig::encode_timeout`], and orders of
+    /// magnitude smaller: `-version` prints a banner and exits. It is here so
+    /// [`super::Foundry::capabilities`] — the on-demand operator status
+    /// surface — cannot be wedged by a binary on a stalled mount either, using
+    /// the same resolved value the startup snapshot uses.
+    pub(in crate::foundry) capability_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for FoundryConfig {
@@ -139,6 +147,11 @@ impl FoundryConfig {
             handbrake_bin: non_empty_or(
                 cfg.foundry_handbrake_bin.as_deref(),
                 DEFAULT_HANDBRAKE_BIN,
+            ),
+            // Resolved by `capability` itself, not clamped again here: one
+            // rule, one home.
+            capability_timeout: crate::media::capability::resolve_timeout(
+                cfg.capability_timeout_secs,
             ),
         }
     }
@@ -646,6 +659,9 @@ mod tests {
             ffprobe_bin: DEFAULT_FFPROBE_BIN.to_string(),
             ffmpeg_bin: DEFAULT_FFMPEG_BIN.to_string(),
             handbrake_bin: DEFAULT_HANDBRAKE_BIN.to_string(),
+            capability_timeout: std::time::Duration::from_secs(
+                crate::media::capability::DEFAULT_CAPABILITY_TIMEOUT_SECS,
+            ),
         }
     }
 

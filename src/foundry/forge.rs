@@ -1851,7 +1851,12 @@ pub struct SweepReport {
 
 /// Detect tooling using the configured binary names.
 pub(in crate::foundry) fn detect_capabilities(cfg: &FoundryConfig) -> Capabilities {
-    capability::detect(&cfg.ffprobe_bin, &cfg.ffmpeg_bin, &cfg.handbrake_bin)
+    capability::detect(
+        &cfg.ffprobe_bin,
+        &cfg.ffmpeg_bin,
+        &cfg.handbrake_bin,
+        cfg.capability_timeout,
+    )
 }
 
 #[cfg(test)]
@@ -3051,6 +3056,9 @@ mod tests {
             ffprobe_bin: ffprobe.to_string(),
             ffmpeg_bin: ffmpeg.to_string(),
             handbrake_bin: "muse-foundry-absent-handbrake".to_string(),
+            capability_timeout: std::time::Duration::from_secs(
+                crate::media::capability::DEFAULT_CAPABILITY_TIMEOUT_SECS,
+            ),
         }
     }
 

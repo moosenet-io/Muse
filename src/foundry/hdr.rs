@@ -45,7 +45,7 @@
 //! things that are known to be invisible to us, which is deliberately exposed
 //! as data rather than buried in prose: the deletion rule consumes it.
 
-use crate::foundry::probe::{StreamSideData, VideoStream};
+use crate::media::probe::{StreamSideData, VideoStream};
 
 // --- Dynamic range ---------------------------------------------------------
 

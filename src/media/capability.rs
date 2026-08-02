@@ -1,4 +1,11 @@
-//! MUSEF-02 — what media tooling actually exists on this host, right now.
+//! What media tooling actually exists on this host, right now.
+//!
+//! Built as `foundry::capability` (S128 MUSEF-02) and **promoted unchanged** to
+//! `crate::media::capability` by S130-A MPRB-01. Foundry still consumes it
+//! through the permanent re-export shim in [`crate::foundry`];
+//! [`crate::media::MediaCore`] runs [`detect`] once when it is constructed, so
+//! probe consumers can degrade once on a host without `ffprobe` instead of
+//! failing per file.
 //!
 //! ## Why this module exists at all
 //! **None of `ffprobe`, `ffmpeg` or `HandBrakeCLI` is installed on <host>**, the
@@ -97,7 +104,7 @@ impl ToolReport {
     }
 }
 
-/// What Foundry can actually do on this host.
+/// What this host can actually do with media files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub ffprobe: ToolReport,

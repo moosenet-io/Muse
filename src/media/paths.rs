@@ -1,4 +1,22 @@
-//! MUSEF-01 — the path safety primitive every Foundry operation goes through.
+//! The path safety primitive every filesystem-addressing Muse subsystem goes
+//! through.
+//!
+//! Built as `foundry::paths` (S128 MUSEF-01) and **promoted unchanged** to
+//! `crate::media::paths` by S130-A MPRB-01. Foundry still consumes it — through
+//! the permanent re-export shim in [`crate::foundry`] — and is joined by the
+//! shared media core ([`crate::media::MediaCore`]), which builds a second,
+//! independent, **read-only** guard over `MUSE_LIBRARY_ROOT`.
+//!
+//! ## Visibility after the MPRB-01 promotion
+//! Under S128 the raw-path accessors and [`PathGuard::new`] were
+//! `pub(in crate::foundry)`, a narrowing chosen deliberately and tightened twice
+//! under review. `pub(in …)` is only expressible for an ancestor module of the
+//! item, so moving this file out of `foundry` made that form unrepresentable.
+//! The visibility is therefore `pub(crate)` — **the narrowest form that still
+//! compiles after the move**, and still not `pub`: nothing outside this crate
+//! can mint a guard or extract a raw path. The narrowing that was lost is
+//! "other Muse modules cannot call these"; that is a real, if small, reduction
+//! and is recorded here rather than left to be discovered.
 //!
 //! ## Why this type exists
 //! Foundry is the first Muse subsystem that *writes to* and *deletes from* the
@@ -49,30 +67,32 @@ pub struct ResolvedPath(PathBuf);
 impl ResolvedPath {
     /// The underlying canonical path.
     ///
-    /// Restricted to the `foundry` module. A reviewer observed that a public
-    /// accessor makes the type boundary porous: any caller could take the path
-    /// out of a read-only `ResolvedPath` and hand it to `std::fs::write` while
-    /// the mutation gate was closed. Narrowing the accessor means nothing
-    /// *outside* Foundry can extract a raw path at all.
+    /// Crate-internal (`pub(crate)`; `pub(in crate::foundry)` before the
+    /// MPRB-01 promotion — see the module docs). A reviewer observed that a
+    /// public accessor makes the type boundary porous: any caller could take
+    /// the path out of a read-only `ResolvedPath` and hand it to
+    /// `std::fs::write` while the mutation gate was closed. Narrowing the
+    /// accessor means nothing *outside the crate* can extract a raw path at
+    /// all.
     ///
     /// **What this does and does not guarantee, stated plainly.** Inside
-    /// Foundry the boundary is a strong convention, not a sandbox: Rust cannot
+    /// the crate the boundary is a strong convention, not a sandbox: Rust cannot
     /// stop a module that holds a `&Path` from calling `std::fs::remove_file`
     /// on it, and read operations legitimately need the path (ffprobe, ffmpeg,
-    /// `File::open`). So the guarantee is: *outside* Foundry, no raw path;
-    /// *inside* Foundry, a function that takes [`MutablePath`] documents and
+    /// `File::open`). So the guarantee is: *outside* the crate, no raw path;
+    /// *inside* it, a function that takes [`MutablePath`] documents and
     /// type-checks its intent to mutate, and any `fs` mutation reached from a
     /// plain `ResolvedPath` is a reviewable defect. Making that unrepresentable
-    /// would need every filesystem call to route through a Foundry IO façade
+    /// would need every filesystem call to route through an IO façade
     /// that only accepts `MutablePath` — a worthwhile design, scoped as a
     /// follow-up rather than claimed here.
-    pub(in crate::foundry) fn as_path(&self) -> &Path {
+    pub(crate) fn as_path(&self) -> &Path {
         &self.0
     }
 
-    /// Consume into the owned canonical [`PathBuf`]. Foundry-internal, for the
+    /// Consume into the owned canonical [`PathBuf`]. Crate-internal, for the
     /// same reason as [`ResolvedPath::as_path`].
-    pub(in crate::foundry) fn into_path_buf(self) -> PathBuf {
+    pub(crate) fn into_path_buf(self) -> PathBuf {
         self.0
     }
 
@@ -95,25 +115,26 @@ impl ResolvedPath {
     /// directory; no component of it comes from the library, from a probe, or
     /// from a request. The one consumer is
     /// [`crate::foundry::validate::probe_scratch_file`], which runs ffprobe on
-    /// it, and `pub(in crate::foundry)` keeps that reachable only from inside
-    /// the module.
+    /// it, and `pub(crate)` keeps that reachable only from inside this crate
+    /// (it was `pub(in crate::foundry)` before the MPRB-01 promotion — see the
+    /// module docs).
     ///
     /// Not canonicalized, deliberately: the caller has just created the file at
     /// exactly this path, and canonicalizing would only introduce a failure
     /// mode (a scratch mount that is itself a symlink) with nothing to gain —
     /// this value is never compared against a root.
-    pub(in crate::foundry) fn for_process_owned_scratch(path: &Path) -> Self {
+    pub(crate) fn for_process_owned_scratch(path: &Path) -> Self {
         Self(path.to_path_buf())
     }
 
     /// A lossy display form for logs and error messages.
     ///
-    /// Foundry-internal like the rest. A reviewer noted that a display string
+    /// Crate-internal like the rest. A reviewer noted that a display string
     /// still round-trips into a `Path`, so calling it "safe outside Foundry"
     /// was wrong — the disclosure is real even if the capability is not. In
     /// practice no `ResolvedPath` can be obtained outside the module anyway,
     /// so this is belt-and-braces, but it removes the argument entirely.
-    pub(in crate::foundry) fn display(&self) -> std::path::Display<'_> {
+    pub(crate) fn display(&self) -> std::path::Display<'_> {
         self.0.display()
     }
 }
@@ -121,8 +142,8 @@ impl ResolvedPath {
 // NOTE: no `Display` impl for `ResolvedPath` or `MutablePath`, deliberately.
 // A trait impl is public wherever the type is, so `format!("{}", p)` would have
 // disclosed the canonical path to any holder regardless of how narrow the
-// inherent accessors are. Foundry-internal code formats paths via the
-// `pub(in crate::foundry) display()` above; outside code has no instance to
+// inherent accessors are. Crate-internal code formats paths via the
+// `pub(crate) display()` above; code outside the crate has no instance to
 // format in the first place, and now no way to render one if it did.
 
 /// A [`ResolvedPath`] that has *also* passed the mutation gate.
@@ -144,24 +165,24 @@ pub struct MutablePath(ResolvedPath);
 // Same as ResolvedPath above: no consumers until MUSEF-08.
 #[allow(dead_code)]
 impl MutablePath {
-    /// The underlying canonical path. Foundry-internal, as for
+    /// The underlying canonical path. Crate-internal, as for
     /// [`ResolvedPath::as_path`].
-    pub(in crate::foundry) fn as_path(&self) -> &Path {
+    pub(crate) fn as_path(&self) -> &Path {
         self.0.as_path()
     }
 
     /// Consume into the owned canonical [`PathBuf`].
-    pub(in crate::foundry) fn into_path_buf(self) -> PathBuf {
+    pub(crate) fn into_path_buf(self) -> PathBuf {
         self.0.into_path_buf()
     }
 
     /// Downgrade to a plain [`ResolvedPath`] for a read-only call.
-    pub(in crate::foundry) fn as_resolved(&self) -> &ResolvedPath {
+    pub(crate) fn as_resolved(&self) -> &ResolvedPath {
         &self.0
     }
 
-    /// A lossy display form. Foundry-internal, as for [`ResolvedPath::display`].
-    pub(in crate::foundry) fn display(&self) -> std::path::Display<'_> {
+    /// A lossy display form. Crate-internal, as for [`ResolvedPath::display`].
+    pub(crate) fn display(&self) -> std::path::Display<'_> {
         self.0.display()
     }
 }
@@ -237,21 +258,28 @@ pub struct PathGuard {
 impl PathGuard {
     /// Build a guard from raw configured roots.
     ///
-    /// `pub(in crate::foundry)` deliberately, and narrowed twice under review.
-    /// A guard is a *capability*: code that can mint its own with arbitrary
-    /// roots and `enable_mutation: true` has bypassed the configuration
-    /// entirely. `pub(crate)` was not enough — any current or future module
-    /// anywhere in the crate could still call it — so construction is now
-    /// restricted to the `foundry` module itself, where
-    /// [`crate::foundry::FoundryConfig::guard`] is the only caller and applies
-    /// the full validation first.
+    /// `pub(crate)` — see "visibility after the MPRB-01 promotion" in the
+    /// module docs. A guard is a *capability*: code that can mint its own with
+    /// arbitrary roots and `enable_mutation: true` has bypassed the
+    /// configuration entirely, so this constructor is deliberately not `pub`.
+    ///
+    /// Under S128 it was `pub(in crate::foundry)`, narrowed twice under review.
+    /// MPRB-01 moved this module out of `foundry` into the shared
+    /// `crate::media` core, and `pub(in crate::foundry)` is not expressible on
+    /// an item that no longer lives under `foundry` — so the visibility is now
+    /// `pub(crate)`, the narrowest form that keeps BOTH legitimate callers
+    /// compiling. Those callers are exactly two, and a third is a review
+    /// finding: [`crate::foundry::FoundryConfig::guard`] (the mutation-capable
+    /// curation guard) and [`crate::media::MediaCore::from_config`] (the
+    /// read-only library guard, `enable_mutation: false`). Both apply their own
+    /// full validation first.
     ///
     /// Each root is canonicalized; roots that do not exist or cannot be
     /// resolved are dropped with a warning. If *every* root drops out, the
     /// guard is still constructed but refuses all paths with
     /// [`PathError::NoAllowedRoots`] — callers that want "Foundry is not
     /// configured at all" semantics should check [`PathGuard::is_inert`].
-    pub(in crate::foundry) fn new<I, P>(roots: I, enable_mutation: bool) -> Self
+    pub(crate) fn new<I, P>(roots: I, enable_mutation: bool) -> Self
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
@@ -298,12 +326,12 @@ impl PathGuard {
         self.roots.is_empty()
     }
 
-    /// The canonical allowed roots. **Foundry-internal** — these are raw
+    /// The canonical allowed roots. **Crate-internal** — these are raw
     /// `PathBuf`s, and a caller who has them can append a child and call
-    /// `std::fs` directly, bypassing confinement entirely. Outside Foundry use
+    /// `std::fs` directly, bypassing confinement entirely. Outside the crate use
     /// [`crate::foundry::Foundry::root_descriptions`], which yields display
     /// strings that cannot be used to open a file.
-    pub(in crate::foundry) fn roots(&self) -> &[PathBuf] {
+    pub(crate) fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
 

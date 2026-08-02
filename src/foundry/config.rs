@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::foundry::paths::PathGuard;
+use crate::media::paths::PathGuard;
 
 /// Default retention for the Foundry recycle bin, in days.
 ///
@@ -42,7 +42,7 @@ const DEFAULT_HANDBRAKE_BIN: &str = "HandBrakeCLI";
 /// (`root_descriptions`, `root_count`, `mutation_enabled`, `retention_days`).
 #[derive(Clone)]
 // MUSEF-02 is now the consumer of `ffprobe_bin` and `ffmpeg_bin`
-// (`crate::foundry::probe` / `crate::foundry::forge`). `handbrake_bin` is still
+// (`crate::media::probe` / `crate::foundry::forge`). `handbrake_bin` is still
 // only *reported* — see its field doc.
 //
 // NOTE the missing `Debug` derive — it is deliberate. A reviewer pointed out
@@ -82,7 +82,7 @@ pub struct FoundryConfig {
     pub(in crate::foundry) ffmpeg_bin: String,
     /// `HandBrakeCLI` binary (name on `PATH`, or an absolute path).
     ///
-    /// Detected and reported by [`crate::foundry::capability`], but not driven:
+    /// Detected and reported by [`crate::media::capability`], but not driven:
     /// Foundry constructs its own ffmpeg argv (see
     /// [`crate::foundry::plan::build_transcode_args`]) so that the exact
     /// command is pure, reviewable and unit-tested, which a HandBrake preset

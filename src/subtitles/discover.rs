@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::foundry::probe::{MediaProbe, SubtitleStream};
+use crate::media::probe::{MediaProbe, SubtitleStream};
 
 use super::cues::SubtitleFormat;
 use super::{AvailableSubtitle, SubtitleSource};
@@ -61,7 +61,7 @@ pub fn is_image_codec(codec: &str) -> bool {
 }
 
 /// Enumerate the embedded subtitle tracks in an already-taken probe.
-/// **Pure** — the ffprobe call itself lives in [`crate::foundry::probe`].
+/// **Pure** — the ffprobe call itself lives in [`crate::media::probe`].
 ///
 /// One sampled library file carries 42 subtitle streams, so this is not a
 /// theoretical list; it is routinely the largest of the three tiers, and it is

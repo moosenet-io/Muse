@@ -127,15 +127,15 @@ use std::os::unix::io::AsRawFd;
 use std::time::{Duration, SystemTime};
 use std::path::{Path, PathBuf};
 
-use crate::foundry::capability::{self, Capabilities};
+use crate::media::capability::{self, Capabilities};
 use crate::foundry::config::FoundryConfig;
-use crate::foundry::paths::{MutablePath, PathError, PathGuard, ResolvedPath};
+use crate::media::paths::{MutablePath, PathError, PathGuard, ResolvedPath};
 use crate::foundry::plan::{
     output_container, plan_transcode, AudioAction, TranscodeDecision, TranscodePlan,
     TranscodeReason, Undecidable, VideoAction,
 };
 use crate::foundry::policy::TranscodePolicy;
-use crate::foundry::probe::{run_ffprobe, MediaProbe, ProbeError};
+use crate::media::probe::{run_ffprobe, MediaProbe, ProbeError};
 
 /// Extension given to the superseded original.
 ///
@@ -1499,13 +1499,13 @@ fn run_encode_and_swap(
     //
     // The ceiling is deliberately generous — a 4K feature is legitimately
     // hours on a CPU — so it never fires on honest work, only on a wedge.
-    let status = crate::foundry::probe::spawn_with_timeout(
+    let status = crate::media::probe::spawn_with_timeout(
         &cfg.ffmpeg_bin,
         args,
         cfg.encode_timeout,
     )
     .map_err(|e| match e {
-        crate::foundry::probe::ProbeError::Timeout { secs } => format!(
+        crate::media::probe::ProbeError::Timeout { secs } => format!(
             "ffmpeg did not finish within {secs}s and was abandoned — the encode is \
              incomplete and NOTHING was swapped; the original is untouched"
         ),

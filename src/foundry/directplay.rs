@@ -5,7 +5,7 @@
 //!
 //! Path A's *mechanism* already exists and is not reimplemented here. Every
 //! incoming title goes through the machinery MUSEF-02 built:
-//! [`crate::foundry::probe`] describes it, [`crate::foundry::plan`] decides,
+//! [`crate::media::probe`] describes it, [`crate::foundry::plan`] decides,
 //! and [`crate::foundry::forge`] encodes to a staging file, re-probes it,
 //! verifies it against the source and only then performs the atomic-claim
 //! swap. That swap is the thing standing between "normalize on ingest" and a
@@ -59,7 +59,7 @@ use crate::foundry::hdr::{
 };
 use crate::foundry::plan::TranscodeDecision;
 use crate::foundry::policy::{normalize_container, Container, TranscodePolicy};
-use crate::foundry::probe::MediaProbe;
+use crate::media::probe::MediaProbe;
 
 // --- What forces a client-side transcode -----------------------------------
 
@@ -485,10 +485,10 @@ pub const DURATION_TOLERANCE_SECS: f64 = 1.0;
 /// available stand-in is "every visible property is unchanged" — evidence, not
 /// proof, which is why it errs toward keeping the file.
 pub(crate) fn unreproduced_audio<'a>(
-    source: &'a [crate::foundry::probe::AudioStream],
-    output: &[crate::foundry::probe::AudioStream],
-) -> Vec<&'a crate::foundry::probe::AudioStream> {
-    let mut unmatched_output: Vec<&crate::foundry::probe::AudioStream> = output.iter().collect();
+    source: &'a [crate::media::probe::AudioStream],
+    output: &[crate::media::probe::AudioStream],
+) -> Vec<&'a crate::media::probe::AudioStream> {
+    let mut unmatched_output: Vec<&crate::media::probe::AudioStream> = output.iter().collect();
     let mut unmatched_source = Vec::new();
 
     for a in source {
@@ -531,12 +531,12 @@ pub(crate) fn unreproduced_audio<'a>(
 fn audio_streams_an_encode_will_produce(
     source: &MediaProbe,
     channels: &[u32],
-) -> Vec<crate::foundry::probe::AudioStream> {
+) -> Vec<crate::media::probe::AudioStream> {
     source
         .audio
         .iter()
         .enumerate()
-        .map(|(i, a)| crate::foundry::probe::AudioStream {
+        .map(|(i, a)| crate::media::probe::AudioStream {
             index: a.index,
             codec: "aac".to_string(),
             channels: channels.get(i).copied().or(a.channels),

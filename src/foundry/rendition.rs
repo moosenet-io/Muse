@@ -31,7 +31,7 @@
 //! [`rendition_output_path`] computes where a rendition *would* go. It creates
 //! no directory and touches no file. Execution belongs to
 //! [`crate::foundry::forge`], and the paths it is given must still go through
-//! [`crate::foundry::paths::PathGuard`] like every other path in Foundry.
+//! [`crate::media::paths::PathGuard`] like every other path in Foundry.
 
 use std::path::{Component, Path, PathBuf};
 

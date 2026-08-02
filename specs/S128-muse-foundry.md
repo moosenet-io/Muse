@@ -5,6 +5,20 @@ module: Muse
 prefix: MUSEF
 spec_id: S128-muse-foundry
 
+> **Superseding note (added 2026-08-02 by S130-A `MPRB-01`, not a rewrite of this
+> spec).** Three files this spec scopes have **moved**, without any behaviour
+> change: `src/foundry/probe.rs`, `src/foundry/capability.rs` and
+> `src/foundry/paths.rs` now live at `src/media/probe.rs`,
+> `src/media/capability.rs` and `src/media/paths.rs`. `crate::foundry`
+> re-exports all three under their original module paths as a permanent
+> compatibility surface, so every `crate::foundry::probe::…` /
+> `::capability::…` / `::paths::…` reference below is still a valid spelling —
+> but the **file paths** in the FILES sections of MUSEF-01 and MUSEF-02 are
+> historical. See `specs/S130-A-maestro-probe.md` `MPRB-01` for why (Foundry is
+> default-deny and inert, which left a stock deployment unable to probe its own
+> library). The rest of this spec is unchanged and remains the record of what
+> S128 delivered.
+
 ## Metadata
 - **Author:** Moose (operator) / Claude (scoping)
 - **Session:** S128

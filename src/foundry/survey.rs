@@ -36,7 +36,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::foundry::probe::MediaProbe;
+use crate::media::probe::MediaProbe;
 use crate::foundry::plan::{plan_transcode, TranscodeDecision, Undecidable};
 use crate::foundry::policy::TranscodePolicy;
 use crate::foundry::Foundry;

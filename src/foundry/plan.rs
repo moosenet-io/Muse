@@ -25,7 +25,7 @@
 use crate::foundry::policy::{
     normalize_container, scale_to_fit, Container, TranscodePolicy,
 };
-use crate::foundry::probe::MediaProbe;
+use crate::media::probe::MediaProbe;
 
 /// What Foundry decided about one file.
 #[derive(Debug, Clone, PartialEq)]

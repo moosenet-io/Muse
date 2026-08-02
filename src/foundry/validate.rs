@@ -67,7 +67,7 @@ use crate::foundry::config::FoundryConfig;
 use crate::foundry::forge::{expectation_for, verify_output, VerifyExpectation, VerifyFailure};
 use crate::foundry::plan::{plan_transcode, TranscodeDecision, TranscodePlan, TranscodeReason};
 use crate::foundry::policy::{normalize_container, Container, TranscodePolicy};
-use crate::foundry::probe::{run_ffprobe, MediaProbe};
+use crate::media::probe::{run_ffprobe, MediaProbe};
 use crate::foundry::Foundry;
 
 // ---------------------------------------------------------------------------
@@ -1468,7 +1468,7 @@ fn validate_one(
 /// process generated, in a directory it verified. Nothing about it is
 /// attacker-influenced or derived from the library.
 fn probe_scratch_file(ffprobe_bin: &str, path: &Path) -> Result<MediaProbe, String> {
-    let resolved = crate::foundry::paths::ResolvedPath::for_process_owned_scratch(path);
+    let resolved = crate::media::paths::ResolvedPath::for_process_owned_scratch(path);
     run_ffprobe(ffprobe_bin, &resolved).map_err(|e| e.to_string())
 }
 

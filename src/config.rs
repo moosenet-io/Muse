@@ -309,6 +309,19 @@ pub struct Config {
     /// `HandBrakeCLI` binary (a `PATH` name or an absolute path).
     pub foundry_handbrake_bin: Option<String>,
 
+    // --- S130-A MPRB-01: the shared media core ---
+    /// `ffprobe` binary for the **shared** media core (`MUSE_PROBE_FFPROBE_BIN`).
+    ///
+    /// Non-secret behavioural config, like everything else in this block.
+    /// `crate::media::MediaCore::from_config` resolves the binary with a
+    /// documented precedence: this value, then `foundry_ffprobe_bin`
+    /// (`MUSE_FOUNDRY_FFPROBE_BIN`), then `"ffprobe"` on `PATH`. Falling back to
+    /// Foundry's setting is deliberate — an operator who already pointed Foundry
+    /// at a custom ffprobe build should not have to configure the same binary on
+    /// the same host twice, which is exactly the configuration trap
+    /// `foundry_ffmpeg_bin` avoids by reusing `MUSE_FFMPEG_PATH`.
+    pub probe_ffprobe_bin: Option<String>,
+
     // --- SUBS-01: the subtitle system ---
     /// Wyzie subtitle-provider API key (`WYZIE_KEY`).
     ///
@@ -727,6 +740,7 @@ impl Config {
                 .and_then(|v| v.parse::<u32>().ok()),
             foundry_ffprobe_bin: env_opt("MUSE_FOUNDRY_FFPROBE_BIN"),
             foundry_handbrake_bin: env_opt("MUSE_FOUNDRY_HANDBRAKE_BIN"),
+            probe_ffprobe_bin: env_opt("MUSE_PROBE_FFPROBE_BIN"),
             // SUBS-01. Read exactly like every other optional credential:
             // from the environment at runtime, never a literal.
             wyzie_key: env_opt("WYZIE_KEY").map(QbitPassword::from),
@@ -928,6 +942,11 @@ impl Default for Config {
             foundry_retention_days: None,
             foundry_ffprobe_bin: None,
             foundry_handbrake_bin: None,
+
+            // The shared media core's own ffprobe override: unset by default,
+            // so `MediaCore` falls back to Foundry's setting and then to
+            // `ffprobe` on PATH.
+            probe_ffprobe_bin: None,
 
             // SUBS-01 defaults are the SAFE values: no provider credential
             // (so the provider tier is inert) and no store directory (so

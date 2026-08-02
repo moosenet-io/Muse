@@ -239,7 +239,7 @@ pub async fn list_subtitles(
     // Probing goes through `Foundry`, not a bare ffprobe call, so the
     // allowed-roots path guard applies here exactly as it does everywhere else
     // that reads a library file.
-    let mut probed: Option<crate::foundry::probe::MediaProbe> = None;
+    let mut probed: Option<crate::media::probe::MediaProbe> = None;
     let (embedded, embedded_status) = match probe_media(&state, &path) {
         Ok(probe) => {
             let found = discover::embedded_from_probe(&probe);

@@ -314,16 +314,16 @@ pub fn extract_speech_activity(ffmpeg_bin: &str, media_path: &Path) -> Result<Ve
     // the crate could ever construct it. A silencedetect pass decodes a whole
     // programme's audio off the library mount, so a stalled read wedges it the
     // same way it wedged ffprobe (FOUNDRY-10, observed live).
-    let output = match crate::foundry::probe::spawn_with_timeout(
+    let output = match crate::media::probe::spawn_with_timeout(
         ffmpeg_bin,
         &args,
         std::time::Duration::from_secs(FFMPEG_TIMEOUT_SECS),
     ) {
         Ok(out) => out,
-        Err(crate::foundry::probe::ProbeError::Timeout { secs }) => {
+        Err(crate::media::probe::ProbeError::Timeout { secs }) => {
             return Err(SyncError::Timeout { seconds: secs })
         }
-        Err(crate::foundry::probe::ProbeError::ToolMissing { .. }) => {
+        Err(crate::media::probe::ProbeError::ToolMissing { .. }) => {
             return Err(SyncError::ToolMissing {
                 binary: ffmpeg_bin.to_string(),
             })

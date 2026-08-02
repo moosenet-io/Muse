@@ -41,7 +41,7 @@ use crate::foundry::plan::{
     Undecidable, VideoAction,
 };
 use crate::foundry::policy::Container;
-use crate::foundry::probe::MediaProbe;
+use crate::media::probe::MediaProbe;
 use crate::foundry::rendition::{
     rendition_output_path, DynamicRangeTreatment, Ladder, PathModelError, Rendition,
     RenditionName, RenditionRequest, VideoTreatment,
@@ -569,7 +569,7 @@ pub fn upscale_refusal(source: (u32, u32), video: VideoAction) -> Option<Renditi
 /// rather than duplicating a file for nothing.
 pub fn hifi_has_anything_to_preserve(
     probe: &MediaProbe,
-    video: &crate::foundry::probe::VideoStream,
+    video: &crate::media::probe::VideoStream,
 ) -> bool {
     let above_1080p = video.width.unwrap_or(0) > 1920 || video.height.unwrap_or(0) > 1080;
     let hdr = !matches!(classify_hdr(video), HdrVerdict::Sdr);

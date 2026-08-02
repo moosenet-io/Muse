@@ -33,6 +33,9 @@ pub mod kg;
 pub mod library;
 pub mod maintenance;
 pub mod matching;
+// S130-A MPRB-01: the shared media core (`probe`, `capability`, `paths`),
+// promoted out of `foundry` so a stock deployment can describe its own library.
+pub mod media;
 pub mod metadata;
 mod metrics;
 pub mod models;

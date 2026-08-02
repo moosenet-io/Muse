@@ -3726,3 +3726,247 @@ pub async fn foundry_validate(
         })).collect::<Vec<_>>(),
     })))
 }
+
+// --- FOUNDRY-11: the armed run ---------------------------------------------
+
+/// `POST /ops/foundry/run` — the deliberate large run Path A was built for.
+///
+/// `foundry_optimize` refuses more than eight paths on the grounds that "a
+/// 16,000-item run is something an operator builds deliberately rather than
+/// something one request can start". This IS that deliberate build, and every
+/// safeguard it carries exists because the alternative is an unattended process
+/// rewriting a library.
+///
+/// **What it will not do:**
+/// - Start without `MUSE_FOUNDRY_ENABLE_MUTATION` open.
+/// - Start without `confirm` restating the exact title count it is about to
+///   attempt — the operator states the size, so a mis-typed limit cannot
+///   silently become a bigger run than intended.
+/// - Start a second run while one is in flight.
+/// - Touch a title whose original cannot be reclaimed, unless asked. The
+///   default is `reclaimable_only`: of 3,621 titles that would be re-encoded on
+///   this library, only 463 can ever have their original removed, and for the
+///   rest a rewrite permanently leaves BOTH copies on disk.
+/// - Keep going past its ceilings: title count, consecutive failures, free
+///   space, or wall clock. Every one of those reports a distinct stop reason,
+///   and only an exhausted candidate list counts as having finished.
+///
+/// The originals are still not destroyed here. Forge hard-links each to
+/// `<name>.muse-superseded`; reclaiming that space remains the reaper's job,
+/// behind its own two gates.
+#[derive(Debug, serde::Deserialize)]
+pub struct RunBody {
+    /// Ceiling on titles ATTEMPTED. Not a target.
+    pub max_titles: Option<usize>,
+    /// `"reclaimable_only"` (default) or `"all"`.
+    pub policy: Option<String>,
+    /// Must equal `"run <max_titles> titles"`. The operator restates the size.
+    pub confirm: Option<String>,
+    /// Wall-clock ceiling for the whole run.
+    pub deadline_secs: Option<u64>,
+    /// Stop after this many failures in a row.
+    pub max_consecutive_failures: Option<u32>,
+    /// Floor for free space on the work filesystem.
+    pub min_free_gib: Option<u64>,
+}
+
+pub async fn foundry_run_start(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RunBody>,
+) -> MuseResult<Json<Value>> {
+    use crate::foundry::run::{self, CandidatePolicy, RunLimits};
+
+    let Some(foundry) = crate::foundry::Foundry::from_config(&state.config) else {
+        return Ok(Json(json!({
+            "started": false,
+            "reason": "foundry is not configured (MUSE_FOUNDRY_* unset) — nothing was started",
+        })));
+    };
+
+    // The global gate, reported once for the run rather than as N identical
+    // per-file skips.
+    if !foundry.mutation_enabled() {
+        return Ok(Json(json!({
+            "started": false,
+            "reason": "MUSE_FOUNDRY_ENABLE_MUTATION is closed — this deployment cannot \
+                       modify the library, so no run was started",
+        })));
+    }
+
+    let max_titles = body.max_titles.unwrap_or(10).clamp(1, 50_000);
+
+    // The operator restates the SIZE. `confirm` on the optimize endpoint
+    // restates a path; here the dangerous quantity is how many titles, so that
+    // is what must be restated. A mis-typed limit fails closed instead of
+    // starting a larger run than intended.
+    if let Err(why) = run::check_confirm(max_titles, body.confirm.as_deref()) {
+        return Err(MuseError::BadRequest(why));
+    }
+
+    let policy_choice = match body.policy.as_deref().unwrap_or("reclaimable_only") {
+        "reclaimable_only" => CandidatePolicy::ReclaimableOnly,
+        "all" => CandidatePolicy::All,
+        other => {
+            return Err(MuseError::BadRequest(format!(
+                "policy must be \"reclaimable_only\" or \"all\", got {other:?}"
+            )))
+        }
+    };
+
+    let Some(root) = state.config.library_root.clone() else {
+        return Ok(Json(json!({
+            "started": false,
+            "reason": "MUSE_LIBRARY_ROOT is not set — there is nothing to run against",
+        })));
+    };
+
+    let limits = RunLimits {
+        max_titles,
+        max_consecutive_failures: body.max_consecutive_failures.unwrap_or(3),
+        min_free_bytes: body
+            .min_free_gib
+            .unwrap_or(50)
+            .saturating_mul(1024 * 1024 * 1024),
+        deadline: std::time::Duration::from_secs(
+            body.deadline_secs.unwrap_or(6 * 3600).clamp(60, 72 * 3600),
+        ),
+    };
+
+    if run::global_handle().is_active() {
+        return Err(MuseError::BadRequest(
+            "a run is already in flight; stop it or wait for it to finish".into(),
+        ));
+    }
+
+    let work_dir = state.config.foundry_work_dir.clone();
+    let transcode_policy = crate::foundry::policy::TranscodePolicy::direct_play_normalization();
+
+    // Selection runs on the blocking pool too: it surveys the library, which is
+    // ~46 minutes of ffprobe over NFS for 16,221 files.
+    tokio::task::spawn_blocking(move || {
+        let candidates: Vec<std::path::PathBuf> =
+            crate::library::scan::walk_media_files(std::path::Path::new(&root))
+                .into_iter()
+                .map(|f| f.absolute_path)
+                .collect();
+
+        tracing::info!(
+            candidates = candidates.len(),
+            "foundry run: surveying to select candidates"
+        );
+
+        // Survey everything, then keep only what the chosen policy admits.
+        let summary = crate::foundry::survey::survey_files(
+            &foundry,
+            &transcode_policy,
+            &candidates,
+            candidates.len().max(1),
+            std::time::Duration::from_secs(6 * 3600),
+        );
+
+        let surveyed: Vec<(std::path::PathBuf, bool)> = summary
+            .files
+            .iter()
+            .filter_map(|f| match &f.outcome {
+                crate::foundry::survey::SurveyOutcome::WouldTranscode {
+                    predicted_deletion_refusals,
+                    ..
+                } => Some((
+                    std::path::PathBuf::from(&f.path),
+                    predicted_deletion_refusals.is_empty(),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        let selected = run::select_candidates(&surveyed, policy_choice);
+        tracing::info!(
+            would_transcode = surveyed.len(),
+            selected = selected.len(),
+            policy = ?policy_choice,
+            "foundry run: candidates selected"
+        );
+
+        match run::execute_run(
+            &foundry,
+            &transcode_policy,
+            &selected,
+            &limits,
+            work_dir.as_deref().map(std::path::Path::new),
+            run::global_handle(),
+        ) {
+            Ok(report) => tracing::info!(
+                stop_reason = report.stop_reason.as_str(),
+                "foundry run: complete"
+            ),
+            Err(e) => tracing::warn!(?e, "foundry run: refused to start"),
+        }
+    });
+
+    Ok(Json(json!({
+        "started": true,
+        "max_titles": max_titles,
+        "policy": match policy_choice {
+            CandidatePolicy::ReclaimableOnly => "reclaimable_only",
+            CandidatePolicy::All => "all",
+        },
+        "note": "candidate selection surveys the library first; poll GET /ops/foundry/run \
+                 for progress. Originals are hard-linked to .muse-superseded, never deleted \
+                 by this endpoint.",
+    })))
+}
+
+/// `GET /ops/foundry/run` — progress of the run in flight, or the last one.
+///
+/// `stop_reason` is `null` while running. Its presence is the ONLY signal that
+/// a run is over, so a reader cannot mistake a stalled run for a finished one —
+/// the same distinction the survey draws between truncated and complete.
+pub async fn foundry_run_status() -> MuseResult<Json<Value>> {
+    let handle = crate::foundry::run::global_handle();
+    let Some(p) = handle.snapshot() else {
+        return Ok(Json(json!({
+            "ever_run": false,
+            "active": false,
+            "note": "no run has been started in this process",
+        })));
+    };
+
+    Ok(Json(json!({
+        "ever_run": true,
+        "active": handle.is_active(),
+        "candidates_total": p.candidates_total,
+        "current": p.current.as_ref().map(|c| c.display().to_string()),
+        "ledger": {
+            "attempted": p.ledger.attempted,
+            "rewritten": p.ledger.rewritten,
+            "failed": p.ledger.failed,
+            "skipped": p.ledger.skipped,
+            "bytes_before_total": p.ledger.bytes_before_total,
+            "bytes_after_total": p.ledger.bytes_after_total,
+            "bytes_reclaimed": p.ledger.bytes_reclaimed(),
+        },
+        "stop_reason": p.stop_reason.as_ref().map(|r| r.as_str()),
+        "stop_detail": p.stop_reason.as_ref().map(|r| r.to_string()),
+        // Derived from the stop reason, never from the counts: a run cancelled
+        // on its last title must not read as having finished.
+        "completed": p.stop_reason.as_ref().map(|r| r.is_complete()),
+    })))
+}
+
+/// `POST /ops/foundry/run/stop` — ask the run in flight to stop.
+///
+/// Takes effect before the NEXT title, not mid-encode: killing ffmpeg partway
+/// would leave a staged file to clean up, and the staged file is not the
+/// library copy, so waiting costs nothing but one title's time.
+pub async fn foundry_run_stop() -> MuseResult<Json<Value>> {
+    let was_active = crate::foundry::run::global_handle().request_stop();
+    Ok(Json(json!({
+        "stop_requested": true,
+        "was_active": was_active,
+        "note": if was_active {
+            "the run will stop before its next title; the one in flight finishes first"
+        } else {
+            "no run was in flight — nothing was stopped"
+        },
+    })))
+}

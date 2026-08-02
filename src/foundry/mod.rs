@@ -61,6 +61,7 @@ pub mod plan;
 pub mod policy;
 pub mod probe;
 pub mod reaper;
+pub mod run;
 
 pub use capability::{Capabilities, ToolReport, ToolState};
 pub use config::FoundryConfig;

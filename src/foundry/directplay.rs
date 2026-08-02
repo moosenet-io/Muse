@@ -467,6 +467,85 @@ pub const DURATION_TOLERANCE_SECS: f64 = 1.0;
 /// Observed live: an AV1 1080p 10-bit UNTAGGED episode was re-encoded for
 /// hours, then refused with `SourceDynamicRangeUnknown`. Untagged 10-bit is
 /// common in AV1 and anime web encodes, so this is not a rare tail.
+/// **The audio matching rule, in one place.**
+///
+/// Returns the source streams that the output does not reproduce. Empty means
+/// every source track was accounted for.
+///
+/// This exists as its own function because the deletion gate and the
+/// *prediction* of that gate had drifted apart: the gate refused an mp3 -> aac
+/// swap while the prediction said the title would reclaim disk. Two copies of a
+/// rule this subtle will always drift, so there is now one copy and both call
+/// it. The prediction runs it against the output the plan *will* produce.
+///
+/// A codec that may be hiding a format ffprobe cannot see gets the strict rule:
+/// same codec and enough channels is NOT enough, because a re-encoded E-AC-3
+/// 6-channel track looks exactly like the Atmos track it was made from. Nothing
+/// in the probe output distinguishes a copy from a re-encode, so the closest
+/// available stand-in is "every visible property is unchanged" — evidence, not
+/// proof, which is why it errs toward keeping the file.
+pub(crate) fn unreproduced_audio<'a>(
+    source: &'a [crate::foundry::probe::AudioStream],
+    output: &[crate::foundry::probe::AudioStream],
+) -> Vec<&'a crate::foundry::probe::AudioStream> {
+    let mut unmatched_output: Vec<&crate::foundry::probe::AudioStream> = output.iter().collect();
+    let mut unmatched_source = Vec::new();
+
+    for a in source {
+        let may_hide_object_audio = undetectable_formats()
+            .iter()
+            .any(|u| u.carried_by_codec.eq_ignore_ascii_case(a.codec.trim()));
+
+        let found = unmatched_output.iter().position(|o| {
+            o.codec.eq_ignore_ascii_case(&a.codec)
+                && match (a.channels, o.channels) {
+                    (Some(src), Some(out)) => out >= src,
+                    // An unknown channel count on either side cannot be shown
+                    // to match, so it does not.
+                    _ => false,
+                }
+                && (!may_hide_object_audio
+                    || match (a.bitrate_bps, o.bitrate_bps) {
+                        (Some(src), Some(out)) => src == out,
+                        // An absent bitrate on either side is not evidence of
+                        // a copy. Unknown refuses.
+                        _ => false,
+                    })
+        });
+        match found {
+            Some(i) => {
+                unmatched_output.remove(i);
+            }
+            None => unmatched_source.push(a),
+        }
+    }
+    unmatched_source
+}
+
+/// The audio streams an `AudioAction::Encode` will produce.
+///
+/// `Encode` always emits **aac** (`-c:a aac`) with a per-stream channel target
+/// (`-ac:a:{i}`), so the output is fully determined by the plan. Bitrate is
+/// left unknown because it is — which is exactly why a re-encode of a
+/// possibly-object-bearing track cannot be shown to be a copy.
+fn audio_streams_an_encode_will_produce(
+    source: &MediaProbe,
+    channels: &[u32],
+) -> Vec<crate::foundry::probe::AudioStream> {
+    source
+        .audio
+        .iter()
+        .enumerate()
+        .map(|(i, a)| crate::foundry::probe::AudioStream {
+            index: a.index,
+            codec: "aac".to_string(),
+            channels: channels.get(i).copied().or(a.channels),
+            language: a.language.clone(),
+            bitrate_bps: None,
+        })
+        .collect()
+}
+
 pub fn predicted_deletion_refusals(
     source: &MediaProbe,
     plan: &crate::foundry::plan::TranscodePlan,
@@ -506,18 +585,47 @@ pub fn predicted_deletion_refusals(
         }
     }
 
-    if matches!(plan.audio, AudioAction::Encode { .. }) {
-        for a in &source.audio {
-            if let Some(u) = undetectable_formats()
+    // ANY audio re-encode blocks deletion — not only the undetectable formats.
+    //
+    // This prediction under-reported badly, and a real end-to-end swap exposed
+    // it. `may_delete_original` matches a source stream to an output stream
+    // with `o.codec.eq_ignore_ascii_case(&a.codec)`, so a planned mp3 -> aac
+    // re-encode produces NO matching stream and the gate refuses. The codec
+    // changed, which is the entire point of the re-encode, and the gate
+    // correctly cannot show nothing was lost.
+    //
+    // Predicting only the Atmos/DTS:X cases told the operator ~160 titles would
+    // re-encode without reclaiming disk, when the real population is every
+    // title needing any audio work — a number a 16,000-item run was to be sized
+    // on.
+    if let AudioAction::Encode { channels } = &plan.audio {
+        // Run the GATE'S OWN RULE against the output this plan will produce,
+        // rather than restating it. Two descriptions of one rule drift, and
+        // this one already had: the previous version flagged only the codecs
+        // that might hide Atmos or DTS:X, so an mp3 -> aac re-encode was
+        // predicted to reclaim disk while the gate refused it.
+        //
+        // Simulating instead of describing also avoids the opposite error. An
+        // aac source re-encoded to aac with the same or more channels DOES
+        // match, and the gate allows the deletion — a blanket "any encode
+        // refuses" would over-report those and understate reclaimable disk.
+        let predicted_output = audio_streams_an_encode_will_produce(source, channels);
+        for a in unreproduced_audio(&source.audio, &predicted_output) {
+            match undetectable_formats()
                 .iter()
                 .find(|u| u.carried_by_codec.eq_ignore_ascii_case(a.codec.trim()))
             {
-                out.push(format!(
+                Some(u) => out.push(format!(
                     "audio stream {} is `{}`, which may carry {} — invisible to ffprobe, so a \
                      re-encode cannot be shown to have preserved it",
                     a.index, a.codec, u.name
-                ));
-                break;
+                )),
+                None => out.push(format!(
+                    "audio stream {} is `{}` and this plan re-encodes it to aac; the deletion \
+                     gate matches streams by CODEC, so the re-encoded track will not match its \
+                     source and the original cannot be shown to have been reproduced",
+                    a.index, a.codec
+                )),
             }
         }
     }
@@ -651,43 +759,11 @@ pub fn may_delete_original(
     // than "some audio exists": a TrueHD 7.1 replaced by AAC 5.1 is a loss
     // that no channel-count comparison alone would catch.
 
-    let mut unmatched_output: Vec<&crate::foundry::probe::AudioStream> =
-        output.audio.iter().collect();
-    let mut reproduced = 0usize;
-    for a in &source.audio {
-        // A codec that may be hiding a format ffprobe cannot see gets the
-        // strict rule: same codec and enough channels is NOT enough, because a
-        // re-encoded E-AC-3 6-channel track looks exactly like the Atmos track
-        // it was made from. Nothing in the probe output distinguishes a copy
-        // from a re-encode, so the closest available stand-in is "every
-        // visible property is unchanged" — which is evidence, not proof, and
-        // is why this errs toward keeping the file.
-        let may_hide_object_audio = undetectable_formats()
-            .iter()
-            .any(|u| u.carried_by_codec.eq_ignore_ascii_case(a.codec.trim()));
-
-        let found = unmatched_output.iter().position(|o| {
-            o.codec.eq_ignore_ascii_case(&a.codec)
-                && match (a.channels, o.channels) {
-                    (Some(src), Some(out)) => out >= src,
-                    // An unknown channel count on either side cannot be shown
-                    // to match, so it does not.
-                    _ => false,
-                }
-                && (!may_hide_object_audio
-                    || match (a.bitrate_bps, o.bitrate_bps) {
-                        (Some(src), Some(out)) => src == out,
-                        // An absent bitrate on either side is not evidence of
-                        // a copy. Unknown refuses.
-                        _ => false,
-                    })
-        });
-        match found {
-            Some(i) => {
-                unmatched_output.remove(i);
-                reproduced += 1;
-            }
-            None => {
+    let unmatched_source = unreproduced_audio(&source.audio, &output.audio);
+    let reproduced = source.audio.len() - unmatched_source.len();
+    {
+        for a in unmatched_source {
+            {
                 blockers.push(DeletionBlocker::AudioStreamNotReproduced {
                     stream_index: a.index,
                     codec: a.codec.clone(),
@@ -1175,6 +1251,283 @@ mod tests {
         assert!(
             predicted_deletion_refusals(&p, &plan).is_empty(),
             "a plain SDR re-encode reclaims disk and must not be flagged"
+        );
+    }
+
+    /// The bug this prediction had, stated as a test.
+    ///
+    /// A plain mp3 stereo track carries no hidden object audio, so the old
+    /// prediction said "nothing will refuse". The gate then refused anyway,
+    /// because mp3 -> aac changes the codec and `may_delete_original` matches
+    /// streams BY CODEC. Found by running the swap end-to-end on a real file,
+    /// not by reading the code.
+    #[test]
+    fn a_plain_audio_reencode_is_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let p = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "mp3", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+
+        let refusals = predicted_deletion_refusals(&p, &plan);
+        assert!(
+            !refusals.is_empty(),
+            "an mp3 -> aac re-encode must be predicted to block deletion: the gate \
+             matches streams by codec, so a re-encoded track never matches its source"
+        );
+        assert!(
+            refusals.iter().any(|r| r.contains("CODEC")),
+            "the refusal must name the real reason (codec matching), not a \
+             hidden-object-audio guess that does not apply to mp3: {refusals:?}"
+        );
+    }
+
+    /// The prediction must agree with the gate, not merely be non-empty.
+    /// Both are run over the same source and the same re-encode: if the gate
+    /// refuses, the prediction must have said so.
+    #[test]
+    fn the_prediction_agrees_with_the_gate_for_a_plain_audio_reencode() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "mp3", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+
+        // What the encode actually produces: h264 video, aac audio.
+        let output = probe(vec![video("h264", 720, 480)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses = !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+        assert!(
+            gate_refuses,
+            "sanity: the gate must refuse an mp3 -> aac swap, since no output \
+             stream matches the source codec"
+        );
+        assert_eq!(
+            gate_refuses, predicted,
+            "the prediction must agree with the gate — a prediction that says \
+             'reclaims disk' where the gate refuses is what mis-sized the survey"
+        );
+    }
+
+    /// The opposite error, which the first version of this fix committed: a
+    /// blanket "any audio encode refuses" over-reports.
+    ///
+    /// `Encode` emits aac. An aac source re-encoded to aac with the SAME
+    /// channel count matches the gate's rule, so the gate allows the deletion
+    /// and the prediction must not claim otherwise — over-reporting understates
+    /// how much disk a run reclaims.
+    #[test]
+    fn an_aac_to_aac_reencode_at_the_same_channel_count_predicts_no_refusal() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let p = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+        assert!(
+            predicted_deletion_refusals(&p, &plan).is_empty(),
+            "aac -> aac at the same channel count matches the gate's rule, so \
+             predicting a refusal would understate reclaimable disk"
+        );
+    }
+
+    /// An upmix still matches: the gate's rule is `out >= src`.
+    #[test]
+    fn an_aac_upmix_predicts_no_refusal_because_the_gate_allows_it() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let p = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![6] },
+            container: Container::Matroska,
+        };
+        assert!(predicted_deletion_refusals(&p, &plan).is_empty());
+    }
+
+    /// A DOWNMIX does not: 2 channels out cannot reproduce 6 in.
+    #[test]
+    fn an_aac_downmix_is_predicted_to_refuse_because_channels_are_lost() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let p = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "aac", 6)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+        assert!(
+            !predicted_deletion_refusals(&p, &plan).is_empty(),
+            "a 5.1 -> stereo downmix loses channels, so the gate refuses and the \
+             prediction must say so"
+        );
+    }
+
+    /// The property that matters, over a spread of cases rather than one:
+    /// whatever the plan does to audio, the prediction and the gate agree.
+    /// The mis-count happened because nothing asserted this.
+    #[test]
+    fn the_prediction_and_the_gate_agree_across_audio_shapes() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        // (source codec, source channels, planned channels)
+        let cases = [
+            ("mp3", 2u32, 2u32),
+            ("aac", 2, 2),
+            ("aac", 2, 6),
+            ("aac", 6, 2),
+            ("ac3", 6, 6),
+            ("eac3", 6, 6),
+            ("flac", 2, 2),
+            ("truehd", 8, 6),
+        ];
+
+        for (codec, src_ch, out_ch) in cases {
+            let source = probe(
+                vec![video("mpeg4", 720, 480)],
+                vec![audio(1, codec, src_ch)],
+            );
+            let plan = TranscodePlan {
+                video_stream_index: 0,
+                video: VideoAction::Encode { scale: None },
+                audio: AudioAction::Encode {
+                    channels: vec![out_ch],
+                },
+                container: Container::Matroska,
+            };
+
+            // The file the plan actually produces, probed.
+            let mut out_audio = audio(1, "aac", out_ch);
+            out_audio.bitrate_bps = None;
+            let output = probe(vec![video("h264", 720, 480)], vec![out_audio]);
+
+            let gate_refuses = !decide(&source, &NormalizationOutcome::Verified { output })
+                .is_allowed();
+            let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+            assert_eq!(
+                gate_refuses, predicted,
+                "prediction and gate disagree for {codec} {src_ch}ch -> aac {out_ch}ch \
+                 (gate refuses: {gate_refuses}, predicted: {predicted})"
+            );
+        }
+    }
+
+    /// Multi-stream, because per-stream index mapping is the one place the
+    /// prediction and the gate could still diverge (raised at the FOUNDRY-29
+    /// gate). Two source tracks with different channel targets: the first is
+    /// reproduced, the second is downmixed and must refuse.
+    #[test]
+    fn the_prediction_and_the_gate_agree_across_multiple_audio_streams() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("mpeg4", 720, 480)],
+            vec![audio(1, "aac", 2), audio(2, "aac", 6)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode {
+                channels: vec![2, 2],
+            },
+            container: Container::Matroska,
+        };
+
+        let mut o1 = audio(1, "aac", 2);
+        o1.bitrate_bps = None;
+        let mut o2 = audio(2, "aac", 2);
+        o2.bitrate_bps = None;
+        let output = probe(vec![video("h264", 720, 480)], vec![o1, o2]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        assert!(gate_refuses, "the 6ch track is downmixed to 2ch, so the gate must refuse");
+        assert_eq!(
+            gate_refuses,
+            !refusals.is_empty(),
+            "prediction and gate must agree with more than one audio stream: {refusals:?}"
+        );
+        assert!(
+            refusals.iter().any(|r| r.contains("stream 2")),
+            "the refusal must name the stream that actually lost channels, not the \
+             one that was fine: {refusals:?}"
+        );
+    }
+
+    /// The channel target is read PER STREAM, not once for all of them.
+    ///
+    /// The previous multi-stream test used `[2, 2]`, where the first target and
+    /// the i-th target are the same value — so `channels.first()` passed it and
+    /// the index mapping was never actually constrained. Caught by mutating
+    /// `channels.get(i)` to `channels.first()` and finding the mutant survived.
+    ///
+    /// Here the two targets differ: stream 1 keeps its 6 channels, stream 2 is
+    /// downmixed. Reading the first target for both would predict that stream 2
+    /// keeps 6 channels too, and miss the refusal the gate raises.
+    #[test]
+    fn each_audio_stream_uses_its_own_channel_target() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("mpeg4", 720, 480)],
+            vec![audio(1, "aac", 6), audio(2, "aac", 6)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode {
+                channels: vec![6, 2],
+            },
+            container: Container::Matroska,
+        };
+
+        let mut o1 = audio(1, "aac", 6);
+        o1.bitrate_bps = None;
+        let mut o2 = audio(2, "aac", 2);
+        o2.bitrate_bps = None;
+        let output = probe(vec![video("h264", 720, 480)], vec![o1, o2]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        assert!(gate_refuses, "stream 2 loses channels, so the gate refuses");
+        assert_eq!(
+            gate_refuses,
+            !refusals.is_empty(),
+            "reading the first channel target for every stream hides stream 2's \
+             downmix: {refusals:?}"
+        );
+    }
+
+    /// Fewer channel targets than streams: the trailing stream falls back to
+    /// its source channel count, so it is reproduced and must not be flagged.
+    #[test]
+    fn a_short_channel_list_falls_back_to_the_source_channel_count() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("mpeg4", 720, 480)],
+            vec![audio(1, "aac", 2), audio(2, "aac", 2)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+        assert!(
+            predicted_deletion_refusals(&source, &plan).is_empty(),
+            "the second stream keeps its own channel count, so both are reproduced"
         );
     }
 

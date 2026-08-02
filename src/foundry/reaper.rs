@@ -140,6 +140,9 @@ impl std::fmt::Display for ReapOutcome {
 pub struct ReapedFile {
     pub superseded_path: String,
     pub replacement_path: String,
+    /// Bytes that unlinking this backup would actually FREE — zero when the
+    /// inode has another name. Not the file's apparent size; see
+    /// [`reclaimable_bytes`].
     pub bytes: Option<u64>,
     pub outcome: ReapOutcome,
 }

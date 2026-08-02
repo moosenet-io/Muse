@@ -723,7 +723,11 @@ pub enum LockRefusal {
 /// This is not a claim to have closed the TOCTOU race — nothing short of
 /// holding the directory can — only to have narrowed it from "the length of
 /// two ffprobes" to "the length of two stats".
-fn delete_verified(superseded: &Path, replacement: Option<&Path>) -> ReapOutcome {
+fn delete_verified(
+    guard: &crate::media::paths::PathGuard,
+    superseded: &Path,
+    replacement: Option<&Path>,
+) -> ReapOutcome {
     let Some(replacement) = replacement else {
         return ReapOutcome::CouldNotInspect {
             detail: "no replacement path to re-verify against".to_string(),
@@ -746,7 +750,35 @@ fn delete_verified(superseded: &Path, replacement: Option<&Path>) -> ReapOutcome
         }
         _ => {}
     }
-    match std::fs::remove_file(superseded) {
+    // **Resolve through the guard before unlinking.**
+    //
+    // `paths.rs` builds a type-level design — `MutablePath` is obtainable only
+    // via `resolve_for_mutation`, which checks the mutation gate and then
+    // confines the path to an allowed root — expressly so that "a function that
+    // takes `MutablePath` type-checks its intent to mutate". The single most
+    // destructive call site in Muse was bypassing it entirely and calling
+    // `remove_file` on a raw `&Path` straight from the walk.
+    //
+    // Confinement was still upheld, but only INCIDENTALLY: `decide_one` probes
+    // the backup, and `Foundry::probe_file` resolves through the guard, so an
+    // unconfined path failed its probe and was kept. That is a load-bearing
+    // side effect of a diagnostic call. Any future change that caches probes,
+    // short-circuits them, or reorders the probe after the gate would silently
+    // remove the only confinement check on the deletion path, and no test would
+    // fail. Raised in the FOUNDRY-11 reaper audit.
+    //
+    // Now the check is where the deletion is, and it is the gate's own code
+    // saying yes rather than a coincidence.
+    let target = match guard.resolve_for_mutation(superseded) {
+        Ok(t) => t,
+        Err(e) => {
+            return ReapOutcome::CouldNotInspect {
+                detail: format!("refusing to delete a path the guard did not allow: {e}"),
+            }
+        }
+    };
+
+    match std::fs::remove_file(target.as_path()) {
         Ok(()) => {
             tracing::info!(
                 path = %superseded.display(),
@@ -842,7 +874,8 @@ pub fn reap(foundry: &Foundry, retention: Duration, mutate: bool) -> ReapRun {
             let (outcome, replacement, bytes) = decide_one(&probe, &superseded, retention);
 
             let outcome = if mutate && outcome == ReapOutcome::WouldDelete {
-                let deleted = delete_verified(&superseded, replacement.as_deref());
+                let deleted =
+                    delete_verified(foundry.guard(), &superseded, replacement.as_deref());
                 if deleted == ReapOutcome::Deleted {
                     run.bytes_reclaimed = run.bytes_reclaimed.saturating_add(bytes.unwrap_or(0));
                 }
@@ -1624,6 +1657,11 @@ mod tests {
     /// The mutate branch, tested for real rather than re-implemented.
     ///
     /// Opus caught the first version at the gate: it never called the deletion
+    /// A guard over `d` with mutation OPEN — what a real reap runs with.
+    fn guard_over(d: &Path) -> crate::media::paths::PathGuard {
+        crate::media::paths::PathGuard::new([d.to_path_buf()], true)
+    }
+
     /// path at all, it restated the condition in the test and asserted on
     /// that. It would have passed with the real branch broken, and left the
     /// only code that destroys data uncovered.
@@ -1635,10 +1673,60 @@ mod tests {
         fs::write(&live, b"the replacement").unwrap();
         fs::write(&sup, b"the original").unwrap();
 
-        assert_eq!(delete_verified(&sup, Some(&live)), ReapOutcome::Deleted);
+        assert_eq!(
+            delete_verified(&guard_over(&d), &sup, Some(&live)),
+            ReapOutcome::Deleted
+        );
         assert!(!sup.exists(), "the backup must be gone");
         assert!(live.exists(), "the replacement must be untouched");
         assert_eq!(fs::read(&live).unwrap(), b"the replacement");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// **A backup outside the allowed roots is not deleted, even with a valid
+    /// replacement beside it.**
+    ///
+    /// Confinement used to hold here only as a side effect of `decide_one`
+    /// probing through the guard. `delete_verified` itself took a raw `&Path`
+    /// and unlinked it. This asserts the deletion path enforces confinement on
+    /// its own, so a future change to probing cannot silently remove the only
+    /// check.
+    #[test]
+    fn a_backup_outside_the_allowed_roots_is_never_deleted() {
+        let allowed = tmp("guard-allowed");
+        let elsewhere = tmp("guard-elsewhere");
+        let live = elsewhere.join("Movie.mkv");
+        let sup = elsewhere.join("Movie.mkv.muse-superseded");
+        fs::write(&live, b"the replacement").unwrap();
+        fs::write(&sup, b"the original").unwrap();
+
+        // The guard permits only `allowed`; the files live somewhere else.
+        let outcome = delete_verified(&guard_over(&allowed), &sup, Some(&live));
+
+        assert!(
+            !outcome.deleted(),
+            "a path outside the roots must not be unlinked, got {outcome:?}"
+        );
+        assert!(sup.exists(), "the file must still be there");
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&elsewhere);
+    }
+
+    /// The guard also carries the mutation gate: with it CLOSED, nothing is
+    /// unlinked even for a perfectly confined, perfectly valid pair.
+    #[test]
+    fn a_closed_mutation_gate_stops_the_deletion_at_the_guard() {
+        let d = tmp("guard-closed");
+        let live = d.join("Movie.mkv");
+        let sup = d.join("Movie.mkv.muse-superseded");
+        fs::write(&live, b"the replacement").unwrap();
+        fs::write(&sup, b"the original").unwrap();
+
+        let closed = crate::media::paths::PathGuard::new([d.clone()], false);
+        let outcome = delete_verified(&closed, &sup, Some(&live));
+
+        assert!(!outcome.deleted(), "got {outcome:?}");
+        assert!(sup.exists());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1657,7 +1745,7 @@ mod tests {
         // replacement goes away before the unlink.
         fs::remove_file(&live).unwrap();
 
-        let outcome = delete_verified(&sup, Some(&live));
+        let outcome = delete_verified(&guard_over(&d), &sup, Some(&live));
         assert!(
             matches!(outcome, ReapOutcome::ReplacementMissing { .. }),
             "got {outcome:?}"
@@ -1677,7 +1765,7 @@ mod tests {
         fs::hard_link(&sup, &live).unwrap();
 
         assert_eq!(
-            delete_verified(&sup, Some(&live)),
+            delete_verified(&guard_over(&d), &sup, Some(&live)),
             ReapOutcome::SameInodeAsReplacement
         );
         assert!(sup.exists());
@@ -1784,12 +1872,28 @@ mod tests {
     fn there_is_exactly_one_deletion_call_site_in_this_module() {
         let src = include_str!("reaper.rs");
         let body = src.split("#[cfg(test)]").next().expect("a non-test body");
+        // Counts CALL SYNTAX, not the bare word: prose in a comment naming
+        // `remove_file` is not a deletion call site, and a test that cannot
+        // tell the difference gets edited to make comments pass rather than
+        // being trusted.
         assert_eq!(
-            body.matches("remove_file").count(),
+            body.matches("fs::remove_file(").count(),
             1,
             "the reaper must have exactly one deletion call site"
         );
-        assert_eq!(body.matches("remove_dir_all").count(), 0);
+        assert_eq!(body.matches("fs::remove_dir_all(").count(), 0);
+        // And that one site must unlink a path the GUARD resolved, never a raw
+        // one straight from the walk — confinement and the mutation gate are
+        // the guard's job, and relying on a probe elsewhere to enforce them
+        // incidentally is not a check.
+        assert!(
+            body.contains("guard.resolve_for_mutation(superseded)"),
+            "the deletion must resolve its target through the PathGuard"
+        );
+        assert!(
+            body.contains("fs::remove_file(target.as_path())"),
+            "and it must unlink THAT resolved path, not the raw input"
+        );
         // ...and it must sit behind both the mutate flag and a WouldDelete
         // verdict, which are checked together.
         assert!(

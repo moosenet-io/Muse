@@ -506,20 +506,40 @@ pub fn predicted_deletion_refusals(
         }
     }
 
+    // ANY audio re-encode blocks deletion — not only the undetectable formats.
+    //
+    // This prediction under-reported badly, and a real end-to-end swap exposed
+    // it. `may_delete_original` matches a source stream to an output stream
+    // with `o.codec.eq_ignore_ascii_case(&a.codec)`, so a planned mp3 -> aac
+    // re-encode produces NO matching stream and the gate refuses. The codec
+    // changed, which is the entire point of the re-encode, and the gate
+    // correctly cannot show nothing was lost.
+    //
+    // Predicting only the Atmos/DTS:X cases told the operator ~160 titles would
+    // re-encode without reclaiming disk, when the real population is every
+    // title needing any audio work — a number a 16,000-item run was to be sized
+    // on.
     if matches!(plan.audio, AudioAction::Encode { .. }) {
-        for a in &source.audio {
-            if let Some(u) = undetectable_formats()
+        let hidden_format = source.audio.iter().find_map(|a| {
+            undetectable_formats()
                 .iter()
                 .find(|u| u.carried_by_codec.eq_ignore_ascii_case(a.codec.trim()))
-            {
-                out.push(format!(
-                    "audio stream {} is `{}`, which may carry {} — invisible to ffprobe, so a \
-                     re-encode cannot be shown to have preserved it",
-                    a.index, a.codec, u.name
-                ));
-                break;
-            }
-        }
+                .map(|u| {
+                    format!(
+                        "audio stream {} is `{}`, which may carry {} — invisible to ffprobe, \
+                         so a re-encode cannot be shown to have preserved it",
+                        a.index, a.codec, u.name
+                    )
+                })
+        });
+        out.push(hidden_format.unwrap_or_else(|| {
+            let codecs: Vec<&str> = source.audio.iter().map(|a| a.codec.as_str()).collect();
+            format!(
+                "this plan re-encodes audio ({codecs:?}), and the deletion gate matches \
+                 streams by CODEC — a re-encoded track never matches its source, so the \
+                 original cannot be shown to have been reproduced"
+            )
+        }));
     }
 
     out
@@ -1175,6 +1195,69 @@ mod tests {
         assert!(
             predicted_deletion_refusals(&p, &plan).is_empty(),
             "a plain SDR re-encode reclaims disk and must not be flagged"
+        );
+    }
+
+    /// The bug this prediction had, stated as a test.
+    ///
+    /// A plain mp3 stereo track carries no hidden object audio, so the old
+    /// prediction said "nothing will refuse". The gate then refused anyway,
+    /// because mp3 -> aac changes the codec and `may_delete_original` matches
+    /// streams BY CODEC. Found by running the swap end-to-end on a real file,
+    /// not by reading the code.
+    #[test]
+    fn a_plain_audio_reencode_is_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let p = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "mp3", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+
+        let refusals = predicted_deletion_refusals(&p, &plan);
+        assert!(
+            !refusals.is_empty(),
+            "an mp3 -> aac re-encode must be predicted to block deletion: the gate \
+             matches streams by codec, so a re-encoded track never matches its source"
+        );
+        assert!(
+            refusals.iter().any(|r| r.contains("CODEC")),
+            "the refusal must name the real reason (codec matching), not a \
+             hidden-object-audio guess that does not apply to mp3: {refusals:?}"
+        );
+    }
+
+    /// The prediction must agree with the gate, not merely be non-empty.
+    /// Both are run over the same source and the same re-encode: if the gate
+    /// refuses, the prediction must have said so.
+    #[test]
+    fn the_prediction_agrees_with_the_gate_for_a_plain_audio_reencode() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "mp3", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+
+        // What the encode actually produces: h264 video, aac audio.
+        let output = probe(vec![video("h264", 720, 480)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses = !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+        assert!(
+            gate_refuses,
+            "sanity: the gate must refuse an mp3 -> aac swap, since no output \
+             stream matches the source codec"
+        );
+        assert_eq!(
+            gate_refuses, predicted,
+            "the prediction must agree with the gate — a prediction that says \
+             'reclaims disk' where the gate refuses is what mis-sized the survey"
         );
     }
 

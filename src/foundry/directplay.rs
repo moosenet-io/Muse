@@ -1422,6 +1422,115 @@ mod tests {
         }
     }
 
+    /// Multi-stream, because per-stream index mapping is the one place the
+    /// prediction and the gate could still diverge (raised at the FOUNDRY-29
+    /// gate). Two source tracks with different channel targets: the first is
+    /// reproduced, the second is downmixed and must refuse.
+    #[test]
+    fn the_prediction_and_the_gate_agree_across_multiple_audio_streams() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("mpeg4", 720, 480)],
+            vec![audio(1, "aac", 2), audio(2, "aac", 6)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode {
+                channels: vec![2, 2],
+            },
+            container: Container::Matroska,
+        };
+
+        let mut o1 = audio(1, "aac", 2);
+        o1.bitrate_bps = None;
+        let mut o2 = audio(2, "aac", 2);
+        o2.bitrate_bps = None;
+        let output = probe(vec![video("h264", 720, 480)], vec![o1, o2]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        assert!(gate_refuses, "the 6ch track is downmixed to 2ch, so the gate must refuse");
+        assert_eq!(
+            gate_refuses,
+            !refusals.is_empty(),
+            "prediction and gate must agree with more than one audio stream: {refusals:?}"
+        );
+        assert!(
+            refusals.iter().any(|r| r.contains("stream 2")),
+            "the refusal must name the stream that actually lost channels, not the \
+             one that was fine: {refusals:?}"
+        );
+    }
+
+    /// The channel target is read PER STREAM, not once for all of them.
+    ///
+    /// The previous multi-stream test used `[2, 2]`, where the first target and
+    /// the i-th target are the same value — so `channels.first()` passed it and
+    /// the index mapping was never actually constrained. Caught by mutating
+    /// `channels.get(i)` to `channels.first()` and finding the mutant survived.
+    ///
+    /// Here the two targets differ: stream 1 keeps its 6 channels, stream 2 is
+    /// downmixed. Reading the first target for both would predict that stream 2
+    /// keeps 6 channels too, and miss the refusal the gate raises.
+    #[test]
+    fn each_audio_stream_uses_its_own_channel_target() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("mpeg4", 720, 480)],
+            vec![audio(1, "aac", 6), audio(2, "aac", 6)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode {
+                channels: vec![6, 2],
+            },
+            container: Container::Matroska,
+        };
+
+        let mut o1 = audio(1, "aac", 6);
+        o1.bitrate_bps = None;
+        let mut o2 = audio(2, "aac", 2);
+        o2.bitrate_bps = None;
+        let output = probe(vec![video("h264", 720, 480)], vec![o1, o2]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        assert!(gate_refuses, "stream 2 loses channels, so the gate refuses");
+        assert_eq!(
+            gate_refuses,
+            !refusals.is_empty(),
+            "reading the first channel target for every stream hides stream 2's \
+             downmix: {refusals:?}"
+        );
+    }
+
+    /// Fewer channel targets than streams: the trailing stream falls back to
+    /// its source channel count, so it is reproduced and must not be flagged.
+    #[test]
+    fn a_short_channel_list_falls_back_to_the_source_channel_count() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("mpeg4", 720, 480)],
+            vec![audio(1, "aac", 2), audio(2, "aac", 2)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+        assert!(
+            predicted_deletion_refusals(&source, &plan).is_empty(),
+            "the second stream keeps its own channel count, so both are reproduced"
+        );
+    }
+
     /// A COPY preserves everything, so even an HDR source predicts nothing.
     /// Without this the prediction could be satisfied by keying on the source
     /// alone and ignoring the plan.

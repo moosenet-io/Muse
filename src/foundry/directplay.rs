@@ -1749,10 +1749,11 @@ mod tests {
     /// the `len == 1` case: it could not catch a parser regression that began
     /// counting `attached_pic` streams. Raised at the FOUNDRY-30 gate.
     ///
-    /// This matters more than the case it guards. An embedded poster is
-    /// extremely common, so counting cover art as a lost video stream would
-    /// predict a refusal for a large fraction of the library and understate
-    /// reclaimable disk across the whole run.
+    /// This matters more than the case it guards: counting cover art as a lost
+    /// video stream would predict a refusal for every poster-bearing file and
+    /// understate reclaimable disk. Measured prevalence on this library is
+    /// 1.0% of a 400-file random sample (2026-08-02) — a real population, not a
+    /// dominant one.
     #[test]
     fn embedded_cover_art_is_not_treated_as_a_lost_video_stream() {
         use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
@@ -1809,12 +1810,16 @@ mod tests {
     /// **Every file with embedded cover art is un-reclaimable, and the gate is
     /// right about it.**
     ///
-    /// This is a policy consequence rather than a bug, and it is pinned here
-    /// because of its scale: an embedded poster is very common in an
-    /// *arr-populated library, and the argv maps only video/audio/subtitles/
-    /// attachments — never the artwork. So a rewrite genuinely loses it, the
-    /// gate genuinely cannot show the original was reproduced, and the original
-    /// is kept forever.
+    /// This is a policy consequence rather than a bug. The argv maps only
+    /// video/audio/subtitles/attachments — never the artwork — so a rewrite
+    /// genuinely loses it, the gate genuinely cannot show the original was
+    /// reproduced, and the original is kept forever.
+    ///
+    /// Measured, not assumed: 1.0% of a 400-file random sample carries embedded
+    /// cover art (2026-08-02), and the full-library survey attributes 30 of
+    /// 3,158 un-reclaimable titles to undescribable streams. It was worth
+    /// checking precisely because it looked like it might dominate; it does
+    /// not. Audio codec changes do, at 3,567.
     ///
     /// The prediction and the gate AGREE here, which is the property that
     /// matters: the survey reports these as un-reclaimable up front rather than

@@ -2890,9 +2890,12 @@ mod library_kind_tests {
 
 #[derive(Debug, Deserialize)]
 pub struct SurveyQuery {
-    /// How many files to examine. Bounded so a survey cannot become an accidental
-    /// hours-long ffprobe sweep of the whole library on a shared host.
+    /// How many files to examine. Default 25, up to 50,000 — enough to
+    /// pre-flight the whole library deliberately. Encodes nothing.
     pub limit: Option<usize>,
+    /// Wall-clock ceiling for the survey, in seconds. Default 3600, clamped
+    /// 30..86400. A survey that hits it reports what it actually examined.
+    pub deadline_secs: Option<u64>,
 }
 
 /// `POST /ops/foundry/survey` — report what transcoding WOULD do. Encodes nothing.
@@ -2917,7 +2920,24 @@ pub async fn foundry_survey(
     };
 
     let caps = foundry.capabilities();
-    let limit = q.limit.unwrap_or(25).clamp(1, 500);
+    // Ceiling raised 500 -> 50_000 so the WHOLE library can be pre-flighted.
+    //
+    // The old bound existed because an unbounded survey was "an accidental
+    // hours-long ffprobe sweep of the whole library on a shared host". Two
+    // things changed: ffprobe now has a 120s timeout (FOUNDRY-10, after one
+    // wedged probe blocked a run indefinitely), and the survey has its own
+    // deadline below. Measured on this library: 500 files in 85s, so all
+    // 16,221 is roughly 46 minutes — practical for a deliberate pre-flight,
+    // and it encodes NOTHING.
+    //
+    // The default stays 25. Surveying everything is an explicit choice.
+    let limit = q.limit.unwrap_or(25).clamp(1, 50_000);
+    // A survey that runs past this reports what it DID examine rather than
+    // running unbounded — the same distinction the validator draws between a
+    // completed sample and a truncated one.
+    let survey_deadline = std::time::Duration::from_secs(
+        q.deadline_secs.unwrap_or(3600).clamp(30, 86_400),
+    );
 
     // Candidates come from the same walker the library scanner uses, so the survey looks at
     // exactly the files Muse considers media — not a second, divergent notion of "a video".
@@ -2938,7 +2958,8 @@ pub async fn foundry_survey(
     // endpoint reports what Path A WOULD do, so reporting the default's
     // decisions would describe work that is not the work.
     let policy = crate::foundry::policy::TranscodePolicy::direct_play_normalization();
-    let summary = crate::foundry::survey::survey_files(&foundry, &policy, &candidates, limit);
+    let summary =
+        crate::foundry::survey::survey_files(&foundry, &policy, &candidates, limit, survey_deadline);
 
     Ok(Json(json!({
         "ran": true,

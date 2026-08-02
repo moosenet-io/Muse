@@ -255,6 +255,9 @@ pub fn decide_next_step(
 pub struct RunReport {
     pub ledger: RunLedger,
     pub stop_reason: StopReason,
+    /// Whether the candidate list this run was given covered the whole library.
+    /// `completed()` requires BOTH this and an exhausted list.
+    pub survey_complete: bool,
     /// Titles never attempted, because the run stopped first. Reported so an
     /// early stop states its own size rather than leaving the operator to
     /// subtract.
@@ -262,10 +265,15 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    /// Whether every candidate was processed. Delegates to the stop reason;
-    /// see [`StopReason::is_complete`] for why this is not a count comparison.
+    /// Whether the library was actually processed.
+    ///
+    /// Requires an exhausted candidate list AND a complete survey. Either alone
+    /// is a half-truth: a run can exhaust a partial list without having looked
+    /// at most of the library, and a complete survey means nothing if the run
+    /// stopped early. See [`StopReason::is_complete`] for why the first half is
+    /// not a count comparison.
     pub fn completed(&self) -> bool {
-        self.stop_reason.is_complete()
+        self.stop_reason.is_complete() && self.survey_complete
     }
 }
 
@@ -379,6 +387,9 @@ where
                 return RunReport {
                     ledger,
                     stop_reason,
+                    // The driver is given a list; whether that list covered the
+                    // library is the caller's fact, and `execute_run` sets it.
+                    survey_complete: true,
                     candidates_unprocessed: candidates.len().saturating_sub(next),
                 }
             }
@@ -433,6 +444,13 @@ pub struct RunProgress {
     pub ledger: RunLedger,
     pub candidates_total: usize,
     pub current: Option<PathBuf>,
+    /// Whether the survey that produced the candidate list was complete.
+    ///
+    /// A survey has its own deadline and can truncate. Exhausting a PARTIAL
+    /// candidate list would otherwise report `NoMoreCandidates` and therefore
+    /// `completed`, telling an operator the library was processed when most of
+    /// it was never even looked at. Raised at the FOUNDRY-11 gate.
+    pub survey_complete: bool,
     /// `None` while running. Present once stopped — and its presence is the
     /// only signal that the run is over, so a status reader cannot mistake a
     /// stalled run for a finished one.
@@ -446,9 +464,19 @@ impl RunHandle {
 
     /// Ask a run to stop. Returns whether a run was actually in flight, so an
     /// operator is told "there was nothing to stop" rather than a bare success.
+    ///
+    /// **Sets the flag only when a run is actually active.** Storing it
+    /// unconditionally meant an idle stop request left `cancel` latched, and
+    /// the next run — started minutes or hours later by someone who never saw
+    /// that request — was born cancelled and stopped on its first title with no
+    /// explanation an operator could distinguish from a broken run. Raised at
+    /// the FOUNDRY-11 gate.
     pub fn request_stop(&self) -> bool {
-        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.active.load(std::sync::atomic::Ordering::SeqCst)
+        let active = self.active.load(std::sync::atomic::Ordering::SeqCst);
+        if active {
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        active
     }
 
     pub fn is_active(&self) -> bool {
@@ -499,7 +527,15 @@ impl RunHandle {
     /// it decides to start, so it cannot report "started" and then lose the
     /// race.
     pub fn claim(&self) -> Option<RunSlot<'_>> {
-        self.try_claim().then(|| RunSlot { handle: self })
+        self.try_claim().then(|| {
+            // Clear any stale cancel as part of claiming, so a run can never be
+            // born cancelled however the flag came to be set. `release` clears
+            // it too; doing it at BOTH ends means neither is load-bearing on
+            // its own.
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            RunSlot { handle: self }
+        })
     }
 }
 
@@ -578,11 +614,19 @@ pub fn execute_run(
     candidates: &[PathBuf],
     limits: &RunLimits,
     work_dir: Option<&std::path::Path>,
-    handle: &RunHandle,
-    // Taken by value and dropped at the end of this function. The slot is
-    // released by `Drop`, so it is given back even if this unwinds.
-    _slot: RunSlot<'_>,
+    // The slot IS the handle. Taking them as two parameters let a caller claim
+    // one handle and pass another — including claiming a fresh local
+    // `RunHandle` and running concurrently with the endpoint-managed global
+    // one, which is exactly the concurrency this guard exists to prevent.
+    // Raised at the FOUNDRY-11 gate. Now there is one parameter and no way for
+    // them to disagree.
+    slot: RunSlot<'_>,
+    // `survey_complete`: whether the survey that produced these candidates was
+    // itself complete. A truncated survey means the list is partial, so
+    // exhausting it is NOT the same as having processed the library.
+    survey_complete: bool,
 ) -> RunReport {
+    let handle = slot.handle;
     let started = std::time::Instant::now();
     let mutation_enabled = foundry.mutation_enabled();
 
@@ -593,11 +637,12 @@ pub fn execute_run(
             ledger: RunLedger::default(),
             candidates_total: candidates.len(),
             current: None,
+            survey_complete,
             stop_reason: None,
         });
     }
 
-    let report = drive_run_with_progress(
+    let mut report = drive_run_with_progress(
         limits,
         candidates,
         || RunObservation {
@@ -658,10 +703,13 @@ pub fn execute_run(
         },
     );
 
+    report.survey_complete = survey_complete;
+
     if let Ok(mut g) = handle.progress.lock() {
         if let Some(p) = g.as_mut() {
             p.ledger = report.ledger.clone();
             p.current = None;
+            p.survey_complete = survey_complete;
             p.stop_reason = Some(report.stop_reason.clone());
         }
     }
@@ -912,6 +960,7 @@ mod tests {
                 ..Default::default()
             },
             stop_reason: StopReason::Cancelled,
+            survey_complete: true,
             candidates_unprocessed: 0,
         };
         assert!(!report.completed());
@@ -1385,6 +1434,58 @@ mod tests {
     fn the_phrase_names_the_actual_size() {
         assert_eq!(confirm_phrase(463), "run 463 titles");
         assert!(check_confirm(463, Some(&confirm_phrase(463))).is_ok());
+    }
+
+    /// **A truncated survey must not produce a "completed" run.**
+    ///
+    /// The survey has its own deadline and can stop early. Exhausting a PARTIAL
+    /// candidate list still yields `NoMoreCandidates`, so without this the run
+    /// would tell an operator the library was processed when most of it was
+    /// never looked at. Raised at the FOUNDRY-11 gate.
+    #[test]
+    fn exhausting_a_partial_candidate_list_is_not_a_completed_run() {
+        let report = RunReport {
+            ledger: RunLedger::default(),
+            stop_reason: StopReason::NoMoreCandidates,
+            survey_complete: false,
+            candidates_unprocessed: 0,
+        };
+        assert!(
+            !report.completed(),
+            "the list was exhausted but the library was never fully surveyed"
+        );
+
+        let complete = RunReport {
+            survey_complete: true,
+            ..report
+        };
+        assert!(complete.completed());
+    }
+
+    /// **An idle stop request must not poison the next run.**
+    ///
+    /// Storing `cancel` unconditionally meant a stop sent while nothing was
+    /// running stayed latched, and a run started hours later by someone who
+    /// never saw that request died on its first title. Raised at the
+    /// FOUNDRY-11 gate.
+    #[test]
+    fn a_stop_request_while_idle_does_not_cancel_the_next_run() {
+        let handle = RunHandle::new();
+        assert!(!handle.request_stop(), "nothing was running");
+
+        let _slot = handle.claim().expect("the slot is free");
+        assert!(
+            !handle.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "the next run must not be born cancelled by a stop nobody remembers"
+        );
+    }
+
+    #[test]
+    fn a_stop_request_during_a_run_still_cancels_that_run() {
+        let handle = RunHandle::new();
+        let _slot = handle.claim().expect("free");
+        assert!(handle.request_stop());
+        assert!(handle.cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

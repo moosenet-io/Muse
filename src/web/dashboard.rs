@@ -3911,8 +3911,10 @@ pub async fn foundry_run_start(
             &selected,
             &limits,
             work_dir.as_deref().map(std::path::Path::new),
-            run::global_handle(),
             slot,
+            // A truncated survey means the candidate list does not cover the
+            // library, so the run must not be able to report itself complete.
+            !summary.truncated,
         );
         tracing::info!(
             stop_reason = report.stop_reason.as_str(),
@@ -3941,11 +3943,24 @@ pub async fn foundry_run_start(
 /// the same distinction the survey draws between truncated and complete.
 pub async fn foundry_run_status() -> MuseResult<Json<Value>> {
     let handle = crate::foundry::run::global_handle();
+    let active = handle.is_active();
     let Some(p) = handle.snapshot() else {
+        // A claimed slot with no snapshot yet means the run is SURVEYING — up
+        // to ~46 minutes over 16,000 files before the first title is touched.
+        // Reporting a hardcoded `active: false` here contradicted the
+        // `started: true` the operator had just been given, and contradicted
+        // the stop endpoint, which would say `was_active: true` at the same
+        // moment. Raised at the FOUNDRY-11 gate.
         return Ok(Json(json!({
-            "ever_run": false,
-            "active": false,
-            "note": "no run has been started in this process",
+            "ever_run": active,
+            "active": active,
+            "phase": if active { "surveying" } else { "idle" },
+            "note": if active {
+                "a run has started and is surveying the library to select candidates; \
+                 no title has been touched yet"
+            } else {
+                "no run has been started in this process"
+            },
         })));
     };
 
@@ -3963,11 +3978,19 @@ pub async fn foundry_run_status() -> MuseResult<Json<Value>> {
             "bytes_after_total": p.ledger.bytes_after_total,
             "bytes_reclaimed": p.ledger.bytes_reclaimed(),
         },
+        "survey_complete": p.survey_complete,
         "stop_reason": p.stop_reason.as_ref().map(|r| r.as_str()),
         "stop_detail": p.stop_reason.as_ref().map(|r| r.to_string()),
-        // Derived from the stop reason, never from the counts: a run cancelled
-        // on its last title must not read as having finished.
-        "completed": p.stop_reason.as_ref().map(|r| r.is_complete()),
+        // Derived from the stop reason AND the survey's completeness, never
+        // from the counts: a run cancelled on its last title must not read as
+        // finished, and neither must one that exhausted a partial candidate
+        // list because the survey truncated.
+        "completed": p.stop_reason.as_ref().map(|r| r.is_complete() && p.survey_complete),
+        // A run that is no longer active but recorded no stop reason did not
+        // finish — it died. Saying so is the difference between "nothing to
+        // report" and "we cannot tell you what happened", which this codebase
+        // keeps having to relearn.
+        "ended_without_recording_a_reason": !active && p.stop_reason.is_none(),
     })))
 }
 

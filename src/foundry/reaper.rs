@@ -140,6 +140,9 @@ impl std::fmt::Display for ReapOutcome {
 pub struct ReapedFile {
     pub superseded_path: String,
     pub replacement_path: String,
+    /// Bytes that unlinking this backup would actually FREE — zero when the
+    /// inode has another name. Not the file's apparent size; see
+    /// [`reclaimable_bytes`].
     pub bytes: Option<u64>,
     pub outcome: ReapOutcome,
 }
@@ -439,6 +442,27 @@ pub fn effective_retention(configured: Duration, requested: Option<Duration>) ->
     }
 }
 
+/// **What unlinking this backup would actually free.**
+///
+/// `len()` is what the file appears to be. It is what unlinking FREES only when
+/// this is the last name for the inode. A library whose files are hard-linked
+/// elsewhere — the standard \*arr atomic-move setup keeps the download-client
+/// name alongside the library name — would have every deletion report its full
+/// apparent size while `df` did not move. Across 16,000 titles an operator
+/// would be told multiple TB were reclaimed, see no change, and reasonably
+/// conclude the deletions had failed. Raised in the FOUNDRY-11 reaper audit.
+///
+/// Measured on the target library before implementing: 0 of 500 sampled media
+/// files have `nlink > 1`, so this is insurance rather than a live correction.
+/// It is still the honest number, and the cost of being wrong is an operator
+/// mistrusting a working reaper.
+fn reclaimable_bytes(p: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(p).ok()?;
+    // More than one name: the bytes survive the unlink under another name.
+    Some(if md.nlink() > 1 { 0 } else { md.len() })
+}
+
 /// Decide one preserved original. **Never deletes** — the decision and the
 /// deletion are separate so the decision is testable without a filesystem that
 /// can lose data.
@@ -494,7 +518,7 @@ pub fn decide_one(
         );
     }
 
-    let bytes = std::fs::metadata(superseded).ok().map(|m| m.len());
+    let bytes = reclaimable_bytes(superseded);
 
     // The replacement must EXIST. Without it this backup is the only copy of
     // the title, and deleting it destroys the title outright.
@@ -506,6 +530,53 @@ pub fn decide_one(
             Some(replacement),
             bytes,
         );
+    }
+
+    // **A symlinked replacement defeats the same-inode check below.**
+    //
+    // `identity_of` uses `symlink_metadata`, which does NOT follow — so if the
+    // replacement is a symlink pointing at this very backup, it reports the
+    // LINK's inode, the identity check sees two different inodes, and the guard
+    // that exists precisely to catch "these are the same file" does not fire.
+    //
+    // Everything after that agrees the deletion is safe, because everything
+    // after that DOES follow: `PathGuard::resolve` canonicalizes, both probes
+    // land on the same real file, and `may_delete_original` compares a probe
+    // against itself — identical codecs, streams, resolution and duration — and
+    // returns `Allow` unconditionally. The only copy of the title is unlinked
+    // and the symlink is left dangling.
+    //
+    // I could not identify anything in Muse that creates this state
+    // (`fs::hard_link` does not follow symlinks, so forge cannot mint it), so
+    // this is a defeated defence rather than a proven live path. That is reason
+    // to close it, not to leave it: the walk already refuses symlinks on the
+    // grounds that "a link could point outside the allowed roots entirely, and
+    // this module deletes what it is given", and the replacement-resolution
+    // path was doing the opposite. Raised in the FOUNDRY-11 reaper audit.
+    match std::fs::symlink_metadata(&replacement) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return (
+                ReapOutcome::CouldNotInspect {
+                    detail: format!(
+                        "the replacement {} is a symlink; a link cannot be shown to be a \
+                         distinct file from this backup, so the backup is kept",
+                        replacement.display()
+                    ),
+                },
+                Some(replacement),
+                bytes,
+            )
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return (
+                ReapOutcome::CouldNotInspect {
+                    detail: e.to_string(),
+                },
+                Some(replacement),
+                bytes,
+            )
+        }
     }
 
     // Same inode means the swap never released the original name. Deleting
@@ -1307,6 +1378,103 @@ mod tests {
                 "a listing read in full is complete, whatever it contained"
             );
         }
+    }
+
+    // --- a symlinked replacement -------------------------------------------
+
+    /// **The defeated defence.**
+    ///
+    /// If the replacement is a symlink to the backup itself, `identity_of`
+    /// (which does not follow) sees two different inodes, so the same-inode
+    /// guard does not fire — while everything downstream DOES follow, compares
+    /// the file against itself, and returns `Allow`. The only copy of the title
+    /// would be unlinked.
+    ///
+    /// Built on a real filesystem with a real symlink rather than a fixture,
+    /// because the whole bug is about which calls traverse links and which do
+    /// not — a mock would encode my belief about that rather than test it.
+    #[test]
+    fn a_replacement_that_is_a_symlink_to_the_backup_is_never_deleted() {
+        let dir = std::env::temp_dir().join(format!(
+            "muse-reap-symlink-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let backup = dir.join("Movie.mkv.muse-superseded");
+        std::fs::write(&backup, b"the only copy of the title").expect("write backup");
+
+        // The replacement is a SYMLINK pointing back at the backup.
+        let replacement = dir.join("Movie.mkv");
+        std::os::unix::fs::symlink(&backup, &replacement).expect("symlink");
+
+        // Sanity: the trap really is set — the identity check alone does NOT
+        // catch this, which is why the explicit symlink refusal has to exist.
+        let a = crate::foundry::forge::identity_of(&backup).expect("backup identity");
+        let b = crate::foundry::forge::identity_of(&replacement).expect("link identity");
+        assert_ne!(
+            a, b,
+            "symlink_metadata reports the LINK's inode, so the same-inode guard \
+             cannot see through this — that is the bug being closed"
+        );
+
+        // Probing follows the link, so both sides look identical and the gate
+        // would allow. A probe that always succeeds models that worst case.
+        let probe = |_: &Path| -> Result<MediaProbe, String> {
+            Err("probe should not be reached: the symlink must be refused first".to_string())
+        };
+        let (outcome, _, _) = decide_one(&probe, &backup, Duration::ZERO);
+
+        assert!(
+            !outcome.would_delete(),
+            "a symlinked replacement must never authorise deleting the backup, got {outcome:?}"
+        );
+        assert!(
+            matches!(outcome, ReapOutcome::CouldNotInspect { .. }),
+            "and it must say why, got {outcome:?}"
+        );
+        assert!(
+            backup.is_file(),
+            "decide_one must not have deleted anything — it never deletes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- reclaimable bytes --------------------------------------------------
+
+    #[test]
+    fn a_backup_with_one_name_reports_its_full_size_as_reclaimable() {
+        let dir = std::env::temp_dir().join(format!("muse-reap-nlink1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let f = dir.join("A.mkv.muse-superseded");
+        std::fs::write(&f, vec![0u8; 1024]).expect("write");
+
+        assert_eq!(reclaimable_bytes(&f), Some(1024));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hard-linked backup frees NOTHING when unlinked — the bytes survive
+    /// under the other name. Reporting its apparent size would tell an operator
+    /// the run reclaimed space it did not reclaim.
+    #[test]
+    fn a_hard_linked_backup_reports_no_reclaimable_bytes() {
+        let dir = std::env::temp_dir().join(format!("muse-reap-nlink2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let f = dir.join("B.mkv.muse-superseded");
+        std::fs::write(&f, vec![0u8; 4096]).expect("write");
+        std::fs::hard_link(&f, dir.join("B-elsewhere.mkv")).expect("hard link");
+
+        assert_eq!(
+            reclaimable_bytes(&f),
+            Some(0),
+            "the bytes survive under the other name, so unlinking frees nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- the retention floor -----------------------------------------------

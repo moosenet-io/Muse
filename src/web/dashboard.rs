@@ -3442,7 +3442,12 @@ pub async fn foundry_reap(
         "files": run.files.iter().map(|f| json!({
             "superseded": f.superseded_path,
             "replacement": f.replacement_path,
-            "bytes": f.bytes,
+            // Named for what it IS: the bytes unlinking would free, which is
+            // zero for a multiply-linked backup. Calling it "bytes" invited
+            // reading it as the file's size, and a 0 there would look like an
+            // empty file rather than one whose bytes survive under another
+            // name. Raised at the REAP-02 gate.
+            "reclaimable_bytes": f.bytes,
             "outcome": f.outcome.to_string(),
             "deleted": f.outcome.deleted(),
         })).collect::<Vec<_>>(),

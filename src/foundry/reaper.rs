@@ -1174,6 +1174,40 @@ mod tests {
     }
 
     /// Retention is a real gate, not a label.
+    /// The aggregator must treat "could not inspect" as KEPT and as reclaiming
+    /// nothing — flagged as unverified at the REAP-01 gate, so pinned here
+    /// rather than argued.
+    #[test]
+    fn a_file_that_could_not_be_inspected_counts_as_kept_and_reclaims_nothing() {
+        let run = ReapRun {
+            files: vec![
+                ReapedFile {
+                    superseded_path: "/lib/A.mkv.muse-superseded".into(),
+                    replacement_path: "/lib/A.mkv".into(),
+                    bytes: Some(1_000),
+                    outcome: ReapOutcome::CouldNotInspect {
+                        detail: "2 entries in the containing directory could not be read".into(),
+                    },
+                },
+                ReapedFile {
+                    superseded_path: "/lib/B.mkv.muse-superseded".into(),
+                    replacement_path: "/lib/B.mkv".into(),
+                    bytes: Some(2_000),
+                    outcome: ReapOutcome::Deleted,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(run.deleted(), 1);
+        assert_eq!(run.would_delete(), 1, "an uninspectable file is not deletable");
+        assert_eq!(run.kept(), 1, "it must be counted as kept, not vanish");
+        assert!(
+            !ReapOutcome::CouldNotInspect { detail: String::new() }.would_delete(),
+            "CouldNotInspect must never be a delete judgement"
+        );
+    }
+
     // --- resolution trustworthiness ----------------------------------------
 
     fn m(paths: &[&str]) -> Vec<PathBuf> {

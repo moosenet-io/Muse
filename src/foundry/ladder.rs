@@ -31,7 +31,6 @@
 //! of its inputs and every branch is unit-tested on a host with no ffmpeg at
 //! all — which is this one.
 
-use crate::foundry::directplay::BITMAP_SUBTITLE_CODECS;
 use crate::foundry::hdr::{
     classify_dolby_vision, classify_hdr, tone_map, DolbyVisionVerdict, DynamicRangeUnknown,
     HdrTransfer, HdrVerdict, ToneMap, ToneMapSupport,
@@ -41,7 +40,7 @@ use crate::foundry::plan::{
     Undecidable, VideoAction,
 };
 use crate::foundry::policy::Container;
-use crate::media::probe::MediaProbe;
+use crate::media::probe::{is_bitmap_subtitle_codec, MediaProbe};
 use crate::foundry::rendition::{
     rendition_output_path, DynamicRangeTreatment, Ladder, PathModelError, Rendition,
     RenditionName, RenditionRequest, VideoTreatment,
@@ -453,11 +452,11 @@ fn decide_rung(
     // MP4 cannot carry bitmap subtitles. `-c:s copy` of a PGS track into MP4
     // fails the mux; the alternative (dropping it) is a silent loss.
     if plan.container == Container::Mp4 {
-        if let Some(s) = probe.subtitles.iter().find(|s| {
-            BITMAP_SUBTITLE_CODECS
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(s.codec.trim()))
-        }) {
+        if let Some(s) = probe
+            .subtitles
+            .iter()
+            .find(|s| is_bitmap_subtitle_codec(&s.codec))
+        {
             return RenditionOutcome::Refused {
                 why: RenditionRefusal::BitmapSubtitlesCannotEnterMp4 {
                     stream_index: s.index,
@@ -1687,29 +1686,42 @@ mod tests {
             vec![vid("hevc", 1920, 1080, 10_000_000)],
             vec![aud(1, "aac", 2)],
         );
-        p.subtitles = vec![SubtitleStream {
-            index: 2,
-            codec: "hdmv_pgs_subtitle".into(),
-            language: Some("eng".into()),
-            forced: false,
-            default: true,
-        }];
+        // SUBCODEC-01: driven from a LITERAL alias set, not from
+        // `BITMAP_SUBTITLE_CODECS` — a loop over the const it guards would
+        // simply run one fewer iteration if an entry were deleted, and pass.
+        for codec in [
+            "hdmv_pgs_subtitle",
+            "dvd_subtitle",
+            "dvb_subtitle",
+            "xsub",
+            "pgssub",
+            "dvdsub",
+            "dvbsub",
+        ] {
+            p.subtitles = vec![SubtitleStream {
+                index: 2,
+                codec: codec.into(),
+                language: Some("eng".into()),
+                forced: false,
+                default: true,
+            }];
 
-        for name in [RenditionName::Mobile, RenditionName::Web] {
-            let out = rung(&p, name, &ctx_available());
-            assert!(
-                matches!(
-                    out,
-                    RenditionOutcome::Refused {
-                        why: RenditionRefusal::BitmapSubtitlesCannotEnterMp4 { .. }
-                    }
-                ),
-                "{name:?}: {out:?}"
-            );
+            for name in [RenditionName::Mobile, RenditionName::Web] {
+                let out = rung(&p, name, &ctx_available());
+                assert!(
+                    matches!(
+                        out,
+                        RenditionOutcome::Refused {
+                            why: RenditionRefusal::BitmapSubtitlesCannotEnterMp4 { .. }
+                        }
+                    ),
+                    "{name:?} must refuse `{codec}`: {out:?}"
+                );
+            }
+            // The Matroska rung carries them.
+            let out = rung(&p, RenditionName::Tv, &ctx_available());
+            assert!(out.is_encode(), "`{codec}`: got {out:?}");
         }
-        // The Matroska rung carries them.
-        let out = rung(&p, RenditionName::Tv, &ctx_available());
-        assert!(out.is_encode(), "got {out:?}");
     }
 
     #[test]

@@ -321,6 +321,81 @@ pub struct SubtitleStream {
     pub default: bool,
 }
 
+/// **The** set of subtitle codec names Muse treats as BITMAP (image) rather
+/// than text. One list, one home, for every consumer.
+///
+/// # Why this lives here and nowhere else
+/// Until `SUBCODEC-01` this rule was stated **twice** — `IMAGE_SUBTITLE_CODECS`
+/// in `crate::subtitles::discover` (4 entries) and `BITMAP_SUBTITLE_CODECS` in
+/// `crate::foundry::directplay` (7 entries) — and the two disagreed. A stream
+/// whose codec was `pgssub` was bitmap to one module and not-bitmap to the
+/// other, for the same input. A restatement is internally consistent and reads
+/// correctly, which is exactly why the disagreement survived; the only durable
+/// fix is that there is nothing left to disagree with. **Do not add a second
+/// const "for convenience" — that is the defect, not the fix.** It lives on
+/// `media::probe` because `codec` on [`SubtitleStream`] is populated here, from
+/// ffprobe's `codec_name`, so this is the boundary the vocabulary belongs to.
+///
+/// # Membership, decided per entry — not by taking the longer list
+/// ffprobe's `codec_name` is the **`AVCodecDescriptor.name`**, not a decoder
+/// name: `fftools/ffprobe.c` does
+/// `if (cd = avcodec_descriptor_get(par->codec_id)) print_str("codec_name", cd->name);`.
+/// Descriptor names live in `libavcodec/codec_desc.c`, and **exactly four**
+/// subtitle descriptors there carry `AV_CODEC_PROP_BITMAP_SUB`:
+///
+/// | entry | what it is | verdict |
+/// |---|---|---|
+/// | `hdmv_pgs_subtitle` | descriptor name, `AV_CODEC_ID_HDMV_PGS_SUBTITLE`, `PROP_BITMAP_SUB` | **canonical** — ffprobe emits this |
+/// | `dvd_subtitle` | descriptor name, `AV_CODEC_ID_DVD_SUBTITLE`, `PROP_BITMAP_SUB` | **canonical** |
+/// | `dvb_subtitle` | descriptor name, `AV_CODEC_ID_DVB_SUBTITLE`, `PROP_BITMAP_SUB` | **canonical** |
+/// | `xsub` | descriptor name, `AV_CODEC_ID_XSUB`, `PROP_BITMAP_SUB` | **canonical** |
+/// | `pgssub` | *decoder* name only — `pgssubdec.c`, `.p.name = "pgssub"` | alias, kept defensively |
+/// | `dvdsub` | *decoder/encoder* name only — `dvdsubdec.c`/`dvdsubenc.c` | alias, kept defensively |
+/// | `dvbsub` | *decoder/encoder* name only — `dvbsubdec.c`/`dvbsubenc.c` | alias, kept defensively |
+///
+/// The three aliases are **not** strings ffprobe can report as `codec_name` —
+/// they do not appear in `codec_desc.c` at all. They are kept anyway, and the
+/// reason is asymmetric risk, not thoroughness: failing to recognise a bitmap
+/// track fails **open** in both consumers (Foundry would report no direct-play
+/// blocker and would let a PGS track into an MP4 mux that cannot carry it), and
+/// no *text* subtitle codec bears any of these three names, so an alias cannot
+/// produce a false positive. Cost of keeping: nothing. Cost of dropping: a
+/// silent wrong answer if a `codec` value ever reaches Muse from an ffmpeg
+/// `-c:s` argument or a third-party tool rather than from `ffprobe`.
+///
+/// # What this claim rests on
+/// **Source reading, not execution.** `ffprobe` is installed on neither the dev
+/// box nor <host>, so no descriptor name here was confirmed against a live
+/// probe. Every row above was verified by reading FFmpeg `master`
+/// (`libavcodec/codec_desc.c`, `libavcodec/{pgssub,dvdsub,dvbsub}dec.c`,
+/// `fftools/ffprobe.c`). If ffprobe ever becomes available, re-confirm rather
+/// than inheriting this note.
+pub const BITMAP_SUBTITLE_CODECS: &[&str] = &[
+    // canonical ffprobe `codec_name` values
+    "hdmv_pgs_subtitle",
+    "dvd_subtitle",
+    "dvb_subtitle",
+    "xsub",
+    // decoder-name aliases, defensive (see table above)
+    "pgssub",
+    "dvdsub",
+    "dvbsub",
+];
+
+/// Whether `codec` names a bitmap (image) subtitle stream.
+///
+/// The single matching rule as well as the single list: trimmed and
+/// ASCII-case-insensitive. Before `SUBCODEC-01` the two call sites also matched
+/// *differently* (`contains` over a lowercased needle vs `eq_ignore_ascii_case`),
+/// so the comparison is centralised here too — a shared list with two matchers
+/// can still diverge.
+pub fn is_bitmap_subtitle_codec(codec: &str) -> bool {
+    let codec = codec.trim();
+    BITMAP_SUBTITLE_CODECS
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(codec))
+}
+
 impl MediaProbe {
     /// The stream the planner judges: the first non-cover-art video stream.
     ///
@@ -1557,6 +1632,148 @@ mod tests {
 
     fn h264_mkv() -> MediaProbe {
         parse_probe_json(H264_MKV).expect("the captured fixture must parse")
+    }
+
+    // --- SUBCODEC-01: the bitmap-subtitle vocabulary ------------------------
+
+    /// The expected membership, written out **as a literal** rather than read
+    /// from [`BITMAP_SUBTITLE_CODECS`].
+    ///
+    /// This is the whole point. A test that loops over the const it is meant to
+    /// be guarding cannot fail when an entry is deleted — it just loops one
+    /// fewer time and reports success. Every assertion below is driven from
+    /// this literal, so removing an alias from the production const kills the
+    /// test instead of shrinking it.
+    const EXPECTED_BITMAP_CODECS: &[&str] = &[
+        "hdmv_pgs_subtitle",
+        "dvd_subtitle",
+        "dvb_subtitle",
+        "xsub",
+        "pgssub",
+        "dvdsub",
+        "dvbsub",
+    ];
+
+    fn probe_json_with_subtitle(codec: &str) -> String {
+        format!(
+            r#"{{
+            "streams": [
+                {{
+                    "index": 0,
+                    "codec_name": "h264",
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "pix_fmt": "yuv420p",
+                    "bit_rate": "5000000",
+                    "disposition": {{ "default": 1, "forced": 0, "attached_pic": 0 }}
+                }},
+                {{
+                    "index": 1,
+                    "codec_name": "aac",
+                    "codec_type": "audio",
+                    "channels": 2,
+                    "bit_rate": "192000",
+                    "disposition": {{ "default": 1, "forced": 0 }},
+                    "tags": {{ "language": "eng" }}
+                }},
+                {{
+                    "index": 2,
+                    "codec_name": "{codec}",
+                    "codec_type": "subtitle",
+                    "disposition": {{ "default": 1, "forced": 0 }},
+                    "tags": {{ "language": "eng" }}
+                }}
+            ],
+            "format": {{
+                "format_name": "matroska,webm",
+                "duration": "5400.048000",
+                "size": "3400000000",
+                "bit_rate": "5037037"
+            }}
+        }}"#
+        )
+    }
+
+    /// **The divergence guard.** `SUBCODEC-01`.
+    ///
+    /// Before this item there were two lists of bitmap subtitle codecs —
+    /// `subtitles::discover::IMAGE_SUBTITLE_CODECS` (4) and
+    /// `foundry::directplay::BITMAP_SUBTITLE_CODECS` (7) — and they disagreed
+    /// about `pgssub`/`dvdsub`/`dvbsub`. Each list was internally consistent and
+    /// read correctly, which is why the disagreement survived review; nothing
+    /// compared them.
+    ///
+    /// This compares them. It asserts, over the **full** alias set and from a
+    /// literal, that every consumer that classifies a subtitle codec resolves
+    /// through the one symbol in this module — the probe predicate, the
+    /// `subtitles` predicate, and Foundry's real `direct_play_blockers` entry
+    /// point on a probe parsed from actual ffprobe-shaped JSON. If any consumer
+    /// ever grows its own copy again, or if the shared list is trimmed, this
+    /// fails.
+    #[test]
+    fn every_consumer_classifies_the_same_bitmap_subtitle_codecs() {
+        use crate::foundry::directplay::{direct_play_blockers, DirectPlayBlocker};
+        use crate::foundry::policy::TranscodePolicy;
+        use crate::subtitles::discover::is_image_codec;
+
+        // The shared list is exactly the reconciled membership — not shorter
+        // (a dropped alias fails open), not longer (an unreviewed entry).
+        assert_eq!(
+            BITMAP_SUBTITLE_CODECS, EXPECTED_BITMAP_CODECS,
+            "the one bitmap-subtitle list changed without this guard being updated"
+        );
+
+        let policy = TranscodePolicy::direct_play_normalization();
+
+        for codec in EXPECTED_BITMAP_CODECS {
+            // 1. the home predicate, including the matching rule (trim + case).
+            assert!(is_bitmap_subtitle_codec(codec), "{codec}");
+            assert!(
+                is_bitmap_subtitle_codec(&codec.to_ascii_uppercase()),
+                "{codec}: matching must be case-insensitive"
+            );
+            assert!(
+                is_bitmap_subtitle_codec(&format!("  {codec}  ")),
+                "{codec}: matching must tolerate ffprobe whitespace"
+            );
+
+            // 2. `subtitles` — "image" and "bitmap" must be the same rule.
+            assert!(
+                is_image_codec(codec),
+                "{codec}: bitmap at the probe boundary but not image-based to \
+                 subtitles::discover — the two lists have diverged again"
+            );
+
+            // 3. Foundry's production entry point, over a parsed probe.
+            let probe = parse_probe_json(&probe_json_with_subtitle(codec))
+                .unwrap_or_else(|e| panic!("{codec}: fixture must parse: {e}"));
+            assert_eq!(probe.subtitles.len(), 1, "{codec}: fixture shape");
+            let blockers = direct_play_blockers(&probe, &policy);
+            assert!(
+                blockers
+                    .iter()
+                    .any(|b| matches!(b, DirectPlayBlocker::DefaultBitmapSubtitles { .. })),
+                "{codec}: a default bitmap track must be reported as a direct-play \
+                 blocker, got {blockers:?}"
+            );
+        }
+
+        // Negative control: the guard must not be satisfiable by a predicate
+        // that answers `true` to everything.
+        for codec in ["subrip", "ass", "ssa", "webvtt", "mov_text", "dvb_teletext", "text", ""] {
+            assert!(!is_bitmap_subtitle_codec(codec), "{codec} is text");
+            assert!(!is_image_codec(codec), "{codec} is text");
+            let probe = parse_probe_json(&probe_json_with_subtitle(codec))
+                .unwrap_or_else(|e| panic!("{codec}: fixture must parse: {e}"));
+            let blockers = direct_play_blockers(&probe, &policy);
+            assert!(
+                !blockers
+                    .iter()
+                    .any(|b| matches!(b, DirectPlayBlocker::DefaultBitmapSubtitles { .. })),
+                "{codec}: a text track must not be reported as bitmap, got {blockers:?}"
+            );
+        }
     }
 
     /// MODIFIED by S130-A MPRB-02, and this is the ONLY pre-existing test in

@@ -31,14 +31,6 @@ use super::{AvailableSubtitle, SubtitleSource};
 /// non-shiftable is more honest than pretending they are not there.
 pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa", "sub", "idx", "sup"];
 
-/// ffprobe codec names for IMAGE-based subtitle streams.
-///
-/// These carry bitmaps, not text. They are listed so they can be marked
-/// non-shiftable — handing one to [`super::cues::apply_offset`] would be a
-/// category error, and the operator needs to know the timing control does not
-/// apply before they reach for it.
-pub const IMAGE_SUBTITLE_CODECS: &[&str] = &["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"];
-
 /// Map an ffprobe subtitle codec name to the text format Muse can shift it as.
 /// `None` for image-based codecs and for anything unrecognised — an unknown
 /// codec is treated as non-shiftable rather than optimistically assumed to be
@@ -56,8 +48,21 @@ pub fn format_for_codec(codec: &str) -> Option<SubtitleFormat> {
 }
 
 /// Whether a codec is one of the known image-based subtitle formats.
+///
+/// These carry bitmaps, not text. They are named so they can be marked
+/// non-shiftable — handing one to [`super::cues::apply_offset`] would be a
+/// category error, and the operator needs to know the timing control does not
+/// apply before they reach for it.
+///
+/// The list itself is **not** restated here. It is
+/// [`crate::media::probe::BITMAP_SUBTITLE_CODECS`], the same one
+/// [`crate::foundry::directplay::direct_play_blockers`] and
+/// [`crate::foundry::ladder`] consult; before `SUBCODEC-01` this module kept a
+/// second, shorter copy and the two disagreed about `pgssub`/`dvdsub`/`dvbsub`.
+/// "Image" here and "bitmap" there are the same rule under two names, so they
+/// resolve through one symbol.
 pub fn is_image_codec(codec: &str) -> bool {
-    IMAGE_SUBTITLE_CODECS.contains(&codec.trim().to_ascii_lowercase().as_str())
+    crate::media::probe::is_bitmap_subtitle_codec(codec)
 }
 
 /// Enumerate the embedded subtitle tracks in an already-taken probe.
@@ -422,9 +427,23 @@ mod tests {
         let available = embedded_from_probe(&probe);
         assert_eq!(available.len(), 1, "an image subtitle is still a real subtitle");
         assert!(!available[0].is_shiftable());
-        assert!(is_image_codec("hdmv_pgs_subtitle"));
-        assert!(is_image_codec("DVD_SUBTITLE"));
+        // SUBCODEC-01: the full alias set, from a literal — `is_image_codec`
+        // now resolves through `media::probe::BITMAP_SUBTITLE_CODECS`, and this
+        // module must not grow a second, shorter copy again.
+        for codec in [
+            "hdmv_pgs_subtitle",
+            "dvd_subtitle",
+            "dvb_subtitle",
+            "xsub",
+            "pgssub",
+            "dvdsub",
+            "dvbsub",
+        ] {
+            assert!(is_image_codec(codec), "{codec} is bitmap");
+            assert!(is_image_codec(&codec.to_ascii_uppercase()), "{codec} uppercase");
+        }
         assert!(!is_image_codec("subrip"));
+        assert!(!is_image_codec("webvtt"));
     }
 
     #[test]

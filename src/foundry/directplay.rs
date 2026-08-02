@@ -59,7 +59,7 @@ use crate::foundry::hdr::{
 };
 use crate::foundry::plan::TranscodeDecision;
 use crate::foundry::policy::{normalize_container, Container, TranscodePolicy};
-use crate::media::probe::MediaProbe;
+use crate::media::probe::{is_bitmap_subtitle_codec, MediaProbe};
 
 // --- What forces a client-side transcode -----------------------------------
 
@@ -149,10 +149,15 @@ impl std::fmt::Display for DirectPlayBlocker {
     }
 }
 
-/// Bitmap (image) subtitle codecs. Text codecs (`subrip`, `ass`, `mov_text`,
-/// `webvtt`) render client-side and never force anything.
-pub const BITMAP_SUBTITLE_CODECS: &[&str] =
-    &["hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub", "xsub"];
+// Bitmap (image) subtitle codecs. Text codecs (`subrip`, `ass`, `mov_text`,
+// `webvtt`) render client-side and never force anything.
+//
+// The list is NOT restated here. `SUBCODEC-01`: this module used to own a
+// 7-entry `BITMAP_SUBTITLE_CODECS` while `subtitles::discover` owned a 4-entry
+// `IMAGE_SUBTITLE_CODECS`, and they disagreed. The single home is
+// `crate::media::probe::{BITMAP_SUBTITLE_CODECS, is_bitmap_subtitle_codec}` —
+// see that doc comment for the per-entry membership evidence. The import is at
+// the top of this file with the rest.
 
 /// Name every reason a client would have to transcode this file.
 ///
@@ -228,10 +233,7 @@ pub fn direct_play_blockers(
     }
 
     for s in &probe.subtitles {
-        let is_bitmap = BITMAP_SUBTITLE_CODECS
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(s.codec.trim()));
-        if is_bitmap && (s.default || s.forced) {
+        if is_bitmap_subtitle_codec(&s.codec) && (s.default || s.forced) {
             out.push(DirectPlayBlocker::DefaultBitmapSubtitles {
                 stream_index: s.index,
                 codec: s.codec.clone(),

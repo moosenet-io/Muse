@@ -255,6 +255,9 @@ fn ops_routes() -> Router<Arc<AppState>> {
         .route("/foundry/reap", post(crate::web::dashboard::foundry_reap))
         // FOUNDRY-26: Path B's trigger. Marks are the ONLY source of rendition
         // candidates; the plan endpoint cannot see the library.
+        // FOUNDRY-27: Path A's trigger. Explicit paths only, both gates
+        // required, at most 8 per request — deliberately not a sweep.
+        .route("/foundry/optimize", post(crate::web::dashboard::foundry_optimize))
         .route("/foundry/marks", post(crate::web::dashboard::foundry_mark))
         .route("/foundry/marks/revoke", post(crate::web::dashboard::foundry_unmark))
         .route("/foundry/renditions/plan", post(crate::web::dashboard::foundry_renditions_plan))

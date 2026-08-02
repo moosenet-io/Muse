@@ -2937,6 +2937,49 @@ mod tests {
     /// was learned about the file at all. The distinction matters at
     /// 16,000-item scale, where transient stalls are certain and a pile of
     /// "failures" would obscure the real ones.
+    /// Path A's trigger must never become a sweep.
+    ///
+    /// `optimize_file` had NO production caller until FOUNDRY-27, so the full
+    /// chain — probe, plan, encode, verify, swap — had never executed. The
+    /// three existing optimize_file tests cover only refusal paths, which
+    /// means the most destructive operation in Muse was also the least
+    /// exercised.
+    ///
+    /// The trigger is therefore the narrowest one that can prove the chain
+    /// works: explicit paths, bounded count, both gates. If a future change
+    /// makes it enumerate anything, the blast radius stops being "what was
+    /// typed".
+    #[test]
+    fn the_optimize_endpoint_is_explicit_paths_only_and_never_a_sweep() {
+        let dash = include_str!("../web/dashboard.rs");
+        let start = dash
+            .find("pub async fn foundry_optimize")
+            .expect("the Path A trigger exists");
+        let body = &dash[start..start + 3000];
+
+        assert!(
+            !body.contains("walk_media_files") && !body.contains("library_root"),
+            "the trigger must not be able to enumerate the library — a sweep would make \
+             one request able to rewrite 16,000 files"
+        );
+        assert!(
+            body.contains("body.paths.len() > 8"),
+            "it must be bounded per request"
+        );
+        assert!(
+            body.contains("foundry.mutation_enabled()"),
+            "it must consult the GLOBAL gate, not only forge's internal check"
+        );
+        assert!(
+            body.contains("confirm"),
+            "it must require the operator to restate what is being rewritten"
+        );
+        assert!(
+            body.contains("direct_play_normalization()"),
+            "it must use Path A's real policy, not the default"
+        );
+    }
+
     /// The production encode must be bounded.
     ///
     /// It rewrites library files AND holds the title's swap lock while it

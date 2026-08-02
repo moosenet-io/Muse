@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::foundry::directplay::{may_delete_original, DeletionDecision, NormalizationOutcome};
-use crate::foundry::probe::MediaProbe;
+use crate::media::probe::MediaProbe;
 use crate::foundry::Foundry;
 
 /// The extension `forge` gives a preserved original. Must match

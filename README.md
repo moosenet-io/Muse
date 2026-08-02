@@ -78,6 +78,7 @@ A fuller derived diagram, per-subsystem narrative, and the end-to-end request fl
 | `discord` | Discord bot core: allowlisted friends, default-private consent, brain-driven replies | [reference/discord](docs/reference/discord.md) |
 | `premiere` | Scheduled premiere events, RSVP, discussion threads, engagement-tiered request budgets | [reference/premiere](docs/reference/premiere.md) |
 | `foundry` | Media formatting: transcode fabric, subtitle matcher, library organizer — **default-off**, see below | [S128 spec](specs/S128-muse-foundry.md) |
+| `media` | The shared media core: `probe` (ffprobe invocation + pure parser), `capability` (host tool detection), `paths` (`PathGuard`/`ResolvedPath`). Promoted out of `foundry` so a stock, Foundry-less deployment can still describe its own library | [S130-A spec](specs/S130-A-maestro-probe.md) |
 
 The full inventory — including `curation`, `taste_model`, `embed`, `recall`, `acquisition`,
 `decision`, `download`, `library`, `matching`, `watch_together`, `taste_review`, `web`,
@@ -113,6 +114,34 @@ Nothing here is a secret, so all of it is plain configuration. Foundry's later
 credentials (a subtitle-provider key, a worker-node token) are secret-shaped
 and will be routed through the same redacting path as every other Muse
 credential.
+
+## The shared media core (`media`)
+
+`probe`, `capability` and `paths` were built inside Foundry (S128 MUSEF-01/02)
+and were promoted verbatim into `src/media/` by
+[S130-A](specs/S130-A-maestro-probe.md) `MPRB-01`. The reason is the section
+directly above: **Foundry is inert unless you configure it**, so while the probe
+layer lived inside Foundry, a stock deployment could not describe its own
+library at all. Nothing in those three modules is curation-specific.
+
+`crate::foundry` re-exports all three under their original paths as a
+**permanent compatibility surface**, not a deprecation — Foundry legitimately
+consumes the shared core forever, and `crate::foundry::probe::…` remains a
+supported spelling.
+
+`MediaCore::from_config` builds a **read-only** guard over `MUSE_LIBRARY_ROOT`
+(`enable_mutation` is hardcoded false — no env var can open it) that is entirely
+independent of Foundry's mutation-capable guard: two guards, no shared state.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MUSE_PROBE_FFPROBE_BIN` | *(unset)* | Probe binary for the shared media core — a `PATH` name or an absolute path. **Precedence:** this, then `MUSE_FOUNDRY_FFPROBE_BIN`, then `ffprobe` on `PATH`. Falling back to Foundry's setting is deliberate, so an operator who already pointed Foundry at a custom build is not silently handed the system `ffprobe`. |
+
+The library root itself is `MUSE_LIBRARY_ROOT` (see the library-scan
+configuration): a **read-only** mount. Unset leaves the media core's guard
+inert — it refuses every path rather than falling open — and never fails
+startup. A host with no `ffprobe` reports `can_probe() == false` and degrades
+once, rather than failing per file.
 
 ## Quick start
 

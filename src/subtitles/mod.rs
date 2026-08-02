@@ -74,7 +74,7 @@ pub enum SubtitleSource {
     /// A subtitle stream inside the media container itself.
     Embedded {
         /// The stream's ABSOLUTE index as ffprobe reported it, matching
-        /// [`crate::foundry::probe::SubtitleStream::index`].
+        /// [`crate::media::probe::SubtitleStream::index`].
         ///
         /// Stored, but never trusted alone across time. Foundry's transcode
         /// path rewrites a file with `-map 0:s?` (every subtitle stream, in

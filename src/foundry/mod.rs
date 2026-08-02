@@ -16,6 +16,13 @@
 //! | `lexicon` | find, score, sync-verify and write subtitles | 4 |
 //! | `archivist` | plan and apply library folder/naming layout | 5 |
 //!
+//! ## Where `probe`, `capability` and `paths` live now (S130-A MPRB-01)
+//! In [`crate::media`], not here. They were promoted verbatim into the shared
+//! media core and are re-exported below under their original
+//! `crate::foundry::*` paths as a permanent compatibility surface, so every
+//! spelling in this module and its callers still compiles. The doc paragraphs
+//! below that describe them still describe the same code, at its new home.
+//!
 //! This item (**MUSEF-01**) ships only the foundation both of those rest on:
 //! typed [`config::FoundryConfig`] and the [`paths::PathGuard`] /
 //! [`paths::ResolvedPath`] safety primitive.
@@ -46,21 +53,37 @@
 //! returns `None` and no Foundry surface exists. An absent backend capability
 //! leaves the module inert, never broken.
 
-pub mod capability;
 pub mod config;
 pub mod directplay;
 pub mod forge;
 pub mod hdr;
 pub mod ladder;
 pub mod marks;
-pub mod paths;
 pub mod rendition;
 pub mod survey;
 pub mod validate;
 pub mod plan;
 pub mod policy;
-pub mod probe;
 pub mod reaper;
+
+// ---------------------------------------------------------------------------
+// The shared media core, re-exported under Foundry's old module paths.
+//
+// `probe`, `capability` and `paths` were built here (S128 MUSEF-01/02) and were
+// promoted verbatim to `crate::media` by S130-A MPRB-01: nothing in them is
+// curation-specific, and Foundry is default-deny and inert unless the operator
+// sets `MUSE_FOUNDRY_ALLOWED_ROOTS` — so leaving the probe layer inside Foundry
+// left the library unprobeable on a stock deployment.
+//
+// These three re-exports are a **permanent compatibility surface, not a
+// deprecation shim**. Foundry legitimately consumes the shared core forever, so
+// the old `crate::foundry::probe::*` spelling stays supported; there is no plan
+// to remove it and no deprecation attribute. They also mean the promotion changed
+// nothing for any existing caller — which is what makes "no compatibility break"
+// a compiler-checked claim rather than an assertion.
+pub use crate::media::capability;
+pub use crate::media::paths;
+pub use crate::media::probe;
 
 pub use capability::{Capabilities, ToolReport, ToolState};
 pub use config::FoundryConfig;

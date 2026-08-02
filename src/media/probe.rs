@@ -1,5 +1,10 @@
-//! MUSEF-02 — describe a media file: the `ffprobe` invocation and, separately,
-//! the pure parser for its output.
+//! Describe a media file: the `ffprobe` invocation and, separately, the pure
+//! parser for its output.
+//!
+//! Built as `foundry::probe` (S128 MUSEF-02) and **promoted unchanged** to
+//! `crate::media::probe` by S130-A MPRB-01, because nothing in it is
+//! curation-specific and Foundry is inert on a stock deployment. Foundry still
+//! consumes it through the permanent re-export shim in [`crate::foundry`].
 //!
 //! ## The split, and why it is not cosmetic
 //! `ffprobe` **is not installed on <host>**, the host Muse runs on (verified
@@ -15,7 +20,7 @@
 //! failure. A probe that did not happen, or whose output did not parse, is a
 //! [`ProbeError`] — never a `MediaProbe` with empty stream lists, which the
 //! planner downstream would read as "this file has no video" and act on. The
-//! same rule as the rest of Foundry: an unobserved fact is reported as
+//! same rule as the rest of the media core: an unobserved fact is reported as
 //! unobserved, not as a benign default.
 
 use std::time::Duration;
@@ -23,7 +28,7 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::foundry::paths::ResolvedPath;
+use crate::media::paths::ResolvedPath;
 
 /// Build the `ffprobe` CLI arguments (everything after the binary name).
 ///
@@ -292,9 +297,9 @@ impl std::fmt::Display for ProbeError {
             ),
             Self::ToolMissing { binary } => write!(
                 f,
-                "ffprobe binary `{binary}` is not installed on this host — Foundry \
-                 cannot describe media files (set MUSE_FOUNDRY_FFPROBE_BIN, or \
-                 install ffmpeg)"
+                "ffprobe binary `{binary}` is not installed on this host — media \
+                 files cannot be described (set MUSE_PROBE_FFPROBE_BIN, or the \
+                 older MUSE_FOUNDRY_FFPROBE_BIN, or install ffmpeg)"
             ),
             Self::Spawn { binary, message } => {
                 write!(f, "could not spawn ffprobe binary `{binary}`: {message}")
@@ -337,10 +342,11 @@ fn truncate_for_log(s: &str) -> String {
 
 /// Actually invoke `ffprobe` on a guard-resolved path and parse the result.
 ///
-/// This is the **only** function in Foundry that spawns a probe process; every
-/// other probe-shaped operation goes through it. It takes a [`ResolvedPath`],
+/// This is the **only** function in the crate that spawns a probe process; every
+/// other probe-shaped operation goes through it — Foundry's included, via the
+/// re-export shim. It takes a [`ResolvedPath`],
 /// not a `&Path`, so "I forgot to validate this path" is a compile error rather
-/// than a review catch (see [`crate::foundry::paths`]).
+/// than a review catch (see [`crate::media::paths`]).
 ///
 /// Read-only by construction: a `ResolvedPath` carries no mutation capability,
 /// and ffprobe with these arguments writes nothing.

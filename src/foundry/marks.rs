@@ -445,8 +445,17 @@ mod tests {
         fs::write(blocked.join("Hidden.mkv"), b"x").unwrap();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
 
+        // Probe root-ness INDEPENDENTLY of the code under test.
+        //
+        // This was `problem.is_none()`, which is exactly the observable a
+        // broken implementation produces — so a mutation that reported the
+        // partial read as complete made the test conclude "must be root" and
+        // return early, passing vacuously. The skip-condition and the
+        // failure-condition were the same thing. Caught by that mutation
+        // surviving.
+        let running_as_root = fs::read_dir(&blocked).is_ok();
+
         let (files, problem) = expand(&mark(MarkScope::Show, &d));
-        let running_as_root = problem.is_none();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&d);
 
@@ -468,8 +477,10 @@ mod tests {
         fs::write(d.join("Hidden.mkv"), b"x").unwrap();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
 
+        // Independent probe, for the same reason as above.
+        let running_as_root = fs::read_dir(&d).is_ok();
         let (files, problem) = expand(&mark(MarkScope::Season, &d));
-        let running_as_root = !files.is_empty();
+        let _ = &files;
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&d);
 

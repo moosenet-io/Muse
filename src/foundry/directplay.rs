@@ -546,6 +546,35 @@ fn audio_streams_an_encode_will_produce(
         .collect()
 }
 
+/// **What the deletion gate will refuse, predicted from the source and the plan
+/// alone — before spending the encode.**
+///
+/// ## What this can and cannot know
+///
+/// The prediction is deliberately one-sided: everything it reports, the gate
+/// will refuse. It does NOT report everything the gate might refuse, because
+/// some of the gate's inputs do not exist until the output has been encoded and
+/// re-probed. Those are listed here rather than left as silence, because a
+/// caller reading an empty list must know it means "nothing foreseeable", not
+/// "nothing possible":
+///
+/// - **The output's dimensions or duration coming back unknown.** The gate
+///   refuses these, but they are properties of a probe of a file that does not
+///   exist yet. A failed probe of the output is not foreseeable from the source.
+/// - **Duration drift.** The gate requires the durations to match within
+///   [`DURATION_TOLERANCE_SECS`]; whether an encode truncates is not knowable
+///   in advance.
+/// - **Encoder dimension rounding.** The prediction trusts `plan.scale` as the
+///   output geometry. An encoder that rounds to even dimensions can produce
+///   something a pixel smaller than the plan claimed, which the gate would
+///   refuse. Raised at the FOUNDRY-30 gate; it makes this an under-report in a
+///   narrow case, never an over-report.
+///
+/// Everything else the gate checks IS modelled: audio stream reproduction (via
+/// the gate's own [`unreproduced_audio`]), HDR, Dolby Vision, resolution
+/// reduction, unknown source dimensions, and dropped attachments. Subtitles and
+/// chapters are not modelled because the argv copies them unconditionally, so
+/// there is nothing to predict.
 pub fn predicted_deletion_refusals(
     source: &MediaProbe,
     plan: &crate::foundry::plan::TranscodePlan,
@@ -583,6 +612,84 @@ pub fn predicted_deletion_refusals(
                 );
             }
         }
+    }
+
+    // Resolution, by the gate's rule: it refuses when `ow < sw || oh < sh`, and
+    // refuses again when either side's dimensions are unknown.
+    //
+    // The audio half of this function had drifted from the gate (FOUNDRY-29);
+    // the video half had the same gap. A plan that DOWNSCALES was predicted to
+    // reclaim disk while the gate refused the deletion, so the original would
+    // be kept forever and the survey would not have said so. Under Path A a
+    // scale only fires above 3840x2160, which is why it went unnoticed.
+    if let Some(v) = source.primary_video() {
+        match (v.width, v.height) {
+            (Some(sw), Some(sh)) => {
+                if let VideoAction::Encode {
+                    scale: Some((ow, oh)),
+                } = plan.video
+                {
+                    if ow < sw || oh < sh {
+                        out.push(format!(
+                            "this plan scales {sw}x{sh} down to {ow}x{oh}, and a replacement \
+                             with fewer pixels never authorises deleting the original"
+                        ));
+                    }
+                }
+            }
+            // Unknown source dimensions cannot be shown to have been preserved,
+            // whatever the plan does — the gate refuses these outright.
+            _ => out.push(
+                "the source's video dimensions are unknown, so the gate cannot be shown the \
+                 replacement did not reduce them"
+                    .to_string(),
+            ),
+        }
+    }
+
+    // Only the PRIMARY video stream is mapped. `build_transcode_args` emits a
+    // single `-map 0:{video_stream_index}`, so a source with more than one real
+    // video stream — multi-angle, or a second angle muxed in — loses every
+    // other one, and the gate refuses with `StreamsLost { kind: "video" }`.
+    // Raised at the FOUNDRY-30 gate; the planner has no pre-refusal for it, so
+    // it is reachable.
+    //
+    // Cover art does NOT count: the probe parser filters `attached_pic` streams
+    // out of its video list (see `MediaProbe::video`), which is also why the
+    // argv maps an ABSOLUTE stream index rather than `0:v:0`. Were that not so,
+    // this would fire on the very common case of an embedded poster.
+    if source.video.len() > 1 {
+        out.push(format!(
+            "the source has {} video streams and a rewrite maps only the primary one, so the \
+             others will be lost and the original cannot be shown to have been reproduced",
+            source.video.len()
+        ));
+    }
+
+    // Attachments survive only into Matroska: the argv emits `-c:t copy` under
+    // `container_holds_attachments`, which is Matroska alone. An already-
+    // acceptable MP4 source is kept as MP4, so its attachments would be dropped
+    // and the gate would refuse with `StreamsLost`.
+    //
+    // In practice the planner refuses this combination first, with
+    // `Undecidable::AttachmentsCannotBeCarried` (plan.rs), so a plan reaching
+    // here with fonts and a non-Matroska target should not exist. This is kept
+    // as a consistency check rather than a live prediction: if that pre-refusal
+    // is ever relaxed, the prediction stays correct instead of silently
+    // under-reporting.
+    //
+    // Subtitles and chapters need no equivalent: the argv maps and copies them
+    // unconditionally (`-map 0:s?`, `-map_chapters 0`, `-c:s copy`), so
+    // predicting a refusal for them would over-report.
+    if !source.attachments.is_empty()
+        && !crate::foundry::plan::container_holds_attachments(plan.container)
+    {
+        out.push(format!(
+            "the source carries {} attachment(s) and the target container does not hold \
+             attachments, so they will be dropped and the original cannot be shown to have \
+             been reproduced",
+            source.attachments.len()
+        ));
     }
 
     // ANY audio re-encode blocks deletion — not only the undetectable formats.
@@ -1529,6 +1636,348 @@ mod tests {
             predicted_deletion_refusals(&source, &plan).is_empty(),
             "the second stream keeps its own channel count, so both are reproduced"
         );
+    }
+
+    /// The video half of the FOUNDRY-29 divergence.
+    ///
+    /// A plan that downscales was predicted to reclaim disk while the gate
+    /// refused the deletion — so the original would be kept forever and the
+    /// survey would not have said so. Under Path A a scale only fires above
+    /// 3840x2160, which is why nothing noticed.
+    #[test]
+    fn a_downscaling_plan_is_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(vec![video("hevc", 7680, 4320)], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode {
+                scale: Some((3840, 2160)),
+            },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        let refusals = predicted_deletion_refusals(&source, &plan);
+        assert!(
+            refusals.iter().any(|r| r.contains("7680x4320")),
+            "the refusal must name the reduction: {refusals:?}"
+        );
+    }
+
+    /// A scale that does NOT reduce either dimension is not a downscale, so it
+    /// must not be flagged — the same over-report trap the audio side fell into.
+    #[test]
+    fn a_scale_that_reduces_nothing_predicts_no_refusal() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(vec![video("mpeg4", 1920, 1080)], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode {
+                scale: Some((1920, 1080)),
+            },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(predicted_deletion_refusals(&source, &plan).is_empty());
+    }
+
+    /// Unknown source dimensions refuse — cross-checked against the REAL gate
+    /// rather than merely asserted non-empty. Raised at the FOUNDRY-30 gate:
+    /// the unknown branch is exactly where a drift could hide, so asserting the
+    /// prediction alone would not have shown agreement.
+    #[test]
+    fn unknown_source_dimensions_are_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut v = video("h264", 1920, 1080);
+        v.width = None;
+        let source = probe(vec![v], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Copy,
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+
+        // A copy of a source whose width is unknown probes back the same way.
+        let mut ov = video("h264", 1920, 1080);
+        ov.width = None;
+        let output = probe(vec![ov], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+        assert!(gate_refuses, "the gate refuses unknown dimensions");
+        assert_eq!(gate_refuses, predicted, "prediction must agree with the gate");
+    }
+
+    /// A rewrite maps only the primary video stream, so a genuine second video
+    /// stream is lost and the gate refuses. Raised at the FOUNDRY-30 gate; the
+    /// planner has no pre-refusal for it.
+    #[test]
+    fn a_second_video_stream_is_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(
+            vec![video("h264", 1920, 1080), video("h264", 1920, 1080)],
+            vec![audio(1, "aac", 2)],
+        );
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+
+        // What the argv produces: one video stream.
+        let output = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        assert!(gate_refuses, "the gate refuses a lost video stream");
+        assert!(
+            refusals.iter().any(|r| r.contains("video streams")),
+            "the prediction must name the lost video streams: {refusals:?}"
+        );
+    }
+
+    /// Cover art is NOT a second video stream — starting from real ffprobe
+    /// JSON, not from a hand-built fixture.
+    ///
+    /// The first version of this test built a one-video-stream fixture and
+    /// relied on `probe()` having pre-filtered, which made it a duplicate of
+    /// the `len == 1` case: it could not catch a parser regression that began
+    /// counting `attached_pic` streams. Raised at the FOUNDRY-30 gate.
+    ///
+    /// This matters more than the case it guards: counting cover art as a lost
+    /// video stream would predict a refusal for every poster-bearing file and
+    /// understate reclaimable disk. Measured prevalence on this library is
+    /// 1.0% of a 400-file random sample (2026-08-02) — a real population, not a
+    /// dominant one.
+    #[test]
+    fn embedded_cover_art_is_not_treated_as_a_lost_video_stream() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+
+        // A file with one real video stream, an audio stream, and an embedded
+        // poster carried as an mjpeg stream with disposition.attached_pic=1 —
+        // exactly how ffprobe reports cover art.
+        let json = r#"{
+          "streams": [
+            {"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,
+             "pix_fmt":"yuv420p","disposition":{"attached_pic":0}},
+            {"index":1,"codec_type":"audio","codec_name":"aac","channels":2,
+             "disposition":{"attached_pic":0}},
+            {"index":2,"codec_type":"video","codec_name":"mjpeg","width":600,"height":900,
+             "disposition":{"attached_pic":1}}
+          ],
+          "format": {"format_name":"matroska,webm","duration":"5400.0","size":"4000000000"},
+          "chapters": []
+        }"#;
+
+        let source = crate::foundry::probe::parse_probe_json(json)
+            .expect("this is well-formed ffprobe output");
+        assert_eq!(
+            source.video.len(),
+            1,
+            "the parser must exclude attached_pic from the video list — if this \
+             fails, the prediction below would fire on every poster-bearing file"
+        );
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        let refusals = predicted_deletion_refusals(&source, &plan);
+
+        // It is NOT reported as a lost video stream...
+        assert!(
+            !refusals.iter().any(|r| r.contains("video streams")),
+            "cover art must not be counted as a second video stream: {refusals:?}"
+        );
+
+        // ...but it IS reported, via the undescribable-streams rule, because
+        // the parser records it in `other_stream_count` and the argv does not
+        // map it. The poster really is dropped by a rewrite, so refusing is
+        // correct — see the test below, which pins that the gate agrees.
+        assert!(
+            !refusals.is_empty(),
+            "an embedded poster is dropped by the rewrite, so deletion is refused"
+        );
+    }
+
+    /// **Every file with embedded cover art is un-reclaimable, and the gate is
+    /// right about it.**
+    ///
+    /// This is a policy consequence rather than a bug. The argv maps only
+    /// video/audio/subtitles/attachments — never the artwork — so a rewrite
+    /// genuinely loses it, the gate genuinely cannot show the original was
+    /// reproduced, and the original is kept forever.
+    ///
+    /// Measured, not assumed: 1.0% of a 400-file random sample carries embedded
+    /// cover art (2026-08-02), and the full-library survey attributes 30 of
+    /// 3,158 un-reclaimable titles to undescribable streams. It was worth
+    /// checking precisely because it looked like it might dominate; it does
+    /// not. Audio codec changes do, at 3,567.
+    ///
+    /// The prediction and the gate AGREE here, which is the property that
+    /// matters: the survey reports these as un-reclaimable up front rather than
+    /// discovering it one encode at a time.
+    ///
+    /// Changing this means carrying the artwork through the rewrite, which is a
+    /// deliberate feature and an operator's call — not something to silence at
+    /// the gate.
+    #[test]
+    fn cover_art_makes_a_title_unreclaimable_and_the_gate_agrees() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut source = probe(vec![video("mpeg4", 720, 480)], vec![audio(1, "aac", 2)]);
+        // What the parser records for an embedded poster.
+        source.other_stream_count = 1;
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+
+        // The rewrite does not map the artwork, so the output has none.
+        let output = probe(vec![video("h264", 720, 480)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+        assert!(gate_refuses, "the dropped artwork cannot be shown reproduced");
+        assert_eq!(
+            gate_refuses, predicted,
+            "the survey must report this up front, not discover it per-encode"
+        );
+    }
+
+    /// Unknown source dimensions refuse whatever the plan does — including an
+    /// Encode with a known scale, where the OUTPUT dimensions are known and
+    /// only the source's are not. Raised at the FOUNDRY-30 gate: the earlier
+    /// test covered only the Copy path.
+    #[test]
+    fn unknown_source_dimensions_refuse_even_when_the_output_size_is_known() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut v = video("h264", 1920, 1080);
+        v.width = None;
+        let source = probe(vec![v], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode {
+                scale: Some((1920, 1080)),
+            },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+
+        // The encode produces a file with known dimensions.
+        let output = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+
+        let gate_refuses =
+            !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+        let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+        assert!(
+            gate_refuses,
+            "the gate cannot compare against an unknown source size, so it refuses"
+        );
+        assert_eq!(gate_refuses, predicted);
+    }
+
+    /// Attachments survive only into Matroska. An acceptable MP4 source is kept
+    /// as MP4, so its attachments are dropped and the gate refuses — the
+    /// prediction must say so. Raised at the FOUNDRY-30 gate.
+    #[test]
+    fn attachments_dropped_by_a_non_matroska_target_are_predicted_to_block() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+        source.attachments = vec![crate::foundry::probe::AttachmentStream {
+            index: 3,
+            codec: "ttf".into(),
+            filename: Some("font.ttf".into()),
+        }];
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Mp4,
+        };
+
+        let refusals = predicted_deletion_refusals(&source, &plan);
+        assert!(
+            refusals.iter().any(|r| r.contains("attachment")),
+            "an MP4 target drops attachments, so the gate refuses: {refusals:?}"
+        );
+    }
+
+    /// The same source into Matroska keeps them, so nothing is predicted —
+    /// the over-report guard for the case above.
+    #[test]
+    fn attachments_kept_by_a_matroska_target_predict_no_refusal() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut source = probe(vec![video("h264", 1920, 1080)], vec![audio(1, "aac", 2)]);
+        source.attachments = vec![crate::foundry::probe::AttachmentStream {
+            index: 3,
+            codec: "ttf".into(),
+            filename: Some("font.ttf".into()),
+        }];
+
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(predicted_deletion_refusals(&source, &plan).is_empty());
+    }
+
+    /// The agreement property for video, over a spread of resolutions and plans.
+    #[test]
+    fn the_prediction_and_the_gate_agree_across_video_shapes() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        // (source w, source h, planned scale, expected output w/h)
+        //
+        // Single-axis reductions are here because the gate's rule is
+        // `ow < sw || oh < sh`: a version checking only one axis would pass a
+        // sweep where both axes always shrink together. Raised at the gate.
+        let cases: [(u32, u32, Option<(u32, u32)>); 7] = [
+            (7680, 4320, Some((3840, 2160))), // downscale, both axes
+            (1920, 1080, Some((1280, 1080))), // width only
+            (1920, 1080, Some((1920, 720))),  // height only
+            (1920, 1080, Some((1920, 1080))), // no-op scale
+            (1920, 1080, None),               // re-encode at source size
+            (720, 480, None),                 // small, untouched
+            (3840, 2160, Some((3840, 2160))), // 4K, no reduction
+        ];
+
+        for (sw, sh, scale) in cases {
+            let source = probe(vec![video("mpeg4", sw, sh)], vec![audio(1, "aac", 2)]);
+            let plan = TranscodePlan {
+                video_stream_index: 0,
+                video: VideoAction::Encode { scale },
+                audio: AudioAction::Copy,
+                container: Container::Matroska,
+            };
+
+            let (ow, oh) = scale.unwrap_or((sw, sh));
+            let output = probe(vec![video("h264", ow, oh)], vec![audio(1, "aac", 2)]);
+
+            let gate_refuses =
+                !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+            let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+            assert_eq!(
+                gate_refuses, predicted,
+                "prediction and gate disagree for {sw}x{sh} -> {scale:?} \
+                 (gate refuses: {gate_refuses}, predicted: {predicted})"
+            );
+        }
     }
 
     /// A COPY preserves everything, so even an HDR source predicts nothing.

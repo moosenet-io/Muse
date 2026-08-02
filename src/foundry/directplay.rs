@@ -585,6 +585,39 @@ pub fn predicted_deletion_refusals(
         }
     }
 
+    // Resolution, by the gate's rule: it refuses when `ow < sw || oh < sh`, and
+    // refuses again when either side's dimensions are unknown.
+    //
+    // The audio half of this function had drifted from the gate (FOUNDRY-29);
+    // the video half had the same gap. A plan that DOWNSCALES was predicted to
+    // reclaim disk while the gate refused the deletion, so the original would
+    // be kept forever and the survey would not have said so. Under Path A a
+    // scale only fires above 3840x2160, which is why it went unnoticed.
+    if let Some(v) = source.primary_video() {
+        match (v.width, v.height) {
+            (Some(sw), Some(sh)) => {
+                if let VideoAction::Encode {
+                    scale: Some((ow, oh)),
+                } = plan.video
+                {
+                    if ow < sw || oh < sh {
+                        out.push(format!(
+                            "this plan scales {sw}x{sh} down to {ow}x{oh}, and a replacement \
+                             with fewer pixels never authorises deleting the original"
+                        ));
+                    }
+                }
+            }
+            // Unknown source dimensions cannot be shown to have been preserved,
+            // whatever the plan does — the gate refuses these outright.
+            _ => out.push(
+                "the source's video dimensions are unknown, so the gate cannot be shown the \
+                 replacement did not reduce them"
+                    .to_string(),
+            ),
+        }
+    }
+
     // ANY audio re-encode blocks deletion — not only the undetectable formats.
     //
     // This prediction under-reported badly, and a real end-to-end swap exposed
@@ -1529,6 +1562,101 @@ mod tests {
             predicted_deletion_refusals(&source, &plan).is_empty(),
             "the second stream keeps its own channel count, so both are reproduced"
         );
+    }
+
+    /// The video half of the FOUNDRY-29 divergence.
+    ///
+    /// A plan that downscales was predicted to reclaim disk while the gate
+    /// refused the deletion — so the original would be kept forever and the
+    /// survey would not have said so. Under Path A a scale only fires above
+    /// 3840x2160, which is why nothing noticed.
+    #[test]
+    fn a_downscaling_plan_is_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(vec![video("hevc", 7680, 4320)], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode {
+                scale: Some((3840, 2160)),
+            },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        let refusals = predicted_deletion_refusals(&source, &plan);
+        assert!(
+            refusals.iter().any(|r| r.contains("7680x4320")),
+            "the refusal must name the reduction: {refusals:?}"
+        );
+    }
+
+    /// A scale that does NOT reduce either dimension is not a downscale, so it
+    /// must not be flagged — the same over-report trap the audio side fell into.
+    #[test]
+    fn a_scale_that_reduces_nothing_predicts_no_refusal() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let source = probe(vec![video("mpeg4", 1920, 1080)], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode {
+                scale: Some((1920, 1080)),
+            },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(predicted_deletion_refusals(&source, &plan).is_empty());
+    }
+
+    /// Unknown source dimensions refuse, because the gate refuses them.
+    #[test]
+    fn unknown_source_dimensions_are_predicted_to_block_deletion() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        let mut v = video("h264", 1920, 1080);
+        v.width = None;
+        let source = probe(vec![v], vec![audio(1, "aac", 2)]);
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Copy,
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(!predicted_deletion_refusals(&source, &plan).is_empty());
+    }
+
+    /// The agreement property for video, over a spread of resolutions and plans.
+    #[test]
+    fn the_prediction_and_the_gate_agree_across_video_shapes() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        // (source w, source h, planned scale, expected output w/h)
+        let cases: [(u32, u32, Option<(u32, u32)>); 5] = [
+            (7680, 4320, Some((3840, 2160))), // downscale
+            (1920, 1080, Some((1920, 1080))), // no-op scale
+            (1920, 1080, None),               // re-encode at source size
+            (720, 480, None),                 // small, untouched
+            (3840, 2160, Some((3840, 2160))), // 4K, no reduction
+        ];
+
+        for (sw, sh, scale) in cases {
+            let source = probe(vec![video("mpeg4", sw, sh)], vec![audio(1, "aac", 2)]);
+            let plan = TranscodePlan {
+                video_stream_index: 0,
+                video: VideoAction::Encode { scale },
+                audio: AudioAction::Copy,
+                container: Container::Matroska,
+            };
+
+            let (ow, oh) = scale.unwrap_or((sw, sh));
+            let output = probe(vec![video("h264", ow, oh)], vec![audio(1, "aac", 2)]);
+
+            let gate_refuses =
+                !decide(&source, &NormalizationOutcome::Verified { output }).is_allowed();
+            let predicted = !predicted_deletion_refusals(&source, &plan).is_empty();
+
+            assert_eq!(
+                gate_refuses, predicted,
+                "prediction and gate disagree for {sw}x{sh} -> {scale:?} \
+                 (gate refuses: {gate_refuses}, predicted: {predicted})"
+            );
+        }
     }
 
     /// A COPY preserves everything, so even an HDR source predicts nothing.

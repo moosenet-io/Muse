@@ -184,6 +184,54 @@ impl ReapRun {
 /// Returns `None` when the path does not carry the extension at all, which is
 /// how a caller's own mistake surfaces rather than being reinterpreted.
 pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
+    resolve_replacement(superseded).map(|(_, path)| path)
+}
+
+/// What a directory listing established about a backup's replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchVerdict {
+    /// Exactly one media sibling shares the stem, from a listing that was read
+    /// in full. The only verdict that may authorise a deletion.
+    Unique,
+    /// None found, or several — we cannot tell which file superseded this
+    /// backup.
+    Ambiguous,
+    /// The listing was incomplete, so the candidate set may be short.
+    Incomplete { unreadable: usize },
+}
+
+/// **Was the resolution trustworthy?** Pure, so it is testable.
+///
+/// The fail-closed ambiguity rule only works if every candidate was SEEN. A
+/// transient NFS error (ESTALE, EIO) dropping one of two same-stem files
+/// collapses the list from 2 to 1, and the survivor — which may not be the file
+/// that superseded this backup — would otherwise resolve cleanly and authorise
+/// deleting against the wrong replacement.
+///
+/// This is decided from the SAME listing that produced the matches, and that is
+/// the point. An earlier version checked completeness with a second, separate
+/// `read_dir`, which did not close the race — it moved it: a transient error
+/// hitting only the resolution read left the guard already satisfied. Raised at
+/// the REAP-01 gate. One read, one verdict.
+pub(crate) fn classify_matches(matches: &[PathBuf], unreadable: usize) -> MatchVerdict {
+    if unreadable > 0 {
+        return MatchVerdict::Incomplete { unreadable };
+    }
+    match matches.len() {
+        1 => MatchVerdict::Unique,
+        _ => MatchVerdict::Ambiguous,
+    }
+}
+
+/// The verdict for a backup's replacement lookup, for callers that need to
+/// tell "could not look" from "not there".
+///
+/// `replacement_of` collapses both into the same-name fallback, which is right
+/// for its callers that only need a path. [`decide_one`] needs the difference:
+/// reporting a partial listing as `ReplacementMissing` would state "this backup
+/// is the ONLY copy of the title" — a confident and false claim about a
+/// directory that simply could not be read.
+pub(crate) fn resolve_replacement(superseded: &Path) -> Option<(MatchVerdict, PathBuf)> {
     let name = superseded.file_name()?.to_str()?;
     let stem = name.strip_suffix(&format!(".{SUPERSEDED_EXT}"))?;
     if stem.is_empty() {
@@ -191,47 +239,25 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
     }
     let same_name = superseded.with_file_name(stem);
     if same_name.is_file() {
-        return Some(same_name);
+        // A same-name replacement needs no listing at all.
+        return Some((MatchVerdict::Unique, same_name));
     }
 
-    // The swap may have CHANGED THE CONTAINER, in which case the replacement
-    // has a different extension and the name above no longer exists.
-    //
-    // This is not an edge case: converting `avi` to `mkv` is most of what
-    // Path A does on this library, so keying only on the original name meant
-    // the reaper could never reclaim anything Path A actually converted — it
-    // reported "the replacement does not exist, this backup is the ONLY copy"
-    // and kept the file forever. Every reaper test used same-name fixtures, so
-    // this was invisible until a real swap ran end to end.
-    //
-    // Resolution is by STEM, and is fail-closed on ambiguity: exactly one
-    // media sibling sharing the stem counts as the replacement. Two or more
-    // means we cannot tell which one superseded this backup, and guessing
-    // would risk deleting the last copy of a title.
-    // Every failure below falls back to `same_name` rather than to None.
-    //
-    // Returning None would discard the path entirely, and the caller would
-    // report "not a superseded name" — a confusing lie about a file that
-    // plainly is one. Falling back to the original name means the caller
-    // reports ReplacementMissing and KEEPS the backup, which is the correct
-    // outcome for "I could not work out what replaced this".
     let (Some(dir), Some(base)) = (
         superseded.parent(),
         Path::new(stem).file_stem().and_then(|s| s.to_str()),
     ) else {
-        return Some(same_name);
+        return Some((MatchVerdict::Ambiguous, same_name));
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Some(same_name);
+        return Some((MatchVerdict::Ambiguous, same_name));
     };
+
     let mut matches: Vec<PathBuf> = Vec::new();
-    // NOTE: unreadable entries are handled by `listing_is_complete`, called
-    // from `decide_one` — not here. This function's job is to resolve a name;
-    // refusing on a partial listing is a SAFETY decision, and it belongs where
-    // it can be reported as the distinct outcome it is rather than collapsing
-    // into "the replacement does not exist".
+    let mut unreadable = 0usize;
     for entry in entries {
         let Ok(entry) = entry else {
+            unreadable += 1;
             continue;
         };
         let p = entry.path();
@@ -243,13 +269,15 @@ pub fn replacement_of(superseded: &Path) -> Option<PathBuf> {
         }
     }
 
-    match matches.as_slice() {
-        [only] => Some(only.clone()),
-        // None found, or several: return the same-name path so the caller
-        // reports ReplacementMissing and KEEPS the backup. Ambiguity must
-        // never resolve into a deletion.
-        _ => Some(same_name),
-    }
+    let verdict = classify_matches(&matches, unreadable);
+    let path = match verdict {
+        MatchVerdict::Unique => matches[0].clone(),
+        // Ambiguous or incomplete: hand back the same-name path so a caller
+        // that only wants a path reports ReplacementMissing and KEEPS the
+        // backup.
+        _ => same_name,
+    };
+    Some((verdict, path))
 }
 
 /// Every `.muse-superseded` file under `root`, recursively.
@@ -411,18 +439,6 @@ pub fn effective_retention(configured: Duration, requested: Option<Duration>) ->
     }
 }
 
-/// How many entries in a backup's directory could not be read, or `None` when
-/// the listing was complete.
-///
-/// A directory that cannot be OPENED is not reported here: `replacement_of`
-/// already falls back to the same-name path in that case, which refuses.
-fn incomplete_listing_for(superseded: &Path) -> Option<usize> {
-    let dir = superseded.parent()?;
-    let entries = std::fs::read_dir(dir).ok()?;
-    let unreadable = entries.filter(|e| e.is_err()).count();
-    (unreadable > 0).then_some(unreadable)
-}
-
 /// Decide one preserved original. **Never deletes** — the decision and the
 /// deletion are separate so the decision is testable without a filesystem that
 /// can lose data.
@@ -435,7 +451,7 @@ pub fn decide_one(
     superseded: &Path,
     retention: Duration,
 ) -> (ReapOutcome, Option<PathBuf>, Option<u64>) {
-    let Some(replacement) = replacement_of(superseded) else {
+    let Some((verdict, replacement)) = resolve_replacement(superseded) else {
         return (
             ReapOutcome::CouldNotInspect {
                 detail: format!("{} is not a superseded name", superseded.display()),
@@ -461,7 +477,10 @@ pub fn decide_one(
     // confident and FALSE claim when the truth is that a directory could not be
     // read. Ignorance rendering as absence is the bug; ignorance rendering as a
     // different specific certainty is the same bug wearing a hat.
-    if let Some(unreadable) = incomplete_listing_for(superseded) {
+    // Decided from the SAME listing that produced `replacement`, so a
+    // transient error cannot satisfy a completeness guard and then corrupt the
+    // resolution. One read, one verdict.
+    if let MatchVerdict::Incomplete { unreadable } = verdict {
         return (
             ReapOutcome::CouldNotInspect {
                 detail: format!(
@@ -1155,6 +1174,75 @@ mod tests {
     }
 
     /// Retention is a real gate, not a label.
+    // --- resolution trustworthiness ----------------------------------------
+
+    fn m(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn exactly_one_candidate_from_a_complete_listing_resolves() {
+        assert_eq!(
+            classify_matches(&m(&["/lib/Movie/Movie.mkv"]), 0),
+            MatchVerdict::Unique
+        );
+    }
+
+    #[test]
+    fn no_candidates_or_several_are_ambiguous() {
+        assert_eq!(classify_matches(&m(&[]), 0), MatchVerdict::Ambiguous);
+        assert_eq!(
+            classify_matches(&m(&["/lib/M/M.mkv", "/lib/M/M.mp4"]), 0),
+            MatchVerdict::Ambiguous
+        );
+    }
+
+    /// **The collapse this guard exists to stop.**
+    ///
+    /// Two same-stem candidates would be Ambiguous and keep the backup. A
+    /// transient NFS error dropping one leaves a single match that looks
+    /// perfectly unique — and it may not be the file that superseded this
+    /// backup. An incomplete listing must never resolve, however tidy the
+    /// survivors look.
+    #[test]
+    fn a_single_candidate_from_an_incomplete_listing_does_not_resolve() {
+        assert_eq!(
+            classify_matches(&m(&["/lib/Movie/Movie.mkv"]), 1),
+            MatchVerdict::Incomplete { unreadable: 1 },
+            "one unreadable entry may have hidden the real replacement"
+        );
+    }
+
+    /// Incompleteness outranks even a clean-looking ambiguity count, because
+    /// the count itself is unreliable when entries were missed.
+    #[test]
+    fn incompleteness_outranks_the_match_count() {
+        assert_eq!(
+            classify_matches(&m(&[]), 3),
+            MatchVerdict::Incomplete { unreadable: 3 }
+        );
+        assert_eq!(
+            classify_matches(&m(&["/a/M.mkv", "/a/M.mp4"]), 2),
+            MatchVerdict::Incomplete { unreadable: 2 }
+        );
+    }
+
+    /// A complete listing with no errors must NOT be reported as incomplete —
+    /// the over-refusal guard. Every reap would otherwise report
+    /// CouldNotInspect and nothing would ever be reclaimed.
+    #[test]
+    fn a_complete_listing_is_never_reported_incomplete() {
+        for matches in [m(&[]), m(&["/a/M.mkv"]), m(&["/a/M.mkv", "/a/M.mp4"])] {
+            assert!(
+                !matches!(
+                    classify_matches(&matches, 0),
+                    MatchVerdict::Incomplete { .. }
+                ),
+                "a listing read in full is complete, whatever it contained"
+            );
+        }
+    }
+
     // --- the retention floor -----------------------------------------------
 
     /// **The one-parameter disarm this floor exists to close.**

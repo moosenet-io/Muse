@@ -37,13 +37,69 @@ use crate::media::probe::{MediaProbe, ProbeError, ProbeState};
 /// queue's partial index (`migrations/0113_media_files_probe.sql`) hard-codes
 /// `media_info_version < 1`, because a partial-index predicate must be constant.
 /// A bump therefore needs a new migration adding a `< 2` index, or the re-probe
-/// sweep seq-scans the whole table.
+/// sweep seq-scans the whole table. (The *query's* predicate is generated from
+/// this constant by [`probe_queue_predicate`] and moves on its own; the migration
+/// is the one artefact SQL forces you to write by hand, which is why
+/// `the_queue_index_predicate_matches_the_current_schema_version` guards it.)
 ///
 /// **Bump it whenever [`MediaProbe`]'s shape changes.** The document embeds that
 /// type verbatim via serde, which is what keeps this module from restating its
 /// field list — the cost of that choice is that a field added there changes what
 /// a v1 document contains.
 pub const MEDIA_INFO_SCHEMA_VERSION: u16 = 1;
+
+/// **The one definition of "this row still needs a probe."**
+///
+/// It is stated as a function of the only fact both sides of the system can see:
+/// the version the row *claims*. `None` means the row makes no version claim at
+/// all — the cell is absent, or it holds the pre-S130 container-only shape.
+///
+/// # Why this exists, and why it is `Option<u16>` rather than a `StoredMediaInfo`
+/// The rule had two implementations. [`StoredMediaInfo::needs_probe`] evaluated
+/// it over a parsed document, and `repo::media_file::list_needing_probe` restated
+/// it as a hand-written SQL literal (`media_info_version < 1`). The two agreed
+/// only because the constant happened to be `1`: a v2 document was correctly left
+/// alone by the Rust and equally excluded by `< 1` **by accident**, while a
+/// version-0 claim was queued by the SQL and skipped by the Rust. One claim, two
+/// mechanisms, kept aligned by a constant's current value — the exact class of
+/// defect this epic keeps paying for.
+///
+/// The signature is `Option<u16>` precisely because that is what `media_info_version`
+/// is: the column is a mirror of [`StoredMediaInfo::claimed_version`], written in
+/// the same statement as the document (see `repo::media_file::set_probe_result`).
+/// So a rule over the claim is a rule both a Rust `match` and a SQL `WHERE` can
+/// evaluate over the *same* value, and [`probe_queue_predicate`] renders exactly
+/// this function into SQL rather than restating it.
+///
+/// # The rule
+/// - **No claim** → probe it. Never probed by S130, or legacy.
+/// - **Strictly older than [`MEDIA_INFO_SCHEMA_VERSION`]** → probe it. Re-probing
+///   UPGRADES the row; that is what a schema bump is for.
+/// - **Equal or newer** → leave it. Re-probing a document a newer binary wrote
+///   DOWNGRADES the row, which a rolling deploy must never do.
+pub const fn version_needs_probe(claimed_version: Option<u16>) -> bool {
+    match claimed_version {
+        None => true,
+        Some(version) => version < MEDIA_INFO_SCHEMA_VERSION,
+    }
+}
+
+/// [`version_needs_probe`] rendered as a SQL boolean over `column` — the backfill
+/// queue's predicate, **generated, never hand-written**.
+///
+/// The SQL side is the one that must scale: the queue is a keyset scan over
+/// ~16,000 rows backed by a partial index, and a partial-index predicate must be
+/// a constant expression. That is a real constraint, but it constrains the
+/// *rendering*, not the *rule* — so the rule stays in Rust, where it can be
+/// unit-tested without a database, and this function projects it. The literal
+/// interpolated here is [`MEDIA_INFO_SCHEMA_VERSION`] itself, so a bump moves the
+/// query and the Rust predicate in one edit and cannot move only one.
+///
+/// `column` is a caller-supplied identifier, never user input; every call site in
+/// this crate passes the literal `"media_info_version"`.
+pub fn probe_queue_predicate(column: &str) -> String {
+    format!("({column} IS NULL OR {column} < {MEDIA_INFO_SCHEMA_VERSION})")
+}
 
 /// The longest string accepted as a file extension. Beyond this it is not an
 /// extension, it is a filename with a dot in it (or an attack on a text column).
@@ -408,11 +464,31 @@ impl StoredMediaInfo {
         }
     }
 
-    /// Whether this row still needs a probe. Legacy and absent rows do; a
-    /// document from a newer binary does not (that binary knows more than this
-    /// one, and re-probing would DOWNGRADE the row).
+    /// The version this row claims, or `None` when it claims none.
+    ///
+    /// This is the Rust-side value of the `media_info_version` column: they are
+    /// written in one statement (`repo::media_file::set_probe_result`) and so
+    /// cannot diverge. Everything that reasons about "how old is this document"
+    /// — here and in SQL — reasons about this one value.
+    pub fn claimed_version(&self) -> Option<u16> {
+        match self {
+            // No `schema_version` key at all: never probed, or pre-S130.
+            Self::Absent | Self::Legacy(_) => None,
+            Self::V1(doc) => Some(doc.schema_version),
+            Self::UnknownVersion { version } => Some(*version),
+        }
+    }
+
+    /// Whether this row still needs a probe.
+    ///
+    /// **This does not state the rule — it evaluates [`version_needs_probe`]**,
+    /// the same function [`probe_queue_predicate`] renders into the backfill
+    /// queue's SQL. The scan (which calls this) and the backfill worker (which
+    /// drains that queue) therefore cannot disagree about what needs a probe,
+    /// including across a schema bump. See `version_needs_probe` for why that is
+    /// worth a seam.
     pub fn needs_probe(&self) -> bool {
-        matches!(self, Self::Absent | Self::Legacy(_))
+        version_needs_probe(self.claimed_version())
     }
 }
 
@@ -583,6 +659,146 @@ mod tests {
             "MEDIA_INFO_SCHEMA_VERSION is {MEDIA_INFO_SCHEMA_VERSION} but no migration \
              indexes `{expected}` — add the new partial index before bumping the constant, \
              or the re-probe sweep seq-scans the whole table"
+        );
+    }
+
+    // --- one rule, two renderings ------------------------------------------
+
+    /// A deliberately minimal interpreter for the ONE predicate shape
+    /// [`probe_queue_predicate`] emits: `(<col> IS NULL OR <col> < <n>)`.
+    ///
+    /// **This is the weaker half of the pair, and is labelled as such.** It reads
+    /// the generated string; it does not execute Postgres — there is no
+    /// `MUSE_TEST_DATABASE_URL` in this environment (MUSE #130), so the queue
+    /// query itself is SKIPPED, never passed. What this *does* establish is that
+    /// the exact string `list_needing_probe` runs classifies a row the same way
+    /// `needs_probe()` classifies the document behind it, at every version. It
+    /// asserts the shape rather than pattern-matching leniently, so a change to
+    /// the emitted SQL fails here loudly instead of being silently reinterpreted.
+    fn evaluate_predicate(sql: &str, column_value: Option<u16>) -> bool {
+        const COLUMN: &str = "media_info_version";
+        let body = sql
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("predicate is not parenthesised: {sql}"));
+        let (null_arm, less_arm) = body
+            .split_once(" OR ")
+            .unwrap_or_else(|| panic!("predicate is not a two-armed OR: {sql}"));
+        assert_eq!(
+            null_arm,
+            format!("{COLUMN} IS NULL"),
+            "the null arm changed shape: {sql}"
+        );
+        let bound: u16 = less_arm
+            .strip_prefix(&format!("{COLUMN} < "))
+            .unwrap_or_else(|| panic!("the ordering arm changed shape: {sql}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("the version bound is not a u16 ({e}): {sql}"));
+        match column_value {
+            None => true,
+            Some(version) => version < bound,
+        }
+    }
+
+    /// A stored document claiming exactly `version`. At the current version this
+    /// is a real, parsed `V1`; at any other it is `UnknownVersion` — which is the
+    /// point, since both must answer `claimed_version()` the same way.
+    fn stored_at_version(version: u16) -> StoredMediaInfo {
+        let doc = MediaInfoDoc::new(probe("matroska,webm"), "Movies/A Film.mkv");
+        let mut value = doc.to_json().unwrap();
+        value.as_object_mut().unwrap()["schema_version"] = Json::from(version);
+        StoredMediaInfo::from_json(Some(&value))
+    }
+
+    /// **The divergence test.** `needs_probe()` (what MPRB-06's scan calls) and the
+    /// generated queue predicate (what MPRB-07's backfill worker drains) must
+    /// classify the same set of rows — at every version, not just at the one that
+    /// happens to be current.
+    ///
+    /// Before PROBEVER-01 these were two independent statements of one rule: the
+    /// Rust said `Absent | Legacy`, the SQL said `< 1`. They agreed only by
+    /// accident of the constant's value. This test fails if anyone re-splits them,
+    /// and it is why a schema bump can no longer make the scan and the backfill
+    /// disagree about what "needs a probe" means.
+    #[test]
+    fn needs_probe_and_the_generated_queue_predicate_agree_at_every_version() {
+        let sql = probe_queue_predicate("media_info_version");
+
+        // Rows that make no version claim: the column is NULL for both.
+        let legacy = StoredMediaInfo::from_json(Some(&serde_json::json!({ "container": "mkv" })));
+        for stored in [StoredMediaInfo::Absent, legacy] {
+            assert_eq!(
+                stored.claimed_version(),
+                None,
+                "fixture precondition: {stored:?} must claim no version, or this \
+                 test is comparing the two sides over different inputs"
+            );
+            assert!(
+                stored.needs_probe(),
+                "an unversioned row must always be queued: {stored:?}"
+            );
+            assert_eq!(
+                stored.needs_probe(),
+                evaluate_predicate(&sql, None),
+                "the scan and the backfill queue disagree about an unversioned row"
+            );
+        }
+
+        // Every version from 0 to two beyond the current constant. `+ 2` so that
+        // "newer than this binary" is covered on both sides of a future bump.
+        for version in 0..=(MEDIA_INFO_SCHEMA_VERSION + 2) {
+            let stored = stored_at_version(version);
+            assert_eq!(
+                stored.claimed_version(),
+                Some(version),
+                "fixture precondition: the document must claim version {version}; \
+                 if `from_json` rejected it for some OTHER reason, this loop would \
+                 be asserting agreement over an input the parser never saw"
+            );
+            assert_eq!(
+                stored.needs_probe(),
+                evaluate_predicate(&sql, Some(version)),
+                "at schema_version {version} the scan says needs_probe={} but the \
+                 backfill queue's predicate `{sql}` says {} — one rule, two \
+                 mechanisms, drifted",
+                stored.needs_probe(),
+                evaluate_predicate(&sql, Some(version))
+            );
+        }
+    }
+
+    /// The rule's *direction*, stated once so the seam cannot be "corrected" into
+    /// something symmetric. Older is upgraded; equal and newer are left alone.
+    #[test]
+    fn the_rule_re_probes_older_documents_and_never_touches_newer_ones() {
+        assert!(
+            version_needs_probe(None),
+            "a row with no version claim has never been probed"
+        );
+        for older in 0..MEDIA_INFO_SCHEMA_VERSION {
+            assert!(
+                version_needs_probe(Some(older)),
+                "version {older} is older than {MEDIA_INFO_SCHEMA_VERSION} and must be re-probed"
+            );
+        }
+        assert!(
+            !version_needs_probe(Some(MEDIA_INFO_SCHEMA_VERSION)),
+            "the current version is up to date"
+        );
+        assert!(
+            !version_needs_probe(Some(MEDIA_INFO_SCHEMA_VERSION + 1)),
+            "re-probing a newer binary's document DOWNGRADES the row"
+        );
+    }
+
+    /// The predicate carries the constant, not a copy of its current value.
+    #[test]
+    fn the_queue_predicate_is_generated_from_the_schema_version_constant() {
+        assert_eq!(
+            probe_queue_predicate("media_info_version"),
+            format!(
+                "(media_info_version IS NULL OR media_info_version < {MEDIA_INFO_SCHEMA_VERSION})"
+            )
         );
     }
 

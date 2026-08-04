@@ -2,10 +2,12 @@
 //! (blueprint §3/§7.3: 1:1 for movies via `media_item_id`, many-to-many for
 //! TV season-pack files via `attach_to_episode`).
 
+use std::sync::OnceLock;
+
 use sqlx::PgPool;
 
 use crate::error::{MuseError, MuseResult};
-use crate::media::doc::{MediaInfoDoc, StoredProbeState};
+use crate::media::doc::{probe_queue_predicate, MediaInfoDoc, StoredProbeState};
 use crate::media::probe::{MediaProbe, ProbeError};
 use crate::models::media_file::{MediaFile, NewMediaFile, ReleaseTypeKind};
 
@@ -220,9 +222,16 @@ pub struct ProbeProgress {
     pub suspicious: i64,
     pub unreadable: i64,
     pub probe_failed: i64,
-    /// Unprobed AND out of attempts — the backfill will never return to these, so
-    /// a sweep that reports "complete" while this is nonzero is telling the truth
-    /// only if this number is stated alongside it.
+    /// **In the backfill queue's version scope AND out of attempts** — the
+    /// backfill will never return to these, so a sweep that reports "complete"
+    /// while this is nonzero is telling the truth only if this number is stated
+    /// alongside it.
+    ///
+    /// Because it describes *the queue*, its version test is the queue's own
+    /// generated predicate, not a hand-written `IS NULL`. The three counters
+    /// above are deliberately different questions — "carries a v1+ document",
+    /// "was never probed by S130", "holds the pre-S130 shape" — and are censuses
+    /// of the column, not statements about eligibility.
     pub permanently_failed: i64,
 }
 
@@ -317,25 +326,45 @@ pub async fn set_probe_error(pool: &PgPool, id: i64, error: &ProbeError) -> Muse
 /// a library of this size (~16,000 titles), and worse, it *shifts* when a row is
 /// updated mid-sweep, so a resumed run can skip files entirely.
 ///
-/// The predicate matches the partial index in `0113` exactly. A `suspicious` row
-/// carries a v1 document and is therefore NOT returned — it has been probed; it
-/// merely needs a human, which is what the audit index is for.
+/// **The version half of the predicate is generated, not written here.** It comes
+/// from [`probe_queue_predicate`], which renders the same
+/// [`crate::media::doc::version_needs_probe`] rule that
+/// [`crate::media::doc::StoredMediaInfo::needs_probe`] evaluates — the rule
+/// MPRB-06's scan calls. The
+/// literal used to be spelled `media_info_version < 1` in this file, which agreed
+/// with `needs_probe()` only because the constant was `1`; the scan and this
+/// worker would have parted company the moment a v2 existed. One rule, one
+/// definition, two renderings of it.
+///
+/// The predicate still matches the partial index in `0113` exactly — that index
+/// is the one artefact that must be hand-written (a partial-index predicate must
+/// be constant), and `doc.rs`'s
+/// `the_queue_index_predicate_matches_the_current_schema_version` fails the build
+/// if a bump lands without it. A `suspicious` row carries a v1 document and is
+/// therefore NOT returned — it has been probed; it merely needs a human, which is
+/// what the audit index is for.
 pub async fn list_needing_probe(
     pool: &PgPool,
     after_id: i64,
     limit: i64,
     max_attempts: i32,
 ) -> MuseResult<Vec<MediaFile>> {
-    sqlx::query_as::<_, MediaFile>(
-        r#"
+    static SQL: OnceLock<String> = OnceLock::new();
+    let sql = SQL.get_or_init(|| {
+        format!(
+            r#"
         SELECT * FROM media_files
         WHERE id > $1
-          AND (media_info_version IS NULL OR media_info_version < 1)
+          AND {}
           AND probe_attempts < $2
         ORDER BY id
         LIMIT $3
         "#,
-    )
+            probe_queue_predicate("media_info_version")
+        )
+    });
+
+    sqlx::query_as::<_, MediaFile>(sql)
     .bind(after_id)
     .bind(max_attempts)
     .bind(limit)
@@ -350,8 +379,10 @@ pub async fn list_needing_probe(
 /// [`list_needing_probe`], or `permanently_failed` describes a queue that is not
 /// the one actually running.
 pub async fn probe_progress(pool: &PgPool, max_attempts: i32) -> MuseResult<ProbeProgress> {
-    sqlx::query_as::<_, ProbeProgress>(
-        r#"
+    static SQL: OnceLock<String> = OnceLock::new();
+    let sql = SQL.get_or_init(|| {
+        format!(
+            r#"
         SELECT
             count(*)                                                         AS total,
             count(*) FILTER (WHERE media_info_version >= 1)                  AS probed,
@@ -362,11 +393,15 @@ pub async fn probe_progress(pool: &PgPool, max_attempts: i32) -> MuseResult<Prob
             count(*) FILTER (WHERE probe_state = 'suspicious')               AS suspicious,
             count(*) FILTER (WHERE probe_state = 'unreadable')               AS unreadable,
             count(*) FILTER (WHERE probe_state = 'probe_failed')             AS probe_failed,
-            count(*) FILTER (WHERE media_info_version IS NULL
+            count(*) FILTER (WHERE {}
                                AND probe_attempts >= $1)                     AS permanently_failed
         FROM media_files
         "#,
-    )
+            probe_queue_predicate("media_info_version")
+        )
+    });
+
+    sqlx::query_as::<_, ProbeProgress>(sql)
     .bind(max_attempts)
     .fetch_one(pool)
     .await
@@ -424,6 +459,42 @@ mod tests {
 
         // And the even-width case still behaves.
         assert!(truncate_probe_error(&"é".repeat(2000)).ends_with("… (truncated)"));
+    }
+
+    /// No query in this file may hand-write the version half of the probe-queue
+    /// predicate; it comes from [`probe_queue_predicate`].
+    ///
+    /// **Weaker class, and named as such:** this is a source-text guard. It proves
+    /// the literal is not written here, not that the generated one is used
+    /// correctly — that is
+    /// `doc.rs::needs_probe_and_the_generated_queue_predicate_agree_at_every_version`'s
+    /// job. Both are needed: this one stops the rule from being re-forked, that
+    /// one stops the fork from being wrong.
+    #[test]
+    fn no_query_in_this_file_hand_writes_the_version_predicate() {
+        // Split so this test's own source does not match itself.
+        let needle = concat!("media_info_version", " < ");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/repo/media_file.rs");
+        let src = std::fs::read_to_string(&path).expect("read this file");
+
+        // Precondition: the guard is looking at the right text at all.
+        assert!(
+            src.contains("probe_queue_predicate"),
+            "the guard read the wrong file — it does not even mention the generator"
+        );
+
+        let offenders: Vec<&str> = src
+            .lines()
+            .filter(|line| line.contains(needle))
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a version comparison is hand-written in this file: {offenders:?} — use \
+             probe_queue_predicate() so the scan's rule and the queue's rule stay one \
+             rule"
+        );
     }
 
     #[test]

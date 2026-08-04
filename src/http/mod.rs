@@ -267,6 +267,15 @@ fn ops_routes() -> Router<Arc<AppState>> {
             "/probe/coverage-report",
             post(crate::media::http::coverage_markdown),
         )
+        // MPRB-07 (Plane MUSE #144): the probe backfill worker's two doors —
+        // `POST` starts one run in the background (202, or 409 when one is
+        // already in flight), `GET` reports whether one is running and what the
+        // last one did. Both bearer-gated with the rest of `/ops`: the POST
+        // spawns ffprobe against the library, and the GET's report describes it.
+        .route(
+            "/probe/backfill",
+            post(crate::media::http::backfill_start).get(crate::media::http::backfill_status),
+        )
         // FOUNDRY-02: report what transcoding WOULD do. Encodes nothing, writes nothing.
         .route("/foundry/survey", post(crate::web::dashboard::foundry_survey))
         // FOUNDRY-04: really encode a diverse sample TO SCRATCH and verify it.

@@ -602,6 +602,26 @@ pub enum RunStartRefusal {
     AlreadyRunning,
 }
 
+/// Stamp the CALLER's survey-completeness onto the driver's report.
+///
+/// [`drive_run_with_progress`] is handed a candidate list and cannot know
+/// whether that list covered the library, so it always reports
+/// `survey_complete: true`; only `execute_run`'s caller knows. That single
+/// assignment used to live inline in [`execute_run`], which needs a live
+/// `Foundry` and is therefore unreachable from any test — replacing it with
+/// `= true` left the whole suite green (FSURV-02 S1).
+///
+/// This is the seam, and it is deliberately the smallest one that works: a
+/// pure function over an already-built report, with `execute_run` otherwise
+/// unchanged. What it protects is [`RunReport::completed`], which is what
+/// tells an operator a 16,221-title sweep is finished — a truncated survey
+/// that reads as a complete run would say "done" about a library that was
+/// never fully examined.
+pub fn finish_report(mut report: RunReport, survey_complete: bool) -> RunReport {
+    report.survey_complete = survey_complete;
+    report
+}
+
 /// **Execute a run against a real `Foundry`.** Blocking; callers put it on a
 /// thread that may block.
 ///
@@ -642,7 +662,7 @@ pub fn execute_run(
         });
     }
 
-    let mut report = drive_run_with_progress(
+    let report = drive_run_with_progress(
         limits,
         candidates,
         || RunObservation {
@@ -703,13 +723,17 @@ pub fn execute_run(
         },
     );
 
-    report.survey_complete = survey_complete;
+    let report = finish_report(report, survey_complete);
 
     if let Ok(mut g) = handle.progress.lock() {
         if let Some(p) = g.as_mut() {
             p.ledger = report.ledger.clone();
             p.current = None;
-            p.survey_complete = survey_complete;
+            // Read back from the report rather than stamping `survey_complete`
+            // a second time: two hand-maintained copies of one fact diverge on
+            // the next edit, and this one decides whether the operator is told
+            // the library is done.
+            p.survey_complete = report.survey_complete;
             p.stop_reason = Some(report.stop_reason.clone());
         }
     }
@@ -1460,6 +1484,76 @@ mod tests {
             ..report
         };
         assert!(complete.completed());
+    }
+
+    /// **The caller's answer must actually reach the report.**
+    ///
+    /// FSURV-02 S1. The test above proves the RULE — a report with
+    /// `survey_complete: false` is not complete. It says nothing about whether
+    /// the false ever gets there, because the assignment lived inside
+    /// `execute_run`, which needs a live `Foundry` and no test can call. So
+    /// `report.survey_complete = true` in place of the caller's value survived
+    /// the whole suite: the rule was guarded and the wiring was not.
+    ///
+    /// `drive_run` always yields `survey_complete: true` — that is the input
+    /// this has to overwrite, and it is why a mutation to `= true` is
+    /// invisible to any test that only checks the happy case.
+    #[test]
+    fn the_callers_survey_completeness_overrides_the_drivers_optimistic_default() {
+        let from_driver = drive_run(
+            &limits(),
+            &[PathBuf::from("/a.mkv")],
+            || obs(0),
+            |_| TitleOutcome::Skipped,
+        );
+        assert!(
+            from_driver.survey_complete,
+            "the driver cannot know, so it reports true and the caller corrects it"
+        );
+
+        let truncated = finish_report(from_driver.clone(), false);
+        assert!(
+            !truncated.survey_complete,
+            "a truncated survey must survive the stamp"
+        );
+        assert!(
+            !truncated.completed(),
+            "and it must make the run read as NOT completed — the whole point"
+        );
+        // Nothing else may be rewritten on the way through.
+        assert_eq!(truncated.ledger, from_driver.ledger);
+        assert_eq!(truncated.stop_reason, from_driver.stop_reason);
+
+        let whole = finish_report(from_driver.clone(), true);
+        assert!(whole.survey_complete && whole.completed());
+    }
+
+    /// `execute_run` must pass the CALLER's value, not a literal.
+    ///
+    /// This is deliberately the weaker guard class, and it is worth naming
+    /// why. `execute_run` needs a live `Foundry`, so the one line that binds
+    /// the caller's `survey_complete` to [`finish_report`] cannot be reached
+    /// from any test — substituting `true` for the parameter there still
+    /// leaves the suite green (verified). A source-text assertion proves the
+    /// wiring is WRITTEN; the test above proves the function it wires to
+    /// BEHAVES. Neither replaces the other, and covering the remaining line
+    /// properly would mean restructuring `execute_run`, which is a bigger
+    /// change than this defect justifies.
+    #[test]
+    fn execute_run_hands_finish_report_the_callers_own_answer() {
+        let body = include_str!("run.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        assert!(
+            body.contains("finish_report(report, survey_complete)"),
+            "a literal here would report a truncated survey as a completed library sweep"
+        );
+        assert!(
+            body.contains("p.survey_complete = report.survey_complete;"),
+            "the progress snapshot must read the report back rather than keep a \
+             second copy of the same fact"
+        );
     }
 
     /// **An idle stop request must not poison the next run.**

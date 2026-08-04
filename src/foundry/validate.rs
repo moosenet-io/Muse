@@ -1315,6 +1315,20 @@ fn fill_output(file: &mut ValidatedFile, out: &MediaProbe) {
     };
 }
 
+/// Record what the PLANNER decided, before anything is encoded.
+///
+/// Split out of [`validate_one`] for exactly the reason [`fill_output`] is
+/// separate: `validate_one` needs a scratch directory and a live ffmpeg, so no
+/// test reaches any statement inside it. A mutation that replaced
+/// `plan_reasons` with `Vec::new()` left the whole suite green (FSURV-02 S4) —
+/// the report would have said a file was re-encoded while refusing to say why,
+/// and nothing would have noticed. Here it is a pure function that the test
+/// suite can call directly.
+fn fill_plan(file: &mut ValidatedFile, reasons: &[TranscodeReason], plan: &TranscodePlan) {
+    file.plan_reasons = reasons.iter().map(TranscodeReason::to_string).collect();
+    file.plan_summary = Some(describe_plan(plan));
+}
+
 /// Probe, plan, ENCODE TO SCRATCH, re-probe, verify, delete. Never touches the
 /// original.
 ///
@@ -1373,8 +1387,7 @@ fn validate_one(
         }
         TranscodeDecision::Transcode { plan, args, reasons } => (plan, args, reasons),
     };
-    file.plan_reasons = reasons.iter().map(TranscodeReason::to_string).collect();
-    file.plan_summary = Some(describe_plan(&plan));
+    fill_plan(&mut file, &reasons, &plan);
 
     // --- bounds ------------------------------------------------------------
     let reserve = match budget_admits(probe.size_bytes, already_reserved, bounds) {
@@ -3167,6 +3180,113 @@ mod tests {
         out.size_bytes = Some(100 * 1024 * 1024);
         fill_output(&mut f, &out);
         assert!(f.size_delta_bytes.unwrap() < 0, "a saving must read as negative");
+    }
+
+    /// Every field `fill_output` derives must be asserted, not just the one.
+    ///
+    /// FSURV-02 S5: `fill_output` WAS called by a test — the size-delta one
+    /// above — which is what made it look covered. That test asserts a single
+    /// field, so emptying `output_audio_codecs` inside the same function
+    /// changed nothing any test looked at and the mutation survived. Being
+    /// exercised is not the same as having your outputs asserted, so this
+    /// pins all six derived fields against the probe they came from.
+    #[test]
+    fn fill_output_derives_every_field_from_the_output_probe() {
+        let mut f = describe_input(
+            Path::new("/x.mkv"),
+            &probe("matroska", "mpeg4", 720, 480, &["mp3"], 0),
+        );
+        let mut out = probe("mov,mp4,m4a", "hevc", 1920, 1080, &["eac3", "aac"], 3);
+        out.duration_secs = Some(1234.5);
+        out.size_bytes = Some(700 * 1024 * 1024);
+
+        fill_output(&mut f, &out);
+
+        assert_eq!(f.output_container.as_deref(), Some("mov,mp4,m4a"));
+        assert_eq!(f.output_video_codec.as_deref(), Some("hevc"));
+        assert_eq!(f.output_dimensions, Some((1920, 1080)));
+        assert_eq!(
+            f.output_audio_codecs,
+            vec!["eac3".to_string(), "aac".to_string()],
+            "every output audio codec, in order — an empty list would read as \
+             `the encode dropped the audio` and no test noticed it before"
+        );
+        assert_eq!(f.output_subtitle_count, Some(3));
+        assert_eq!(f.output_duration_secs, Some(1234.5));
+        assert_eq!(f.output_bytes, Some(700 * 1024 * 1024));
+        // ...and the field that WAS covered still is.
+        assert_eq!(f.size_delta_bytes, Some(200 * 1024 * 1024));
+
+        // The input side must be left alone: `fill_output` describes the
+        // OUTPUT, and overwriting the input characteristics would make the
+        // before/after comparison compare the file with itself.
+        assert_eq!(f.input_video_codec, "mpeg4");
+        assert_eq!(f.input_audio_codecs, vec!["mp3".to_string()]);
+    }
+
+    /// The planner's reasons must reach the report.
+    ///
+    /// FSURV-02 S4: this assignment lived inside `validate_one`, which needs a
+    /// scratch dir and a live ffmpeg, so no test reached it — replacing the
+    /// reasons with `Vec::new()` left the suite green. A validation report
+    /// that says a file was re-encoded but cannot say why is not a report an
+    /// operator can act on.
+    #[test]
+    fn fill_plan_carries_the_planner_reasons_and_summary_into_the_report() {
+        // The reasons come from the REAL planner, never spelled out here: a
+        // fixture that invents its own text can agree with a test while
+        // disagreeing with production (FSURV-01's finding in `survey`).
+        let src = probe("avi", "mpeg4", 1920, 1080, &["mp3"], 0);
+        let decision = plan_transcode(&src, &TranscodePolicy::default(), "/in.avi", "/out.mkv");
+        let TranscodeDecision::Transcode { plan, reasons, .. } = decision else {
+            panic!("fixture must transcode, got {decision:?}");
+        };
+        assert!(
+            reasons.len() >= 2,
+            "the fixture must produce SEVERAL reasons, or a mutation that keeps \
+             only the first would still pass: {reasons:?}"
+        );
+
+        let mut f = describe_input(Path::new("/x.avi"), &src);
+        assert!(
+            f.plan_reasons.is_empty() && f.plan_summary.is_none(),
+            "the skeleton starts empty, so a populated field can only come from fill_plan"
+        );
+
+        fill_plan(&mut f, &reasons, &plan);
+
+        assert_eq!(f.plan_reasons.len(), reasons.len());
+        for r in &reasons {
+            assert!(
+                f.plan_reasons.contains(&r.to_string()),
+                "the report must carry `{r}`: {:?}",
+                f.plan_reasons
+            );
+        }
+        assert_eq!(f.plan_summary, Some(describe_plan(&plan)));
+    }
+
+    /// `validate_one` must actually call [`fill_plan`].
+    ///
+    /// The weaker guard class, named as such. `validate_one` needs a scratch
+    /// directory and a live ffmpeg, so deleting the call there still leaves
+    /// the suite green (verified) — the extraction moved the LOGIC under test,
+    /// not its invocation. This catches outright removal; the test above
+    /// catches a wrong value.
+    #[test]
+    fn validate_one_records_the_plan_it_is_about_to_run() {
+        let body = include_str!("validate.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        assert!(
+            body.contains("fill_plan(&mut file, &reasons, &plan);"),
+            "a report that cannot say why a file was re-encoded is not actionable"
+        );
+        assert!(
+            body.contains("fill_output(&mut file, p);"),
+            "...and the same for the output side"
+        );
     }
 
     #[test]

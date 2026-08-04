@@ -230,12 +230,51 @@ pub fn survey_files(
     deadline: std::time::Duration,
 ) -> SurveySummary {
     let started = std::time::Instant::now();
+    survey_with(
+        policy,
+        candidates,
+        limit,
+        deadline,
+        || started.elapsed(),
+        |path| foundry.probe_file(path),
+    )
+}
+
+/// [`survey_files`] with the two things that need the world supplied by the
+/// caller: the clock and the prober.
+///
+/// This is the seam, and it is the whole of it. The loop, the limit, the
+/// deadline check and — the part that matters — the RECORDING of `truncated`
+/// are unchanged and live here; `survey_files` is now a two-line wrapper that
+/// binds `Instant::now()` and `Foundry::probe_file`. Nothing about the survey's
+/// structure moved.
+///
+/// It exists because [`survey_truncation`] only made the PREDICATE testable.
+/// The comment on that function says the recording matters more than the
+/// stopping, and it was right: with the recording still inside a function that
+/// needs a live `Foundry`, deleting `summary.truncated = true` and replacing
+/// `candidates.len() > limit` with `false` BOTH left the whole suite green
+/// (FSURV-02 S2 and S3). A partial survey that reads as a complete one
+/// understates what a 16,221-title run entails, which is the number the
+/// operator is deciding on.
+fn survey_with<Clock, Probe>(
+    policy: &TranscodePolicy,
+    candidates: &[PathBuf],
+    limit: usize,
+    deadline: std::time::Duration,
+    mut elapsed: Clock,
+    mut probe_file: Probe,
+) -> SurveySummary
+where
+    Clock: FnMut() -> std::time::Duration,
+    Probe: FnMut(&Path) -> Result<MediaProbe, String>,
+{
     let mut summary = SurveySummary {
         truncated: candidates.len() > limit,
         ..Default::default()
     };
     for path in candidates.iter().take(limit) {
-        if let Some(reason) = survey_truncation(started.elapsed(), deadline) {
+        if let Some(reason) = survey_truncation(elapsed(), deadline) {
             summary.truncated = true;
             tracing::warn!(
                 examined = summary.examined,
@@ -244,7 +283,7 @@ pub fn survey_files(
             );
             break;
         }
-        match foundry.probe_file(path) {
+        match probe_file(path) {
             Ok(probe) => {
                 // The output path is only used to BUILD the argv, which a survey never runs.
                 // A sentinel is passed rather than a real destination so nothing downstream can
@@ -443,6 +482,175 @@ mod tests {
         SurveyOutcome::ProbeFailed {
             error: "ffprobe: not found".into(),
         }
+    }
+
+    // --- the survey LOOP, through the seam --------------------------------
+
+    /// A clock that returns whatever the test says the elapsed time is.
+    fn frozen(at: std::time::Duration) -> impl FnMut() -> std::time::Duration {
+        move || at
+    }
+
+    fn paths(n: usize) -> Vec<PathBuf> {
+        (0..n).map(|i| PathBuf::from(format!("/srv/media/{i}.mkv"))).collect()
+    }
+
+    /// **S3: hitting the LIMIT must be recorded, not merely obeyed.**
+    ///
+    /// `truncated: candidates.len() > limit` had no test — replacing it with
+    /// `false` left the whole suite green, because everything that could reach
+    /// it needed a live `Foundry`. A survey that examined 500 of 16,221 files
+    /// and did not say so reports the wrong size of job.
+    #[test]
+    fn a_survey_that_stops_at_its_limit_says_so() {
+        let s = survey_with(
+            &TranscodePolicy::default(),
+            &paths(3),
+            2,
+            std::time::Duration::from_secs(3600),
+            frozen(std::time::Duration::ZERO),
+            |_| Err("ffprobe: not found".to_string()),
+        );
+        assert_eq!(s.examined, 2, "the limit is obeyed");
+        assert!(
+            s.truncated,
+            "...and RECORDED — 2 of 3 examined is not a whole-library answer"
+        );
+
+        // The other side of the flag, or `truncated: true` would pass too.
+        let whole = survey_with(
+            &TranscodePolicy::default(),
+            &paths(3),
+            10,
+            std::time::Duration::from_secs(3600),
+            frozen(std::time::Duration::ZERO),
+            |_| Err("ffprobe: not found".to_string()),
+        );
+        assert_eq!(whole.examined, 3);
+        assert!(
+            !whole.truncated,
+            "a survey that reached the end of the list is NOT truncated"
+        );
+    }
+
+    /// **S2: hitting the DEADLINE must be recorded, not merely obeyed.**
+    ///
+    /// `survey_truncation` (the predicate) was already tested. Deleting
+    /// `summary.truncated = true` while keeping the `break` still stopped the
+    /// survey and still left every test green — the run would end early and
+    /// report itself complete, which is the failure that actually matters.
+    ///
+    /// The limit is deliberately larger than the candidate list here, so
+    /// `truncated` starts `false` and only the deadline can set it. Otherwise
+    /// the limit rule would mask the one under test.
+    #[test]
+    fn a_survey_that_runs_out_of_time_records_the_truncation_not_just_the_stop() {
+        let deadline = std::time::Duration::from_secs(60);
+        let mut probed = 0usize;
+
+        let s = survey_with(
+            &TranscodePolicy::default(),
+            &paths(3),
+            10,
+            deadline,
+            frozen(deadline),
+            |_| {
+                probed += 1;
+                Err("ffprobe: not found".to_string())
+            },
+        );
+        assert_eq!(probed, 0, "the deadline had already passed");
+        assert_eq!(s.examined, 0);
+        assert!(
+            s.truncated,
+            "an out-of-time survey must be marked truncated; 0 of 3 examined \
+             must never read as a completed survey"
+        );
+
+        // Same list, same limit, clock inside the deadline: not truncated. So
+        // the flag above came from the deadline and nothing else.
+        let in_time = survey_with(
+            &TranscodePolicy::default(),
+            &paths(3),
+            10,
+            deadline,
+            frozen(std::time::Duration::ZERO),
+            |_| Err("ffprobe: not found".to_string()),
+        );
+        assert_eq!(in_time.examined, 3);
+        assert!(!in_time.truncated);
+    }
+
+    /// The seam is the production path, not a parallel one.
+    ///
+    /// `survey_files` is now a wrapper that binds `Instant::now()` and
+    /// `Foundry::probe_file` to this function, so a test that drives it with a
+    /// real `MediaProbe` exercises the same plan-and-classify the live survey
+    /// does — including `predicted_deletion_refusals`, which is derived here
+    /// and never restated.
+    #[test]
+    fn the_survey_loop_plans_and_classifies_each_probe_it_is_given() {
+        let optimal_probe = probe_of(
+            vec![vid("h264", 1920, 1080, Some(5_000_000))],
+            vec![aud(1, "eac3", 6)],
+        );
+        let fat_probe = probe_of(
+            vec![vid("h264", 1920, 1080, Some(20_000_000))],
+            vec![aud(1, "eac3", 6)],
+        );
+        let mut next = vec![
+            Err("ffprobe: not found".to_string()),
+            Ok(fat_probe),
+            Ok(optimal_probe),
+        ];
+
+        let s = survey_with(
+            &TranscodePolicy::default(),
+            &paths(3),
+            50_000,
+            std::time::Duration::from_secs(3600),
+            frozen(std::time::Duration::ZERO),
+            |_| next.pop().expect("one result per candidate"),
+        );
+
+        assert_eq!(s.examined, 3);
+        assert!(!s.truncated, "the whole list was covered");
+        assert_eq!(s.already_optimal, 1);
+        assert_eq!(s.would_transcode, 1);
+        assert_eq!(s.probe_failed, 1);
+        assert_eq!(s.files.len(), 3, "per-file detail, in order");
+        assert_eq!(s.files[0].path, "/srv/media/0.mkv");
+        assert!(
+            matches!(&s.files[1].outcome, SurveyOutcome::WouldTranscode { reasons, .. } if !reasons.is_empty()),
+            "the reasons are derived by `classify` on the real plan: {:?}",
+            s.files[1].outcome
+        );
+    }
+
+    /// `survey_files` must bind the REAL clock and the REAL prober.
+    ///
+    /// The weaker guard class, named as such. `survey_files` takes a live
+    /// `Foundry`, so the two lines that bind `Instant::now()` and
+    /// `probe_file` to [`survey_with`] cannot be reached from a test —
+    /// freezing that clock at zero still leaves the suite green (verified).
+    /// This proves the wiring is WRITTEN; the tests above prove the loop
+    /// BEHAVES. A seam moves the logic under test, it does not make its own
+    /// binding testable.
+    #[test]
+    fn survey_files_binds_the_real_clock_and_the_real_prober() {
+        let body = include_str!("survey.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        assert!(
+            body.contains("|| started.elapsed(),"),
+            "a frozen clock would make the deadline unreachable and every survey \
+             report itself complete"
+        );
+        assert!(
+            body.contains("|path| foundry.probe_file(path),"),
+            "the survey must probe the files it was given"
+        );
     }
 
     #[test]

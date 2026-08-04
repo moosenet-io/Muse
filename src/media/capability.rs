@@ -22,7 +22,8 @@
 //! - [`ToolState::Present`] — it ran, and we have its version string.
 //! - [`ToolState::Missing`] — the binary does not exist on this host.
 //! - [`ToolState::Unusable`] — it exists but did not work (permissions, a
-//!   broken install, a non-zero exit).
+//!   broken install, a non-zero exit, **or a version probe that never
+//!   returned**).
 //!
 //! A bool would collapse the last two, and "installed but broken" reported as
 //! "not installed" sends the operator to `apt install` for a problem that is
@@ -34,8 +35,12 @@
 //! ([`crate::foundry::forge`]) turns that into an explicit skip with a stated
 //! reason. Silently treating a missing encoder as "the file was fine" is the
 //! precise false claim Foundry is built to avoid.
+//!
+//! Nor may it **wait forever**. See [`detect_tool`]: every probe here runs
+//! under a deadline, because this module's one impure call happens at process
+//! startup.
 
-use std::process::Command;
+use std::time::Duration;
 
 /// Whether one external tool is usable, and what it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,16 +177,98 @@ pub fn parse_version_banner(output: &str) -> Option<String> {
     Some(truncated)
 }
 
+// --- The deadline ----------------------------------------------------------
+
+/// The compiled ceiling on ONE version probe, when
+/// `MUSE_CAPABILITY_TIMEOUT_SECS` is unset.
+///
+/// Five seconds is already generous by three orders of magnitude: `-version`
+/// formats a banner and exits, which is single-digit milliseconds on any host
+/// that is working at all. This is not a budget for slow work — there is no
+/// slow work here — it is the line past which "the binary is wedged" is the
+/// only remaining explanation.
+pub const DEFAULT_CAPABILITY_TIMEOUT_SECS: u64 = 5;
+
+/// Bounds on `MUSE_CAPABILITY_TIMEOUT_SECS`.
+///
+/// The floor exists for the same reason [`crate::media`]'s does: `0` would
+/// report every tool as timed out, so a single mistyped env var would make a
+/// fully-provisioned host look like it had no ffmpeg at all. The ceiling is
+/// low on purpose and is NOT the probe deadline's six hours — this call is on
+/// the startup path, and a startup that is allowed to stall for an hour is the
+/// hang this item removes wearing a number.
+///
+/// Out-of-range values CLAMP rather than fall back, so an operator who asked
+/// for more time gets as much as is allowed instead of silently getting the
+/// value they were trying to change.
+const MIN_CAPABILITY_TIMEOUT_SECS: u64 = 1;
+const MAX_CAPABILITY_TIMEOUT_SECS: u64 = 60;
+
+/// The version-probe deadline actually in force, from the crate config's
+/// optional seconds value.
+///
+/// One home for the resolution, called by both entry points that detect —
+/// [`crate::media::MediaCore::from_config`] and
+/// [`crate::foundry::forge::detect_capabilities`] — so the two cannot drift
+/// into disagreeing about how long a wedged tool is waited on.
+pub fn resolve_timeout(configured_secs: Option<u64>) -> Duration {
+    Duration::from_secs(
+        configured_secs
+            .map(|s| s.clamp(MIN_CAPABILITY_TIMEOUT_SECS, MAX_CAPABILITY_TIMEOUT_SECS))
+            .unwrap_or(DEFAULT_CAPABILITY_TIMEOUT_SECS),
+    )
+}
+
 // --- The impure edge -------------------------------------------------------
 
-/// Probe one tool by running it. The single thin layer that spawns anything in
-/// this module.
+/// Probe one tool by running it, **under a deadline**. The single thin layer
+/// that spawns anything in this module.
 ///
 /// `version_argv` is passed in rather than hardcoded because HandBrakeCLI
 /// spells the flag `--version` while ffmpeg/ffprobe use `-version`.
-fn detect_tool(tool: &'static str, bin: &str, version_argv: &[String]) -> ToolReport {
-    let state = match Command::new(bin).args(version_argv).output() {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ToolState::Missing,
+///
+/// ## Why the deadline is not optional here
+/// This runs at `MediaCore` construction, i.e. at process startup. The
+/// original of this function used a bare `Command::output()`, which waits for
+/// the child with no bound at all — so a configured binary that hangs instead
+/// of exiting hung STARTUP: no health endpoint, no log past this line, no
+/// serve, and under a supervisor a restart loop that never converges. The
+/// trigger is not exotic. `ffprobe` living on, or reading from, a network
+/// mount that stalls leaves it in uninterruptible D-state; that is not a
+/// hypothesis, it is the fault [`crate::media::probe`] was built after — a
+/// single stalled read once held an entire validation run forever.
+///
+/// The deadline is [`crate::media::probe::spawn_with_timeout`], **called, not
+/// restated**. It already does spawn → drain → poll → kill → reap, including
+/// the parts that are easy to get wrong (draining both pipes on their own
+/// threads so a chatty child cannot deadlock, and `try_wait` rather than
+/// `wait` after the kill so the timeout path cannot itself hang on a D-state
+/// child). A second copy of that logic here would be a second thing to keep
+/// correct, and copies drift.
+///
+/// A tool that blows the deadline is [`ToolState::Unusable`], never a startup
+/// failure and never a panic: "present but not answering" is a normal,
+/// reportable host state, and this module exists precisely to express it.
+/// [`Capabilities::can_probe`] then returns false and every consumer degrades
+/// exactly as it does for a missing binary.
+fn detect_tool(
+    tool: &'static str,
+    bin: &str,
+    version_argv: &[String],
+    timeout: Duration,
+) -> ToolReport {
+    use crate::media::probe::ProbeError;
+
+    let state = match crate::media::probe::spawn_with_timeout(bin, version_argv, timeout) {
+        Err(ProbeError::ToolMissing { .. }) => ToolState::Missing,
+        Err(ProbeError::Timeout { secs }) => ToolState::Unusable {
+            reason: format!(
+                "`{bin} {}` did not answer within the {secs}s version-probe timeout and was \
+                 killed — the binary is present but wedged (a stalled network mount will do \
+                 this); raise MUSE_CAPABILITY_TIMEOUT_SECS only if that is genuinely too short",
+                version_argv.join(" ")
+            ),
+        },
         Err(e) => ToolState::Unusable {
             reason: format!("could not be executed: {e}"),
         },
@@ -226,22 +313,33 @@ fn detect_tool(tool: &'static str, bin: &str, version_argv: &[String]) -> ToolRe
 
 /// Detect every tool Foundry may use.
 ///
-/// Called on demand rather than cached at startup, deliberately: on this fleet
+/// Called on demand by Foundry rather than cached, deliberately: on this fleet
 /// ffmpeg is expected to *appear* during the lifetime of the process (the
 /// operator installs it into a running container), and a capability snapshot
 /// taken at boot would keep reporting "not installed" long after it was. The
 /// cost is three `--version` spawns per call, which is nothing next to an
-/// encode.
-pub fn detect(ffprobe_bin: &str, ffmpeg_bin: &str, handbrake_bin: &str) -> Capabilities {
+/// encode. [`crate::media::MediaCore`] makes the opposite trade and snapshots
+/// once; both go through here.
+///
+/// `timeout` bounds EACH tool's probe, so the worst case for the whole call is
+/// three times it — still bounded, which is the only property startup needs.
+/// Resolve it with [`resolve_timeout`] rather than inventing a value.
+pub fn detect(
+    ffprobe_bin: &str,
+    ffmpeg_bin: &str,
+    handbrake_bin: &str,
+    timeout: Duration,
+) -> Capabilities {
     let ffmpeg_style = version_args();
     Capabilities {
-        ffprobe: detect_tool("ffprobe", ffprobe_bin, &ffmpeg_style),
-        ffmpeg: detect_tool("ffmpeg", ffmpeg_bin, &ffmpeg_style),
+        ffprobe: detect_tool("ffprobe", ffprobe_bin, &ffmpeg_style, timeout),
+        ffmpeg: detect_tool("ffmpeg", ffmpeg_bin, &ffmpeg_style, timeout),
         // HandBrakeCLI spells it with two dashes and rejects `-version`.
         handbrake: detect_tool(
             "HandBrakeCLI",
             handbrake_bin,
             &["--version".to_string()],
+            timeout,
         ),
     }
 }
@@ -270,6 +368,15 @@ mod tests {
         ToolState::Present {
             version: v.to_string(),
         }
+    }
+
+    /// The deadline for tests that are NOT about the deadline.
+    ///
+    /// Deliberately generous, so a loaded CI box cannot turn an assertion about
+    /// classification into a flaky timeout. The CAPDET-01 tests below pass
+    /// their own short value.
+    fn generous() -> Duration {
+        Duration::from_secs(30)
     }
 
     #[test]
@@ -402,6 +509,7 @@ mod tests {
             "nonexistent",
             "muse-foundry-no-such-binary-xyzzy",
             &version_args(),
+            generous(),
         );
         assert_eq!(r.state, ToolState::Missing);
         assert!(!r.is_present());
@@ -415,6 +523,7 @@ mod tests {
             "muse-foundry-absent-ffprobe",
             "muse-foundry-absent-ffmpeg",
             "muse-foundry-absent-handbrake",
+            generous(),
         );
         assert_eq!(c.ffprobe.tool, "ffprobe");
         assert_eq!(c.ffmpeg.tool, "ffmpeg");
@@ -428,7 +537,7 @@ mod tests {
     fn a_tool_that_exits_nonzero_is_unusable_not_missing() {
         // `false` exists on every host and always exits 1: an installed but
         // non-cooperating binary. It must not be reported as absent.
-        let r = detect_tool("false-tool", "/bin/false", &version_args());
+        let r = detect_tool("false-tool", "/bin/false", &version_args(), generous());
         match r.state {
             ToolState::Unusable { ref reason } => {
                 assert!(reason.contains("exited"), "got {reason}")
@@ -442,12 +551,167 @@ mod tests {
         // `true` exits 0 and prints nothing. Reporting it Present with an
         // empty version would be claiming a working tool we never observed
         // working.
-        let r = detect_tool("true-tool", "/bin/true", &version_args());
+        let r = detect_tool("true-tool", "/bin/true", &version_args(), generous());
         assert!(
             !r.is_present(),
             "a silent success is not evidence the tool works, got {:?}",
             r.state
         );
         assert!(matches!(r.state, ToolState::Unusable { .. }));
+    }
+
+    // --- S130-A CAPDET-01: the version-probe deadline -----------------------
+
+    /// Write an executable that never exits, standing in for a wedged tool.
+    ///
+    /// `exec sleep` rather than a bare `sleep`, deliberately: the deadline path
+    /// kills the process it spawned, and with a plain `sleep` that is the shell
+    /// — leaving the real sleeper orphaned and running for its full duration
+    /// after the test ends. `exec` makes the killed process the sleeper itself.
+    ///
+    /// A stub is the ONLY way to exercise this. Neither the dev box nor <host>
+    /// has ffprobe installed, and no real tool can be made to hang on demand.
+    fn hanging_stub(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "muse-capdet01-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create stub dir");
+        let path = dir.join("wedged-tool");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 600\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+        path
+    }
+
+    /// The bug CAPDET-01 fixes, at the level of the one function that spawns.
+    ///
+    /// Before the fix this call was a bare `Command::output()` and this test
+    /// would not fail — it would never return at all.
+    #[test]
+    fn a_tool_that_never_exits_is_unusable_rather_than_an_unbounded_wait() {
+        let stub = hanging_stub("detect-tool");
+        let started = std::time::Instant::now();
+        let r = detect_tool(
+            "wedged",
+            &stub.to_string_lossy(),
+            &version_args(),
+            Duration::from_secs(1),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the probe must be bounded by its deadline, took {elapsed:?}"
+        );
+        match r.state {
+            ToolState::Unusable { ref reason } => {
+                assert!(
+                    reason.contains("timeout"),
+                    "the reason must name the timeout, so the operator is not sent \
+                     to `apt install` for a wedged mount; got {reason}"
+                );
+                assert!(reason.contains("1s"), "and the deadline that fired; got {reason}");
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+        assert!(!r.is_present(), "a tool we never observed working is not present");
+
+        let _ = std::fs::remove_dir_all(stub.parent().expect("stub dir"));
+    }
+
+    /// A wedged tool must be `Unusable`, NOT `Missing`. The two send the
+    /// operator at opposite problems — one at `apt install`, one at the mount.
+    #[test]
+    fn a_wedged_tool_is_never_reported_as_not_installed() {
+        let stub = hanging_stub("not-missing");
+        let r = detect_tool(
+            "wedged",
+            &stub.to_string_lossy(),
+            &version_args(),
+            Duration::from_secs(1),
+        );
+        assert_ne!(r.state, ToolState::Missing);
+        assert!(r.summary().contains("unusable"), "got {}", r.summary());
+        assert!(
+            !r.summary().contains("NOT INSTALLED"),
+            "the binary is right there; got {}",
+            r.summary()
+        );
+        let _ = std::fs::remove_dir_all(stub.parent().expect("stub dir"));
+    }
+
+    /// The whole snapshot stays bounded, and one wedged tool does not stop the
+    /// other two from being reported.
+    #[test]
+    fn one_wedged_tool_does_not_prevent_the_others_being_detected() {
+        let stub = hanging_stub("detect-all");
+        let started = std::time::Instant::now();
+        let c = detect(
+            &stub.to_string_lossy(),
+            "muse-capdet-absent-ffmpeg",
+            "muse-capdet-absent-handbrake",
+            Duration::from_secs(1),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "three probes, each bounded, is still bounded"
+        );
+        assert!(!c.can_probe());
+        assert!(matches!(c.ffprobe.state, ToolState::Unusable { .. }));
+        assert_eq!(
+            c.ffmpeg.state,
+            ToolState::Missing,
+            "the wedged ffprobe must not turn the other reports into guesses"
+        );
+        assert_eq!(c.unavailable(), vec!["ffprobe", "ffmpeg", "HandBrakeCLI"]);
+        let _ = std::fs::remove_dir_all(stub.parent().expect("stub dir"));
+    }
+
+    #[test]
+    fn the_deadline_defaults_to_the_compiled_value_and_clamps_nonsense() {
+        assert_eq!(
+            resolve_timeout(None),
+            Duration::from_secs(DEFAULT_CAPABILITY_TIMEOUT_SECS)
+        );
+        assert_eq!(resolve_timeout(Some(3)), Duration::from_secs(3));
+        // Zero would report every tool on a healthy host as timed out.
+        assert_eq!(
+            resolve_timeout(Some(0)),
+            Duration::from_secs(MIN_CAPABILITY_TIMEOUT_SECS)
+        );
+        // And an effectively infinite value is the startup hang again.
+        assert_eq!(
+            resolve_timeout(Some(u64::MAX)),
+            Duration::from_secs(MAX_CAPABILITY_TIMEOUT_SECS)
+        );
+    }
+
+    /// The deadline is CALLED, not restated.
+    ///
+    /// A second copy of the spawn/poll/kill/reap logic would be a second thing
+    /// to keep correct, and this epic has already paid 20x for a restated rule
+    /// (`predicted_deletion_refusals`). This asserts the call site exists in the
+    /// non-test body — the same shape `forge.rs` and `subtitles/sync.rs` use to
+    /// pin their own use of it.
+    #[test]
+    fn detection_calls_the_shared_spawn_timeout_rather_than_reimplementing_it() {
+        let body = include_str!("capability.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a non-test body");
+        assert!(
+            body.contains("probe::spawn_with_timeout"),
+            "the deadline must come from media::probe, not a local copy"
+        );
+        assert!(
+            !body.contains("Command::new"),
+            "a local spawn here means the shared deadline was re-implemented"
+        );
     }
 }

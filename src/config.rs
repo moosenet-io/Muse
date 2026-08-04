@@ -346,6 +346,23 @@ pub struct Config {
     /// without a rebuild. Also clamped.
     pub probe_max_output_bytes: Option<usize>,
 
+    // --- S130-A CAPDET-01: the capability version-probe deadline ---
+    /// Wall-clock ceiling on ONE tool version probe — `ffprobe -version` and
+    /// friends — in seconds (`MUSE_CAPABILITY_TIMEOUT_SECS`). `None` keeps
+    /// `media::capability::DEFAULT_CAPABILITY_TIMEOUT_SECS`.
+    ///
+    /// This is a **much** shorter deadline than `probe_timeout_secs`, and
+    /// deliberately so: `-version` prints a banner and exits, which is
+    /// milliseconds of work on any host. The knob exists because
+    /// `capability::detect` runs at `MediaCore` construction, i.e. at process
+    /// startup — a binary that hangs instead of exiting (an executable page
+    /// fault on a stalled network mount is not interruptible) would otherwise
+    /// hang startup itself, with no health endpoint and no log past that point.
+    ///
+    /// Clamped, not trusted, and blank-is-unset like every other knob here: see
+    /// `media::capability` for the bounds.
+    pub capability_timeout_secs: Option<u64>,
+
     // --- SUBS-01: the subtitle system ---
     /// Wyzie subtitle-provider API key (`WYZIE_KEY`).
     ///
@@ -770,6 +787,11 @@ impl Config {
             probe_timeout_secs: env_opt("MUSE_PROBE_TIMEOUT_SECS").and_then(|v| v.trim().parse().ok()),
             probe_max_output_bytes: env_opt("MUSE_PROBE_MAX_OUTPUT_BYTES")
                 .and_then(|v| v.trim().parse().ok()),
+            // CAPDET-01. Same door, same blank-is-unset parse: a blank or
+            // unparseable value falls back to the compiled default rather than
+            // being read as zero, which would report every tool as timed out.
+            capability_timeout_secs: env_opt("MUSE_CAPABILITY_TIMEOUT_SECS")
+                .and_then(|v| v.trim().parse().ok()),
             // SUBS-01. Read exactly like every other optional credential:
             // from the environment at runtime, never a literal.
             wyzie_key: env_opt("WYZIE_KEY").map(QbitPassword::from),
@@ -980,6 +1002,9 @@ impl Default for Config {
             // limit". `MediaCore` is what resolves them.
             probe_timeout_secs: None,
             probe_max_output_bytes: None,
+            // Likewise: unset means the compiled version-probe deadline, never
+            // an unbounded one. `media::capability` resolves it.
+            capability_timeout_secs: None,
 
             // SUBS-01 defaults are the SAFE values: no provider credential
             // (so the provider tier is inert) and no store directory (so
@@ -1281,6 +1306,33 @@ mod tests {
         let cfg = Config::from_env();
         assert_eq!(cfg.probe_timeout_secs, None);
         std::env::remove_var("MUSE_PROBE_TIMEOUT_SECS");
+    }
+
+    /// S130-A CAPDET-01: the version-probe deadline comes through the same
+    /// single env door, and `media::capability` never reads the environment.
+    ///
+    /// Unset means the compiled 5s, never "no deadline" — an unbounded version
+    /// probe is the startup hang this item removed.
+    #[test]
+    #[serial]
+    fn capdet01_capability_timeout_is_read_from_env_and_absent_when_unset() {
+        std::env::set_var("MUSE_CAPABILITY_TIMEOUT_SECS", "7");
+        assert_eq!(Config::from_env().capability_timeout_secs, Some(7));
+
+        std::env::remove_var("MUSE_CAPABILITY_TIMEOUT_SECS");
+        assert_eq!(Config::from_env().capability_timeout_secs, None);
+
+        // Blank-is-unset, and unparseable-is-unset: neither may read as zero,
+        // which would report every tool on a healthy host as timed out.
+        for bad in ["", "   ", "five"] {
+            std::env::set_var("MUSE_CAPABILITY_TIMEOUT_SECS", bad);
+            assert_eq!(
+                Config::from_env().capability_timeout_secs,
+                None,
+                "{bad:?} is not a deadline"
+            );
+        }
+        std::env::remove_var("MUSE_CAPABILITY_TIMEOUT_SECS");
     }
 
     #[test]

@@ -335,6 +335,9 @@ mod tests {
             ffprobe_bin: "ffprobe".into(),
             ffmpeg_bin: "ffmpeg".into(),
             handbrake_bin: "HandBrakeCLI".into(),
+            capability_timeout: std::time::Duration::from_secs(
+                crate::media::capability::DEFAULT_CAPABILITY_TIMEOUT_SECS,
+            ),
         }
     }
 

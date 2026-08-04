@@ -234,7 +234,19 @@ mod tests {
         let pct = together_pct(0, 0);
         assert!(pct.is_finite());
         assert_eq!(pct, 0.0);
-        assert!(serde_json::to_string(&json!(pct)).is_ok());
+        // WEAKTEST-02: the old assertion here was `to_string(&json!(pct)).is_ok()`,
+        // which is a TAUTOLOGY — `json!` turns a non-finite f64 into `Value::Null`
+        // and `to_string` on any `Value` is infallible, so it passed for NaN, the
+        // one value it claimed to defend against (proved by mutation: substituting
+        // `f64::NAN` for `pct` left it green). Assert the SERIALIZED TEXT instead:
+        // a NaN reaches the client as `null`, which is exactly the row-integrity
+        // failure this test exists to catch, and `"null" != "0.0"` catches it.
+        assert_eq!(
+            serde_json::to_string(&json!(pct)).expect("a Value always serializes"),
+            "0.0",
+            "a NaN would serialize as `null`, silently blanking the row rather than \
+             reporting 0% — the number must reach the client as a real number",
+        );
     }
 
     /// MUSE #89: the basis string must actually reach the client. A reviewer

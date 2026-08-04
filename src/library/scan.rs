@@ -917,7 +917,18 @@ mod tests {
         let before = checksum_tree(&dir);
 
         let files = walk_media_files(&dir);
-        assert!(!files.is_empty());
+        // WEAKTEST-01 (Plane MUSE #131 sweep): `!files.is_empty()` did not
+        // establish that the read-only pass below actually covers EVERY
+        // fixture file — truncating the walker to a single result left this
+        // test green (four sibling tests caught it, this one did not). The
+        // fixture contains exactly two media files (plus .nfo/.jpg/.txt that
+        // must NOT be walked), so the count is asserted exactly.
+        assert_eq!(
+            files.len(),
+            2,
+            "the walk must return both fixture media files (and no sidecars): {:?}",
+            files.iter().map(|f| f.absolute_path.clone()).collect::<Vec<_>>()
+        );
         for f in &files {
             let art = crate::library::sidecar::detect(&f.absolute_path);
             if let Some(poster) = &art.poster_path {

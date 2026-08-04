@@ -117,6 +117,23 @@ async fn main() -> anyhow::Result<()> {
         return run_parity_report_cli().await;
     }
 
+    // MPRB-10: the two probe operator CLIs. Gated behind an explicit
+    // subcommand exactly like the three above, and returning before any server
+    // bootstrap, for a reason specific to these: the live `muse.service`
+    // already owns this database and this library mount. The HTTP doors
+    // (`POST /ops/probe/backfill`, `POST /ops/probe/coverage-report`) reach the
+    // same code, but reaching them means running a SECOND full service —
+    // schedulers, acquisition workers, the foundry mutation gate — beside the
+    // live one. These subcommands run the sweep and the census and nothing
+    // else, so a backfill can be paced, interrupted and resumed by an operator
+    // without a second copy of the service existing for its duration.
+    if std::env::args().nth(1).as_deref() == Some("probe-backfill") {
+        return run_probe_backfill_cli().await;
+    }
+    if std::env::args().nth(1).as_deref() == Some("probe-coverage-report") {
+        return run_probe_coverage_report_cli().await;
+    }
+
     let config = Config::from_env();
 
     init_tracing(&config.log_level);
@@ -350,6 +367,72 @@ async fn run_parity_report_cli() -> anyhow::Result<()> {
             .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize report: {e}\"}}"))
     );
 
+    Ok(())
+}
+
+/// MPRB-10 operator CLI: `muse probe-backfill`.
+///
+/// One backfill run, in the foreground, over `MUSE_DATABASE_URL`'s library.
+/// Prints the [`media::backfill::BackfillReport`] as JSON and exits.
+///
+/// **Resumable by construction, not by a checkpoint this writes.** The queue
+/// predicate is "no v1 document and attempts left", so a row leaves it the
+/// moment its result is persisted: interrupting this process loses at most the
+/// one probe in flight, and running it again continues from where the database
+/// is. `MUSE_PROBE_BACKFILL_MAX_FILES` bounds a single invocation for exactly
+/// that reason.
+///
+/// It runs migrations first. `0113` is the migration these columns live in, and
+/// a sweep against a database without it would fail every write; the migration
+/// is additive and idempotent (see its banner), so applying it from here is
+/// safe while the live service — which predates it — keeps running.
+async fn run_probe_backfill_cli() -> anyhow::Result<()> {
+    init_tracing("info");
+
+    let config = Config::from_env();
+    let pool = db::build_pool(&config)
+        .map_err(|e| anyhow::anyhow!("failed to construct database pool: {e}"))?;
+    db::migrate(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("migrations failed: {e}"))?;
+
+    let media = crate::media::MediaCore::from_config(&config);
+    let backfill_config = crate::media::backfill::BackfillConfig::resolve(&config);
+    tracing::info!(
+        rate_per_min = backfill_config.rate_per_min,
+        batch_size = backfill_config.batch_size,
+        max_attempts = backfill_config.max_attempts,
+        max_files = backfill_config.max_files,
+        can_probe = media.can_probe(),
+        library_guard_inert = media.library_guard_is_inert(),
+        "probe backfill CLI: starting one run"
+    );
+
+    let report = crate::media::backfill::run_from_pool(&pool, &media, backfill_config).await;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize report: {e}\"}}"))
+    );
+    Ok(())
+}
+
+/// MPRB-10 operator CLI: `muse probe-coverage-report`.
+///
+/// The same artifact `POST /ops/probe/coverage-report` returns, on stdout, for
+/// redirecting into `docs/reports/probe-coverage.md`. Read-only: it is a
+/// `SELECT` and a pure render, and it runs no migration.
+async fn run_probe_coverage_report_cli() -> anyhow::Result<()> {
+    init_tracing("warn");
+
+    let config = Config::from_env();
+    let pool = db::build_pool(&config)
+        .map_err(|e| anyhow::anyhow!("failed to construct database pool: {e}"))?;
+
+    let report = crate::media::coverage::report_from_pool(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("building the coverage report failed: {e}"))?;
+    print!("{}", crate::media::coverage::render_markdown(&report));
     Ok(())
 }
 

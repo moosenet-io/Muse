@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod ops;
+pub mod probe_why;
 pub mod requests;
 
 use std::sync::Arc;
@@ -237,6 +238,18 @@ fn ops_routes() -> Router<Arc<AppState>> {
         // sessions against the now-populated catalog. Bearer-protected (this
         // whole `ops` router is nested under `protected`).
         .route("/library/resolve", post(ops::resolve_library))
+        // MPRB-08 (Plane MUSE #145): `GET /ops/probe/:id/why` — why the system
+        // concluded what it concluded about ONE media file. Read-only; it
+        // reports the PERSISTED probe result and never spawns ffprobe.
+        //
+        // `:id`, not `{id}`: axum is pinned at 0.7 (see `Cargo.toml`), where
+        // brace-style path params silently do not match.
+        //
+        // Registered here rather than on the open router deliberately — this
+        // payload discloses library structure and per-file (library-relative)
+        // paths, and `ops_routes()` is the existing bearer-gated home for
+        // operator endpoints. See `crate::http::probe_why`.
+        .route("/probe/:id/why", get(crate::http::probe_why::probe_why))
         // MWEBX-05 (S126): on-demand read-only library scan/refresh — the
         // door the MUSE web Library screen calls to (re)build the library
         // before re-reading `/api/library*`. See

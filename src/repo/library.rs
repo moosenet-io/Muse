@@ -66,30 +66,47 @@ pub async fn list(pool: &PgPool) -> MuseResult<Vec<Library>> {
     .map_err(MuseError::Database)
 }
 
-/// MPRB-07: the library `root_folder` that a set of `media_items` belong to.
+/// Where a `media_item`'s files live: its library root, and the item's own
+/// folder as the source that created it recorded it.
 ///
-/// `media_files.relative_path` is relative to its library's `root_folder` — that
-/// is how `library::scan::walk_media_files` formed it (`strip_prefix(root)`), so
-/// it is how the backfill has to rebuild an absolute path. The backfill holds
-/// `media_files` rows, which carry `media_item_id` and nothing about libraries,
-/// hence this lookup.
+/// **Both are needed, and MPRB-10 is why.** MPRB-07 looked up `root_folder`
+/// alone, on the stated belief that `media_files.relative_path` is always
+/// relative to it. Run against the live database that belief is false for 90%
+/// of the table — see [`crate::media::backfill::candidate_paths`] for the
+/// measurement and the two conventions that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaItemLocation {
+    /// `libraries.root_folder` — an absolute path in **Muse's** namespace, i.e.
+    /// underneath `MUSE_LIBRARY_ROOT`.
+    pub root_folder: String,
+    /// `media_items.path` — the item's own folder. Absolute, but recorded by
+    /// whichever source created the item, so its prefix is that source's
+    /// namespace (Radarr/Sonarr report `/media/…` where Muse mounts
+    /// `/srv/media/…`) and it may be `NULL`.
+    pub item_path: Option<String>,
+}
+
+/// MPRB-07 (corrected by MPRB-10): where a set of `media_items`' files live.
+///
+/// The backfill holds `media_files` rows, which carry `media_item_id` and
+/// nothing about libraries or item folders, hence this lookup.
 ///
 /// **A lookup, not logic.** One `IN` query, no aggregation, no filtering, no
 /// decision — everything the backfill decides is decided above the pool, where
 /// it can execute without `MUSE_TEST_DATABASE_URL` (MUSE #130). It returns the
 /// pairs it found; a `media_item_id` with no row is simply absent from the map,
 /// and the caller decides what that means.
-pub async fn root_folders_for_media_items(
+pub async fn locations_for_media_items(
     pool: &PgPool,
     media_item_ids: &[i64],
-) -> MuseResult<std::collections::HashMap<i64, String>> {
+) -> MuseResult<std::collections::HashMap<i64, MediaItemLocation>> {
     if media_item_ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
 
-    let rows: Vec<(i64, String)> = sqlx::query_as(
+    let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT mi.id, l.root_folder
+        SELECT mi.id, l.root_folder, mi.path
         FROM media_items mi
         JOIN libraries l ON l.id = mi.library_id
         WHERE mi.id = ANY($1)
@@ -100,5 +117,16 @@ pub async fn root_folders_for_media_items(
     .await
     .map_err(MuseError::Database)?;
 
-    Ok(rows.into_iter().collect())
+    Ok(rows
+        .into_iter()
+        .map(|(id, root_folder, item_path)| {
+            (
+                id,
+                MediaItemLocation {
+                    root_folder,
+                    item_path,
+                },
+            )
+        })
+        .collect())
 }

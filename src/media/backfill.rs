@@ -92,7 +92,7 @@
 //! behind a pool is a rule nobody verifies.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,7 @@ use crate::media::sink::{probe_write, ProbeSink, ProbeWrite};
 use crate::media::MediaCore;
 use crate::models::media_file::MediaFile;
 use crate::repo;
+use crate::repo::library::MediaItemLocation;
 
 // --- configuration ---------------------------------------------------------
 
@@ -487,16 +488,23 @@ pub(crate) trait ProbeQueue {
     async fn progress(&self, max_attempts: i32) -> MuseResult<repo::media_file::ProbeProgress>;
 }
 
-/// `media_item_id` → its library's `root_folder`.
+/// `media_item_id` → where its files live.
 #[async_trait]
 pub(crate) trait RootLookup {
-    async fn root_folders(&self, media_item_ids: &[i64]) -> MuseResult<HashMap<i64, String>>;
+    async fn locations(
+        &self,
+        media_item_ids: &[i64],
+    ) -> MuseResult<HashMap<i64, MediaItemLocation>>;
 }
 
 /// Resolving a path inside the library and running `ffprobe` on it.
+///
+/// Takes the **candidates** [`candidate_paths`] produced, in order, rather than
+/// one absolute path: which of them is the file is a filesystem question, and
+/// the filesystem lives behind this trait. See [`candidate_paths`].
 #[async_trait]
 pub(crate) trait FileProber {
-    async fn probe(&self, absolute_path: &Path) -> ProbeOutcome;
+    async fn probe(&self, candidates: &[PathBuf]) -> ProbeOutcome;
 }
 
 /// What [`FileProber`] came back with.
@@ -517,6 +525,98 @@ pub(crate) enum ProbeOutcome {
 #[async_trait]
 pub(crate) trait Pacer {
     async fn pace(&self, delay: Duration);
+}
+
+// --- rebuilding the absolute path (MPRB-10) --------------------------------
+
+/// Where a `media_files` row's bytes might be, in the order to try them.
+///
+/// # The claim this replaces, and the measurement that killed it
+///
+/// MPRB-07 rebuilt the absolute path as `libraries.root_folder /
+/// media_files.relative_path`, on the stated belief that `relative_path` is
+/// always relative to the library root because that is how
+/// `library::scan::walk_media_files` forms it (`strip_prefix(root)`).
+///
+/// That belief was never executed against the live database. MPRB-10 did, over
+/// all 12,873 rows, `stat`-ing every reconstructed path on the host that holds
+/// the mount:
+///
+/// | reconstruction | rows whose file exists |
+/// |---|---:|
+/// | `root_folder / relative_path` (MPRB-07's, alone) | **1,260 (9.8%)** |
+/// | `rebased item folder / relative_path` (alone) | 11,447 (88.9%) |
+/// | either, this function | **12,705 (98.7%)** |
+///
+/// # Because there are two writers of `relative_path`, with two conventions
+///
+/// * `library::scan` writes it relative to the **library root**, item folder
+///   included: `"Veronica Mars/Season 1/…mkv"`. 1,258 rows.
+/// * `arr::ingest` copies Radarr/Sonarr's `relativePath`, which those services
+///   define relative to the **item's own folder**, item folder excluded:
+///   `"…mkv"` for a movie, `"Season 1/…mkv"` for an episode. 11,615 rows.
+///
+/// One column, two meanings, and nothing in the schema distinguishes them. So
+/// this function does not guess: it offers both, and the prober takes whichever
+/// resolves. Only 2 of 12,873 rows had both candidates exist; the scan
+/// convention is offered first so that tie is resolved deterministically, and
+/// this is the entirety of the ambiguity in the live table.
+///
+/// # Rebasing the item folder
+///
+/// `media_items.path` is absolute in **its source's** namespace: Radarr reports
+/// `/media/Movies/…` for what Muse mounts at `/srv/media/Movies/…`. The portable
+/// part is the suffix below the library's own directory name, so the rebase
+/// finds the library root's final component in the item path and re-roots what
+/// follows onto `root_folder`. An item path already inside `root_folder` is
+/// used as-is. Anything else yields no second candidate rather than a guess.
+///
+/// Neither candidate is trusted: both are handed to
+/// `MediaCore::library_guard().resolve`, which canonicalises and confines them
+/// to `MUSE_LIBRARY_ROOT`. A `..` smuggled into `media_items.path` or
+/// `relative_path` cannot escape by being offered here.
+pub(crate) fn candidate_paths(location: &MediaItemLocation, relative_path: &str) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(2);
+    out.push(PathBuf::from(&location.root_folder).join(relative_path));
+
+    if let Some(folder) = rebase_item_folder(&location.root_folder, location.item_path.as_deref()) {
+        let candidate = folder.join(relative_path);
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Re-root an item folder recorded in another namespace onto this library root.
+///
+/// `None` when there is nothing to rebase (no item path) or no shared component
+/// to rebase on — an unrecognisable path produces no candidate, never a
+/// fabricated one.
+pub(crate) fn rebase_item_folder(root_folder: &str, item_path: Option<&str>) -> Option<PathBuf> {
+    let item_path = item_path.map(str::trim).filter(|p| !p.is_empty())?;
+    let root = root_folder.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+
+    // Already in Muse's namespace: nothing to rebase.
+    if item_path == root || item_path.starts_with(&format!("{root}/")) {
+        return Some(PathBuf::from(item_path));
+    }
+
+    // The library's own directory name is the join point between the two
+    // namespaces (`/media/TV Shows/X` ↔ `/srv/media/TV Shows/X`). The FIRST
+    // occurrence, not the last: a library named `Movies` holding an item folder
+    // called `Movies.2019` would otherwise rebase onto the item's own name.
+    let name = root.rsplit('/').next().filter(|n| !n.is_empty())?;
+    let needle = format!("/{name}/");
+    let at = item_path.find(&needle)?;
+    let suffix = &item_path[at + needle.len()..];
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(root).join(suffix))
 }
 
 /// Production: the queue and progress functions MPRB-05 wrote.
@@ -543,8 +643,11 @@ pub(crate) struct DbRootLookup<'a>(pub(crate) &'a PgPool);
 
 #[async_trait]
 impl RootLookup for DbRootLookup<'_> {
-    async fn root_folders(&self, media_item_ids: &[i64]) -> MuseResult<HashMap<i64, String>> {
-        repo::library::root_folders_for_media_items(self.0, media_item_ids).await
+    async fn locations(
+        &self,
+        media_item_ids: &[i64],
+    ) -> MuseResult<HashMap<i64, MediaItemLocation>> {
+        repo::library::locations_for_media_items(self.0, media_item_ids).await
     }
 }
 
@@ -556,11 +659,26 @@ pub(crate) struct MediaCoreProber<'a>(pub(crate) &'a MediaCore);
 
 #[async_trait]
 impl FileProber for MediaCoreProber<'_> {
-    async fn probe(&self, absolute_path: &Path) -> ProbeOutcome {
-        match self.0.library_guard().resolve(absolute_path) {
-            Ok(resolved) => ProbeOutcome::Attempted(self.0.probe_async(&resolved).await),
-            Err(e) => ProbeOutcome::Unresolved(e.to_string()),
+    async fn probe(&self, candidates: &[PathBuf]) -> ProbeOutcome {
+        let mut refusals: Vec<String> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            match self.0.library_guard().resolve(candidate) {
+                // The first candidate that is a real file inside the library
+                // wins. `resolve` is what decides that — this loop never calls
+                // `exists()` itself, so a path that resolves but escapes the
+                // root is refused here exactly as it was before MPRB-10.
+                Ok(resolved) => return ProbeOutcome::Attempted(self.0.probe_async(&resolved).await),
+                Err(e) => refusals.push(format!("{}: {e}", candidate.display())),
+            }
         }
+        // Every candidate refused. Report ALL of them: "no such file" against
+        // one reconstruction, when a second was tried and also failed, is not
+        // the diagnostic an operator needs.
+        ProbeOutcome::Unresolved(if refusals.is_empty() {
+            "no candidate path could be built for this row".to_string()
+        } else {
+            refusals.join("; ")
+        })
     }
 }
 
@@ -623,7 +741,7 @@ pub(crate) async fn run_backfill(
         // handful of libraries, and 200 round trips to answer the same question
         // is the cost this batching exists to avoid.
         let item_ids: Vec<i64> = page.iter().map(|f| f.media_item_id).collect();
-        let root_map = match roots.root_folders(&item_ids).await {
+        let root_map = match roots.locations(&item_ids).await {
             Ok(map) => map,
             Err(e) => {
                 tracing::warn!(error = %e, "probe backfill: library root lookup failed; halting this run");
@@ -649,7 +767,7 @@ pub(crate) async fn run_backfill(
             report.considered += 1;
             report.last_id = cursor.after_id();
 
-            let Some(root) = root_map.get(&file.media_item_id) else {
+            let Some(location) = root_map.get(&file.media_item_id) else {
                 // No library row: the absolute path cannot be rebuilt, so
                 // nothing was observed and nothing is written.
                 report.skipped_unresolved += 1;
@@ -661,9 +779,9 @@ pub(crate) async fn run_backfill(
                 continue;
             };
 
-            let absolute = PathBuf::from(root).join(&file.relative_path);
+            let candidates = candidate_paths(location, &file.relative_path);
             let probe_started = Instant::now();
-            let outcome = prober.probe(&absolute).await;
+            let outcome = prober.probe(&candidates).await;
 
             let result = match outcome {
                 ProbeOutcome::Attempted(result) => result,
@@ -1049,6 +1167,10 @@ mod tests {
         /// Item ids deliberately WITHOUT a library row.
         missing: Vec<i64>,
         fail: bool,
+        /// `media_items.path` for every item, when the fixture wants the
+        /// second (arr-convention) candidate to exist. `None` is the shape of
+        /// a scan-created item and yields one candidate.
+        item_path: Option<String>,
     }
 
     impl FakeRoots {
@@ -1056,20 +1178,29 @@ mod tests {
             Self {
                 missing: Vec::new(),
                 fail: false,
+                item_path: None,
             }
         }
     }
 
     #[async_trait]
     impl RootLookup for FakeRoots {
-        async fn root_folders(&self, ids: &[i64]) -> MuseResult<HashMap<i64, String>> {
+        async fn locations(&self, ids: &[i64]) -> MuseResult<HashMap<i64, MediaItemLocation>> {
             if self.fail {
                 return Err(crate::error::MuseError::Config("libraries are down".into()));
             }
             Ok(ids
                 .iter()
                 .filter(|id| !self.missing.contains(id))
-                .map(|id| (*id, "/library".to_string()))
+                .map(|id| {
+                    (
+                        *id,
+                        MediaItemLocation {
+                            root_folder: "/library".to_string(),
+                            item_path: self.item_path.clone(),
+                        },
+                    )
+                })
                 .collect())
         }
     }
@@ -1080,6 +1211,10 @@ mod tests {
         script: Mutex<Vec<ProbeOutcome>>,
         default_ok: bool,
         seen: Mutex<Vec<PathBuf>>,
+        /// One entry per call: the WHOLE candidate list the loop offered, in
+        /// order. `seen` flattens these; this keeps the grouping, which is the
+        /// only way to assert what `candidate_paths` actually handed over.
+        offered: Mutex<Vec<Vec<PathBuf>>>,
     }
 
     impl ScriptedProber {
@@ -1088,6 +1223,7 @@ mod tests {
                 script: Mutex::new(Vec::new()),
                 default_ok: true,
                 seen: Mutex::new(Vec::new()),
+                offered: Mutex::new(Vec::new()),
             }
         }
 
@@ -1096,18 +1232,24 @@ mod tests {
                 script: Mutex::new(outcomes),
                 default_ok: true,
                 seen: Mutex::new(Vec::new()),
+                offered: Mutex::new(Vec::new()),
             }
         }
 
         fn seen(&self) -> Vec<PathBuf> {
             self.seen.lock().unwrap().clone()
         }
+
+        fn offered(&self) -> Vec<Vec<PathBuf>> {
+            self.offered.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl FileProber for ScriptedProber {
-        async fn probe(&self, absolute_path: &Path) -> ProbeOutcome {
-            self.seen.lock().unwrap().push(absolute_path.to_path_buf());
+        async fn probe(&self, candidates: &[PathBuf]) -> ProbeOutcome {
+            self.offered.lock().unwrap().push(candidates.to_vec());
+            self.seen.lock().unwrap().extend(candidates.iter().cloned());
             let mut script = self.script.lock().unwrap();
             if script.is_empty() {
                 assert!(self.default_ok, "the script ran out");
@@ -1369,6 +1511,7 @@ mod tests {
             &FakeRoots {
                 missing: vec![2],
                 fail: false,
+                item_path: None,
             },
             &ScriptedProber::always_ok(),
             &RecordingSink::new(),
@@ -1887,6 +2030,7 @@ mod tests {
             &FakeRoots {
                 missing: Vec::new(),
                 fail: true,
+                item_path: None,
             },
             &ScriptedProber::always_ok(),
             &RecordingSink::new(),
@@ -2058,6 +2202,7 @@ mod tests {
             &FakeRoots {
                 missing: vec![4],
                 fail: false,
+                item_path: None,
             },
             &prober,
             &RecordingSink::new(),
@@ -2189,5 +2334,155 @@ mod tests {
             "at least one thread must have run, and none may have panicked"
         );
         assert!(!gate.is_running());
+    }
+
+    // ---- MPRB-10: rebuilding the absolute path ----------------------------
+    //
+    // These are the rules that decide, per row, which bytes get probed. They
+    // were the difference between a backfill that could reach 1,260 of the
+    // live library's 12,873 rows and one that reaches 12,705 — measured by
+    // `stat`-ing every reconstruction against the real mount, not reasoned
+    // about. See `candidate_paths`.
+
+    fn at(root: &str, item: Option<&str>) -> MediaItemLocation {
+        MediaItemLocation {
+            root_folder: root.to_string(),
+            item_path: item.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_scan_convention_is_offered_first() {
+        // `library::scan` writes `relative_path` relative to the library ROOT,
+        // item folder included. 1,258 live rows.
+        let candidates = candidate_paths(
+            &at("/srv/media/TV Shows", None),
+            "Veronica Mars/Season 1/e08.mkv",
+        );
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/srv/media/TV Shows/Veronica Mars/Season 1/e08.mkv")],
+            "with no item path there is exactly one candidate, and it is the \
+             root-relative one MPRB-07 built"
+        );
+    }
+
+    #[test]
+    fn the_arr_convention_is_offered_as_a_second_candidate() {
+        // `arr::ingest` copies Radarr/Sonarr's `relativePath`, which excludes
+        // the item folder — and records `media_items.path` in the ARR's
+        // namespace (`/media/…`), not Muse's (`/srv/media/…`). 11,615 live rows.
+        let candidates = candidate_paths(
+            &at("/srv/media/Movies", Some("/media/Movies/1984")),
+            "1984.avi",
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/srv/media/Movies/1984.avi"),
+                PathBuf::from("/srv/media/Movies/1984/1984.avi"),
+            ],
+            "MPRB-07's reconstruction is candidate 1 and misses; the rebased \
+             item folder is candidate 2 and is where the file actually is"
+        );
+    }
+
+    #[test]
+    fn an_item_path_already_in_muses_namespace_is_not_rebased_twice() {
+        assert_eq!(
+            rebase_item_folder("/srv/media/Movies", Some("/srv/media/Movies/1984")),
+            Some(PathBuf::from("/srv/media/Movies/1984")),
+        );
+    }
+
+    #[test]
+    fn a_library_name_that_also_appears_in_the_item_folder_rebases_on_the_first() {
+        // A library called `Movies` holding `Movies.2019`: matching the LAST
+        // occurrence would rebase onto the item's own name and lose it.
+        assert_eq!(
+            rebase_item_folder("/srv/media/Movies", Some("/media/Movies/Movies.2019")),
+            Some(PathBuf::from("/srv/media/Movies/Movies.2019")),
+        );
+    }
+
+    #[test]
+    fn an_unrecognisable_item_path_yields_no_second_candidate_rather_than_a_guess() {
+        assert_eq!(rebase_item_folder("/srv/media/Movies", None), None);
+        assert_eq!(rebase_item_folder("/srv/media/Movies", Some("   ")), None);
+        assert_eq!(
+            rebase_item_folder("/srv/media/Movies", Some("/elsewhere/Films/1984")),
+            None,
+            "no shared component means no rebase — a fabricated path is worse \
+             than an unresolved row"
+        );
+        assert_eq!(
+            rebase_item_folder("/srv/media/Movies", Some("/media/Movies")),
+            None,
+            "the library root itself is not an item folder"
+        );
+        assert_eq!(
+            rebase_item_folder("", Some("/media/Movies/1984")),
+            None,
+            "an empty root has no name to join on"
+        );
+    }
+
+    #[test]
+    fn identical_candidates_are_offered_once() {
+        let candidates = candidate_paths(
+            &at("/srv/media/Movies", Some("/srv/media/Movies")),
+            "1984.avi",
+        );
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/srv/media/Movies/1984.avi")],
+            "an item path that reduces to the root must not make the prober \
+             stat the same path twice"
+        );
+    }
+
+    #[test]
+    fn a_traversal_in_either_input_is_still_offered_for_the_guard_to_refuse() {
+        // `candidate_paths` deliberately does NOT sanitise: confinement is
+        // `PathGuard::resolve`'s job and there must be exactly one of it. What
+        // this asserts is that nothing here silently DROPS such a path, which
+        // would hide it from the guard's refusal.
+        let candidates = candidate_paths(&at("/srv/media/Movies", None), "../../etc/shadow");
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/srv/media/Movies/../../etc/shadow")]
+        );
+    }
+
+    #[tokio::test]
+    async fn both_candidates_reach_the_prober_in_order() {
+        // The loop-level assertion: the rule above is not decoration, it is
+        // what the production path hands to `FileProber`.
+        let queue = FakeQueue::new(vec![a_file(42, 42, 0)]);
+        let prober = ScriptedProber::always_ok();
+
+        let report = bounded(run_backfill(
+            &queue,
+            &FakeRoots {
+                missing: Vec::new(),
+                fail: false,
+                item_path: Some("/media/library/Movie 42".to_string()),
+            },
+            &prober,
+            &RecordingSink::new(),
+            &RecordingPacer::default(),
+            BackfillConfig::default(),
+        ))
+        .await;
+
+        assert_eq!(report.probed, 1);
+        assert_eq!(
+            prober.offered(),
+            vec![vec![
+                PathBuf::from("/library/Movie 42/Movie 42.mkv"),
+                PathBuf::from("/library/Movie 42/Movie 42/Movie 42.mkv"),
+            ]],
+            "one call, both candidates, scan convention first"
+        );
     }
 }

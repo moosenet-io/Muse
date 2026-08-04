@@ -140,7 +140,11 @@ fn reject_flag_shaped_path(path: &str) -> Result<(), ProbeError> {
 }
 
 /// A parsed `ffprobe` description of one media file.
-#[derive(Debug, Clone, PartialEq)]
+// MPRB-05: serde derives so `MediaInfoDoc` can persist this type WITHOUT
+// restating its field list. Structural only — no field, no semantics, and no
+// behaviour changes here; a field added to this struct is carried into the
+// stored document automatically, which is the entire point.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MediaProbe {
     /// The raw `format.format_name`, e.g. `"matroska,webm"`. Kept raw rather
     /// than normalized because normalization is a *policy* question (see
@@ -224,7 +228,11 @@ pub struct MediaProbe {
 }
 
 /// A Matroska attachment (typically a subtitle font).
-#[derive(Debug, Clone, PartialEq)]
+// MPRB-05: serde derives so `MediaInfoDoc` can persist this type WITHOUT
+// restating its field list. Structural only — no field, no semantics, and no
+// behaviour changes here; a field added to this struct is carried into the
+// stored document automatically, which is the entire point.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttachmentStream {
     pub index: u32,
     /// The attachment's codec name (`ttf`, `otf`, `mimetype`-driven).
@@ -250,7 +258,11 @@ pub struct AttachmentStream {
 /// done case-insensitively by the consumers rather than by mapping to a closed
 /// enum here, so a side-data type this fleet has never seen is carried through
 /// and reported rather than silently discarded.
-#[derive(Debug, Clone, Default, PartialEq)]
+// MPRB-05: serde derives so `MediaInfoDoc` can persist this type WITHOUT
+// restating its field list. Structural only — no field, no semantics, and no
+// behaviour changes here; a field added to this struct is carried into the
+// stored document automatically, which is the entire point.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StreamSideData {
     /// ffprobe's `side_data_type`, e.g. `"DOVI configuration record"`,
     /// `"Mastering display metadata"`, `"Content light level metadata"`.
@@ -270,7 +282,11 @@ pub struct StreamSideData {
     pub el_present: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+// MPRB-05: serde derives so `MediaInfoDoc` can persist this type WITHOUT
+// restating its field list. Structural only — no field, no semantics, and no
+// behaviour changes here; a field added to this struct is carried into the
+// stored document automatically, which is the entire point.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VideoStream {
     /// The stream's absolute index within the file, as ffprobe reported it.
     /// Absolute (not the `v:0` relative form) because the transcode argv maps
@@ -374,7 +390,15 @@ pub struct VideoStream {
     pub color_range: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+// MPRB-05: serde derives so `MediaInfoDoc` can persist this type WITHOUT
+// restating its field list. Structural only — no field, no semantics, and no
+// behaviour changes here; a field added to this struct is carried into the
+// stored document automatically, which is the entire point.
+//
+// `Default` is retained from MPRB-03: its test fixtures rely on
+// `..Default::default()`, so dropping it here would break them. The union of
+// both sides is required — neither alone compiles.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioStream {
     pub index: u32,
     pub codec: String,
@@ -411,7 +435,15 @@ pub struct AudioStream {
     pub forced: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+// MPRB-05: serde derives so `MediaInfoDoc` can persist this type WITHOUT
+// restating its field list. Structural only — no field, no semantics, and no
+// behaviour changes here; a field added to this struct is carried into the
+// stored document automatically, which is the entire point.
+//
+// `Default` is retained from MPRB-03: its test fixtures rely on
+// `..Default::default()`, so dropping it here would break them. The union of
+// both sides is required — neither alone compiles.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SubtitleStream {
     pub index: u32,
     pub codec: String,

@@ -21,8 +21,17 @@
 //! [`probe::MediaProbe`] keeps its name and will keep it. It is an **ephemeral
 //! observation**: what `ffprobe` said about a file at one moment, with no
 //! schema version and no persistence. The *stored, versioned library fact* is a
-//! separate type, `MediaInfoDoc` (S130-A `MPRB-05`), which wraps a `MediaProbe`
-//! in an envelope carrying a schema version, a probe state and a timestamp.
+//! separate type, [`doc::MediaInfoDoc`] (S130-A `MPRB-05`), which wraps a
+//! `MediaProbe` in a versioned envelope.
+//!
+//! **Correction, MPRB-05:** an earlier draft of this paragraph said the envelope
+//! carries "a schema version, a probe state and a timestamp". It carries the
+//! schema version (plus the flat GUI projection and the filename's extension);
+//! the probe **state** and the **timestamp** are `media_files` COLUMNS, not
+//! document fields — deliberately, because a probe that FAILED produces no
+//! document at all and its state must still be recorded. Fixed here rather than
+//! left to rot, since the whole point of `0113`'s `probe_state` column is that
+//! the unhappy states live outside the document.
 //!
 //! Two names, deliberately. An earlier draft proposed renaming `MediaProbe` to
 //! `MediaInfo` during this promotion; that was declined twice, for two separate
@@ -44,6 +53,9 @@
 
 pub mod capability;
 pub mod derive;
+/// MPRB-05: the stored, versioned form of a probe — see the `MediaProbe` vs
+/// `MediaInfoDoc` decision recorded above.
+pub mod doc;
 pub mod paths;
 pub mod probe;
 

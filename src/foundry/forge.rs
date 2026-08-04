@@ -283,6 +283,40 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
+/// Should this title be skipped because the encode could never reclaim the
+/// original's disk? Pure — the opt-in is decided by the caller and read from
+/// the environment there.
+///
+/// The prediction is DERIVED here, by calling
+/// [`crate::foundry::directplay::predicted_deletion_refusals`], which is the
+/// same function the survey reports from. It is not re-derived and not
+/// restated: `predicted_deletion_refusals` restating the deletion gate instead
+/// of consulting it is exactly how the earlier estimate came out wrong by 20x
+/// (3,158 titles against a predicted 160), and that was caught only by a live
+/// run. There is one HDR classifier and one deletion gate; this asks them.
+///
+/// FSURV-02 S6: the skip's construction lived inline in [`optimize_file`],
+/// which needs a live ffprobe, so the only thing guarding it was a source-text
+/// assertion that the call was *written*. Gutting the value to `Vec::new()`
+/// left that text untouched and the suite green: the operator would have been
+/// told a title was skipped as unreclaimable without being told which property
+/// of the file caused it. Returning the whole `SkipReason` from a pure
+/// function lets a test assert the value that is actually propagated.
+fn unreclaimable_skip(
+    opt_in: bool,
+    source: &MediaProbe,
+    plan: &crate::foundry::plan::TranscodePlan,
+) -> Option<SkipReason> {
+    if !opt_in {
+        return None;
+    }
+    let predicted = crate::foundry::directplay::predicted_deletion_refusals(source, plan);
+    if predicted.is_empty() {
+        return None;
+    }
+    Some(SkipReason::UnreclaimableOriginal { predicted })
+}
+
 /// The record of a completed, verified replacement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RewriteRecord {
@@ -1661,17 +1695,11 @@ pub(in crate::foundry) fn optimize_file(
     // of Path A's purpose. Only the other half — reclaiming the original's
     // space — is impossible here. So the operator chooses between "direct play
     // at double disk" and "leave it alone", and that choice is theirs.
-    if std::env::var("MUSE_FOUNDRY_SKIP_UNRECLAIMABLE")
+    let opt_in = std::env::var("MUSE_FOUNDRY_SKIP_UNRECLAIMABLE")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-        .unwrap_or(false)
-    {
-        let predicted =
-            crate::foundry::directplay::predicted_deletion_refusals(&source, &plan);
-        if !predicted.is_empty() {
-            return ForgeStatus::Skipped {
-                reason: SkipReason::UnreclaimableOriginal { predicted },
-            };
-        }
+        .unwrap_or(false);
+    if let Some(reason) = unreclaimable_skip(opt_in, &source, &plan) {
+        return ForgeStatus::Skipped { reason };
     }
 
     // Both tools, not just the encoder: without ffprobe the result could be
@@ -3398,11 +3426,178 @@ mod tests {
              operator opts in"
         );
         // ...and it must consult the PREDICTION rather than re-deriving a rule.
+        //
+        // This guard is KEPT because it still catches outright removal of the
+        // call. It is NOT sufficient on its own, and FSURV-02 S6 proved it:
+        // the mutation that replaced the prediction with `Vec::new()` at the
+        // construction site left this call string intact, so this assertion
+        // passed while the behaviour was destroyed. A source-text guard proves
+        // a call is WRITTEN, not that its result is USED — the test below
+        // asserts the value.
         assert!(
-            body.contains("predicted_deletion_refusals(&source, &plan)"),
+            body.contains("predicted_deletion_refusals(source, plan)"),
             "the skip must use the same prediction the survey reports, or the two \
              would disagree about which titles are affected"
         );
+        assert!(
+            body.contains("unreclaimable_skip(opt_in, &source, &plan)"),
+            "and `optimize_file` must reach the decision through that one function"
+        );
+    }
+
+    /// **The prediction must be DERIVED and PROPAGATED, not merely called.**
+    ///
+    /// FSURV-02 S6. What is asserted here is that the reasons the operator is
+    /// shown are exactly what `predicted_deletion_refusals` returned for this
+    /// source and plan. The expected value is obtained by ASKING that
+    /// function, never by restating what it ought to contain: the last time
+    /// this rule was restated instead of consulted the estimate was wrong by
+    /// 20x (3,158 unreclaimable titles against a predicted 160), and only a
+    /// live run found it.
+    #[test]
+    fn the_unreclaimable_skip_carries_the_prediction_it_was_derived_from() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        use crate::media::probe::{AudioStream, MediaProbe, VideoStream};
+
+        let source = MediaProbe {
+            container: "matroska,webm".to_string(),
+            duration_secs: Some(5400.0),
+            format_bitrate_bps: Some(6_000_000),
+            size_bytes: Some(4_000_000_000),
+            video: vec![VideoStream {
+                index: 0,
+                codec: "h264".to_string(),
+                width: Some(1920),
+                height: Some(1080),
+                bitrate_bps: Some(5_000_000),
+                pix_fmt: Some("yuv420p".into()),
+                attached_pic: false,
+                ..VideoStream::default()
+            }],
+            audio: vec![AudioStream {
+                index: 1,
+                codec: "mp3".to_string(),
+                channels: Some(2),
+                ..Default::default()
+            }],
+            subtitles: Vec::new(),
+            attachments: Vec::new(),
+            data_stream_count: 0,
+            unindexed_stream_count: 0,
+            chapter_count: 0,
+            title: None,
+            other_stream_count: 0,
+            notes: Vec::new(),
+        };
+        let plan = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Encode { channels: vec![2] },
+            container: Container::Matroska,
+        };
+
+        // The one source of truth for what this title predicts.
+        let expected = crate::foundry::directplay::predicted_deletion_refusals(&source, &plan);
+        assert!(
+            !expected.is_empty(),
+            "the fixture must be one the gate would refuse, or this test proves \
+             nothing about propagation"
+        );
+
+        let Some(SkipReason::UnreclaimableOriginal { predicted }) =
+            unreclaimable_skip(true, &source, &plan)
+        else {
+            panic!("an opt-in run over a predicted-refusal title must skip");
+        };
+        assert_eq!(
+            predicted, expected,
+            "the skip must carry the prediction verbatim; an empty list would tell \
+             the operator a title was unreclaimable without saying which property \
+             of the file made it so"
+        );
+        // ...and the reason the operator reads must contain it too, so the
+        // value cannot be dropped between the skip and the message.
+        let rendered = SkipReason::UnreclaimableOriginal {
+            predicted: predicted.clone(),
+        }
+        .to_string();
+        for r in &expected {
+            assert!(rendered.contains(r.as_str()), "missing `{r}` in: {rendered}");
+        }
+    }
+
+    /// A title the gate WOULD allow must not be skipped, and the opt-in must
+    /// still gate everything — otherwise "carries the prediction" could be
+    /// satisfied by a function that skips every file.
+    #[test]
+    fn the_unreclaimable_skip_fires_only_when_opted_in_and_only_when_predicted() {
+        use crate::foundry::plan::{AudioAction, TranscodePlan, VideoAction};
+        use crate::media::probe::{AudioStream, MediaProbe, VideoStream};
+
+        let mut source = MediaProbe {
+            container: "matroska,webm".to_string(),
+            duration_secs: Some(5400.0),
+            format_bitrate_bps: Some(6_000_000),
+            size_bytes: Some(4_000_000_000),
+            video: vec![VideoStream {
+                index: 0,
+                codec: "mpeg4".to_string(),
+                width: Some(720),
+                height: Some(480),
+                bitrate_bps: Some(2_000_000),
+                pix_fmt: Some("yuv420p".into()),
+                attached_pic: false,
+                ..VideoStream::default()
+            }],
+            audio: vec![AudioStream {
+                index: 1,
+                codec: "aac".to_string(),
+                channels: Some(2),
+                ..Default::default()
+            }],
+            subtitles: Vec::new(),
+            attachments: Vec::new(),
+            data_stream_count: 0,
+            unindexed_stream_count: 0,
+            chapter_count: 0,
+            title: None,
+            other_stream_count: 0,
+            notes: Vec::new(),
+        };
+        source.video[0].color_transfer = Some("bt709".into());
+        let clean = TranscodePlan {
+            video_stream_index: 0,
+            video: VideoAction::Encode { scale: None },
+            audio: AudioAction::Copy,
+            container: Container::Matroska,
+        };
+        assert!(
+            crate::foundry::directplay::predicted_deletion_refusals(&source, &clean).is_empty(),
+            "fixture must be one the gate allows"
+        );
+        assert!(
+            unreclaimable_skip(true, &source, &clean).is_none(),
+            "a title that reclaims its disk must not be skipped even when opted in"
+        );
+
+        // And the opt-in still governs a title that WOULD be predicted. The
+        // gate matches audio streams BY CODEC, so mp3 -> aac is a refusal
+        // where aac -> aac at the same channel count is not.
+        source.audio[0].codec = "mp3".to_string();
+        let refused = TranscodePlan {
+            audio: AudioAction::Encode { channels: vec![2] },
+            ..clean
+        };
+        assert!(
+            !crate::foundry::directplay::predicted_deletion_refusals(&source, &refused).is_empty(),
+            "fixture must be one the gate refuses"
+        );
+        assert!(
+            unreclaimable_skip(false, &source, &refused).is_none(),
+            "OFF by default: the operator chooses between direct play at double \
+             disk and leaving the title alone"
+        );
+        assert!(unreclaimable_skip(true, &source, &refused).is_some());
     }
 
     /// The reason must say what was traded away, not just that it skipped.

@@ -1226,14 +1226,36 @@ fn copy_ownership_and_mode(src: &Path, dest: &Path) {
     // call, and chown takes uid/gid by value. No memory is shared or retained.
     let rc = unsafe { libc::chown(c_dest.as_ptr(), md.uid(), md.gid()) };
     if rc != 0 {
-        tracing::warn!(
-            dest = %dest.display(),
-            uid = md.uid(),
-            gid = md.gid(),
-            error = %std::io::Error::last_os_error(),
-            "foundry: could not set the replacement's owner to match the original — the \
-             media stack may be unable to manage this file"
-        );
+        let err = std::io::Error::last_os_error();
+        // EPERM is the EXPECTED answer on an export that refuses chown, and
+        // this fleet's export does exactly that — measured on the live mount,
+        // not assumed. Every rewrite would emit an identical warning, so a
+        // 463-title run would produce 463 alarms about a condition that is
+        // normal here. A warning that fires on every success trains an operator
+        // to ignore warnings, which costs more than the thing it reports.
+        //
+        // It also is not the alarming claim the first version made. Whether a
+        // media manager can rename or delete a file is governed by the
+        // DIRECTORY's write permission, not by the file's owner — and these
+        // directories are 0777 with no sticky bit, so management is unaffected.
+        // The MODE, which is the half that actually controls access to the
+        // file's contents, is set separately above and does succeed here.
+        if err.raw_os_error() == Some(libc::EPERM) {
+            tracing::debug!(
+                dest = %dest.display(),
+                "foundry: the filesystem refuses chown (expected where it is squashed); \
+                 the replacement keeps the writing process's owner, and its mode was \
+                 matched to the original"
+            );
+        } else {
+            tracing::warn!(
+                dest = %dest.display(),
+                uid = md.uid(),
+                gid = md.gid(),
+                error = %err,
+                "foundry: could not set the replacement's owner to match the original"
+            );
+        }
     }
 }
 

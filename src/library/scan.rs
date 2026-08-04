@@ -33,6 +33,28 @@
 //! renames anything under it. Persistence (`media_items`/`media_files`/
 //! `artwork_cache` rows) goes only to Muse's own Postgres database via the
 //! `repo::*` modules, never back to the library filesystem.
+//!
+//! As of MPRB-06 this module also spawns `ffprobe` against files it records.
+//! That does not weaken the boundary: the path is resolved through
+//! [`crate::media::MediaCore`]'s **read-only** library guard (built with
+//! `enable_mutation: false`, permanently), and `ffprobe` is invoked with a
+//! read-only argv (`-show_streams -show_format`, no output file).
+//!
+//! ## MPRB-06 — what the recorded `media_info` is derived from
+//! Until MPRB-06 this file wrote `media_files.media_info` as
+//! `{"container": "<filename extension>"}`. That is a **claim about a file's
+//! contents derived from its name**: a `.mkv` full of HEVC and a `.mkv` full of
+//! MPEG-2 were indistinguishable in the database, and an `.avi` renamed to
+//! `.mkv` was simply believed. Nothing here derives `media_info` from the path
+//! any more — the document comes from `ffprobe`, through
+//! [`crate::media::probe::run_ffprobe_async`] (MPRB-02) and
+//! [`crate::media::doc::MediaInfoDoc`] (MPRB-05). The filename's extension is
+//! still recorded, but *inside* that document, as the hint MPRB-05 documents it
+//! to be, never as the answer.
+//!
+//! **The scanner probes on ARRIVAL, not on sight.** See [`probe_decision`] for
+//! the rule and the reasoning; the 16,221-file catch-up belongs to the backfill
+//! worker (MPRB-07) and its attempt-bounded queue, not to a rescan.
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +62,10 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::error::MuseResult;
+use crate::media::derive::suspicion;
+use crate::media::doc::StoredMediaInfo;
+use crate::media::probe::{MediaProbe, ProbeError};
+use crate::media::MediaCore;
 use crate::metadata::resolve::{self, NamedProvider, ResolveIds};
 use crate::models::library::Library;
 use crate::models::media_item::NewMediaItem;
@@ -399,6 +425,27 @@ pub struct ScanReport {
     /// dropped (S119b codex review). Skips the same idempotency guard
     /// `art_cached` does: an unchanged rescan doesn't re-attach.
     pub nfo_attached: usize,
+    /// MPRB-06: documents persisted this pass — `ok` **plus** `suspicious`.
+    /// A suspicious result parsed, so it counts as probed for completion; it
+    /// is counted again below for attention. Conflating those two questions is
+    /// what makes a sweep look finished when it is not.
+    pub probed: usize,
+    /// Subset of [`Self::probed`]: parsed, stored, and flagged by
+    /// [`crate::media::derive::suspicion`] as describing something implausible.
+    pub probe_suspicious: usize,
+    /// A probe that produced no document. The failure is recorded on the row
+    /// (state + attempt counter) and the scan continues.
+    pub probe_failed: usize,
+    /// Files not probed this pass: the host cannot probe, the file is unchanged
+    /// and already carries a document, the file is unchanged and left to the
+    /// backfill, or its path did not resolve inside the library root.
+    pub probe_skipped: usize,
+    /// The probe produced a verdict and the **database** refused to record it.
+    /// Deliberately not folded into [`Self::probe_failed`]: an operator's
+    /// response to "this file will not parse" and "Postgres rejected a write"
+    /// are entirely different, and reporting one as the other sends them at the
+    /// wrong thing.
+    pub probe_persist_failed: usize,
 }
 
 /// Walk `library.root_folder` and record what's found. Non-blocking per
@@ -413,9 +460,26 @@ pub struct ScanReport {
 /// intended) should call [`walk_media_files`] + `resolver.resolve` directly
 /// rather than this DB-writing entry point; `scan_library` is the full,
 /// DB-gated production path.
-pub async fn scan_library(pool: &PgPool, library: &Library, resolver: &dyn LibraryResolver) -> MuseResult<ScanReport> {
+pub async fn scan_library(
+    pool: &PgPool,
+    library: &Library,
+    resolver: &dyn LibraryResolver,
+    media: &MediaCore,
+) -> MuseResult<ScanReport> {
     let root = PathBuf::from(&library.root_folder);
     let files = walk_media_files(&root);
+
+    // Once per pass, not once per file. MPRB-01 takes the capability snapshot at
+    // construction precisely so a 16,000-item loop does not re-answer it, and a
+    // per-file warning about a host-level fact is 16,000 lines of the same
+    // sentence.
+    if !media.can_probe() {
+        tracing::warn!(
+            library = %library.name,
+            "library scan: ffprobe is not usable on this host — files will be recorded \
+             without a media_info document (the scan itself is unaffected)"
+        );
+    }
 
     let mut report = ScanReport {
         scanned: files.len(),
@@ -434,11 +498,16 @@ pub async fn scan_library(pool: &PgPool, library: &Library, resolver: &dyn Libra
 
         match scan_match {
             ScanMatch::Matched { media_metadata_id } => {
-                match record_matched_file(pool, library.id, media_metadata_id, &file).await {
+                match record_matched_file(pool, library.id, media_metadata_id, &file, media).await {
                     Ok(outcome) => {
                         report.matched += 1;
                         report.art_cached += outcome.art_cached;
                         report.nfo_attached += outcome.nfo_attached;
+                        report.probed += outcome.probe.probed;
+                        report.probe_suspicious += outcome.probe.suspicious;
+                        report.probe_failed += outcome.probe.failed;
+                        report.probe_skipped += outcome.probe.skipped;
+                        report.probe_persist_failed += outcome.probe.persist_failed;
                     }
                     Err(e) => {
                         report.errors += 1;
@@ -472,6 +541,8 @@ struct RecordOutcome {
     art_cached: usize,
     /// 0-1: whether the `.nfo` sidecar (if any) was (re-)attached this pass.
     nfo_attached: usize,
+    /// MPRB-06: what the probe step did for this one file.
+    probe: ProbeTally,
 }
 
 /// Upsert the `media_items` + `media_files` rows for a confidently-matched
@@ -483,6 +554,7 @@ async fn record_matched_file(
     library_id: i64,
     media_metadata_id: i64,
     file: &ScannedFile,
+    media: &MediaCore,
 ) -> MuseResult<RecordOutcome> {
     let media_item = repo::media_item::upsert(
         pool,
@@ -499,16 +571,27 @@ async fn record_matched_file(
     )
     .await?;
 
-    let container = file
-        .absolute_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
-    let media_info = container.map(|c| serde_json::json!({ "container": c }));
+    // MPRB-06: `media_info` is NOT written here, and `upsert_scanned` no longer
+    // accepts it. Until this item the two lines that stood here derived the
+    // stored document from `absolute_path.extension()` — the founding defect of
+    // this epic. `media_files.media_info` now has exactly one writer,
+    // `repo::media_file::set_probe_result`, and exactly one source, `ffprobe`.
+    let (media_file, file_changed) =
+        repo::media_file::upsert_scanned(pool, media_item.id, &file.relative_path, file.size_bytes).await?;
 
-    let (_media_file, _file_changed) =
-        repo::media_file::upsert_scanned(pool, media_item.id, &file.relative_path, file.size_bytes, media_info)
-            .await?;
+    let mut outcome = RecordOutcome {
+        probe: probe_pass(
+            media,
+            &DbProbeSink(pool),
+            media_file.id,
+            &file.relative_path,
+            &file.absolute_path,
+            &media_file.stored_media_info(),
+            file_changed,
+        )
+        .await,
+        ..Default::default()
+    };
 
     // Review finding (codex, this round): sidecar attachment must NOT be
     // gated on the MEDIA FILE's own change status. A prior revision
@@ -523,8 +606,10 @@ async fn record_matched_file(
     // byte-identical re-write -- so an unchanged file with unchanged
     // sidecars still does zero writes, but a changed/new sidecar is
     // attached regardless of whether the media file itself moved.
-    let mut outcome = RecordOutcome::default();
-
+    //
+    // MPRB-06: the same reasoning is why the probe step above is gated on the
+    // media file's change status and this one is not — a probe describes the
+    // media file's own bytes, a sidecar does not.
     if let Some(poster_path) = &file.sidecar_art.poster_path {
         if cache_art(pool, media_item.id, "poster", poster_path).await {
             outcome.art_cached += 1;
@@ -549,6 +634,285 @@ async fn record_matched_file(
     }
 
     Ok(outcome)
+}
+
+// --- MPRB-06: probing on arrival -------------------------------------------
+
+/// What the probe step did for one file. Every field is a distinct outcome; none
+/// is derived from another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProbeTally {
+    /// Documents persisted: `ok` + `suspicious`.
+    probed: usize,
+    /// Subset of `probed`.
+    suspicious: usize,
+    /// A probe with no usable answer; a failure row was written.
+    failed: usize,
+    /// Not probed this pass, for any of the reasons in [`ProbeDecision`], plus
+    /// a path that did not resolve inside the library root.
+    skipped: usize,
+    /// A verdict the database refused to record.
+    persist_failed: usize,
+}
+
+/// Whether this pass should probe this file.
+///
+/// **Pure, and deliberately so** — no filesystem, no database, no `MediaCore`.
+/// The scan integration's real question is a policy question, and a policy that
+/// can only be exercised through a Postgres connection is a policy nobody
+/// verifies. Everything this function needs is passed in.
+///
+/// ## Why an unchanged file is not re-probed
+/// The library is 16,221 titles on an NFS mount. A rescan is a routine
+/// operation — it runs on a schedule and after every import — and probing every
+/// file it walks would turn each one into 16,221 subprocess spawns and 16,221
+/// full-file-header reads across the network, for a set of answers that cannot
+/// have changed: `upsert_scanned` reports `file_changed == false` only when the
+/// row's `size_bytes` still matches what is on disk, and a file whose bytes are
+/// the same has the same codecs.
+///
+/// So this is an **arrival trigger**: probe what is new, and probe what changed.
+///
+/// ## Why an unchanged, never-probed file is left alone rather than probed here
+/// It is not ignored — it is somebody else's job, and that job already exists.
+/// [`crate::repo::media_file::list_needing_probe`] (MPRB-05) is an
+/// attempt-bounded, keyset-paginated queue over exactly these rows, and the
+/// backfill worker (MPRB-07) drains it at a rate an operator controls. Probing
+/// them from the scanner instead would put an unbounded, unresumable,
+/// unthrottled 16,221-file sweep inside a pass whose failure mode is a wedged
+/// NFS mount — and it would do it *twice*, since the backfill queue would still
+/// contain the rows the scan had not reached yet. One rule, one home: the
+/// catch-up sweep has a home, and it is not here.
+///
+/// ## Ordering
+/// Capability is checked first so a host without `ffprobe` produces one clear
+/// answer for every file rather than four different ones, and the answer is
+/// "this host cannot", not "this file did not need it".
+fn probe_decision(can_probe: bool, file_changed: bool, stored: &StoredMediaInfo) -> ProbeDecision {
+    if !can_probe {
+        return ProbeDecision::NoCapability;
+    }
+    if file_changed {
+        // New row, or the bytes moved. Any document already stored describes
+        // contents that no longer exist.
+        return ProbeDecision::Probe;
+    }
+    // `needs_probe()` is MPRB-05's rule, called rather than restated: absent and
+    // legacy rows need one, and a document written by a NEWER binary must not be
+    // re-probed because doing so would DOWNGRADE the row.
+    if stored.needs_probe() {
+        return ProbeDecision::DeferredToBackfill;
+    }
+    ProbeDecision::UpToDate
+}
+
+/// The outcome of [`probe_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeDecision {
+    /// New or changed: probe it now.
+    Probe,
+    /// This host has no usable `ffprobe`. Degrade — the scan still records the
+    /// file, it simply records no document (Module Contract §2).
+    NoCapability,
+    /// Unchanged, and already carrying a document. Nothing to do, no writes.
+    UpToDate,
+    /// Unchanged, and carrying no document this binary understands. The
+    /// backfill's queue owns it.
+    DeferredToBackfill,
+}
+
+impl ProbeDecision {
+    /// The `reason` field of the skip log, so an operator reading the log sees
+    /// which of the three skips happened.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::NoCapability => "no_ffprobe_on_this_host",
+            Self::UpToDate => "unchanged_and_already_probed",
+            Self::DeferredToBackfill => "unchanged_left_to_the_backfill",
+        }
+    }
+}
+
+/// What a finished probe should have written to the row.
+///
+/// A borrowed view, not a copy: it exists so the decision of *which* MPRB-05
+/// writer to call, and *what* to label the result, can be made and tested
+/// without a database connection.
+#[derive(Debug)]
+enum ProbeWrite<'a> {
+    /// It parsed. `suspicion` is [`crate::media::derive::suspicion`]'s verdict —
+    /// `None` for a file with nothing wrong with it. A suspicious result is
+    /// still stored, and stored labelled; MPRB-05's `set_probe_result` owns that
+    /// rule and this type only carries the description to it.
+    Document {
+        probe: &'a MediaProbe,
+        suspicion: Option<&'static str>,
+    },
+    /// It did not. The `ProbeError` is passed through **verbatim**;
+    /// classification happens in `StoredProbeState::from_error` →
+    /// `ProbeError::state` (MPRB-02), and nowhere else. This module contains no
+    /// `match` over `ProbeError` — deliberately, because a second one would be
+    /// free to drift from the first the moment a variant is added.
+    Failure { error: &'a ProbeError },
+}
+
+/// Decide what to write, from what the probe returned.
+fn probe_write(result: &Result<MediaProbe, ProbeError>) -> ProbeWrite<'_> {
+    match result {
+        Ok(probe) => ProbeWrite::Document {
+            probe,
+            // Called, not restated. `suspicion` is MPRB-03's rule and there is
+            // exactly one of it.
+            suspicion: suspicion(probe).map(|s| s.as_str()),
+        },
+        Err(error) => ProbeWrite::Failure { error },
+    }
+}
+
+/// The database edge of the probe step — **the only part of it that needs a
+/// pool**, and deliberately the only part that is not exercised without one.
+///
+/// Its whole body is a two-arm dispatch onto MPRB-05's writers. Everything that
+/// decides anything — whether to probe, what the probe said, how a failure is
+/// classified, what gets counted — sits above this trait and runs for real in
+/// the tests below against a recording fake. Without this split the entire item
+/// would be verifiable only where `MUSE_TEST_DATABASE_URL` is set, which is not
+/// where it is built (MUSE #130).
+///
+/// `Send + Sync` is required at the use site rather than left to inference: the
+/// scan runs inside an axum handler, and a `&dyn Trait` held across an `await`
+/// is what silently makes that handler's future non-`Send`.
+#[async_trait]
+trait ProbeSink {
+    async fn record(
+        &self,
+        media_file_id: i64,
+        relative_path: &str,
+        write: &ProbeWrite<'_>,
+    ) -> MuseResult<()>;
+}
+
+/// The production sink: MPRB-05's two writers, and nothing else.
+struct DbProbeSink<'a>(&'a PgPool);
+
+#[async_trait]
+impl ProbeSink for DbProbeSink<'_> {
+    async fn record(
+        &self,
+        media_file_id: i64,
+        relative_path: &str,
+        write: &ProbeWrite<'_>,
+    ) -> MuseResult<()> {
+        match write {
+            ProbeWrite::Document { probe, suspicion } => {
+                repo::media_file::set_probe_result(self.0, media_file_id, relative_path, probe, *suspicion)
+                    .await
+            }
+            ProbeWrite::Failure { error } => {
+                repo::media_file::set_probe_error(self.0, media_file_id, error).await
+            }
+        }
+    }
+}
+
+/// Probe one file and persist the result, or explain why neither happened.
+///
+/// Never returns an error: a probe failure, a path that will not resolve and a
+/// refused write are all recorded in the [`ProbeTally`] and logged. **A file
+/// that cannot be probed must not fail the scan** — the scan's job is to record
+/// what is on disk, and it did.
+async fn probe_pass(
+    media: &MediaCore,
+    sink: &(dyn ProbeSink + Send + Sync),
+    media_file_id: i64,
+    relative_path: &str,
+    absolute_path: &Path,
+    stored: &StoredMediaInfo,
+    file_changed: bool,
+) -> ProbeTally {
+    let mut tally = ProbeTally::default();
+
+    let decision = probe_decision(media.can_probe(), file_changed, stored);
+    if decision != ProbeDecision::Probe {
+        tally.skipped += 1;
+        tracing::debug!(
+            path = %relative_path,
+            reason = decision.as_str(),
+            "library scan: not probing this file"
+        );
+        return tally;
+    }
+
+    // Resolved through the media core's READ-ONLY library guard, never by
+    // handing `run_ffprobe_async` a raw path: `ResolvedPath` is the type that
+    // says this file is inside `MUSE_LIBRARY_ROOT`, and the scanner is not
+    // exempt from proving it.
+    let resolved = match media.library_guard().resolve(absolute_path) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            // NOT persisted as a probe failure. Nothing was observed about the
+            // file, and burning one of its bounded `probe_attempts` on a
+            // configuration fault would eventually exhaust the backfill's
+            // retries for a file that is perfectly readable.
+            tally.skipped += 1;
+            tracing::warn!(
+                path = %relative_path,
+                error = %e,
+                "library scan: a walked file did not resolve inside MUSE_LIBRARY_ROOT; not probing it"
+            );
+            return tally;
+        }
+    };
+
+    let result = media.probe_async(&resolved).await;
+    let write = probe_write(&result);
+
+    match &write {
+        ProbeWrite::Document { suspicion, .. } => {
+            if let Some(reason) = *suspicion {
+                tracing::info!(
+                    path = %relative_path,
+                    suspicion = reason,
+                    "library scan: probed, and the result describes something implausible"
+                );
+            }
+        }
+        ProbeWrite::Failure { error } => {
+            tracing::warn!(
+                path = %relative_path,
+                error = %error,
+                retryable = error.is_retryable(),
+                "library scan: probe produced no usable answer; recording the failure and continuing"
+            );
+        }
+    }
+
+    // Counted from what was WRITTEN, not from what was observed. `probed` is
+    // reported as documents persisted; incrementing it before the write and
+    // leaving it standing when the write is refused would make the counter a
+    // claim about the database that the database never agreed to.
+    match sink.record(media_file_id, relative_path, &write).await {
+        Ok(()) => match &write {
+            ProbeWrite::Document { suspicion, .. } => {
+                tally.probed += 1;
+                if suspicion.is_some() {
+                    tally.suspicious += 1;
+                }
+            }
+            ProbeWrite::Failure { .. } => tally.failed += 1,
+        },
+        Err(e) => {
+            tally.persist_failed += 1;
+            tracing::warn!(
+                path = %relative_path,
+                error = %e,
+                "library scan: could not record the probe outcome; the file is still recorded"
+            );
+        }
+    }
+
+    tally
 }
 
 /// Read (READ-ONLY) + cache the `.nfo` sidecar into `artwork_cache` under
@@ -676,6 +1040,17 @@ pub async fn run_scan(
         return Ok(Vec::new());
     };
 
+    // Built ONCE for the whole run, not once per library: construction takes the
+    // host capability snapshot, which costs three bounded subprocess spawns
+    // (CAPDET-01), and the answer is a property of the host, not of a library.
+    let media = MediaCore::from_config(config);
+    if media.library_guard_is_inert() {
+        tracing::warn!(
+            "library scan: the media core's library guard is inert — no walked file will \
+             resolve, so nothing will be probed this run"
+        );
+    }
+
     let libraries = repo::library::list(pool).await?;
     let mut reports = Vec::new();
 
@@ -694,7 +1069,7 @@ pub async fn run_scan(
         }
 
         let resolver = DbLibraryResolver { pool, providers };
-        match scan_library(pool, &library, &resolver).await {
+        match scan_library(pool, &library, &resolver, &media).await {
             Ok(report) => {
                 tracing::info!(
                     library = %library.name,
@@ -705,6 +1080,11 @@ pub async fn run_scan(
                     errors = report.errors,
                     art_cached = report.art_cached,
                     nfo_attached = report.nfo_attached,
+                    probed = report.probed,
+                    probe_suspicious = report.probe_suspicious,
+                    probe_failed = report.probe_failed,
+                    probe_skipped = report.probe_skipped,
+                    probe_persist_failed = report.probe_persist_failed,
                     "library scan: pass complete"
                 );
                 reports.push(report);
@@ -729,6 +1109,26 @@ mod tests {
         dir.push(format!("muse-library-scan-test-{name}-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).expect("create fixture dir");
         dir
+    }
+
+    /// A binary name that cannot exist on any host — same device
+    /// `crate::media`'s own tests use.
+    const ABSENT_BIN: &str = "muse-scan-no-such-ffprobe-xyzzy";
+
+    /// A [`MediaCore`] that cannot probe, for the DB-gated tests below.
+    ///
+    /// Those tests predate MPRB-06 and assert the walk/match/sidecar behaviour;
+    /// they are given a core that degrades so their subject stays what it was.
+    /// The probe path itself is exercised **without** a database, further down,
+    /// against a real `ffprobe`-shaped subprocess — see
+    /// [`probe_pass_persists_what_the_file_says_not_what_it_is_called`].
+    fn no_probe_core() -> MediaCore {
+        MediaCore::from_config(&crate::config::Config {
+            probe_ffprobe_bin: Some(ABSENT_BIN.to_string()),
+            ffmpeg_path: ABSENT_BIN.to_string(),
+            foundry_handbrake_bin: Some(ABSENT_BIN.to_string()),
+            ..Default::default()
+        })
     }
 
     fn checksum_tree(root: &Path) -> Vec<(String, u64, Vec<u8>)> {
@@ -1085,7 +1485,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let report = scan_library(&pool, &library, &AlwaysErrorsResolver)
+        let report = scan_library(&pool, &library, &AlwaysErrorsResolver, &no_probe_core())
             .await
             .expect("scan_library itself must not error even though every file's resolver call does");
 
@@ -1182,7 +1582,7 @@ mod tests {
 
         let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
 
-        let report = scan_library(&pool, &library, &resolver).await.expect("first scan_library pass");
+        let report = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("first scan_library pass");
         assert_eq!(report.scanned, 1);
         assert_eq!(report.matched, 1, "the fixture's title+year should exactly match the seeded metadata row");
         assert_eq!(report.art_cached, 1, "the sidecar poster should have been cached");
@@ -1196,6 +1596,21 @@ mod tests {
             .expect("list media_files");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].size_bytes, Some(contents.len() as i64));
+        // MPRB-06: a freshly scanned row carries NO document. Before this item it
+        // carried `{"container": "mkv"}` — a `Legacy` document derived from the
+        // filename. The scan core here cannot probe, so the honest state is
+        // "not probed yet", which is what the backfill queue looks for.
+        assert_eq!(
+            files[0].stored_media_info(),
+            StoredMediaInfo::Absent,
+            "the scanner must never mint a document from the filename's extension"
+        );
+        assert_eq!(files[0].media_info_version, None);
+        assert_eq!(report.probed, 0);
+        assert_eq!(
+            report.probe_skipped, 1,
+            "a host that cannot probe still scans; it records no document"
+        );
 
         let art = repo::artwork_cache::get(&pool, "media_item", items[0].id, "poster")
             .await
@@ -1206,7 +1621,7 @@ mod tests {
 
         // Idempotent re-scan: no duplicate media_items/media_files rows, AND
         // (review finding 3, codex) no re-caching of unchanged sidecar art.
-        let report2 = scan_library(&pool, &library, &resolver).await.expect("second scan_library pass");
+        let report2 = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("second scan_library pass");
         assert_eq!(report2.matched, 1);
         assert_eq!(
             report2.art_cached, 0,
@@ -1229,7 +1644,7 @@ mod tests {
         fs::write(movie_dir.join("fanart.jpg"), b"newly-added-fanart-bytes").unwrap();
         fs::write(movie_dir.join("movie.nfo"), b"<movie><title>added later</title></movie>").unwrap();
 
-        let report3 = scan_library(&pool, &library, &resolver).await.expect("third scan_library pass");
+        let report3 = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("third scan_library pass");
         assert_eq!(report3.matched, 1);
         assert_eq!(
             report3.art_cached, 1,
@@ -1254,7 +1669,7 @@ mod tests {
 
         // And re-scanning again with nothing further changed is back to a
         // full no-op, including for the sidecars just attached above.
-        let report4 = scan_library(&pool, &library, &resolver).await.expect("fourth scan_library pass");
+        let report4 = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("fourth scan_library pass");
         assert_eq!(report4.matched, 1);
         assert_eq!(report4.art_cached, 0, "unchanged sidecars (poster+fanart) must not be re-cached again");
         assert_eq!(report4.nfo_attached, 0, "an unchanged .nfo must not be re-attached again");
@@ -1342,7 +1757,7 @@ mod tests {
         .expect("seed a media_metadata row whose title+year exactly matches the fixture file");
 
         let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
-        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+        let report = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("scan_library pass");
 
         assert_eq!(report.scanned, 1);
         assert_eq!(
@@ -1442,7 +1857,7 @@ mod tests {
         .expect("seed the media_metadata row the .nfo's tmdb id points at");
 
         let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
-        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+        let report = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("scan_library pass");
 
         assert_eq!(report.scanned, 1);
         assert_eq!(
@@ -1550,7 +1965,7 @@ mod tests {
         .expect("seed a media_metadata row whose title+year exactly matches the fixture file");
 
         let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
-        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+        let report = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("scan_library pass");
 
         assert_eq!(report.scanned, 1);
         assert_eq!(
@@ -1659,7 +2074,7 @@ mod tests {
         assert_eq!(files[0].parsed.year, None, "precondition: this fixture filename must parse with no year");
 
         let resolver = DbLibraryResolver { pool: &pool, providers: &[] };
-        let report = scan_library(&pool, &library, &resolver).await.expect("scan_library pass");
+        let report = scan_library(&pool, &library, &resolver, &no_probe_core()).await.expect("scan_library pass");
 
         assert_eq!(report.scanned, 1);
         assert_eq!(
@@ -1703,5 +2118,638 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&sibling).ok();
+    }
+
+    // --- MPRB-06: the probe step ------------------------------------------
+    //
+    // Everything below runs WITHOUT a database. `probe_pass` is the whole
+    // production probe step; only its final write is behind the `ProbeSink`
+    // trait, so these tests drive the real decision, the real subprocess, the
+    // real parser and the real classification, and inspect what the production
+    // code asked the database to store. `MUSE_TEST_DATABASE_URL` is not set on
+    // the build host (MUSE #130), so anything that needed a pool would report
+    // `ok` while executing nothing.
+
+    mod probe_step {
+        use super::*;
+        use crate::media::derive::Suspicion;
+        use crate::media::doc::{MediaInfoDoc, StoredProbeState};
+        use crate::media::probe::{parse_probe_json, ProbeState};
+
+        /// The committed golden corpus (MPRB-04): real `ffprobe` output from the
+        /// real library, scrubbed. Used here so "what the file says" is not a
+        /// document this test wrote for itself.
+        fn golden(name: &str) -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/probe")
+                .join(format!("{name}.json"))
+        }
+
+        fn golden_probe(name: &str) -> MediaProbe {
+            parse_probe_json(&fs::read_to_string(golden(name)).expect("read the golden fixture"))
+                .expect("the golden fixture must parse")
+        }
+
+        /// A `StoredMediaInfo::V1` built from a real probe, with the variant
+        /// asserted rather than assumed: a fixture that silently landed in
+        /// `UnknownVersion` would make every "already probed" test below pass for
+        /// the wrong reason.
+        fn v1_of(name: &str) -> StoredMediaInfo {
+            let json = MediaInfoDoc::new(golden_probe(name), "Movie.mkv")
+                .to_json()
+                .expect("the document must serialise");
+            let stored = StoredMediaInfo::from_json(Some(&json));
+            assert!(
+                matches!(stored, StoredMediaInfo::V1(_)),
+                "fixture is not a v1 document: {stored:?}"
+            );
+            stored
+        }
+
+        fn legacy() -> StoredMediaInfo {
+            // Built by parsing rather than by `json!`, so this fixture does not
+            // trip the guard below that forbids the scanner from constructing a
+            // container document.
+            let value: serde_json::Value =
+                serde_json::from_str(r#"{"container":"mkv"}"#).expect("fixture parses");
+            let stored = StoredMediaInfo::from_json(Some(&value));
+            assert!(matches!(stored, StoredMediaInfo::Legacy(_)), "{stored:?}");
+            stored
+        }
+
+        fn newer_binarys_document() -> StoredMediaInfo {
+            let stored = StoredMediaInfo::from_json(Some(&serde_json::json!({
+                "schema_version": 2, "probe": {}
+            })));
+            assert!(
+                matches!(stored, StoredMediaInfo::UnknownVersion { version: 2 }),
+                "{stored:?}"
+            );
+            stored
+        }
+
+        // --- the rule, exercised without a filesystem or a database ---------
+
+        #[test]
+        fn a_new_or_changed_file_is_always_probed() {
+            for stored in [
+                StoredMediaInfo::from_json(None),
+                legacy(),
+                v1_of("dv_hdr_hevc_4k"),
+                newer_binarys_document(),
+            ] {
+                assert_eq!(
+                    probe_decision(true, true, &stored),
+                    ProbeDecision::Probe,
+                    "a file whose bytes moved must be re-probed whatever the row held: {stored:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_unchanged_file_that_already_has_a_document_is_not_reprobed() {
+            assert_eq!(
+                probe_decision(true, false, &v1_of("dv_hdr_hevc_4k")),
+                ProbeDecision::UpToDate,
+                "a rescan of 16,221 unchanged files must not spawn 16,221 probes"
+            );
+        }
+
+        #[test]
+        fn an_unchanged_unprobed_file_is_left_to_the_backfills_bounded_queue() {
+            for stored in [StoredMediaInfo::from_json(None), legacy()] {
+                assert_eq!(
+                    probe_decision(true, false, &stored),
+                    ProbeDecision::DeferredToBackfill,
+                    "{stored:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_unchanged_row_written_by_a_newer_binary_is_never_downgraded() {
+            assert_eq!(
+                probe_decision(true, false, &newer_binarys_document()),
+                ProbeDecision::UpToDate,
+                "re-probing a document a newer binary wrote would replace a richer \
+                 answer with a poorer one"
+            );
+        }
+
+        #[test]
+        fn a_host_without_ffprobe_probes_nothing_and_says_which_it_is() {
+            for changed in [true, false] {
+                for stored in [
+                    StoredMediaInfo::from_json(None),
+                    legacy(),
+                    v1_of("dv_hdr_hevc_4k"),
+                    newer_binarys_document(),
+                ] {
+                    assert_eq!(
+                        probe_decision(false, changed, &stored),
+                        ProbeDecision::NoCapability,
+                        "changed={changed} stored={stored:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                ProbeDecision::NoCapability.as_str(),
+                "no_ffprobe_on_this_host"
+            );
+        }
+
+        // --- the step, exercised against a real subprocess -------------------
+
+        /// What the production code asked the database to store.
+        #[derive(Debug)]
+        enum Recorded {
+            Document {
+                media_file_id: i64,
+                relative_path: String,
+                probe: MediaProbe,
+                suspicion: Option<String>,
+            },
+            Failure {
+                media_file_id: i64,
+                error: ProbeError,
+            },
+        }
+
+        #[derive(Default)]
+        struct RecordingSink {
+            writes: Mutex<Vec<Recorded>>,
+            /// When set, every write is refused — the DB-said-no path.
+            refuse: bool,
+        }
+
+        #[async_trait]
+        impl ProbeSink for RecordingSink {
+            async fn record(
+                &self,
+                media_file_id: i64,
+                relative_path: &str,
+                write: &ProbeWrite<'_>,
+            ) -> MuseResult<()> {
+                self.writes.lock().unwrap().push(match write {
+                    ProbeWrite::Document { probe, suspicion } => Recorded::Document {
+                        media_file_id,
+                        relative_path: relative_path.to_string(),
+                        probe: (*probe).clone(),
+                        suspicion: (*suspicion).map(str::to_string),
+                    },
+                    ProbeWrite::Failure { error } => Recorded::Failure {
+                        media_file_id,
+                        error: (*error).clone(),
+                    },
+                });
+                if self.refuse {
+                    return Err(crate::error::MuseError::Internal(anyhow::anyhow!(
+                        "the database refused this write"
+                    )));
+                }
+                Ok(())
+            }
+        }
+
+        /// An executable `/bin/sh` stub standing in for `ffprobe` that **records
+        /// every probe invocation**, so "this pass did not probe" is a claim
+        /// about a process rather than about a counter.
+        ///
+        /// `-version` is answered like a real `ffprobe` and deliberately NOT
+        /// counted: `MediaCore::from_config` runs the capability detection
+        /// (CAPDET-01) at construction, and counting that spawn would have made
+        /// the marker read 1 for a pass that never probed anything — a
+        /// zero-spawn assertion is worthless if something else spawns.
+        fn stub_ffprobe(dir: &Path, body: &str) -> (String, PathBuf) {
+            let marker = dir.join("spawns");
+            let path = dir.join("stub-ffprobe");
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in -version) echo 'ffprobe version 5.1.9'; exit 0;; esac\necho spawned >> '{}'\n{body}\n",
+                    marker.display()
+                ),
+            )
+            .expect("write the stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            }
+
+            // Wait until the stub is actually executable before returning it.
+            //
+            // This is not defensive padding — it was added after the mutation
+            // battery caught the failure. A freshly written script is racy to
+            // exec in a multi-threaded test binary: another thread forking while
+            // our write fd is still open leaves the child holding it, and the
+            // exec fails with ETXTBSY. `MediaCore::from_config` runs its
+            // capability detection at construction, so a lost race turned
+            // `can_probe()` into `false` and the test's subject silently became
+            // the degradation path instead of the probe path — a real result
+            // replaced by a different real result, which is exactly the kind of
+            // environmental blindness that makes a mutation look survivable.
+            for attempt in 0..100 {
+                match std::process::Command::new(&path).arg("-version").output() {
+                    Ok(out) if out.status.success() => break,
+                    other => {
+                        assert!(attempt < 99, "the stub never became executable: {other:?}");
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            }
+
+            (path.to_string_lossy().into_owned(), marker)
+        }
+
+        fn spawn_count(marker: &Path) -> usize {
+            fs::read_to_string(marker).map(|s| s.lines().count()).unwrap_or(0)
+        }
+
+        /// A `MediaCore` rooted at `dir`, probing via `bin`.
+        ///
+        /// Asserts the capability snapshot came out `true`: every test using this
+        /// helper is about what happens when a probe RUNS, and a core that
+        /// quietly could not probe would send them all down the degradation path
+        /// while still executing. The assertion makes that a named failure rather
+        /// than a confusing one.
+        fn core_rooted(dir: &Path, bin: &str) -> MediaCore {
+            let core = MediaCore::from_config(&crate::config::Config {
+                probe_ffprobe_bin: Some(bin.to_string()),
+                library_root: Some(dir.to_string_lossy().into_owned()),
+                ffmpeg_path: ABSENT_BIN.to_string(),
+                foundry_handbrake_bin: Some(ABSENT_BIN.to_string()),
+                ..Default::default()
+            });
+            assert!(
+                core.can_probe(),
+                "the stub must be detected as a usable ffprobe, or this test is \
+                 exercising the degradation path by accident"
+            );
+            core
+        }
+
+        /// **The founding defect, and its fix.**
+        ///
+        /// The subject file is named `Feature.mkv`. What it actually contains is
+        /// the real library's MSMPEG4v2-in-AVI capture. Before MPRB-06 the row
+        /// would have recorded `{"container": "mkv"}` — the name. It now records
+        /// what the tool read: an `avi` container and an `msmpeg4v2` video
+        /// stream, contradicting the extension outright.
+        #[tokio::test]
+        async fn probe_pass_persists_what_the_file_says_not_what_it_is_called() {
+            let dir = unique_dir("probe-contents-not-name");
+            let (bin, marker) = stub_ffprobe(
+                &dir,
+                &format!("cat '{}'", golden("legacy_msmpeg4v2_avi").display()),
+            );
+            let subject = dir.join("Feature.mkv");
+            fs::write(&subject, b"not really a video").unwrap();
+            let sink = RecordingSink::default();
+
+            let tally = probe_pass(
+                &core_rooted(&dir, &bin),
+                &sink,
+                77,
+                "Feature.mkv",
+                &subject,
+                &StoredMediaInfo::from_json(None),
+                true,
+            )
+            .await;
+
+            assert_eq!(spawn_count(&marker), 1, "exactly one probe for one new file");
+            assert_eq!(
+                tally,
+                ProbeTally { probed: 1, ..Default::default() },
+                "a clean probe is one stored document and nothing else"
+            );
+
+            let writes = sink.writes.lock().unwrap();
+            let [Recorded::Document { media_file_id, relative_path, probe, suspicion }] =
+                &writes[..]
+            else {
+                panic!("expected exactly one stored document, got {writes:?}");
+            };
+            assert_eq!(*media_file_id, 77);
+            assert_eq!(relative_path, "Feature.mkv");
+            assert_eq!(*suspicion, None);
+            assert_eq!(
+                probe.container, "avi",
+                "the stored container must come from the file, not from `.mkv`"
+            );
+            assert_eq!(
+                probe.primary_video().map(|v| v.codec.as_str()),
+                Some("msmpeg4v2"),
+                "a codec is a fact about bytes, and the filename cannot supply it"
+            );
+
+            // The extension is still recorded — inside the document, as MPRB-05's
+            // hint, next to the contradicting truth rather than instead of it.
+            let doc = MediaInfoDoc::new(probe.clone(), relative_path);
+            assert_eq!(doc.file_extension.as_deref(), Some("mkv"));
+            assert_ne!(
+                doc.probe.container, "mkv",
+                "recording what the filename claims must not become believing it"
+            );
+
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// An unchanged file is not merely "not counted" — `ffprobe` is not run.
+        /// The marker file is what makes that a statement about a process.
+        #[tokio::test]
+        async fn an_unchanged_already_probed_file_spawns_nothing_and_writes_nothing() {
+            let dir = unique_dir("probe-unchanged");
+            let (bin, marker) = stub_ffprobe(
+                &dir,
+                &format!("cat '{}'", golden("dv_hdr_hevc_4k").display()),
+            );
+            let subject = dir.join("Feature.mkv");
+            fs::write(&subject, b"not really a video").unwrap();
+            let sink = RecordingSink::default();
+
+            let tally = probe_pass(
+                &core_rooted(&dir, &bin),
+                &sink,
+                1,
+                "Feature.mkv",
+                &subject,
+                &v1_of("dv_hdr_hevc_4k"),
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                spawn_count(&marker),
+                0,
+                "a rescan of an unchanged, already-probed file must not touch the mount"
+            );
+            assert!(sink.writes.lock().unwrap().is_empty(), "and must not write");
+            assert_eq!(tally, ProbeTally { skipped: 1, ..Default::default() });
+
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A failure is classified by MPRB-02's taxonomy, reached through
+        /// MPRB-05's wrapper. This module writes no second classification, and
+        /// the assertion is against the typed value rather than a spelling.
+        #[tokio::test]
+        async fn a_failed_probe_is_recorded_with_mprb02s_classification() {
+            let dir = unique_dir("probe-exit-failure");
+            let (bin, marker) = stub_ffprobe(&dir, "echo 'moov atom not found' >&2; exit 1");
+            let subject = dir.join("Broken.mkv");
+            fs::write(&subject, b"truncated").unwrap();
+            let sink = RecordingSink::default();
+
+            let tally = probe_pass(
+                &core_rooted(&dir, &bin),
+                &sink,
+                42,
+                "Broken.mkv",
+                &subject,
+                &StoredMediaInfo::from_json(None),
+                true,
+            )
+            .await;
+
+            assert_eq!(spawn_count(&marker), 1);
+            assert_eq!(
+                tally,
+                ProbeTally { failed: 1, ..Default::default() },
+                "a failure is a failure, never a stored document"
+            );
+
+            let writes = sink.writes.lock().unwrap();
+            let [Recorded::Failure { media_file_id, error }] = &writes[..] else {
+                panic!("expected exactly one recorded failure, got {writes:?}");
+            };
+            assert_eq!(*media_file_id, 42);
+            assert_eq!(
+                StoredProbeState::from_error(error),
+                StoredProbeState::Failed(ProbeState::ProbeFailed),
+                "ffprobe answered and the answer was unusable — that is a statement \
+                 about the file, not about the host"
+            );
+            assert!(!error.is_retryable(), "and re-running it says the same thing");
+
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The other side of the taxonomy, so the test above cannot pass by
+        /// classifying everything as `probe_failed`.
+        #[tokio::test]
+        async fn a_missing_binary_is_recorded_as_unreadable_not_as_a_broken_file() {
+            let dir = unique_dir("probe-tool-missing");
+            let subject = dir.join("Fine.mkv");
+            fs::write(&subject, b"perfectly readable").unwrap();
+            let sink = RecordingSink::default();
+
+            // A core whose capability snapshot says it CAN probe, pointed at a
+            // binary that is gone by the time the probe runs: the state
+            // `can_probe()` alone cannot describe.
+            let (bin, _marker) = stub_ffprobe(&dir, "cat /dev/null");
+            let core = core_rooted(&dir, &bin);
+            assert!(core.can_probe(), "the snapshot must have said yes for this test to mean anything");
+            fs::remove_file(&bin).unwrap();
+
+            let tally = probe_pass(
+                &core,
+                &sink,
+                9,
+                "Fine.mkv",
+                &subject,
+                &StoredMediaInfo::from_json(None),
+                true,
+            )
+            .await;
+
+            assert_eq!(tally, ProbeTally { failed: 1, ..Default::default() });
+            let writes = sink.writes.lock().unwrap();
+            let [Recorded::Failure { error, .. }] = &writes[..] else {
+                panic!("expected one recorded failure, got {writes:?}");
+            };
+            assert_eq!(
+                StoredProbeState::from_error(error),
+                StoredProbeState::Failed(ProbeState::Unreadable),
+                "blaming the operator's media for a missing tool is the one thing \
+                 ProbeError::ToolMissing exists to prevent"
+            );
+            assert!(error.is_retryable());
+
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A parsed-but-implausible result is still stored, and stored labelled —
+        /// with MPRB-03's description, not one this module invented.
+        #[tokio::test]
+        async fn a_suspicious_result_is_stored_and_carries_mprb03s_label() {
+            let dir = unique_dir("probe-suspicious");
+            const ZERO_DURATION: &str = r#"{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080}],"format":{"format_name":"matroska,webm","duration":"0.000000"}}"#;
+            let (bin, _marker) = stub_ffprobe(&dir, &format!("printf '%s' '{ZERO_DURATION}'"));
+            let subject = dir.join("Zero.mkv");
+            fs::write(&subject, b"zero").unwrap();
+            let sink = RecordingSink::default();
+
+            let tally = probe_pass(
+                &core_rooted(&dir, &bin),
+                &sink,
+                5,
+                "Zero.mkv",
+                &subject,
+                &StoredMediaInfo::from_json(None),
+                true,
+            )
+            .await;
+
+            assert_eq!(
+                tally,
+                ProbeTally { probed: 1, suspicious: 1, ..Default::default() },
+                "suspicious counts as probed for completion AND as needing attention"
+            );
+            let writes = sink.writes.lock().unwrap();
+            let [Recorded::Document { suspicion, .. }] = &writes[..] else {
+                panic!("a suspicious result must still be stored, got {writes:?}");
+            };
+            assert_eq!(
+                suspicion.as_deref(),
+                Some(Suspicion::ZeroDuration.as_str()),
+                "the label is MPRB-03's, passed through"
+            );
+
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A walked file that will not resolve inside `MUSE_LIBRARY_ROOT` is a
+        /// configuration fault. It is skipped — not spawned against, and not
+        /// written as a probe failure, which would spend one of the file's
+        /// bounded `probe_attempts` on something that is not wrong with the file.
+        #[tokio::test]
+        async fn a_file_outside_the_library_root_is_skipped_not_recorded_as_a_failure() {
+            let dir = unique_dir("probe-outside-root");
+            let elsewhere = unique_dir("probe-outside-root-other");
+            let (bin, marker) = stub_ffprobe(&dir, "cat /dev/null");
+            let subject = elsewhere.join("Feature.mkv");
+            fs::write(&subject, b"outside").unwrap();
+            let sink = RecordingSink::default();
+
+            let tally = probe_pass(
+                &core_rooted(&dir, &bin),
+                &sink,
+                3,
+                "Feature.mkv",
+                &subject,
+                &StoredMediaInfo::from_json(None),
+                true,
+            )
+            .await;
+
+            assert_eq!(tally, ProbeTally { skipped: 1, ..Default::default() });
+            assert_eq!(spawn_count(&marker), 0);
+            assert!(sink.writes.lock().unwrap().is_empty());
+
+            fs::remove_dir_all(&dir).ok();
+            fs::remove_dir_all(&elsewhere).ok();
+        }
+
+        /// A host with no `ffprobe` still scans. It records no document, it does
+        /// not spawn, and it does not fail.
+        #[tokio::test]
+        async fn a_host_without_ffprobe_degrades_rather_than_failing_the_scan() {
+            let dir = unique_dir("probe-no-capability");
+            let subject = dir.join("Feature.mkv");
+            fs::write(&subject, b"unprobeable here").unwrap();
+            let sink = RecordingSink::default();
+            let core = MediaCore::from_config(&crate::config::Config {
+                probe_ffprobe_bin: Some(ABSENT_BIN.to_string()),
+                library_root: Some(dir.to_string_lossy().into_owned()),
+                ffmpeg_path: ABSENT_BIN.to_string(),
+                foundry_handbrake_bin: Some(ABSENT_BIN.to_string()),
+                ..Default::default()
+            });
+            assert!(!core.can_probe());
+
+            let tally = probe_pass(
+                &core,
+                &sink,
+                11,
+                "Feature.mkv",
+                &subject,
+                &StoredMediaInfo::from_json(None),
+                true,
+            )
+            .await;
+
+            assert_eq!(tally, ProbeTally { skipped: 1, ..Default::default() });
+            assert!(sink.writes.lock().unwrap().is_empty());
+
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A verdict the database refused is not a stored document. `probed` is
+        /// reported as "documents persisted"; counting an observation the write
+        /// never landed would make that number a claim about Postgres that
+        /// Postgres never agreed to.
+        #[tokio::test]
+        async fn a_refused_write_is_counted_as_a_refused_write_not_as_a_document() {
+            let dir = unique_dir("probe-refused-write");
+            let (bin, _marker) = stub_ffprobe(
+                &dir,
+                &format!("cat '{}'", golden("dv_hdr_hevc_4k").display()),
+            );
+            let subject = dir.join("Feature.mkv");
+            fs::write(&subject, b"fine").unwrap();
+            let sink = RecordingSink { refuse: true, ..Default::default() };
+
+            let tally = probe_pass(
+                &core_rooted(&dir, &bin),
+                &sink,
+                8,
+                "Feature.mkv",
+                &subject,
+                &StoredMediaInfo::from_json(None),
+                true,
+            )
+            .await;
+
+            assert_eq!(
+                tally,
+                ProbeTally { persist_failed: 1, ..Default::default() },
+                "no `probed`, and the failure is reported as a WRITE failure, which is \
+                 a different thing from a file that will not parse"
+            );
+            assert_eq!(sink.writes.lock().unwrap().len(), 1, "it was attempted");
+
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The extension-derived write cannot come back without changing a
+        /// signature: `upsert_scanned` no longer takes a `media_info` at all, and
+        /// nothing in the scanner derives a container from a path.
+        #[test]
+        fn the_scanner_no_longer_derives_a_stored_document_from_a_filename() {
+            let me = include_str!("scan.rs");
+            for banned in [
+                concat!("json!({ \"container\"", ":"),
+                concat!("json!({\"container\"", ":"),
+            ] {
+                assert!(
+                    !me.contains(banned),
+                    "the scanner must not construct a container document: {banned}"
+                );
+            }
+            let repo_src = include_str!("../repo/media_file.rs");
+            let signature = repo_src
+                .split("pub async fn upsert_scanned(")
+                .nth(1)
+                .expect("upsert_scanned must exist")
+                .split(')')
+                .next()
+                .unwrap();
+            assert!(
+                !signature.contains("media_info"),
+                "upsert_scanned must not accept a media_info again: {signature}"
+            );
+        }
     }
 }

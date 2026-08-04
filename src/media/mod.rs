@@ -270,13 +270,12 @@ impl MediaCore {
     ///
     /// This is the method the async consumers (MPRB-06 scan integration,
     /// MPRB-07 backfill, Maestro) are meant to call, and it is the reason the
-    /// two knobs above exist: a limit nothing reads is not a limit. Stated
-    /// honestly, as MPRB-01 stated it for `MediaCore` itself — **this item adds
-    /// the method and its tests, not a caller.** Those land with the consumers.
+    /// two knobs above exist: a limit nothing reads is not a limit. MPRB-01
+    /// added the method with no caller and said so; MPRB-06 is the first — the
+    /// library scanner's probe-on-arrival step.
     ///
     /// Takes a [`paths::ResolvedPath`] rather than a `&Path`, so a caller
     /// cannot reach outside `MUSE_LIBRARY_ROOT` by forgetting to resolve.
-    #[allow(dead_code)]
     pub(crate) async fn probe_async(
         &self,
         path: &paths::ResolvedPath,
@@ -312,10 +311,9 @@ impl MediaCore {
     /// Crate-internal: a `PathGuard` is a capability, and handing one to code
     /// outside the crate is the disclosure this module's guards are narrowed to
     /// prevent. `resolve_for_mutation` on this guard always fails.
-    // No consumer until MPRB-06/07; the accessor exists so those items add a
-    // caller rather than a capability. Annotated rather than left as warning
-    // noise, and rather than widening visibility to silence it.
-    #[allow(dead_code)]
+    // MPRB-06 is the first caller: `src/library/scan.rs` resolves every walked
+    // file through this guard before probing it, so the scanner cannot reach
+    // outside `MUSE_LIBRARY_ROOT` by forgetting to.
     pub(crate) fn library_guard(&self) -> &paths::PathGuard {
         &self.library_guard
     }

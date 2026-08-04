@@ -17,16 +17,24 @@ use crate::models::media_file::{MediaFile, NewMediaFile, ReleaseTypeKind};
 /// Looks the row up first, then either leaves it untouched (unchanged size
 /// — the mtime/size guard the spec asks for; this schema has no
 /// `media_files` mtime column, so size is the change signal actually
-/// available), updates `size_bytes`/`media_info` when the file changed size
+/// available), updates `size_bytes` when the file changed size
 /// since the last scan, or inserts a fresh row. Returns `(row, changed)`
 /// so a caller can distinguish "already up to date" from "recorded/updated
 /// this pass" for scan-report counters.
+///
+/// **MPRB-06 removed this function's `media_info` parameter, and that removal is
+/// the fix, not a tidy-up.** Its only caller passed
+/// `{"container": <filename extension>}` — a claim about a file's contents
+/// derived from its name, written for all 16,221 titles. `media_files.media_info`
+/// now has exactly one writer, [`set_probe_result`], fed by `ffprobe`. Anyone
+/// re-adding a way to write that column from the scan path has to change this
+/// signature to do it, which is the point: a convention survives until the next
+/// hurried change; a signature does not.
 pub async fn upsert_scanned(
     pool: &PgPool,
     media_item_id: i64,
     relative_path: &str,
     size_bytes: Option<i64>,
-    media_info: Option<serde_json::Value>,
 ) -> MuseResult<(MediaFile, bool)> {
     let existing = sqlx::query_as::<_, MediaFile>(
         "SELECT * FROM media_files WHERE media_item_id = $1 AND relative_path = $2",
@@ -43,11 +51,16 @@ pub async fn upsert_scanned(
             return Ok((row, false));
         }
 
+        // `media_info` is deliberately absent from this SET list. A size change
+        // means the stored document is stale, but the scanner's probe step
+        // (MPRB-06) is what replaces it, and clearing it here would destroy the
+        // old answer in the window before the new one lands — including when the
+        // re-probe then fails, which is exactly the case `set_probe_error` goes
+        // out of its way to protect.
         let updated = sqlx::query_as::<_, MediaFile>(
             r#"
             UPDATE media_files SET
                 size_bytes = $2,
-                media_info = COALESCE($3, media_info),
                 date_added = COALESCE(date_added, now())
             WHERE id = $1
             RETURNING *
@@ -55,27 +68,29 @@ pub async fn upsert_scanned(
         )
         .bind(row.id)
         .bind(size_bytes)
-        .bind(&media_info)
         .fetch_one(pool)
         .await
         .map_err(MuseError::Database)?;
         return Ok((updated, true));
     }
 
+    // A newly scanned row carries NO `media_info`: it has not been probed yet,
+    // and `NULL` says so. The pre-MPRB-06 insert put the filename's extension
+    // here, which made every fresh row a `legacy` document claiming to describe
+    // contents it had never looked at.
     let created = sqlx::query_as::<_, MediaFile>(
         r#"
         INSERT INTO media_files (
-            media_item_id, relative_path, size_bytes, media_info, date_added,
+            media_item_id, relative_path, size_bytes, date_added,
             languages, release_type
         )
-        VALUES ($1, $2, $3, $4, now(), '{}', $5)
+        VALUES ($1, $2, $3, now(), '{}', $4)
         RETURNING *
         "#,
     )
     .bind(media_item_id)
     .bind(relative_path)
     .bind(size_bytes)
-    .bind(&media_info)
     .bind(ReleaseTypeKind::Single)
     .fetch_one(pool)
     .await
@@ -534,16 +549,22 @@ mod tests {
             .await
             .expect("seed media_item");
 
-            let (file, _) = upsert_scanned(
-                pool,
-                item.id,
-                &format!("{suffix}.mkv"),
-                Some(2000),
-                Some(serde_json::json!({ "container": "mkv" })),
-            )
-            .await
-            .expect("seed media_file");
-            file
+            let (file, _) = upsert_scanned(pool, item.id, &format!("{suffix}.mkv"), Some(2000))
+                .await
+                .expect("seed media_file");
+
+            // The legacy document these tests need is seeded explicitly, because
+            // MPRB-06 removed the scanner's ability to write one: the whole point
+            // of these tests is that a pre-S130 row's `media_info` survives a
+            // failed re-probe, so the row has to actually hold one.
+            sqlx::query("UPDATE media_files SET media_info = $2 WHERE id = $1")
+                .bind(file.id)
+                .bind(serde_json::json!({ "container": "mkv" }))
+                .execute(pool)
+                .await
+                .expect("seed the legacy media_info");
+
+            get(pool, file.id).await.expect("re-read the seeded media_file")
         }
 
         /// The acceptance criterion with the sharpest teeth: `set_probe_error`
@@ -794,13 +815,13 @@ mod tests {
         .await
         .expect("seed media_item");
 
-        let (first, first_changed) = upsert_scanned(&pool, media_item.id, "Movie.mkv", Some(1000), None)
+        let (first, first_changed) = upsert_scanned(&pool, media_item.id, "Movie.mkv", Some(1000))
             .await
             .expect("first upsert_scanned");
         assert!(first_changed, "the first scan of a file must always be recorded as a change");
         assert_eq!(first.size_bytes, Some(1000));
 
-        let (second, second_changed) = upsert_scanned(&pool, media_item.id, "Movie.mkv", Some(1000), None)
+        let (second, second_changed) = upsert_scanned(&pool, media_item.id, "Movie.mkv", Some(1000))
             .await
             .expect("second upsert_scanned with an unchanged size");
         assert!(!second_changed, "an unchanged size must be a clean no-op, not a write");
@@ -809,15 +830,9 @@ mod tests {
         let rows = list_by_media_item(&pool, media_item.id).await.expect("list_by_media_item");
         assert_eq!(rows.len(), 1, "no duplicate row from the two upserts above");
 
-        let (third, third_changed) = upsert_scanned(
-            &pool,
-            media_item.id,
-            "Movie.mkv",
-            Some(2000),
-            Some(serde_json::json!({"container": "mkv"})),
-        )
-        .await
-        .expect("third upsert_scanned with a changed size");
+        let (third, third_changed) = upsert_scanned(&pool, media_item.id, "Movie.mkv", Some(2000))
+            .await
+            .expect("third upsert_scanned with a changed size");
         assert!(third_changed, "a changed size must be recorded as an update");
         assert_eq!(third.id, first.id, "a size change updates the existing row, never inserts a duplicate");
         assert_eq!(third.size_bytes, Some(2000));

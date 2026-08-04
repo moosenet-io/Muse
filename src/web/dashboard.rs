@@ -1099,6 +1099,15 @@ pub async fn trigger_library_scan(State(state): State<Arc<AppState>>) -> MuseRes
     let mut unmatched = 0usize;
     let mut errors = 0usize;
     let mut art_cached = 0usize;
+    // MPRB-06: the probe step's outcome, surfaced where the scan's outcome
+    // already is. Additive fields; the counters are separate because "no
+    // document was stored" has four different causes and an operator's response
+    // differs for each.
+    let mut probed = 0usize;
+    let mut probe_suspicious = 0usize;
+    let mut probe_failed = 0usize;
+    let mut probe_skipped = 0usize;
+    let mut probe_persist_failed = 0usize;
     for r in &reports {
         scanned += r.scanned;
         matched += r.matched;
@@ -1106,6 +1115,11 @@ pub async fn trigger_library_scan(State(state): State<Arc<AppState>>) -> MuseRes
         unmatched += r.unmatched;
         errors += r.errors;
         art_cached += r.art_cached;
+        probed += r.probed;
+        probe_suspicious += r.probe_suspicious;
+        probe_failed += r.probe_failed;
+        probe_skipped += r.probe_skipped;
+        probe_persist_failed += r.probe_persist_failed;
     }
 
     Ok(Json(json!({
@@ -1117,6 +1131,11 @@ pub async fn trigger_library_scan(State(state): State<Arc<AppState>>) -> MuseRes
         "unmatched": unmatched,
         "errors": errors,
         "art_cached": art_cached,
+        "probed": probed,
+        "probe_suspicious": probe_suspicious,
+        "probe_failed": probe_failed,
+        "probe_skipped": probe_skipped,
+        "probe_persist_failed": probe_persist_failed,
     })))
 }
 

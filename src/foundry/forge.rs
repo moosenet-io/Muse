@@ -1286,6 +1286,20 @@ fn copy_ownership_and_mode(src: &Path, dest: &Path) {
 ///
 /// An unreadable directory returns false, so the failure gets reported: an
 /// unknown permission is not evidence that nothing was lost.
+///
+/// ## What this deliberately does not credit, and which way it errs
+///
+/// - **Group-writable directories.** A manager in the directory's group can
+///   manage its entries, but nothing here knows which user the manager runs as
+///   or which groups it holds, so `g+w` is not credited. The cost is a warning
+///   that did not need to be raised — over-reporting, which is the right
+///   direction for a message about lost control.
+/// - **ACLs, NFS server-side mapping, CAP_FOWNER.** All can make the effective
+///   answer differ from the client-visible mode, in either direction. Mode bits
+///   are what is observable here; a named-user ACL denying the manager on an
+///   otherwise-0777 directory would be logged at debug when a warning was
+///   warranted. Stated rather than left silent, because the limit of a check is
+///   part of what the check means. Raised at the FORGE-02 gate.
 fn ownership_is_immaterial_in(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let Some(dir) = path.parent() else {
@@ -3605,11 +3619,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An unreadable directory is not evidence that nothing was lost.
+    /// A directory whose permissions cannot be read is not evidence that
+    /// nothing was lost.
+    ///
+    /// Exercises the MISSING-directory case (ENOENT). An existing-but-
+    /// unreadable one (EACCES) reaches the same `Err` arm, but cannot be built
+    /// reliably in a test that may run as root, since root bypasses the check
+    /// being simulated. Named for what it actually does — the earlier name
+    /// claimed the EACCES case and tested the ENOENT one. Raised at the
+    /// FORGE-02 gate.
     #[test]
-    fn an_unreadable_directory_is_treated_as_ownership_mattering() {
+    fn a_directory_whose_permissions_cannot_be_read_is_treated_as_mattering() {
         let missing = std::path::Path::new("/nonexistent-muse-dir-xyz/Movie.mkv");
         assert!(!ownership_is_immaterial_in(missing));
+    }
+
+    /// Group-writable is deliberately NOT credited: nothing here knows which
+    /// user or groups the media manager runs with. The result is a warning that
+    /// may not have been needed, which is the safe direction for a message
+    /// about losing control of a file.
+    #[test]
+    fn a_group_writable_directory_is_not_credited_and_that_is_deliberate() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-own-gw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).expect("mode");
+        assert!(
+            !ownership_is_immaterial_in(&dir.join("Movie.mkv")),
+            "over-warning is the intended trade here"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **The replacement must inherit the original's mode.**

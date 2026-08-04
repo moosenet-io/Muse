@@ -230,3 +230,136 @@ substituted for the `direct_play_blockers` call.
 consequently unverified against a real database: the keyset paging loop in `census_from_pool`, the
 `SELECT`, and the two HTTP handlers end to end. Every rule *below* those is tested here, which is why
 the database edge was kept to a `SELECT` and a `for` loop with no aggregation logic in it.
+
+---
+
+# MPRB-10 addendum — the run that produced `probe-coverage.md`
+
+**Written 2026-08-04, after the first live backfill.** §5 above ("numbers that cannot be
+computed today") is now answered. §6 ("how to produce the real artifact") is superseded on two
+points, both recorded below rather than silently edited, because the corrections are the finding.
+
+## 1. How it was actually run
+
+| | |
+|---|---|
+| Host | <host>, where `MUSE_LIBRARY_ROOT=/srv/media` is mounted and `ffprobe` 5.1.9 is installed |
+| Door | `muse probe-backfill` — a new operator subcommand, **not** `POST /ops/probe/backfill` |
+| Rate | **180 probes/min**, not the 30/min default |
+| Batch / attempts | 500 rows per keyset page, 3 attempts |
+| Wall clock | 19:39:28 → 20:51:48 UTC, **4,339,704 ms (72 min)** for one uninterrupted pass |
+| Result | considered 12,988 · probed 12,805 · suspicious 0 · failed_terminal 10 · persist_failed 0 · skipped_unresolved 173 · pages 26 · **halted: null** (the queue drained) |
+
+**Why a CLI and not the HTTP door.** The live `muse.service` already owns this database and this
+mount. Reaching `POST /ops/probe/backfill` means running a **second full service** beside it —
+schedulers, acquisition workers, and the foundry mutation gate (`MUSE_FOUNDRY_ENABLE_MUTATION=1`
+in the live environment) all included. The subcommand runs the sweep and nothing else. §6's step 3
+(`POST /ops/probe/coverage-report`) has the same problem and the same answer:
+`muse probe-coverage-report`.
+
+**Why 180/min and not 30.** 30/min is documented in `media::backfill` as conservatism against a
+shared NFS mount rather than a measurement, and at that rate one pass over this queue is ~7 hours.
+Storage read runs roughly 2× client egress, so the pacing is a real consideration — but `ffprobe`
+reads container headers, not streams. 180/min was chosen as a bounded step up, and the observed
+throughput was **~176 probes/min sustained**, i.e. the limiter (not the mount) was the binding
+constraint the whole way. Nothing was measured as degraded on the serving path. A slower rate is
+still the right default for an unattended run; this one was watched.
+
+**§6 step 1 is wrong and was not followed.** It says to apply `0113` "through the `pg_ddl`
+operator door (migrations are not auto-applied)". `pg_ddl` is single-statement and
+operator-guarded, and `0113` is nine statements. The migration was applied by `db::migrate`
+(`sqlx::migrate!`) from the subcommand, which is the same path a deploy uses and which records the
+row in `_sqlx_migrations` (version 113, `success = true`). Migrations *are* auto-applied — by the
+service, at startup.
+
+## 2. The number, with its denominator
+
+**10,025 of 12,806 readable documents — 78.3% — carry no direct-play blocker.**
+
+**It supports the epic's premise.** Direct play is the common case in this library and transcoding
+is the exception, by roughly four to one.
+
+**Read the denominator before quoting it.** `12,806` is *rows in `media_files` carrying a v1
+document*, and that is **not** the library:
+
+| | Files | |
+|---|---:|---|
+| media files on disk under `/srv/media` | **16,237** | `find`, 2026-08-04 |
+| rows in `media_files` | 12,989 | |
+| rows carrying a v1 document | 12,806 | the report's denominator |
+
+So ~3,400 files on disk have **no `media_files` row at all** and are outside every number in the
+report. The 78.3% is a share of what Muse has recorded, not of what is on the shelf. Whether the
+unrecorded remainder resembles the recorded part is unknown and is not assumed here.
+
+The 183 rows that never got a document break down as **173 unresolvable** (the row names a file
+that is no longer on disk — no attempt is burned and nothing is written, so they stay queued
+indefinitely) and **10 terminal probe failures** (genuinely corrupt files; `EBML header parsing
+failed` on the majority).
+
+## 3. The two figures §4 left open
+
+### The 400-file container sample: **it did not survive contact with the census.**
+
+§4's first caution called the sample "the single most direct evidence bearing on the direct-play
+question" and read 193/400 AVI as "a strong signal that the direct-play share is **not** high".
+Measured over the whole recorded library:
+
+| | Sample of 400 | Census of 12,806 |
+|---|---:|---:|
+| avi | 48.3% | **15.6%** |
+| mkv | 37.8% | **79.0%** |
+| mp4 | 13.5% | 5.1% |
+
+The sample overstated AVI by **3.1×**. §4's refusal to extrapolate from it was correct, and the
+directional reading attached to it was wrong. `container_not_streamable` is a blocker on 2,031 of
+12,806 files (15.9%), not on anything like half.
+
+### ~60% vs 22.3% would-be-re-encoded: **still not reconciled, deliberately.**
+
+Nothing in this run reconciles them, and this addendum does not attempt to. The 500-file figure is
+a sample with a different DTS policy, and no per-file record of it survives to re-examine; the
+22.3% is over 16,221 on-disk titles, a denominator no number in the census shares.
+
+What *can* be stated is an adjacent observation, and only as an observation: the census's
+non-candidate share is **21.7%** (2,781 of 12,806), which sits beside the full survey's 22.3%
+(3,621 of 16,221). **This is not a confirmation of either figure.** §4's third caution is the
+reason: "would be re-encoded" and "would not direct-play" are different questions —
+`direct_play_normalization` raises the ceilings to 4K/100 Mbps precisely because bitrate costs
+bandwidth and never prevents direct play — and the two denominators are different populations.
+Two numbers landing near each other while answering different questions over different
+populations is a coincidence until something demonstrates otherwise.
+
+## 4. What this run verified against a real database, and what it did not
+
+**Verified, executing:**
+
+- `0113` applies cleanly (both partial indexes and the `CHECK` present in `pg_catalog` afterwards).
+- The `CHECK` **rejects**: `StoredProbeState::as_str` was mutated to emit an invalid state in a
+  throwaway build; Postgres refused the write (`violates check constraint
+  "media_files_probe_state_values"`), the run reported `persist_failed: 1`, and the row was
+  unchanged — which also demonstrates MPRB-07's "counted from what was WRITTEN" rule, since
+  `failed_terminal` stayed 0.
+- **`set_probe_error` does not overwrite a previously-good `media_info`.** A row holding a v1
+  document was re-probed with a failing `ffprobe`: `probe_state` → `probe_failed`, `probe_error`
+  recorded, `probe_attempts` 0 → 1, and the document's md5 **byte-identical** before and after.
+  This was the epic's headline unverified claim, argued until now only by the absence of a column
+  from a `SET` list.
+- `list_needing_probe`'s predicate and keyset cursor, `probe_progress` (its `remaining` of 183 and
+  `permanently_failed` of 0 match independent `SELECT`s), `root_folders`/locations lookup, all
+  five production `backfill` impls, and both the coverage census and its renderer.
+- The degrade path: pointed at a `/bin/false` "ffprobe", the run went inert with
+  `halted: no_ffprobe_on_this_host` and `remaining: null` — absent, not zero.
+
+**NOT verified:**
+
+- **`0113` re-applied.** Every statement is `IF NOT EXISTS` / `DROP … IF EXISTS` by inspection, and
+  the first application logged `constraint … does not exist, skipping`, so those forms were
+  exercised. A genuine second application was not run: `pg_ddl`/`pg_execute` are operator-guarded,
+  and faking one with a duplicate migration file would leave a version in `_sqlx_migrations` that a
+  real deploy's source does not contain.
+- **MPRB-06's scan-side claims** — that `record_matched_file` wires `file_changed` +
+  `stored_media_info()` into the probe pass, that a freshly scanned row is `Absent` with
+  `media_info_version = NULL`, and that `upsert_scanned` preserves a document across a size change.
+  Reaching them requires running a library scan against the live database, which writes rows for a
+  different reason than this item. They remain argued, not observed.

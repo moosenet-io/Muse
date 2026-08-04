@@ -724,6 +724,13 @@ pub(crate) async fn run_backfill(
                     // exactly when `write` is a `Failure`. Counted as a failure
                     // rather than silently dropped so the report stays balanced
                     // if that ever stops being true.
+                    //
+                    // DISCLOSED: no test kills a mutation of this line, and no
+                    // test can — reaching it requires violating the invariant
+                    // twenty lines above. It is defensive, it is unreachable,
+                    // and it is not covered. `unreachable!()` was declined: a
+                    // panic here would take an eight-hour sweep down to protect
+                    // a counter.
                     (ProbeWrite::Failure { .. }, None) => report.failed_retryable += 1,
                 },
                 Err(e) => {
@@ -779,10 +786,20 @@ pub async fn run_from_pool(
     media: &MediaCore,
     config: BackfillConfig,
 ) -> BackfillReport {
-    let inert = |reason: HaltReason| BackfillReport {
-        halted: Some(reason),
-        rate_per_min: config.rate_per_min,
-        ..Default::default()
+    // An inert run is still a RUN, and it is exported as one. An operator whose
+    // host lost `ffprobe` must not see the backfill simply vanish from
+    // `muse_probe_backfill_runs_total` — silence is the one signal that reads
+    // identically to "nobody asked for a run", which is the opposite of what
+    // happened. It exports with `remaining` absent, so nothing claims the queue
+    // was measured.
+    let inert = |reason: HaltReason| {
+        let report = BackfillReport {
+            halted: Some(reason),
+            rate_per_min: config.rate_per_min,
+            ..Default::default()
+        };
+        crate::metrics::record_probe_backfill(&report);
+        report
     };
 
     if !media.can_probe() {
@@ -965,6 +982,10 @@ mod tests {
         asked: Mutex<Vec<(i64, i64)>>,
         progress: repo::media_file::ProbeProgress,
         fail_after_pages: Option<u64>,
+        /// The end-of-run `probe_progress` measurement is unavailable. Added
+        /// because a mutation survived: setting `remaining = Some(0)` on that
+        /// failure changed nothing any test observed.
+        fail_progress: bool,
     }
 
     impl FakeQueue {
@@ -974,6 +995,7 @@ mod tests {
                 asked: Mutex::new(Vec::new()),
                 progress: repo::media_file::ProbeProgress::default(),
                 fail_after_pages: None,
+                fail_progress: false,
             }
         }
 
@@ -996,6 +1018,7 @@ mod tests {
             _max_attempts: i32,
         ) -> MuseResult<Vec<MediaFile>> {
             self.asked.lock().unwrap().push((after_id, limit));
+            yield_to_the_timer().await;
             if let Some(n) = self.fail_after_pages {
                 if self.asked.lock().unwrap().len() as u64 > n {
                     return Err(crate::error::MuseError::Config("queue is down".into()));
@@ -1014,6 +1037,9 @@ mod tests {
             &self,
             _max_attempts: i32,
         ) -> MuseResult<repo::media_file::ProbeProgress> {
+            if self.fail_progress {
+                return Err(crate::error::MuseError::Config("progress is down".into()));
+            }
             Ok(self.progress.clone())
         }
     }
@@ -1158,11 +1184,33 @@ mod tests {
     impl Pacer for RecordingPacer {
         async fn pace(&self, delay: Duration) {
             self.delays.lock().unwrap().push(delay);
+            yield_to_the_timer().await;
         }
     }
 
+    /// **The anti-hang bound below does not work without this, and that was
+    /// found by mutation, not by reasoning.**
+    ///
+    /// `tokio::time::timeout(d, f)` only fires when `f` returns `Pending` — the
+    /// timer is checked between polls, and a future that never yields is never
+    /// interrupted. Every collaborator in these tests is a fake that completes
+    /// immediately, so a loop that fails to terminate is a tight loop of
+    /// always-ready `await`s: it wedges the whole test binary at 100% CPU and
+    /// reports nothing, which is precisely the failure mode the bound exists to
+    /// prevent. (Observed: mutating `CursorGuard::advance` back to `<` spun the
+    /// suite for twenty minutes with the timeout in place and no output.)
+    ///
+    /// One yield per loop iteration hands control back to the runtime, so the
+    /// timer fires, `timeout` returns `Err`, and the wedge becomes a test
+    /// FAILURE with a message. It is in the two collaborators every iteration
+    /// passes through — the pacer and the queue read.
+    async fn yield_to_the_timer() {
+        tokio::task::yield_now().await;
+    }
+
     /// Every loop test runs under a wall-clock bound: a regression that wedges
-    /// the loop must FAIL, not hang the suite with no output.
+    /// the loop must FAIL, not hang the suite with no output. See
+    /// [`yield_to_the_timer`] for why the bound needs the fakes' cooperation.
     async fn bounded<F: std::future::Future<Output = BackfillReport>>(f: F) -> BackfillReport {
         tokio::time::timeout(Duration::from_secs(20), f)
             .await
@@ -1338,6 +1386,43 @@ mod tests {
         );
     }
 
+    /// The sibling of the test above, and it exists because a mutation SURVIVED.
+    ///
+    /// There are **two** skip paths — a file with no library row (above) and a
+    /// file whose rebuilt path will not resolve inside `MUSE_LIBRARY_ROOT`
+    /// (here) — and the first test only covered the first. Making the *second*
+    /// one consume rate budget changed nothing that any test observed. That is
+    /// "unreached by any test", not "called but not covered", and the fix is a
+    /// test, not an assertion.
+    #[tokio::test]
+    async fn a_file_that_does_not_resolve_is_not_paced_for_either() {
+        let pacer = RecordingPacer::default();
+        let report = bounded(run_backfill(
+            &FakeQueue::new(vec![a_file(1, 1, 0), a_file(2, 2, 0)]),
+            &FakeRoots::all(),
+            &ScriptedProber::scripted(vec![
+                ProbeOutcome::Unresolved("outside every allowed root".into()),
+                ProbeOutcome::Attempted(Ok(golden_probe())),
+            ]),
+            &RecordingSink::new(),
+            &pacer,
+            BackfillConfig {
+                batch_size: 10,
+                ..Default::default()
+            },
+        ))
+        .await;
+
+        assert_eq!(report.skipped_unresolved, 1, "fixture check: the first file must be the unresolved one");
+        assert_eq!(report.probed, 1);
+        assert_eq!(
+            pacer.delays().len(),
+            1,
+            "a path that never resolved never touched the mount, so it must not \
+             consume rate budget — the same rule as the missing-library-row skip"
+        );
+    }
+
     // ---- resumption -------------------------------------------------------
 
     #[tokio::test]
@@ -1465,6 +1550,9 @@ mod tests {
         #[async_trait]
         impl ProbeQueue for StuckQueue {
             async fn next_page(&self, _a: i64, _l: i64, _m: i32) -> MuseResult<Vec<MediaFile>> {
+                // See `yield_to_the_timer`: without this, a cursor regression
+                // spins this loop forever and `bounded` never fires.
+                yield_to_the_timer().await;
                 Ok(vec![a_file(7, 7, 0)])
             }
             async fn progress(&self, _m: i32) -> MuseResult<repo::media_file::ProbeProgress> {
@@ -1883,6 +1971,72 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(queue_remaining(&progress), 0);
+    }
+
+    /// Added because a mutation SURVIVED: nothing observed the difference
+    /// between "the measurement could not be taken" and "the queue is empty".
+    /// That distinction is the whole reason `remaining` is an `Option`, and an
+    /// operator told the backfill is finished when it is merely unmeasured is
+    /// the one wrong answer this field must never give.
+    #[tokio::test]
+    async fn an_unmeasurable_remaining_is_absent_never_zero() {
+        let mut queue = FakeQueue::new(vec![a_file(1, 1, 0)]);
+        queue.fail_progress = true;
+
+        let report = bounded(run_backfill(
+            &queue,
+            &FakeRoots::all(),
+            &ScriptedProber::always_ok(),
+            &RecordingSink::new(),
+            &RecordingPacer::default(),
+            BackfillConfig::default(),
+        ))
+        .await;
+
+        assert_eq!(report.probed, 1, "fixture check: the run itself must have succeeded");
+        assert_eq!(
+            report.remaining, None,
+            "a measurement that could not be taken must be reported as ABSENT — \
+             `Some(0)` reads as a drained queue"
+        );
+        assert_eq!(report.permanently_failed, None);
+    }
+
+    /// The control for [`BackfillReport::is_balanced`]. Every other test asserts
+    /// it is TRUE; without this one a guard hardcoded to `true` would satisfy
+    /// all of them, which is exactly what a surviving mutation showed.
+    #[test]
+    fn the_balance_guard_can_actually_fail() {
+        let missed_a_counter = BackfillReport {
+            considered: 3,
+            probed: 2,
+            ..Default::default()
+        };
+        assert_eq!(missed_a_counter.accounted(), 2);
+        assert!(
+            !missed_a_counter.is_balanced(),
+            "a row that landed in no bucket must be visible, or the guard is decoration"
+        );
+
+        let balanced = BackfillReport {
+            considered: 3,
+            probed: 1,
+            failed_terminal: 1,
+            skipped_unresolved: 1,
+            ..Default::default()
+        };
+        assert!(balanced.is_balanced());
+        // The two subset counters must NOT be double-counted into the total.
+        let with_subsets = BackfillReport {
+            suspicious: 1,
+            exhausted: 1,
+            ..balanced
+        };
+        assert!(
+            with_subsets.is_balanced(),
+            "`suspicious` and `exhausted` are subsets; counting them again would \
+             make every honest run look unbalanced"
+        );
     }
 
     #[tokio::test]

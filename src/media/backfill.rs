@@ -594,7 +594,7 @@ pub(crate) fn candidate_paths(location: &MediaItemLocation, relative_path: &str)
 /// to rebase on — an unrecognisable path produces no candidate, never a
 /// fabricated one.
 pub(crate) fn rebase_item_folder(root_folder: &str, item_path: Option<&str>) -> Option<PathBuf> {
-    let item_path = item_path.map(str::trim).filter(|p| !p.is_empty())?;
+    let item_path = item_path.map(str::trim)?;
     let root = root_folder.trim_end_matches('/');
     if root.is_empty() {
         return None;
@@ -1939,8 +1939,11 @@ mod tests {
         assert_eq!(
             prober.seen(),
             vec![PathBuf::from("/library/Movie 42/Movie 42.mkv")],
-            "relative_path is relative to its library's root_folder — that is how \
-             the scanner formed it"
+            "an item with no recorded folder has exactly one candidate: the \
+             library root joined to relative_path, which is how the SCANNER \
+             forms it. MPRB-10 note — this was believed to be the only \
+             reconstruction; against the live database it is the right one for \
+             1,258 of 12,873 rows. See `candidate_paths`."
         );
     }
 
@@ -2397,18 +2400,30 @@ mod tests {
 
     #[test]
     fn a_library_name_that_also_appears_in_the_item_folder_rebases_on_the_first() {
-        // A library called `Movies` holding `Movies.2019`: matching the LAST
-        // occurrence would rebase onto the item's own name and lose it.
+        // A library called `Movies` holding a folder ALSO called `Movies`.
+        //
+        // FIXTURE NOTE — this test asserted nothing until the mutation sweep
+        // said so. It first used `/media/Movies/Movies.2019`, which contains
+        // `/Movies/` exactly ONCE (`Movies.2019` has no trailing slash), so
+        // `find` and `rfind` return the same index and the `rfind` mutation
+        // survived. The name has to be a whole PATH COMPONENT for there to be
+        // two occurrences at all.
         assert_eq!(
-            rebase_item_folder("/srv/media/Movies", Some("/media/Movies/Movies.2019")),
-            Some(PathBuf::from("/srv/media/Movies/Movies.2019")),
+            rebase_item_folder("/srv/media/Movies", Some("/media/Movies/Movies/2019")),
+            Some(PathBuf::from("/srv/media/Movies/Movies/2019")),
+            "matching the LAST occurrence would drop the item folder and \
+             address /srv/media/Movies/2019, which is a different directory"
         );
     }
 
     #[test]
     fn an_unrecognisable_item_path_yields_no_second_candidate_rather_than_a_guess() {
         assert_eq!(rebase_item_folder("/srv/media/Movies", None), None);
-        assert_eq!(rebase_item_folder("/srv/media/Movies", Some("   ")), None);
+        assert_eq!(
+            rebase_item_folder("/srv/media/Movies", Some("   ")),
+            None,
+            "a blank item path names nothing"
+        );
         assert_eq!(
             rebase_item_folder("/srv/media/Movies", Some("/elsewhere/Films/1984")),
             None,
@@ -2420,10 +2435,32 @@ mod tests {
             None,
             "the library root itself is not an item folder"
         );
+        // FIXTURE NOTE — the line above does NOT reach the empty-suffix guard:
+        // `/media/Movies` has no trailing slash, so the `/Movies/` search fails
+        // first and `?` returns. The mutation that deletes the guard survived
+        // until this second case, which HAS the trailing slash, was added.
+        assert_eq!(
+            rebase_item_folder("/srv/media/Movies", Some("/media/Movies/")),
+            None,
+            "an item path that reduces to the library root with nothing after \
+             it names no item folder"
+        );
         assert_eq!(
             rebase_item_folder("", Some("/media/Movies/1984")),
             None,
             "an empty root has no name to join on"
+        );
+    }
+
+    #[test]
+    fn a_padded_item_path_is_trimmed_before_it_is_rebased() {
+        // Untrimmed, the trailing space survives into the suffix and addresses
+        // `…/1984 ` — a directory that does not exist. (This is also the
+        // fixture that makes the `trim` observable at all: the blank-path case
+        // above is satisfied with or without it.)
+        assert_eq!(
+            rebase_item_folder("/srv/media/Movies", Some(" /media/Movies/1984 ")),
+            Some(PathBuf::from("/srv/media/Movies/1984")),
         );
     }
 
@@ -2484,5 +2521,213 @@ mod tests {
             ]],
             "one call, both candidates, scan convention first"
         );
+    }
+
+    #[test]
+    fn an_item_path_inside_a_root_whose_own_name_repeats_is_not_re_rooted() {
+        // The early "already in Muse's namespace" return is load-bearing here
+        // and nowhere else: the library's final component also appears EARLIER
+        // in its own root, so re-rooting on the first occurrence would splice
+        // the name in twice and address a directory that does not exist.
+        assert_eq!(
+            rebase_item_folder("/srv/Movies/Movies", Some("/srv/Movies/Movies/1984")),
+            Some(PathBuf::from("/srv/Movies/Movies/1984")),
+        );
+    }
+
+    // ---- MPRB-10: the production prober, against a real filesystem ---------
+    //
+    // `candidate_paths` decides WHAT to offer; `MediaCoreProber` decides which
+    // offer is the file. That second decision is a filesystem question, so
+    // these tests use a real temp root and the real `PathGuard` — the fakes
+    // above cannot reach it, and it is the half that was wrong in production.
+
+    fn probe_core(root: &std::path::Path) -> MediaCore {
+        MediaCore::from_config(&crate::config::Config {
+            // Absent on purpose: a spawn failure is an `Attempted(Err(..))`,
+            // which is exactly what distinguishes "we found the file and ran
+            // at it" from "we never found the file".
+            probe_ffprobe_bin: Some("muse-mprb10-no-such-ffprobe".to_string()),
+            ffmpeg_path: "muse-mprb10-no-such-ffmpeg".to_string(),
+            foundry_handbrake_bin: Some("muse-mprb10-no-such-handbrake".to_string()),
+            library_root: Some(root.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+    }
+
+    fn mprb10_temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "muse-mprb10-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp root");
+        dir
+    }
+
+    #[tokio::test]
+    async fn the_prober_falls_through_to_the_second_candidate_when_the_first_is_not_there() {
+        let root = mprb10_temp_root("fallthrough");
+        std::fs::create_dir_all(root.join("Movies/1984")).expect("create item folder");
+        std::fs::write(root.join("Movies/1984/1984.avi"), b"x").expect("write the file");
+
+        let core = probe_core(&root);
+        let prober = MediaCoreProber(&core);
+        let outcome = prober
+            .probe(&[
+                root.join("Movies/1984.avi"),      // MPRB-07's reconstruction
+                root.join("Movies/1984/1984.avi"), // where the file actually is
+            ])
+            .await;
+
+        assert!(
+            matches!(outcome, ProbeOutcome::Attempted(_)),
+            "the second candidate exists, so the row must be PROBED, not skipped \
+             as unresolved: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_prober_takes_the_first_candidate_that_resolves_and_stops() {
+        let root = mprb10_temp_root("first-wins");
+        std::fs::create_dir_all(root.join("Movies/1984")).expect("create item folder");
+        std::fs::write(root.join("Movies/1984.avi"), b"x").expect("write candidate 1");
+
+        let core = probe_core(&root);
+        // Candidate 2 does not exist; if the loop did not stop at the first
+        // resolution it would fall through to it and report Unresolved.
+        let outcome = MediaCoreProber(&core)
+            .probe(&[
+                root.join("Movies/1984.avi"),
+                root.join("Movies/1984/1984.avi"),
+            ])
+            .await;
+
+        assert!(
+            matches!(outcome, ProbeOutcome::Attempted(_)),
+            "first resolving candidate wins: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Writes the argv it was handed to `marker`, then fails. The ONLY way to
+    /// observe WHICH candidate was probed when several of them exist: with an
+    /// absent binary every candidate produces the same `Attempted(Err(..))`,
+    /// which is why the "first resolving candidate wins" mutation survived the
+    /// first sweep.
+    fn fake_ffprobe(dir: &std::path::Path, marker: &std::path::Path) -> PathBuf {
+        let bin = dir.join("fake-ffprobe.sh");
+        // `-version` must SUCCEED. It is the capability snapshot's probe, and
+        // the same shape `media::mod`'s `stub_bin` uses; a script that fails it
+        // still gets spawned for the probe, but the marker-empty failure this
+        // fixture first produced came from getting the shell quoting wrong, so
+        // this follows a form already known to work in this crate.
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"-version\" ]; then\n    echo 'ffprobe version fake'; exit 0\n  fi\ndone\nfor a in \"$@\"; do echo \"$a\" >> '{}'; done\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .expect("write the fake ffprobe");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+        bin
+    }
+
+    #[tokio::test]
+    async fn the_candidate_that_gets_probed_is_the_first_one_that_resolves() {
+        let root = mprb10_temp_root("which-one");
+        let tools = mprb10_temp_root("which-one-tools");
+        let marker = tools.join("probed.txt");
+
+        // BOTH candidates exist and are different files. Only an observation of
+        // the argv can tell which was chosen.
+        std::fs::create_dir_all(root.join("Movies/1984")).expect("item folder");
+        std::fs::write(root.join("Movies/1984.avi"), b"first").expect("candidate 1");
+        std::fs::write(root.join("Movies/1984/1984.avi"), b"second").expect("candidate 2");
+
+        let core = MediaCore::from_config(&crate::config::Config {
+            probe_ffprobe_bin: Some(
+                fake_ffprobe(&tools, &marker).to_string_lossy().to_string(),
+            ),
+            ffmpeg_path: "muse-mprb10-no-such-ffmpeg".to_string(),
+            foundry_handbrake_bin: Some("muse-mprb10-no-such-handbrake".to_string()),
+            library_root: Some(root.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+        // Construction takes the capability snapshot, which spawns the binary.
+        // Start counting after it.
+        let _ = std::fs::remove_file(&marker);
+
+        let outcome = MediaCoreProber(&core)
+            .probe(&[
+                root.join("Movies/1984.avi"),
+                root.join("Movies/1984/1984.avi"),
+            ])
+            .await;
+        assert!(matches!(outcome, ProbeOutcome::Attempted(_)), "{outcome:?}");
+
+        let argv = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            argv.contains("Movies/1984.avi") && !argv.contains("Movies/1984/1984.avi"),
+            "exactly ONE candidate may be probed, and it must be the first that \
+             resolved — probing the last would mean every arr-convention row \
+             pays two stats and every scan-convention row is read from the \
+             wrong place. argv seen: {argv}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&tools);
+    }
+
+    #[tokio::test]
+    async fn when_no_candidate_resolves_every_one_of_them_is_named() {
+        let root = mprb10_temp_root("all-refused");
+        let core = probe_core(&root);
+        let outcome = MediaCoreProber(&core)
+            .probe(&[
+                root.join("Movies/1984.avi"),
+                root.join("Movies/1984/1984.avi"),
+            ])
+            .await;
+
+        match outcome {
+            ProbeOutcome::Unresolved(reason) => {
+                assert!(
+                    reason.contains("Movies/1984.avi") && reason.contains("Movies/1984/1984.avi"),
+                    "'no such file' against ONE reconstruction, when a second was \
+                     tried and also failed, is not the diagnostic an operator \
+                     needs: {reason}"
+                );
+            }
+            other => panic!("no candidate exists, so nothing was observed: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_outside_the_library_root_is_still_refused_by_the_guard() {
+        // The confinement MPRB-01 owns is not weakened by offering two paths:
+        // both go through `resolve`, and a real file outside the root is
+        // refused exactly as one path was before.
+        let root = mprb10_temp_root("confined");
+        let outside = mprb10_temp_root("confined-outside");
+        std::fs::write(outside.join("escape.mkv"), b"x").expect("write the outside file");
+
+        let core = probe_core(&root);
+        let outcome = MediaCoreProber(&core)
+            .probe(&[outside.join("escape.mkv")])
+            .await;
+
+        assert!(
+            matches!(outcome, ProbeOutcome::Unresolved(_)),
+            "a file outside MUSE_LIBRARY_ROOT must never be probed: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

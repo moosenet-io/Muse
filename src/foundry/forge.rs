@@ -1240,12 +1240,22 @@ fn copy_ownership_and_mode(src: &Path, dest: &Path) {
         // directories are 0777 with no sticky bit, so management is unaffected.
         // The MODE, which is the half that actually controls access to the
         // file's contents, is set separately above and does succeed here.
-        if err.raw_os_error() == Some(libc::EPERM) {
+        // Whether this MATTERS is a property of the directory, so ask the
+        // directory rather than inferring it from errno.
+        //
+        // The first version downgraded on EPERM alone. That is right on this
+        // fleet — the export refuses chown and the directories are 0777 — but
+        // errno does not know that. On a deployment with tighter directories,
+        // or an unprivileged media manager, a root-owned file genuinely is
+        // unmanageable and the operator needs to hear about it. Raised at the
+        // FORGE-02 gate by two reviewers independently.
+        if ownership_is_immaterial_in(dest) {
             tracing::debug!(
                 dest = %dest.display(),
-                "foundry: the filesystem refuses chown (expected where it is squashed); \
-                 the replacement keeps the writing process's owner, and its mode was \
-                 matched to the original"
+                error = %err,
+                "foundry: could not chown the replacement, but its directory lets anyone \
+                 manage its entries, so the owner does not affect who can rename, delete \
+                 or replace it; the mode was matched to the original"
             );
         } else {
             tracing::warn!(
@@ -1253,10 +1263,41 @@ fn copy_ownership_and_mode(src: &Path, dest: &Path) {
                 uid = md.uid(),
                 gid = md.gid(),
                 error = %err,
-                "foundry: could not set the replacement's owner to match the original"
+                "foundry: could not set the replacement's owner to match the original, and \
+                 its directory does NOT let other users manage its entries — a media \
+                 manager running as another user may be unable to rename or delete it"
             );
         }
     }
+}
+
+/// Whether a failed `chown` on `path` actually costs anything.
+///
+/// POSIX gives permission to rename or unlink an entry to whoever may WRITE the
+/// containing directory — the file's own owner and mode are irrelevant to that.
+/// So when the directory is world-writable, a file left owned by the wrong user
+/// is still fully manageable by everyone, and a chown failure is cosmetic.
+///
+/// **Unless the sticky bit is set.** With `S_ISVTX` (as on `/tmp`), a
+/// world-writable directory only lets you remove entries you OWN — which is
+/// precisely the case where a wrong owner DOES lock a media manager out. That
+/// nuance is the difference between this check being sound and merely
+/// plausible, which is why the bit is tested rather than assumed clear.
+///
+/// An unreadable directory returns false, so the failure gets reported: an
+/// unknown permission is not evidence that nothing was lost.
+fn ownership_is_immaterial_in(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Ok(md) = std::fs::metadata(dir) else {
+        return false;
+    };
+    let mode = md.permissions().mode();
+    const WORLD_WRITABLE: u32 = 0o002;
+    const STICKY: u32 = 0o1000;
+    (mode & WORLD_WRITABLE) != 0 && (mode & STICKY) == 0
 }
 
 fn rollback_superseded(superseded: &Path) {
@@ -3522,6 +3563,55 @@ mod tests {
     /// leaving ~20 GB that had to be removed manually; at 16,000 items that
     /// fills the scratch filesystem and then presents as unrelated encode
     /// failures.
+    /// A world-writable directory makes ownership immaterial: anyone may
+    /// rename or unlink its entries whatever the file's owner is.
+    #[test]
+    fn ownership_is_immaterial_in_a_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-own-ww-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("mode");
+        assert!(ownership_is_immaterial_in(&dir.join("Movie.mkv")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The sticky-bit case, which is the whole reason this is a check and not
+    /// an assumption.** A world-writable directory with S_ISVTX only lets you
+    /// remove entries you OWN — so a wrong owner really does lock a media
+    /// manager out, and the failure must be reported rather than downgraded.
+    #[test]
+    fn ownership_matters_in_a_sticky_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-own-sticky-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).expect("mode");
+        assert!(
+            !ownership_is_immaterial_in(&dir.join("Movie.mkv")),
+            "with the sticky bit, only the owner may unlink — ownership matters"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ownership_matters_in_a_directory_others_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-own-tight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(!ownership_is_immaterial_in(&dir.join("Movie.mkv")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable directory is not evidence that nothing was lost.
+    #[test]
+    fn an_unreadable_directory_is_treated_as_ownership_mattering() {
+        let missing = std::path::Path::new("/nonexistent-muse-dir-xyz/Movie.mkv");
+        assert!(!ownership_is_immaterial_in(missing));
+    }
+
     /// **The replacement must inherit the original's mode.**
     ///
     /// `fs::copy` gives the new file the process's ownership. Muse runs as

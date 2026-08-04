@@ -123,10 +123,13 @@ pub struct ProbeStatus {
     pub summary: String,
 }
 
-/// The four states a file can be in, kept **distinguishable**: "never probed"
-/// is not "probe failed" is not "unreadable" is not "a state a newer binary
-/// wrote". A missing file never reaches here at all — it is a `404` from
-/// [`crate::repo::media_file::get`].
+/// The **six** states a file can be in, kept distinguishable: `never_probed`,
+/// `ok`, `suspicious`, `unreadable`, `probe_failed`, and `unrecognised_state`.
+/// "Never probed" is not "probe failed" is not "unreadable" is not "a state a
+/// newer binary wrote", and
+/// `every_probe_state_gets_its_own_distinguishable_outcome` asserts all six as
+/// a set, so collapsing any two fails. A missing file never reaches here at all
+/// — it is a `404` from [`crate::repo::media_file::get`].
 ///
 /// The three probed spellings are **not** re-spelled here: they come from
 /// [`StoredProbeState::as_str`], which is MPRB-05's/MPRB-02's vocabulary. Only

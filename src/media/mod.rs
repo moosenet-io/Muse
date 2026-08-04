@@ -58,6 +58,14 @@ pub mod derive;
 pub mod doc;
 pub mod paths;
 pub mod probe;
+/// The `ffprobe` fixture scrubber (S130-A MPRB-04). Test-only: it exists to
+/// mint and to guard `tests/golden/probe/`, and adding a second binary target
+/// for it was declined — see the module docs.
+#[cfg(test)]
+pub mod probe_capture;
+/// The golden probe corpus (S130-A MPRB-04).
+#[cfg(test)]
+pub mod probe_golden;
 
 /// The default `ffprobe` binary when neither override is configured: resolved
 /// via `PATH`, exactly as Foundry's own default is.
@@ -531,7 +539,10 @@ mod tests {
     }
 
     /// Writes an executable stub standing in for `ffprobe`. Same reason as in
-    /// `probe.rs`: ffprobe is installed on neither the dev box nor <host>.
+    /// `probe.rs`: ffprobe is not installed on the dev box, where this suite
+    /// runs. (It IS installed on <host> — see `probe.rs`'s correction — but the
+    /// host that runs Muse is not the host that tests it, so a stub is still
+    /// what a test here has to use.)
     ///
     /// The stub answers `-version` immediately, and that is not decoration.
     /// `MediaCore::from_config` runs `capability::detect`, which invokes the

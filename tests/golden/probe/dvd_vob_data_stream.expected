@@ -1,0 +1,17 @@
+container: mpeg
+duration_secs: Some(6.000000)
+format_bitrate_bps: Some(357856597)
+size_bytes: Some(268392448)
+title: None
+chapter_count: 0
+data_stream_count: 1
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 0
+subtitle_count: 2
+attachment_count: 0
+video index=1 codec=mpeg2video size=Some(720)xSome(576) bitrate=None pix_fmt=Some("yuv420p") profile=Some("main") tag=Some("[0][0][0][0]") level=Some(8) bits_per_raw_sample=None r_fps=Some(25.000000) avg_fps=Some(25.000000) range=Some("tv") transfer=Some("bt470bg") primaries=Some("bt470bg") space=Some("smpte170m") attached_pic=false
+  side_data kind="CPB properties" dv_profile=None dv_bl_compat=None rpu=None bl=None el=None
+subtitle index=2 codec=dvd_subtitle lang=None default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=3 codec=dvd_subtitle lang=None default=false forced=false hearing_impaired=false bitmap=true

@@ -1,0 +1,585 @@
+{
+  "chapters": [
+    {
+      "end": 100100000000,
+      "end_time": "100.100000",
+      "id": -828014561736923206,
+      "start": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 396229000000,
+      "end_time": "396.229000",
+      "id": -4874671005666593622,
+      "start": 100100000000,
+      "start_time": "100.100000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 765931000000,
+      "end_time": "765.931000",
+      "id": -8490651325533006674,
+      "start": 396229000000,
+      "start_time": "396.229000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 892516000000,
+      "end_time": "892.516000",
+      "id": -3987600772398079826,
+      "start": 765931000000,
+      "start_time": "765.931000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 972513000000,
+      "end_time": "972.513000",
+      "id": -5796618803855245663,
+      "start": 892516000000,
+      "start_time": "892.516000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 1136218000000,
+      "end_time": "1136.218000",
+      "id": 3574948162924621215,
+      "start": 972513000000,
+      "start_time": "972.513000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 1430387000000,
+      "end_time": "1430.387000",
+      "id": -8355603835032653662,
+      "start": 1136218000000,
+      "start_time": "1136.218000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 1730729000000,
+      "end_time": "1730.729000",
+      "id": -3410019914354897484,
+      "start": 1430387000000,
+      "start_time": "1430.387000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 1881838000000,
+      "end_time": "1881.838000",
+      "id": -6316318727283466825,
+      "start": 1730729000000,
+      "start_time": "1730.729000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 2330161000000,
+      "end_time": "2330.161000",
+      "id": -4291236504964609655,
+      "start": 1881838000000,
+      "start_time": "1881.838000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 2685724000000,
+      "end_time": "2685.724000",
+      "id": 4086475637403198347,
+      "start": 2330161000000,
+      "start_time": "2330.161000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 2857813000000,
+      "end_time": "2857.813000",
+      "id": 5904127802130433421,
+      "start": 2685724000000,
+      "start_time": "2685.724000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 2979935000000,
+      "end_time": "2979.935000",
+      "id": -6469122059631894635,
+      "start": 2857813000000,
+      "start_time": "2857.813000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 3223345000000,
+      "end_time": "3223.345000",
+      "id": 7519538179120499855,
+      "start": 2979935000000,
+      "start_time": "2979.935000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 3448403000000,
+      "end_time": "3448.403000",
+      "id": -1169323617912361342,
+      "start": 3223345000000,
+      "start_time": "3223.345000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 3683721000000,
+      "end_time": "3683.721000",
+      "id": 6116869866001032883,
+      "start": 3448403000000,
+      "start_time": "3448.403000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 3803758000000,
+      "end_time": "3803.758000",
+      "id": 6958598529690321811,
+      "start": 3683721000000,
+      "start_time": "3683.721000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 4030985000000,
+      "end_time": "4030.985000",
+      "id": 7340135095686919829,
+      "start": 3803758000000,
+      "start_time": "3803.758000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 4313475000000,
+      "end_time": "4313.475000",
+      "id": -7710470896345293695,
+      "start": 4030985000000,
+      "start_time": "4030.985000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 4750078000000,
+      "end_time": "4750.078000",
+      "id": 4191905244750897799,
+      "start": 4313475000000,
+      "start_time": "4313.475000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 4949945000000,
+      "end_time": "4949.945000",
+      "id": 3420699817146607014,
+      "start": 4750078000000,
+      "start_time": "4750.078000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 5249202000000,
+      "end_time": "5249.202000",
+      "id": -2097343047307599954,
+      "start": 4949945000000,
+      "start_time": "4949.945000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 5413366000000,
+      "end_time": "5413.366000",
+      "id": -2186407460456563582,
+      "start": 5249202000000,
+      "start_time": "5249.202000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 5659028000000,
+      "end_time": "5659.028000",
+      "id": 4779417158613753004,
+      "start": 5413366000000,
+      "start_time": "5413.366000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 5817228000000,
+      "end_time": "5817.228000",
+      "id": -7751503786611352183,
+      "start": 5659028000000,
+      "start_time": "5659.028000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 6144471000000,
+      "end_time": "6144.471000",
+      "id": 6921366608612837788,
+      "start": 5817228000000,
+      "start_time": "5817.228000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 6340334000000,
+      "end_time": "6340.334000",
+      "id": 3195165221763773841,
+      "start": 6144471000000,
+      "start_time": "6144.471000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 6603597000000,
+      "end_time": "6603.597000",
+      "id": 5527578219633043594,
+      "start": 6340334000000,
+      "start_time": "6340.334000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 6933343000000,
+      "end_time": "6933.343000",
+      "id": 83361744658998435,
+      "start": 6603597000000,
+      "start_time": "6603.597000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 7207408000000,
+      "end_time": "7207.408000",
+      "id": 683946218259983531,
+      "start": 6933343000000,
+      "start_time": "6933.343000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 7396055000000,
+      "end_time": "7396.055000",
+      "id": -1041105501284773752,
+      "start": 7207408000000,
+      "start_time": "7207.408000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 7562513000000,
+      "end_time": "7562.513000",
+      "id": -4911718676485643115,
+      "start": 7396055000000,
+      "start_time": "7396.055000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 7722923000000,
+      "end_time": "7722.923000",
+      "id": 4619785681091005841,
+      "start": 7562513000000,
+      "start_time": "7562.513000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 7787404000000,
+      "end_time": "7787.404000",
+      "id": 3244409097344226695,
+      "start": 7722923000000,
+      "start_time": "7722.923000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 8502486000000,
+      "end_time": "8502.486000",
+      "id": 7959304859626182301,
+      "start": 7787404000000,
+      "start_time": "7787.404000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    }
+  ],
+  "format": {
+    "bit_rate": "26156957",
+    "duration": "8502.486000",
+    "filename": "fixture-hdr10_no_dolby_vision.bin",
+    "format_long_name": "Matroska / WebM",
+    "format_name": "matroska,webm",
+    "nb_programs": 0,
+    "nb_streams": 3,
+    "probe_score": 100,
+    "size": "27799895388",
+    "start_time": "0.000000",
+    "tags": {
+      "creation_time": "<redacted>",
+      "encoder": "<redacted>",
+      "title": "Fixture Title"
+    }
+  },
+  "streams": [
+    {
+      "avg_frame_rate": "24000/1001",
+      "chroma_location": "topleft",
+      "closed_captions": 0,
+      "codec_long_name": "H.265 / HEVC (High Efficiency Video Coding)",
+      "codec_name": "hevc",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "video",
+      "coded_height": 1600,
+      "coded_width": 3840,
+      "color_primaries": "bt2020",
+      "color_range": "tv",
+      "color_space": "bt2020nc",
+      "color_transfer": "smpte2084",
+      "display_aspect_ratio": "12:5",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 1,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 0,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "extradata_size": 116,
+      "film_grain": 0,
+      "has_b_frames": 0,
+      "height": 1600,
+      "index": 0,
+      "level": 153,
+      "pix_fmt": "yuv420p10le",
+      "profile": "Main 10",
+      "r_frame_rate": "24000/1001",
+      "refs": 1,
+      "sample_aspect_ratio": "1:1",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "BPS": "<redacted>",
+        "BPS-eng": "<redacted>",
+        "DURATION": "<redacted>",
+        "DURATION-eng": "<redacted>",
+        "NUMBER_OF_BYTES": "<redacted>",
+        "NUMBER_OF_BYTES-eng": "<redacted>",
+        "NUMBER_OF_FRAMES": "<redacted>",
+        "NUMBER_OF_FRAMES-eng": "<redacted>",
+        "_STATISTICS_TAGS": "<redacted>",
+        "_STATISTICS_TAGS-eng": "<redacted>",
+        "_STATISTICS_WRITING_APP": "<redacted>",
+        "_STATISTICS_WRITING_APP-eng": "<redacted>",
+        "_STATISTICS_WRITING_DATE_UTC": "<redacted>",
+        "_STATISTICS_WRITING_DATE_UTC-eng": "<redacted>"
+      },
+      "time_base": "1/1000",
+      "width": 3840
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "bits_per_raw_sample": "24",
+      "bits_per_sample": 0,
+      "channel_layout": "7.1",
+      "channels": 8,
+      "codec_long_name": "DCA (DTS Coherent Acoustics)",
+      "codec_name": "dts",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "audio",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 1,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 0,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "index": 1,
+      "profile": "DTS-HD MA",
+      "r_frame_rate": "0/0",
+      "sample_fmt": "s32p",
+      "sample_rate": "48000",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "BPS": "<redacted>",
+        "BPS-eng": "<redacted>",
+        "DURATION": "<redacted>",
+        "DURATION-eng": "<redacted>",
+        "NUMBER_OF_BYTES": "<redacted>",
+        "NUMBER_OF_BYTES-eng": "<redacted>",
+        "NUMBER_OF_FRAMES": "<redacted>",
+        "NUMBER_OF_FRAMES-eng": "<redacted>",
+        "_STATISTICS_TAGS": "<redacted>",
+        "_STATISTICS_TAGS-eng": "<redacted>",
+        "_STATISTICS_WRITING_APP": "<redacted>",
+        "_STATISTICS_WRITING_APP-eng": "<redacted>",
+        "_STATISTICS_WRITING_DATE_UTC": "<redacted>",
+        "_STATISTICS_WRITING_DATE_UTC-eng": "<redacted>",
+        "language": "eng"
+      },
+      "time_base": "1/1000"
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "codec_long_name": "DVD subtitles",
+      "codec_name": "dvd_subtitle",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "subtitle",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 0,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 0,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "duration": "8502.486000",
+      "duration_ts": 8502486,
+      "extradata_size": 344,
+      "height": 1600,
+      "index": 2,
+      "r_frame_rate": "0/0",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "BPS": "<redacted>",
+        "BPS-eng": "<redacted>",
+        "DURATION": "<redacted>",
+        "DURATION-eng": "<redacted>",
+        "NUMBER_OF_BYTES": "<redacted>",
+        "NUMBER_OF_BYTES-eng": "<redacted>",
+        "NUMBER_OF_FRAMES": "<redacted>",
+        "NUMBER_OF_FRAMES-eng": "<redacted>",
+        "_STATISTICS_TAGS": "<redacted>",
+        "_STATISTICS_TAGS-eng": "<redacted>",
+        "_STATISTICS_WRITING_APP": "<redacted>",
+        "_STATISTICS_WRITING_APP-eng": "<redacted>",
+        "_STATISTICS_WRITING_DATE_UTC": "<redacted>",
+        "_STATISTICS_WRITING_DATE_UTC-eng": "<redacted>",
+        "language": "eng"
+      },
+      "time_base": "1/1000",
+      "width": 3840
+    }
+  ]
+}

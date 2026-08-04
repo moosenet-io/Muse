@@ -1,0 +1,6 @@
+{
+  "exit_code": 1,
+  "success": false,
+  "stderr": "[matroska,webm @ 0xADDR] EBML header parsing failed\nfixture-fail_ebml_south_park.bin: Invalid data found when processing input\n",
+  "stdout": "{\n\n}\n"
+}

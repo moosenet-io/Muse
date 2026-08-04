@@ -1,0 +1,27 @@
+container: matroska,webm
+duration_secs: Some(2340.544000)
+format_bitrate_bps: Some(1924230)
+size_bytes: Some(562968245)
+title: Some("Fixture Title")
+chapter_count: 2
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 1
+subtitle_count: 1
+attachment_count: 11
+video index=0 codec=h264 size=Some(640)xSome(480) bitrate=None pix_fmt=Some("yuv420p") profile=Some("high") tag=Some("[0][0][0][0]") level=Some(51) bits_per_raw_sample=Some(8) r_fps=Some(23.976000) avg_fps=Some(23.976000) range=None transfer=None primaries=None space=None attached_pic=false
+audio index=1 codec=aac channels=Some(2) layout=Some("stereo") sample_rate=Some(48000) lang=Some("jpn") bitrate=None profile=Some("lc") default=true forced=false
+subtitle index=2 codec=ass lang=Some("eng") default=true forced=false hearing_impaired=false bitmap=false
+attachment index=3 codec=ttf filename=Some("attachment.ttf")
+attachment index=4 codec=ttf filename=Some("attachment.ttf")
+attachment index=5 codec=ttf filename=Some("attachment.ttf")
+attachment index=6 codec=ttf filename=Some("attachment.ttf")
+attachment index=7 codec=ttf filename=Some("attachment.otf")
+attachment index=8 codec=ttf filename=Some("attachment.ttf")
+attachment index=9 codec=ttf filename=Some("attachment.ttf")
+attachment index=10 codec=ttf filename=Some("attachment.ttf")
+attachment index=11 codec=ttf filename=Some("attachment.ttf")
+attachment index=12 codec=ttf filename=Some("attachment.ttf")
+attachment index=13 codec=ttf filename=Some("attachment.ttf")

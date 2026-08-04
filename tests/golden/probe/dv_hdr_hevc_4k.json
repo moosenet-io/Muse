@@ -1,0 +1,482 @@
+{
+  "chapters": [
+    {
+      "end": 616157000000,
+      "end_time": "616.157000",
+      "id": 8255890032528084715,
+      "start": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 1243702000000,
+      "end_time": "1243.702000",
+      "id": -4306774757784743160,
+      "start": 616157000000,
+      "start_time": "616.157000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 2132549000000,
+      "end_time": "2132.549000",
+      "id": -60272821495549690,
+      "start": 1243702000000,
+      "start_time": "1243.702000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 3010301000000,
+      "end_time": "3010.301000",
+      "id": -7946660119624452663,
+      "start": 2132549000000,
+      "start_time": "2132.549000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 3758341000000,
+      "end_time": "3758.341000",
+      "id": 9097345128988130187,
+      "start": 3010301000000,
+      "start_time": "3010.301000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 4377460000000,
+      "end_time": "4377.460000",
+      "id": 7937634518356126754,
+      "start": 3758341000000,
+      "start_time": "3758.341000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 5081956000000,
+      "end_time": "5081.956000",
+      "id": 5610356963524970686,
+      "start": 4377460000000,
+      "start_time": "4377.460000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 5993785000000,
+      "end_time": "5993.785000",
+      "id": -8819337890177064757,
+      "start": 5081956000000,
+      "start_time": "5081.956000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 6682766000000,
+      "end_time": "6682.766000",
+      "id": 2762797235926673471,
+      "start": 5993785000000,
+      "start_time": "5993.785000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 7159159000000,
+      "end_time": "7159.159000",
+      "id": -8596653236469649108,
+      "start": 6682766000000,
+      "start_time": "6682.766000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    },
+    {
+      "end": 7436930000000,
+      "end_time": "7436.930000",
+      "id": -7797417909623154538,
+      "start": 7159159000000,
+      "start_time": "7159.159000",
+      "tags": {
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000000000"
+    }
+  ],
+  "format": {
+    "bit_rate": "25979106",
+    "duration": "7436.930000",
+    "filename": "fixture-dv_hdr_hevc_4k.bin",
+    "format_long_name": "Matroska / WebM",
+    "format_name": "matroska,webm",
+    "nb_programs": 0,
+    "nb_streams": 8,
+    "probe_score": 100,
+    "size": "24150599646",
+    "start_time": "0.000000",
+    "tags": {
+      "encoder": "<redacted>",
+      "title": ""
+    }
+  },
+  "streams": [
+    {
+      "avg_frame_rate": "24000/1001",
+      "chroma_location": "topleft",
+      "closed_captions": 0,
+      "codec_long_name": "H.265 / HEVC (High Efficiency Video Coding)",
+      "codec_name": "hevc",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "video",
+      "coded_height": 2072,
+      "coded_width": 3832,
+      "color_primaries": "bt2020",
+      "color_range": "tv",
+      "color_space": "bt2020nc",
+      "color_transfer": "smpte2084",
+      "display_aspect_ratio": "958:517",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 1,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 0,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 1,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "extradata_size": 150,
+      "film_grain": 0,
+      "has_b_frames": 4,
+      "height": 2068,
+      "index": 0,
+      "level": 150,
+      "pix_fmt": "yuv420p10le",
+      "profile": "Main 10",
+      "r_frame_rate": "24000/1001",
+      "refs": 1,
+      "sample_aspect_ratio": "1:1",
+      "side_data_list": [
+        {
+          "bl_present_flag": 1,
+          "dv_bl_signal_compatibility_id": 1,
+          "dv_level": 6,
+          "dv_profile": 8,
+          "dv_version_major": 1,
+          "dv_version_minor": 0,
+          "el_present_flag": 0,
+          "rpu_present_flag": 1,
+          "side_data_type": "DOVI configuration record"
+        }
+      ],
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "eng",
+        "title": ""
+      },
+      "time_base": "1/1000",
+      "width": 3832
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "bit_rate": "768000",
+      "bits_per_sample": 0,
+      "channel_layout": "5.1(side)",
+      "channels": 6,
+      "codec_long_name": "ATSC A/52B (AC-3, E-AC-3)",
+      "codec_name": "eac3",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "audio",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 1,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 0,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 1,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "index": 1,
+      "r_frame_rate": "0/0",
+      "sample_fmt": "fltp",
+      "sample_rate": "48000",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "jpn",
+        "title": ""
+      },
+      "time_base": "1/1000"
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "bit_rate": "768000",
+      "bits_per_sample": 0,
+      "channel_layout": "5.1(side)",
+      "channels": 6,
+      "codec_long_name": "ATSC A/52B (AC-3, E-AC-3)",
+      "codec_name": "eac3",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "audio",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 0,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 1,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "index": 2,
+      "r_frame_rate": "0/0",
+      "sample_fmt": "fltp",
+      "sample_rate": "48000",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "eng"
+      },
+      "time_base": "1/1000"
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "codec_long_name": "SubRip subtitle",
+      "codec_name": "subrip",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "subtitle",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 0,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 1,
+        "forced": 1,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "duration": "7436.930000",
+      "duration_ts": 7436930,
+      "index": 3,
+      "r_frame_rate": "0/0",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "eng",
+        "title": ""
+      },
+      "time_base": "1/1000"
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "codec_long_name": "SubRip subtitle",
+      "codec_name": "subrip",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "subtitle",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 0,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 1,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "duration": "7436.930000",
+      "duration_ts": 7436930,
+      "index": 4,
+      "r_frame_rate": "0/0",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "eng"
+      },
+      "time_base": "1/1000"
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "codec_long_name": "SubRip subtitle",
+      "codec_name": "subrip",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "subtitle",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 0,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 0,
+        "forced": 0,
+        "hearing_impaired": 1,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 1,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "duration": "7436.930000",
+      "duration_ts": 7436930,
+      "index": 5,
+      "r_frame_rate": "0/0",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "eng",
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000"
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "codec_long_name": "SubRip subtitle",
+      "codec_name": "subrip",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "subtitle",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 0,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 1,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "duration": "7436.930000",
+      "duration_ts": 7436930,
+      "index": 6,
+      "r_frame_rate": "0/0",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "spa",
+        "title": "Fixture Title"
+      },
+      "time_base": "1/1000"
+    },
+    {
+      "avg_frame_rate": "0/0",
+      "codec_long_name": "SubRip subtitle",
+      "codec_name": "subrip",
+      "codec_tag": "0x0000",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_type": "subtitle",
+      "disposition": {
+        "attached_pic": 0,
+        "captions": 0,
+        "clean_effects": 0,
+        "comment": 0,
+        "default": 0,
+        "dependent": 0,
+        "descriptions": 0,
+        "dub": 1,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "karaoke": 0,
+        "lyrics": 0,
+        "metadata": 0,
+        "original": 0,
+        "still_image": 0,
+        "timed_thumbnails": 0,
+        "visual_impaired": 0
+      },
+      "duration": "7436.930000",
+      "duration_ts": 7436930,
+      "index": 7,
+      "r_frame_rate": "0/0",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "tags": {
+        "language": "fre"
+      },
+      "time_base": "1/1000"
+    }
+  ]
+}

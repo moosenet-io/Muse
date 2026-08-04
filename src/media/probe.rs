@@ -1558,22 +1558,79 @@ struct RawDisposition {
     hearing_impaired: Option<i64>,
 }
 
+/// **The tag-key case rule, stated once** (S130-A `TAGCASE-01`).
+///
+/// `ffprobe` spells its OWN fields lowercase, but container tags pass through
+/// as the muxer authored them, and Matroska in the wild is inconsistent: a
+/// number of tools write `LANGUAGE`/`TITLE` in caps, and a track whose language
+/// tag is not read loses its language silently — no error, no note, just an
+/// audio/subtitle selection rule that stops firing.
+///
+/// So this is **not** a case-fold, and deliberately not: each group lists the
+/// exact spellings that are read, canonical spelling FIRST, and every other
+/// spelling (`Language`, `lang`, `Title`) is not read. Two reasons:
+///
+/// 1. The fixture scrubber ([`crate::media::probe_capture`]) derives its
+///    allowlist from this table rather than restating it. A blanket case-fold
+///    there would carry tag keys through the allowlist that nobody enumerated
+///    — `IMDB`, `Group`, `_STATISTICS_WRITING_APP` all occur in this library —
+///    which is exactly the fail-closed default the scrubber depends on.
+/// 2. An enumerated set is checkable. `the_alias_table_matches_what_the_parser_
+///    actually_reads` parses a document per spelling, so a spelling added here
+///    without being read fails the suite instead of quietly widening the
+///    scrubber.
+///
+/// Order inside a group is precedence: a document carrying both `language` and
+/// `LANGUAGE` resolves to `language`.
+const TAG_KEY_ALIASES: &[&[&str]] = &[
+    &["language", "LANGUAGE"],
+    &["title", "TITLE"],
+    // No `FILENAME` spelling: an attachment filename is written by the muxer's
+    // attachment machinery, not by a tagger, and no capital form was found in
+    // this library's documents. Adding one is a one-line change HERE, and the
+    // scrubber follows automatically.
+    &["filename"],
+];
+
+/// The canonical spelling of a raw tag key, or `None` when the parser does not
+/// read that key at all.
+///
+/// `#[cfg(test)]` because its only caller besides this module's own tests is
+/// [`crate::media::probe_capture`], which is itself test-only. The *rule* it
+/// exposes is not test-only — [`RawTags::get`] below applies the same table on
+/// every production parse.
+#[cfg(test)]
+pub fn canonical_tag_key(key: &str) -> Option<&'static str> {
+    TAG_KEY_ALIASES
+        .iter()
+        .find(|group| group.contains(&key))
+        .map(|group| group[0])
+}
+
+/// A stream's or the container's `tags` object, held as the raw map.
+///
+/// A map rather than named fields so the case rule lives in exactly one place
+/// ([`TAG_KEY_ALIASES`]) instead of being restated as a `#[serde(rename)]` per
+/// spelling. It is also more robust: with named `Option<String>` fields, a tag
+/// whose value `ffprobe` rendered as a number made the WHOLE document fail to
+/// deserialize — turning a readable file into `MalformedOutput`, the same trap
+/// the `Option<serde_json::Value>` fields elsewhere in this file exist to
+/// avoid. Here a non-string tag value is simply not a string tag.
 #[derive(Debug, Deserialize)]
-struct RawTags {
-    #[serde(default)]
-    language: Option<String>,
-    /// Some muxers write `LANGUAGE` rather than `language`. Matroska in
-    /// particular is case-inconsistent across tools, and missing the tag means
-    /// a subtitle/audio track silently loses its language.
-    #[serde(default, rename = "LANGUAGE")]
-    language_upper: Option<String>,
-    /// Attachment filename (the font file name a subtitle renderer looks up).
-    #[serde(default)]
-    filename: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default, rename = "TITLE")]
-    title_upper: Option<String>,
+struct RawTags(std::collections::BTreeMap<String, serde_json::Value>);
+
+impl RawTags {
+    /// Resolve a tag by its CANONICAL spelling, trying every spelling
+    /// [`TAG_KEY_ALIASES`] records for it, in table order.
+    fn get(&self, canonical: &str) -> Option<String> {
+        let group = TAG_KEY_ALIASES.iter().find(|g| g[0] == canonical)?;
+        group.iter().find_map(|spelling| {
+            self.0
+                .get(*spelling)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    }
 }
 
 /// Read a JSON value that may be a number **or** a numeric string, returning
@@ -1922,7 +1979,9 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
         let language = s
             .tags
             .as_ref()
-            .and_then(|t| t.language.clone().or_else(|| t.language_upper.clone()))
+            // Case handling is `TAG_KEY_ALIASES`' job, not this call site's:
+            // `LANGUAGE` is read here because the table says so.
+            .and_then(|t| t.get("language"))
             .map(|l| l.trim().to_ascii_lowercase())
             .filter(|l| !l.is_empty() && l != "und")
             .map(|l| bounded(l, &format!("stream {index}'s language tag"), &mut notes));
@@ -2083,7 +2142,7 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
                 filename: s
                     .tags
                     .as_ref()
-                    .and_then(|t| t.filename.clone())
+                    .and_then(|t| t.get("filename"))
                     .map(|n| n.trim().to_string())
                     .filter(|n| !n.is_empty())
                     .map(|n| {
@@ -2098,7 +2157,7 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
     let title = format
         .as_ref()
         .and_then(|f| f.tags.as_ref())
-        .and_then(|t| t.title.clone().or_else(|| t.title_upper.clone()))
+        .and_then(|t| t.get("title"))
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .map(|t| bounded(t, "the container title tag", &mut notes));
@@ -2674,6 +2733,109 @@ mod tests {
             Some("fra"),
             "the uppercase Matroska spelling must be read, and normalized"
         );
+    }
+
+    // --- S130-A TAGCASE-01: how tag keys are spelled ------------------------
+
+    /// A document carrying `key` on an audio stream, on the container, and on
+    /// an attachment — one probe that exercises all three tag lookups.
+    fn doc_with_tag_key(key: &str) -> String {
+        format!(
+            r#"{{
+                "streams": [
+                    {{ "index": 0, "codec_name": "h264", "codec_type": "video" }},
+                    {{ "index": 1, "codec_name": "aac", "codec_type": "audio",
+                       "tags": {{ "{key}": "fra" }} }},
+                    {{ "index": 2, "codec_name": "ttf", "codec_type": "attachment",
+                       "tags": {{ "{key}": "Font Bold.ttf" }} }}
+                ],
+                "format": {{ "format_name": "matroska,webm",
+                             "tags": {{ "{key}": "A Title" }} }}
+            }}"#
+        )
+    }
+
+    /// The table is only trustworthy if the parser really reads every spelling
+    /// on it. Table-driven on `TAG_KEY_ALIASES` itself, so a spelling ADDED to
+    /// the table without being wired fails here rather than silently widening
+    /// the fixture scrubber, which derives its allowlist from the same table.
+    #[test]
+    fn the_alias_table_matches_what_the_parser_actually_reads() {
+        for group in TAG_KEY_ALIASES {
+            let canonical = group[0];
+            for spelling in group.iter() {
+                let p = parse_probe_json(&doc_with_tag_key(spelling))
+                    .unwrap_or_else(|e| panic!("{spelling} must parse: {e:?}"));
+                let got: Option<String> = match canonical {
+                    "language" => p.audio[0].language.clone(),
+                    "title" => p.title.clone(),
+                    "filename" => p.attachments[0].filename.clone(),
+                    other => panic!("no assertion wired for canonical tag {other}"),
+                };
+                assert!(
+                    got.is_some(),
+                    "TAG_KEY_ALIASES lists {spelling} for {canonical}, but the parser did not \
+                     read it — the scrubber's allowlist derives from this table, so the two \
+                     would now disagree"
+                );
+            }
+        }
+    }
+
+    /// The deliberate boundary: this is an enumerated alias set, NOT a
+    /// case-fold. A spelling nobody listed is not read — which is what lets
+    /// the fixture scrubber stay fail-closed on tag keys.
+    #[test]
+    fn a_tag_spelling_the_table_does_not_list_is_not_read() {
+        for spelling in ["Language", "lang", "Title", "FILENAME"] {
+            assert_eq!(
+                canonical_tag_key(spelling),
+                None,
+                "{spelling} is not in the table"
+            );
+            let p = parse_probe_json(&doc_with_tag_key(spelling)).expect("parses");
+            assert_eq!(p.audio[0].language, None, "{spelling}");
+            assert_eq!(p.title, None, "{spelling}");
+            assert_eq!(p.attachments[0].filename, None, "{spelling}");
+        }
+    }
+
+    /// A tag whose value `ffprobe` rendered as a number must not take the whole
+    /// document down with it. Before `TAGCASE-01` the named `Option<String>`
+    /// fields made this a deserialize error, i.e. a readable file became
+    /// `MalformedOutput` — the state where a planner knows nothing at all.
+    #[test]
+    fn a_non_string_tag_value_does_not_make_the_document_unreadable() {
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "h264", "codec_type": "video" },
+                { "index": 1, "codec_name": "aac", "codec_type": "audio",
+                  "tags": { "language": 5, "LANGUAGE": "deu" } }
+            ],
+            "format": { "format_name": "matroska,webm", "tags": { "title": 0 } }
+        }"#;
+        let p = parse_probe_json(json).expect("a numeric tag value must not fail the parse");
+        assert_eq!(p.title, None, "a non-string title is not a title");
+        assert_eq!(
+            p.audio[0].language.as_deref(),
+            Some("deu"),
+            "an unusable spelling must fall through to the next one"
+        );
+    }
+
+    /// Precedence inside a group is the table's order, not the map's.
+    #[test]
+    fn the_lowercase_spelling_wins_when_a_document_carries_both() {
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "h264", "codec_type": "video" },
+                { "index": 1, "codec_name": "aac", "codec_type": "audio",
+                  "tags": { "language": "eng", "LANGUAGE": "fra" } }
+            ],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        assert_eq!(p.audio[0].language.as_deref(), Some("eng"));
     }
 
     // --- FOUNDRY-03: colour, bit depth and Dolby Vision ---------------------

@@ -710,8 +710,12 @@ mod tests {
             schedule.slots.iter().any(|s| s.is_exploration),
             "at least one scheduled slot must be flagged is_exploration"
         );
-        // Every reserved position across a full 8-slot schedule (interval 4,
-        // budget 0.25) is genuinely exploration, not just "count > 0".
+        // WEAKTEST-01 (Plane MUSE #131 sweep): this block's comment claimed
+        // "not just count > 0" while its only assertion WAS count > 0.
+        // Collapsing `want_exploration` to the one-time `guarantee_pending`
+        // (i.e. deleting the modular cadence entirely) left this assertion
+        // green. It now pins both halves of the mechanism: the one-time
+        // guarantee AND the `interval = 1/budget` cadence beyond it.
         let explore_at: Vec<usize> = schedule
             .slots
             .iter()
@@ -719,7 +723,29 @@ mod tests {
             .filter(|(_, s)| s.is_exploration)
             .map(|(i, _)| i)
             .collect();
-        assert!(!explore_at.is_empty());
+        assert_eq!(
+            explore_at.first().copied(),
+            Some(0),
+            "the one-time serendipity guarantee must reserve the very first slot: {explore_at:?}"
+        );
+        // Deliberately expressed against the cadence rather than against the
+        // literal seed-derived offset, so this stays a statement about the
+        // mechanism and not about seed 4 in particular.
+        let cadence = &explore_at[1..];
+        assert!(
+            !cadence.is_empty(),
+            "budget 0.25 over 8 slots must reserve cadence slots BEYOND the one-time \
+             guarantee — reserving only slot 0 is the fail-open this asserts against: \
+             {explore_at:?}"
+        );
+        assert!(
+            cadence.windows(2).all(|w| w[1] - w[0] == 4),
+            "cadence slots must be exactly interval (= 1/0.25) apart: {explore_at:?}"
+        );
+        assert!(
+            cadence.iter().all(|i| i % 4 == cadence[0] % 4),
+            "every cadence slot must share one modular offset: {explore_at:?}"
+        );
     }
 
     #[test]

@@ -204,13 +204,32 @@ mod tests {
         assert_eq!(ts, vec![50_000]);
     }
 
+    /// WEAKTEST-01 (Plane MUSE #131 sweep): the previous body asserted only
+    /// `t < runtime_ms && t >= 0` per timestamp. The `t >= 0` half was
+    /// vacuous — `frac` starts at 0.1 and `runtime_ms > 0`, so no input
+    /// reachable from this test can produce a negative, and removing the
+    /// lower bound from `ts.clamp(0, max_ts)` left the WHOLE suite green.
+    /// The upper bound is the live mechanism, so it is now asserted
+    /// exactly: for `runtime_ms == 1` every unclamped timestamp would be
+    /// `[0, 0, 1, 1, 1]`, and only the clamp to `max_ts == 0` flattens it.
     #[test]
     fn spread_timestamps_never_seeks_past_eof() {
+        // The clamp actually engaging is observable only at a runtime short
+        // enough for the raw fractions to overshoot EOF.
+        assert_eq!(
+            spread_timestamps(1, 5),
+            vec![0, 0, 0, 0, 0],
+            "every timestamp must be clamped to max_ts (= runtime_ms - 1 = 0)"
+        );
+        // At runtimes where nothing overshoots, the exact spread must be
+        // preserved rather than silently clamped or rounded away.
+        assert_eq!(spread_timestamps(10, 5), vec![1, 3, 5, 7, 9]);
+        assert_eq!(spread_timestamps(100, 5), vec![10, 30, 50, 70, 90]);
+        assert_eq!(spread_timestamps(999, 5), vec![100, 300, 500, 699, 899]);
+
         for &runtime_ms in &[1_i64, 10, 100, 999] {
-            let ts = spread_timestamps(runtime_ms, 5);
-            for t in ts {
+            for t in spread_timestamps(runtime_ms, 5) {
                 assert!(t < runtime_ms, "timestamp {t} must be < runtime {runtime_ms}");
-                assert!(t >= 0);
             }
         }
     }

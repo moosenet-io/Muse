@@ -2007,27 +2007,66 @@ mod tests {
         assert_eq!(json["total"], 412);
     }
 
-    /// Regression guard for the MUSE #84 review's sharpest finding: the four
-    /// new handlers must not convert a query FAILURE into a valid-looking 2xx
-    /// body, because `useMuseSection` renders any 2xx as data. This is asserted
-    /// structurally (on the signatures) rather than by faking a broken pool:
-    /// a `MuseResult` return type cannot silently swallow a `sqlx` error, while
-    /// the previous `Json<T>` returns could and did.
+    /// Regression guard for the MUSE #84 review's sharpest finding: the
+    /// dashboard read handlers must not convert a query FAILURE into a
+    /// valid-looking 2xx body, because `useMuseSection` renders any 2xx as
+    /// data. Asserted structurally (on the signatures) rather than by faking a
+    /// broken pool: a `MuseResult` return type cannot silently swallow a `sqlx`
+    /// error, while a bare `Json<T>` return could and did.
+    ///
+    /// ## Why this test was rewritten (Plane MUSE #131 / #132)
+    /// The original version was a weak constraint — a test that could not
+    /// fail. It read:
+    ///
+    /// ```ignore
+    /// fn assert_fallible<T, F: Fn(&AppState) -> T>(_: F) {}
+    /// let _ = assert_fallible(|_s: &AppState| {
+    ///     let _stats: fn(State<Arc<AppState>>) -> _ = get_stats;
+    ///     ...
+    /// });
+    /// ```
+    ///
+    /// `T` was a free type parameter unified with whatever the closure
+    /// happened to return (here `()`), and each binding's return type was the
+    /// inference placeholder `_`, unified with whatever the handler happened to
+    /// return. Nothing anywhere named `MuseResult`, so the assertion held for
+    /// ANY return type. Demonstrated: rewriting `get_stats` to
+    /// `-> Json<MuseStatsResponse>` with `.unwrap_or(empty)` — precisely the
+    /// fail-open described above — left this test GREEN.
+    ///
+    /// The replacement pins `Fut::Output` to `MuseResult<Json<_>>` explicitly
+    /// (the same shape `mact01_sessions_tests` already uses for the sessions
+    /// handlers), so that same mutation now fails to COMPILE.
     #[test]
     fn the_new_dashboard_handlers_cannot_swallow_a_query_error_into_a_2xx() {
-        // Compile-time proof: each handler's output is a fallible `MuseResult`,
-        // so the only way to a 2xx is a successful query. If someone
-        // reintroduces a `.unwrap_or_else(|_| empty)` fail-open, its return
-        // type stops being `MuseResult` and these bindings stop compiling.
-        fn assert_fallible<T, F: Fn(&AppState) -> T>(_: F) {}
-        let _ = assert_fallible::<_, _>(|_s: &AppState| {
-            // `get_stats`/`get_gaps` take only `State`; `get_on_deck` also
-            // takes `Query`. Referencing them as values is enough to pin the
-            // signature — calling them would need a live pool.
-            let _stats: fn(State<Arc<AppState>>) -> _ = get_stats;
-            let _gaps: fn(State<Arc<AppState>>) -> _ = get_gaps;
-            let _on_deck: fn(State<Arc<AppState>>, Query<AccountQuery>) -> _ = get_on_deck;
-        });
+        // Compile-time proof: each handler's output is a fallible
+        // `MuseResult<Json<_>>`, so the only route to a 2xx is a successful
+        // query. Reintroducing a `.unwrap_or_else(|_| empty)` fail-open
+        // changes the return type to a bare `Json<_>` and stops this
+        // compiling. `T` is inferred, but `MuseResult<Json<T>>` is NOT — it is
+        // written literally in the bound, which is what the old version
+        // lacked.
+        fn assert_state_handler_returns_museresult<T, Fut, F>(_: F)
+        where
+            F: Fn(State<Arc<AppState>>) -> Fut,
+            Fut: std::future::Future<Output = MuseResult<Json<T>>>,
+        {
+        }
+
+        fn assert_state_query_handler_returns_museresult<T, Q, Fut, F>(_: F)
+        where
+            F: Fn(State<Arc<AppState>>, Query<Q>) -> Fut,
+            Fut: std::future::Future<Output = MuseResult<Json<T>>>,
+        {
+        }
+
+        // `get_stats`/`get_gaps` take only `State`; `get_on_deck` also takes
+        // `Query`. All three are wired into the live routers in `web::mod`
+        // (`/stats`, `/gaps`, `/on_deck`), so this pins the production path,
+        // not a disconnected helper.
+        assert_state_handler_returns_museresult(get_stats);
+        assert_state_handler_returns_museresult(get_gaps);
+        assert_state_query_handler_returns_museresult::<_, AccountQuery, _, _>(get_on_deck);
     }
 
     #[tokio::test]

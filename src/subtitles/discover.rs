@@ -377,6 +377,7 @@ mod tests {
             chapter_count: 0,
             title: None,
             other_stream_count: 0,
+            notes: Vec::new(),
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
             language: language.map(str::to_string),
             forced: false,
             default: false,
+            ..Default::default()
         }
     }
 

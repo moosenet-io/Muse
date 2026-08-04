@@ -1899,6 +1899,7 @@ mod tests {
                     channels: Some(2),
                     language: Some("eng".to_string()),
                     bitrate_bps: Some(128_000),
+                    ..Default::default()
                 })
                 .collect(),
             subtitles: (0..subs)
@@ -1908,6 +1909,7 @@ mod tests {
                     language: Some("eng".to_string()),
                     forced: false,
                     default: false,
+                    ..Default::default()
                 })
                 .collect(),
             attachments: Vec::new(),
@@ -1916,6 +1918,7 @@ mod tests {
             chapter_count: 0,
             title: None,
             other_stream_count: 0,
+            notes: Vec::new(),
         }
     }
 

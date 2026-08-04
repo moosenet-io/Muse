@@ -544,6 +544,25 @@ fn audio_streams_an_encode_will_produce(
             channels: channels.get(i).copied().or(a.channels),
             language: a.language.clone(),
             bitrate_bps: None,
+            // S130-A MPRB-03 added these five. Listed explicitly rather than
+            // filled with `..Default::default()`: this value is what the
+            // deletion gate is predicted against, and a field silently
+            // acquiring a benign default is how a prediction stops matching
+            // the gate it predicts.
+            //
+            // Unknown until the output is encoded and re-probed, exactly like
+            // `bitrate_bps` above — an aac encode's reported profile, sample
+            // rate and layout are the encoder's to choose:
+            profile: None,
+            sample_rate_hz: None,
+            channel_layout: None,
+            // Dispositions, by contrast, ARE determined by the plan: the argv
+            // maps these streams, and `-map` carries a stream's disposition
+            // flags across unchanged. Carried from the source rather than
+            // defaulted to false, which would predict a file with no default
+            // audio track at all.
+            default: a.default,
+            forced: a.forced,
         })
         .collect()
 }
@@ -1009,6 +1028,7 @@ mod tests {
             channels: Some(channels),
             language: Some("eng".into()),
             bitrate_bps: Some(640_000),
+            ..Default::default()
         }
     }
 
@@ -1027,6 +1047,7 @@ mod tests {
             chapter_count: 0,
             title: None,
             other_stream_count: 0,
+            notes: Vec::new(),
         }
     }
 
@@ -2134,6 +2155,7 @@ mod tests {
                         language: Some("eng".into()),
                         forced: false,
                         default: true,
+                        ..Default::default()
                     }]
                 }
                 1 => {
@@ -2311,6 +2333,7 @@ mod tests {
             language: Some("eng".into()),
             forced: false,
             default,
+            ..Default::default()
         };
         let policy = TranscodePolicy::direct_play_normalization();
 
@@ -2337,6 +2360,7 @@ mod tests {
             language: Some("eng".into()),
             forced: true,
             default: true,
+            ..Default::default()
         }];
         assert!(direct_play_blockers(&p, &policy).is_empty());
     }

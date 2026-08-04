@@ -73,6 +73,15 @@ pub const REDACTED: &str = "<redacted>";
 /// Array indices are normalized to `[]`, so `/streams/3/codec_name` is matched
 /// as `/streams/[]/codec_name`.
 ///
+/// **Case:** matching is exact, and a `.../tags/<key>` path is first re-spelled
+/// to the key's canonical spelling by [`canonicalize_tag_path`], which asks
+/// [`crate::media::probe::canonical_tag_key`]. So each tag appears here ONCE,
+/// in lowercase, and the set of accepted spellings is whatever the parser
+/// actually reads — derived from the parser's table rather than restated here,
+/// where the two could drift apart (`TAGCASE-01`). A spelling the parser does
+/// not read is left untouched, matches nothing, and is redacted: the
+/// fail-closed default is unchanged, and no blanket case-fold is applied.
+///
 /// Membership rule: a path is here only if it is (a) read by
 /// [`crate::media::probe::parse_probe_json`], or (b) a codec/format descriptor
 /// that is a fixed vocabulary rather than free text. Nothing that a muxer can
@@ -126,8 +135,12 @@ pub const KEEP_PATHS: &[&str] = &[
     // The ISO-639 language tag. A three-letter code from a closed vocabulary,
     // read by the parser, and the thing several subtitle/audio selection rules
     // turn on — a fixture with its languages redacted could not exercise them.
+    //
+    // Listed ONCE, in its canonical spelling. The uppercase Matroska spelling
+    // `LANGUAGE` is covered because [`canonicalize_tag_path`] re-spells a tag
+    // key through `probe::canonical_tag_key` before matching — see the note on
+    // [`KEEP_PATHS`] above. Do not add a second entry for it here.
     "/streams/[]/tags/language",
-    "/streams/[]/tags/LANGUAGE",
     // --- side data (Dolby Vision) ----------------------------------------
     "/streams/[]/side_data_list/[]/side_data_type",
     // --- chapters ---------------------------------------------------------
@@ -144,15 +157,15 @@ pub const KEEP_PATHS: &[&str] = &[
 /// redacted `format.filename` would stop looking like a filename, and a
 /// redacted `tags.title` would still exercise the title path but would make
 /// the golden output say `<redacted>` where a reader expects a title.
+///
+/// Canonical spellings only, for the reason given on [`KEEP_PATHS`]: the
+/// uppercase `TITLE` spelling is covered by [`canonicalize_tag_path`].
 pub const SYNTHESIZE_PATHS: &[&str] = &[
     "/format/filename",
     "/format/tags/title",
-    "/format/tags/TITLE",
     "/streams/[]/tags/title",
-    "/streams/[]/tags/TITLE",
     "/streams/[]/tags/filename",
     "/chapters/[]/tags/title",
-    "/chapters/[]/tags/TITLE",
 ];
 
 /// A residual-PII finding: what was matched and why.
@@ -401,6 +414,32 @@ fn normalize_path(path: &[PathSeg]) -> String {
     out
 }
 
+/// Re-spell a `<prefix>/tags/<key>` path with the key's **canonical** spelling,
+/// so [`KEEP_PATHS`] and [`SYNTHESIZE_PATHS`] list each tag once and the set of
+/// accepted spellings is the one the parser reads.
+///
+/// This is the whole of the derivation (`TAGCASE-01`): the answer to "is
+/// `LANGUAGE` kept?" is `probe::canonical_tag_key`'s answer, which is the same
+/// table `probe::RawTags::get` resolves against, so parser and scrubber cannot
+/// disagree about case without failing
+/// [`tests::the_scrubber_keeps_exactly_the_spellings_the_parser_reads`].
+///
+/// A key the parser does not read is returned unchanged — it matches no
+/// allowlist entry and is redacted. This is NOT a case-insensitive match:
+/// `Language` is not read and is not kept.
+fn canonicalize_tag_path(path: &str) -> String {
+    let Some((prefix, key)) = path.rsplit_once('/') else {
+        return path.to_string();
+    };
+    if !prefix.ends_with("/tags") {
+        return path.to_string();
+    }
+    match crate::media::probe::canonical_tag_key(key) {
+        Some(canonical) => format!("{prefix}/{canonical}"),
+        None => path.to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PathSeg {
     Key(String),
@@ -518,7 +557,7 @@ fn scrub_value(value: &mut Value, path: &mut Vec<PathSeg>, label: &str) {
             }
         }
         Value::String(s) => {
-            let p = normalize_path(path);
+            let p = canonicalize_tag_path(&normalize_path(path));
             if KEEP_PATHS.contains(&p.as_str()) {
                 return;
             }
@@ -876,6 +915,119 @@ mod tests {
         ];
         assert_eq!(normalize_path(&path), "/streams/[]/tags/language");
         assert!(KEEP_PATHS.contains(&"/streams/[]/tags/language"));
+    }
+
+    // --- S130-A TAGCASE-01: tag-key case ------------------------------------
+
+    /// The uppercase Matroska spelling of an allowlisted tag is carried
+    /// verbatim — the case the committed corpus does not contain (every one of
+    /// its 37 fixtures spells it `language`), so nothing else covers it.
+    ///
+    /// The value is a plain ISO-639 code, so the ONLY rule that can decide this
+    /// assertion is the path rule under test: `fra` trips no residual-PII
+    /// scanner and no length bound.
+    #[test]
+    fn the_uppercase_spelling_of_an_allowlisted_tag_is_kept_verbatim() {
+        let raw = r#"{"streams":[{"index":0,"codec_type":"audio","codec_name":"eac3",
+                                   "tags":{"LANGUAGE":"fra"}}],
+                      "format":{"format_name":"matroska,webm"}}"#;
+        let out = scrub_probe_document(raw, "t").expect("must scrub");
+        assert!(out.contains("\"LANGUAGE\": \"fra\""), "{out}");
+        assert!(!out.contains(REDACTED), "a read tag must not be redacted: {out}");
+        // …and the parser really does read it back out of the fixture, so this
+        // is not just a string surviving in a file nobody parses.
+        let p = crate::media::probe::parse_probe_json(&out).expect("parses");
+        assert_eq!(p.audio[0].language.as_deref(), Some("fra"), "{out}");
+    }
+
+    /// The uppercase spelling of a SYNTHESIZED tag is synthesized, not blanked
+    /// and not carried — an operator's real film title in caps must not reach a
+    /// public mirror through a spelling the list forgot.
+    #[test]
+    fn the_uppercase_spelling_of_a_synthesized_tag_is_synthesized() {
+        let raw = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}],
+                      "format":{"format_name":"matroska,webm",
+                                "tags":{"TITLE":"A Real Film (2023)"}}}"#;
+        let out = scrub_probe_document(raw, "t").expect("must scrub");
+        assert!(!out.contains("A Real Film"), "{out}");
+        assert!(out.contains("Fixture Title"), "{out}");
+        assert!(!out.contains(REDACTED), "{out}");
+    }
+
+    /// Fail-closed is unchanged: this is an ENUMERATED alias set, not a
+    /// case-insensitive match. A casing the parser does not read is redacted
+    /// even though its lowercase form is on an allowlist.
+    ///
+    /// `fra`/`A Film` are benign values, so redaction here can only be the path
+    /// rule's doing — if this test ever passed because the residual scanner
+    /// rejected the document instead, the `expect` would fail and say so.
+    #[test]
+    fn a_tag_casing_the_parser_does_not_read_is_redacted_not_kept() {
+        let raw = r#"{"streams":[{"index":0,"codec_type":"audio","codec_name":"eac3",
+                                   "tags":{"Language":"fra","Title":"A Film"}}],
+                      "format":{"format_name":"matroska,webm"}}"#;
+        let out = scrub_probe_document(raw, "t").expect("must scrub");
+        assert!(!out.contains("fra"), "an unread casing must not be carried: {out}");
+        assert!(!out.contains("A Film"), "{out}");
+        assert!(!out.contains("Fixture Title"), "an unread casing is not synthesized: {out}");
+        assert_eq!(out.matches(REDACTED).count(), 2, "{out}");
+    }
+
+    /// The derivation itself: for every spelling the parser reads, the
+    /// scrubber's decision is the SAME as for that tag's canonical spelling.
+    ///
+    /// This is what replaces the old arrangement, where `KEEP_PATHS` and
+    /// `SYNTHESIZE_PATHS` restated the parser's alias set as extra entries.
+    /// Restatement is what this repo has repeatedly paid for; the point is that
+    /// adding a spelling in `probe.rs` cannot leave the scrubber behind.
+    #[test]
+    fn the_scrubber_keeps_exactly_the_spellings_the_parser_reads() {
+        use crate::media::probe::canonical_tag_key;
+        for list_path in KEEP_PATHS.iter().chain(SYNTHESIZE_PATHS.iter()) {
+            let Some((prefix, key)) = list_path.rsplit_once('/') else {
+                continue;
+            };
+            if !prefix.ends_with("/tags") {
+                continue;
+            }
+            // Whatever the canonical key resolves to, every listed spelling of
+            // it must normalize onto this same entry…
+            if let Some(canonical) = canonical_tag_key(key) {
+                assert_eq!(canonical, key, "{list_path} must be listed canonically");
+                for spelling in ["language", "LANGUAGE", "title", "TITLE", "filename"] {
+                    if canonical_tag_key(spelling) != Some(canonical) {
+                        continue;
+                    }
+                    assert_eq!(
+                        canonicalize_tag_path(&format!("{prefix}/{spelling}")),
+                        *list_path,
+                        "spelling {spelling} must resolve onto {list_path}"
+                    );
+                }
+            }
+            // …and a casing outside the parser's table must NOT.
+            let odd = format!("{prefix}/Xx{key}");
+            assert_eq!(canonicalize_tag_path(&odd), odd, "unknown keys are left alone");
+        }
+        // The lists must not have re-grown a second entry for a spelling that
+        // canonicalization already covers.
+        for p in KEEP_PATHS.iter().chain(SYNTHESIZE_PATHS.iter()) {
+            assert_eq!(
+                canonicalize_tag_path(p),
+                **p,
+                "{p} is a non-canonical restatement — remove it, the case rule covers it"
+            );
+        }
+    }
+
+    /// Canonicalization applies to tag keys ONLY. A non-tag field that happens
+    /// to share a name is matched exactly, as before.
+    #[test]
+    fn canonicalization_is_confined_to_tag_keys() {
+        assert_eq!(canonicalize_tag_path("/streams/[]/LANGUAGE"), "/streams/[]/LANGUAGE");
+        assert_eq!(canonicalize_tag_path("/streams/[]/tags/LANGUAGE"), "/streams/[]/tags/language");
+        assert_eq!(canonicalize_tag_path("/format/tags/TITLE"), "/format/tags/title");
+        assert_eq!(canonicalize_tag_path("/streams/[]/codec_name"), "/streams/[]/codec_name");
     }
 
     /// The two lists must not overlap: a path in both would have its policy

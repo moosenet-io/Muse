@@ -191,6 +191,38 @@ impl Foundry {
         // Registration is the right moment: it happens once per process, and a
         // file older than twice the encode ceiling provably cannot belong to a
         // live encode, so this is safe even with another Muse running.
+        // The LIBRARY sweep, which nothing did before: the in-library staging
+        // file a dead encode leaves behind is multi-gigabyte, hidden from the
+        // scanner and the reaper alike, and had no reclamation path at all.
+        if !config.allowed_roots.is_empty() {
+            // On a BACKGROUND thread. Unlike the work-dir sweep — one
+            // `read_dir` of a small scratch directory — this walks every
+            // library root recursively: ~10,000 directories across a 33TB NFS
+            // mount, which on a cold cache is seconds to minutes. Registration
+            // happens on the startup path, and blocking service start on a
+            // cleanup task would trade a disk leak for a slow boot. Raised at
+            // the FORGE-01 gate.
+            //
+            // Safe to run concurrently with anything: the age rule only removes
+            // files older than twice the encode ceiling, which provably cannot
+            // belong to a live encode.
+            let roots = config.allowed_roots.clone();
+            let timeout = config.encode_timeout;
+            std::thread::spawn(move || {
+                let report = forge::sweep_orphaned_inflight(&roots, timeout);
+                if report.removed > 0 || report.failed > 0 || report.unreadable {
+                    tracing::info!(
+                        examined = report.examined,
+                        removed = report.removed,
+                        failed = report.failed,
+                        bytes_reclaimed = report.bytes_reclaimed,
+                        unreadable = report.unreadable,
+                        "foundry: swept orphaned in-library staging files"
+                    );
+                }
+            });
+        }
+
         if let Some(work_dir) = config.work_dir.as_deref() {
             let report = forge::sweep_orphaned_staging(work_dir, config.encode_timeout);
             if report.removed > 0 || report.failed > 0 || report.unreadable {

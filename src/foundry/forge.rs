@@ -787,10 +787,14 @@ pub enum SwapError {
     /// it as a skip with a reason, not a failure.
     LockBusy(PathBuf),
     /// The filesystem refused to create a hard link, which is the primitive
-    /// this swap uses to claim a name atomically. Some filesystems do not
-    /// support links at all — in that case the swap **refuses rather than
-    /// racing**, see [`swap_verified_output`].
-    LinkUnsupported { path: PathBuf, message: String },
+    /// this swap uses to claim a name atomically — so the swap **refuses
+    /// rather than racing**, see [`swap_verified_output`].
+    ///
+    /// Named for what is known (the link failed) rather than for a cause that
+    /// was never established. A previous name, `LinkUnsupported`, asserted the
+    /// filesystem lacked link support; in practice this variant is reached far
+    /// more often by ENOSPC, ESTALE, EROFS and EACCES.
+    LinkFailed { path: PathBuf, message: String },
     Io { step: &'static str, message: String },
 }
 
@@ -827,11 +831,13 @@ impl std::fmt::Display for SwapError {
                  file rather than racing the worker that has it",
                 p.display()
             ),
-            Self::LinkUnsupported { path, message } => write!(
+            Self::LinkFailed { path, message } => write!(
                 f,
                 "could not create a hard link next to {} ({message}) — Foundry's swap needs \
-                 hard links to claim a name without a race, and refuses rather than \
-                 falling back to a check-then-rename that could overwrite a file",
+                 hard links to claim a name without a race, so it refuses rather than \
+                 falling back to a check-then-rename that could overwrite a file. The \
+                 cause is whatever the OS reported above: a full or read-only volume, a \
+                 stale NFS handle and a filesystem without link support all arrive here",
                 path.display()
             ),
             Self::Io { step, message } => write!(f, "{step}: {message}"),
@@ -1163,6 +1169,99 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 ///   [`SwapLock`] for the exact residual race (replace-between-link-and-unlink)
 ///   and why POSIX cannot close it.
 ///
+
+/// **Undo the backup link — but only while the original still has another name.**
+///
+/// Every rollback in [`swap_verified_output`] wants to remove the
+/// `.muse-superseded` entry it just created, on the reasoning that the original
+/// is still sitting at its own name so the backup is redundant. That reasoning
+/// is sound *only if the original is actually still there*.
+///
+/// It is not always there. In the different-container shape the rollback runs
+/// precisely when `remove_file(original)` FAILED — and one way that call fails
+/// is `ENOENT`, because something outside Muse (a Sonarr upgrade, an operator
+/// `mv`, a cleanup script) unlinked the original in the window after the
+/// destination was claimed. In that case the `.muse-superseded` entry is the
+/// SOLE remaining name for the title's inode, and removing it destroys the
+/// title outright: gone from the library, gone from the backup name, and the
+/// staging copy discarded by the caller. Zero copies.
+///
+/// That is the only unbounded-loss path in the module, and it contradicts its
+/// own contract ("Never deletes the original", "no residue is ever the only
+/// copy"). Found by an adversarial audit before the first large run.
+///
+/// The guard is `nlink`, not `original.exists()`: it asks the question that
+/// actually matters — *does this inode have another name?* — and answers it
+/// from the inode itself, so it holds whatever the original's path is doing.
+/// Fail closed: if the link count cannot be read, the backup stays.
+/// Give `dest` the same owner, group and mode as `src`, best-effort.
+///
+/// Warns rather than failing: see the call site for why a metadata mismatch
+/// must not discard a verified encode.
+fn copy_ownership_and_mode(src: &Path, dest: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(md) = std::fs::metadata(src) else {
+        tracing::warn!(
+            src = %src.display(),
+            "foundry: could not read the original's ownership — the replacement keeps \
+             the process's own, which may leave it unmanageable by the media stack"
+        );
+        return;
+    };
+
+    if let Err(e) = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(md.mode())) {
+        tracing::warn!(error = %e, dest = %dest.display(), mode = md.mode(),
+            "foundry: could not set the replacement's mode to match the original");
+    }
+
+    // `chown` needs libc; std has no safe wrapper. A failure here is common and
+    // benign on a root_squash export, so it warns rather than escalating.
+    let c_dest = match std::ffi::CString::new(dest.as_os_str().as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // SAFETY: `c_dest` is a valid NUL-terminated C string that outlives the
+    // call, and chown takes uid/gid by value. No memory is shared or retained.
+    let rc = unsafe { libc::chown(c_dest.as_ptr(), md.uid(), md.gid()) };
+    if rc != 0 {
+        tracing::warn!(
+            dest = %dest.display(),
+            uid = md.uid(),
+            gid = md.gid(),
+            error = %std::io::Error::last_os_error(),
+            "foundry: could not set the replacement's owner to match the original — the \
+             media stack may be unable to manage this file"
+        );
+    }
+}
+
+fn rollback_superseded(superseded: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(superseded) {
+        Ok(md) if md.nlink() > 1 => {
+            let _ = std::fs::remove_file(superseded);
+        }
+        Ok(md) => {
+            tracing::error!(
+                path = %superseded.display(),
+                nlink = md.nlink(),
+                "foundry: KEEPING the backup during rollback — it is the only remaining \
+                 name for this title's inode, so removing it would destroy the title"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %superseded.display(),
+                "foundry: keeping the backup during rollback — its link count could not \
+                 be read, and an unreadable link count is not evidence of a spare copy"
+            );
+        }
+    }
+}
+
 /// # Ordering
 /// 1. `link(original -> superseded)` — atomically claims the backup name. From
 ///    here the original's inode has two names and cannot be lost.
@@ -1206,9 +1305,19 @@ fn swap_verified_output(
     if let Err(e) = std::fs::hard_link(original_p, &superseded) {
         return Err(match e.kind() {
             std::io::ErrorKind::AlreadyExists => SwapError::SupersededNameOccupied(superseded),
-            // EPERM/EMLINK/ENOSYS: the filesystem will not give us the atomic
-            // primitive. Refuse rather than race.
-            _ => SwapError::LinkUnsupported {
+            // Everything else. This used to render as "this filesystem does
+            // not support hard links", which is a DIAGNOSIS the code never
+            // established: ENOSPC, EDQUOT, EIO, ESTALE, EROFS, ENOENT and
+            // EACCES all land here, and at library scale those are the likely
+            // ones — the volume filled up, the NFS handle went stale, the
+            // export flipped read-only. An operator reading a run log full of
+            // "unsupported" goes and checks mount options while the real cause
+            // is a full disk. Raised by an adversarial audit.
+            //
+            // The refusal is unchanged; only the claim about WHY is. Ignorance
+            // rendering as a confident wrong answer is the same failure as
+            // ignorance rendering as absence.
+            _ => SwapError::LinkFailed {
                 path: original_p.to_path_buf(),
                 message: e.to_string(),
             },
@@ -1241,7 +1350,7 @@ fn swap_verified_output(
         // exactly what is wanted here and is safe precisely because the thing
         // being overwritten is the original we just backed up.
         if let Err(e) = std::fs::rename(new_p, final_p) {
-            let _ = std::fs::remove_file(&superseded);
+            rollback_superseded(&superseded);
             return Err(SwapError::Io {
                 step: "moving the new file into place",
                 message: format!("{e} (the original was left untouched)"),
@@ -1252,7 +1361,7 @@ fn swap_verified_output(
         // sitting there is never destroyed...
         if let Err(e) = std::fs::hard_link(new_p, final_p) {
             let occupied = e.kind() == std::io::ErrorKind::AlreadyExists;
-            let _ = std::fs::remove_file(&superseded);
+            rollback_superseded(&superseded);
             return Err(if occupied {
                 SwapError::DestinationOccupied(final_p.to_path_buf())
             } else {
@@ -1268,7 +1377,7 @@ fn swap_verified_output(
             // Roll back the destination we just claimed, so a partial swap
             // does not leave two live copies of the title.
             let _ = std::fs::remove_file(final_p);
-            let _ = std::fs::remove_file(&superseded);
+            rollback_superseded(&superseded);
             return Err(SwapError::Io {
                 step: "releasing the original name",
                 message: format!("{e} (the destination link was rolled back)"),
@@ -1666,6 +1775,26 @@ fn run_encode_and_swap(
         }
     };
 
+    // **Inherit the original's ownership and mode.**
+    //
+    // `fs::copy` copies the SOURCE's permission bits but the new file is owned
+    // by whoever the process runs as. Muse runs as root; this library is
+    // uniformly `nobody:nogroup 0666` on an NFS export. So every rewritten file
+    // came out `root:root 0644` — still world-readable, so playback worked and
+    // nothing looked wrong — while Sonarr, Radarr and every other non-root
+    // manager silently lost the ability to rename, move or delete it. At 463
+    // titles that is 463 files the *arr stack can no longer manage, discovered
+    // long after the fact.
+    //
+    // Found by independently verifying the first ten rewrites rather than by
+    // any failure: nothing errored, and the run reported complete success.
+    //
+    // Fail-SOFT. The bytes are correct and verified; refusing the swap over a
+    // metadata mismatch would discard good work and leave the library
+    // un-optimized. A loud warning is the right weight — the file is usable
+    // either way, and an operator can fix ownership in bulk.
+    copy_ownership_and_mode(original_p, inflight.as_path());
+
     // Flush the copy to disk before verifying it. `fs::copy` leaves the bytes
     // in the page cache; verifying a file that exists only in cache and then
     // losing power leaves a library entry pointing at a partial file that our
@@ -1691,9 +1820,20 @@ fn run_encode_and_swap(
 
     // --- 4. swap -----------------------------------------------------------
     let final_target = final_path_for(original_p, plan.container.extension());
-    let original_mut = guard
-        .resolve_for_mutation(original_p)
-        .map_err(|e| format!("resolving the original for mutation: {e}"))?;
+    // Every other failure after the copy discards the staged file first; this
+    // one used a bare `?` and leaked it. `resolve_for_mutation` canonicalizes,
+    // which on a 33TB NFS mount fails with ESTALE, EIO or ENOENT for reasons
+    // that have nothing to do with the file being wrong — and the orphan it
+    // left behind sits in the LIBRARY directory, where nothing reclaims it
+    // (see `sweep_orphaned_staging`, which only ever sees the work dir).
+    // Raised by an adversarial audit before the first large run.
+    let original_mut = match guard.resolve_for_mutation(original_p) {
+        Ok(m) => m,
+        Err(e) => {
+            discard_staged(&inflight);
+            return Err(format!("resolving the original for mutation: {e}"));
+        }
+    };
     let final_mut = match guard.resolve_new_for_mutation(&final_target) {
         Ok(p) => p,
         Err(e) => {
@@ -1779,6 +1919,98 @@ fn skip_for_lock_error(e: &SwapError) -> Option<SkipReason> {
 ///
 /// Never touches anything outside the work dir, and only files matching the
 /// staging name shapes — a stray operator file in the work dir is left alone.
+/// **Sweep the LIBRARY for orphaned in-library staging files.**
+///
+/// [`sweep_orphaned_staging`] only ever sees the work dir — that is the only
+/// thing its sole caller passes it — so its `INFLIGHT_PREFIX` check was dead
+/// code and the in-library staging files it appears to cover were never
+/// reclaimed by anything.
+///
+/// They are real and they are large. The swap cannot stage in the work dir:
+/// the final step is a same-filesystem `rename`/`link`, and the work dir is
+/// deliberately on a DIFFERENT device (safety rail 3). So the verified copy is
+/// written next to the original as `.muse-foundry-inflight-<uuid>.part`. A
+/// `kill -9`, an OOM, a container restart or a deploy between the copy and the
+/// swap leaves a multi-gigabyte hidden file in the library — invisible to the
+/// media scanner (dot-prefixed, non-media extension), invisible to the reaper
+/// (not a `.muse-superseded` name), and never mentioned in any log. Over
+/// hundreds of titles that is unbounded, unreclaimable library space.
+///
+/// Found by an adversarial audit before the first large run. Recursive,
+/// because staging files land wherever their title lives.
+///
+/// Uses the same age rule as the work-dir sweep and for the same reason: a
+/// file older than twice the encode ceiling provably cannot belong to a live
+/// encode. An unreadable age is KEPT — an unknown age is not evidence of
+/// abandonment.
+pub fn sweep_orphaned_inflight(roots: &[PathBuf], encode_timeout: Duration) -> SweepReport {
+    let mut report = SweepReport::default();
+    let min_age = encode_timeout.saturating_mul(2);
+    for root in roots {
+        sweep_inflight_under(root, min_age, &mut report);
+    }
+    report
+}
+
+fn sweep_inflight_under(dir: &Path, min_age: Duration, report: &mut SweepReport) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        report.unreadable = true;
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `file_type` does NOT traverse symlinks, so a symlinked directory is
+        // not descended into and a symlink is never unlinked as a staging file.
+        let Ok(ft) = entry.file_type() else {
+            report.unreadable = true;
+            continue;
+        };
+        if ft.is_dir() {
+            sweep_inflight_under(&path, min_age, report);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(INFLIGHT_PREFIX) {
+            continue;
+        }
+        report.examined += 1;
+        let md = entry.metadata().ok();
+        let age = md
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| SystemTime::now().duration_since(t).ok());
+        match age {
+            Some(a) if a >= min_age => {
+                let bytes = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        report.removed += 1;
+                        report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
+                        tracing::info!(
+                            path = %path.display(),
+                            age_secs = a.as_secs(),
+                            bytes,
+                            "foundry: removed an orphaned IN-LIBRARY staging file from a \
+                             dead encode"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e,
+                            "foundry: could not remove an orphaned in-library staging file");
+                        report.failed += 1;
+                    }
+                }
+            }
+            _ => report.kept_live_or_unknown += 1,
+        }
+    }
+}
+
 pub fn sweep_orphaned_staging(work_dir: &Path, encode_timeout: Duration) -> SweepReport {
     let mut report = SweepReport::default();
     // Double the ceiling: generous enough that clock skew or a slow unlink
@@ -2726,7 +2958,7 @@ mod tests {
 
         for e in [
             SwapError::Io { step: "creating the Foundry lock directory", message: "EROFS".into() },
-            SwapError::LinkUnsupported { path: PathBuf::from("/lib/a"), message: "EPERM".into() },
+            SwapError::LinkFailed { path: PathBuf::from("/lib/a"), message: "EPERM".into() },
             SwapError::DestinationOccupied(PathBuf::from("/lib/b")),
         ] {
             assert_eq!(
@@ -3265,6 +3497,195 @@ mod tests {
     /// leaving ~20 GB that had to be removed manually; at 16,000 items that
     /// fills the scratch filesystem and then presents as unrelated encode
     /// failures.
+    /// **The replacement must inherit the original's mode.**
+    ///
+    /// `fs::copy` gives the new file the process's ownership. Muse runs as
+    /// root; this library is uniformly `nobody:nogroup 0666`. Every rewritten
+    /// file came out `root:root 0644` — world-readable, so playback worked and
+    /// nothing looked broken — while every non-root media manager silently lost
+    /// the ability to rename, move or delete it.
+    ///
+    /// Ownership itself cannot be asserted here (changing uid needs privileges
+    /// a test does not have and should not want), so this pins the half that
+    /// is testable: the mode is carried across.
+    #[test]
+    fn a_replacement_inherits_the_originals_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-forge-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let original = dir.join("Movie.avi");
+        let replacement = dir.join("Movie.mkv");
+        std::fs::write(&original, b"original").expect("write");
+        std::fs::write(&replacement, b"replacement").expect("write");
+
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o666))
+            .expect("set original mode");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o644))
+            .expect("set replacement mode");
+
+        copy_ownership_and_mode(&original, &replacement);
+
+        let got = std::fs::metadata(&replacement).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            got, 0o666,
+            "the replacement must carry the original's mode, or the media stack \
+             loses write access to every file Foundry touches"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable original must not panic or corrupt the replacement — it
+    /// warns and leaves the file alone.
+    #[test]
+    fn an_unreadable_original_leaves_the_replacement_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-forge-mode-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let replacement = dir.join("Movie.mkv");
+        std::fs::write(&replacement, b"replacement").expect("write");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o644))
+            .expect("mode");
+
+        copy_ownership_and_mode(&dir.join("does-not-exist.avi"), &replacement);
+
+        assert!(replacement.is_file());
+        let got = std::fs::metadata(&replacement).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, 0o644, "unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The one total-loss path in the module.**
+    ///
+    /// In the different-container shape the rollback runs precisely when
+    /// `remove_file(original)` FAILED — and one way it fails is ENOENT,
+    /// because something outside Muse unlinked the original in the window
+    /// after the destination was claimed. The rollback then removed the
+    /// `.muse-superseded` entry too, on the assumption the original was still
+    /// there. It was not: that entry was the SOLE remaining name for the
+    /// title's inode, and removing it destroyed the title outright.
+    ///
+    /// Built on a real filesystem because the whole property is about link
+    /// counts and what unlinking actually does.
+    #[test]
+    fn a_rollback_never_removes_the_last_remaining_name_for_a_title() {
+        let dir = std::env::temp_dir()
+            .join(format!("muse-forge-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let backup = dir.join("Movie.avi.muse-superseded");
+        std::fs::write(&backup, b"the only copy of the title").expect("write");
+
+        // nlink == 1: this is the last name for the inode. The original it was
+        // linked from is gone (an external unlink), which is exactly the state
+        // the failing rollback finds itself in.
+        rollback_superseded(&backup);
+
+        assert!(
+            backup.is_file(),
+            "the last remaining name for a title must never be removed by a rollback"
+        );
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"the only copy of the title",
+            "and its contents must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rollback still does its job when the original IS still there: the
+    /// redundant backup is removed, so a failed swap leaves no residue. Without
+    /// this the fix above would just be "never roll back", which trades one bug
+    /// for a different one.
+    #[test]
+    fn a_rollback_does_remove_the_backup_while_the_original_still_exists() {
+        let dir = std::env::temp_dir()
+            .join(format!("muse-forge-rollback-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let original = dir.join("Movie.avi");
+        let backup = dir.join("Movie.avi.muse-superseded");
+        std::fs::write(&original, b"the title").expect("write");
+        std::fs::hard_link(&original, &backup).expect("hard link");
+
+        // nlink == 2: the original is still reachable under its own name.
+        rollback_superseded(&backup);
+
+        assert!(!backup.exists(), "the redundant backup should be cleaned up");
+        assert!(original.is_file(), "and the original must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable link count is not evidence of a spare copy. Fail closed.
+    #[test]
+    fn a_rollback_keeps_the_backup_when_the_link_count_cannot_be_read() {
+        let dir = std::env::temp_dir()
+            .join(format!("muse-forge-rollback-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A path that does not exist: symlink_metadata errs.
+        rollback_superseded(&dir.join("nothing-here.muse-superseded"));
+        // Nothing to assert about the file; the point is it must not panic and
+        // must not have removed anything else.
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **In-library staging files are reclaimed.** Nothing swept them before:
+    /// the existing sweep only ever sees the work dir, so its INFLIGHT_PREFIX
+    /// check was dead code and a dead encode left a multi-GB hidden file in the
+    /// library permanently.
+    #[test]
+    fn the_library_sweep_removes_an_old_in_library_staging_file() {
+        let root = std::env::temp_dir()
+            .join(format!("muse-forge-inflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("TV Shows").join("Some Show").join("Season 1");
+        std::fs::create_dir_all(&nested).expect("dirs");
+
+        // Recursive: staging files land wherever their title lives.
+        let orphan = nested.join(format!("{INFLIGHT_PREFIX}-dead.part"));
+        std::fs::write(&orphan, vec![0u8; 2048]).expect("write");
+        let keeper = nested.join("Some Show - S01E01.mkv");
+        std::fs::write(&keeper, b"a real episode").expect("write");
+
+        // A zero timeout makes every file older than "now" sweepable.
+        let report = sweep_orphaned_inflight(&[root.clone()], Duration::from_secs(0));
+
+        assert_eq!(report.examined, 1, "only the staging file is a candidate");
+        assert_eq!(report.removed, 1);
+        assert!(!orphan.exists(), "the orphan must be gone");
+        assert!(keeper.is_file(), "a real media file must never be touched");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A staging file young enough to belong to a LIVE encode is kept —
+    /// removing it would corrupt a running swap.
+    #[test]
+    fn the_library_sweep_keeps_a_staging_file_that_may_still_be_live() {
+        let root = std::env::temp_dir()
+            .join(format!("muse-forge-inflight-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dirs");
+        let live = root.join(format!("{INFLIGHT_PREFIX}-running.part"));
+        std::fs::write(&live, b"an encode in progress").expect("write");
+
+        // A large ceiling means nothing on disk is old enough to be orphaned.
+        let report = sweep_orphaned_inflight(&[root.clone()], Duration::from_secs(86_400));
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.kept_live_or_unknown, 1);
+        assert!(live.is_file(), "a live encode's staging file must survive");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn an_orphaned_staging_file_is_swept_but_a_live_one_is_kept() {
         use std::os::unix::fs::PermissionsExt;

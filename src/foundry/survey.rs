@@ -323,6 +323,7 @@ mod tests {
         );
     }
     use super::*;
+    use crate::media::probe::{AudioStream, MediaProbe, VideoStream};
 
     fn summary_of(outcomes: &[SurveyOutcome]) -> SurveySummary {
         let mut s = SurveySummary::default();
@@ -332,20 +333,112 @@ mod tests {
         s
     }
 
+    fn probe_of(video: Vec<VideoStream>, audio: Vec<AudioStream>) -> MediaProbe {
+        MediaProbe {
+            container: "matroska,webm".to_string(),
+            duration_secs: Some(5400.0),
+            format_bitrate_bps: Some(6_000_000),
+            size_bytes: Some(4_000_000_000),
+            video,
+            audio,
+            subtitles: Vec::new(),
+            attachments: Vec::new(),
+            data_stream_count: 0,
+            unindexed_stream_count: 0,
+            chapter_count: 0,
+            title: None,
+            other_stream_count: 0,
+            notes: Vec::new(),
+        }
+    }
+
+    fn vid(codec: &str, w: u32, h: u32, bitrate: Option<u64>) -> VideoStream {
+        VideoStream {
+            index: 0,
+            codec: codec.to_string(),
+            width: Some(w),
+            height: Some(h),
+            bitrate_bps: bitrate,
+            pix_fmt: Some("yuv420p".to_string()),
+            attached_pic: false,
+            ..VideoStream::default()
+        }
+    }
+
+    fn aud(index: u32, codec: &str, channels: u32) -> AudioStream {
+        AudioStream {
+            index,
+            codec: codec.to_string(),
+            channels: Some(channels),
+            language: Some("eng".to_string()),
+            bitrate_bps: Some(640_000),
+            ..Default::default()
+        }
+    }
+
+    /// Run the REAL path: plan the file, then let `classify` derive the
+    /// outcome from that plan.
+    ///
+    /// Every fixture below goes through here rather than hand-building a
+    /// `SurveyOutcome`. That is the whole point of FSURV-01: the previous
+    /// fixtures constructed `WouldTranscode { reasons: vec!["BitrateAbove\
+    /// Ceiling"] }` themselves, so `classify` — the function that actually
+    /// derives `reasons` and `predicted_deletion_refusals` — was never called
+    /// by any test on this path. Emptying `reasons` inside `classify` left the
+    /// whole suite green. The string in that fixture was not even a value
+    /// `classify` can produce: it formats `TranscodeReason` with `{:?}`, so the
+    /// real text is `VideoBitrateAboveCeiling { .. }`. A fixture disagreeing
+    /// with production about the SHAPE of the value is the tell.
+    fn classify_probe(p: &MediaProbe) -> SurveyOutcome {
+        let decision = plan_transcode(
+            p,
+            &TranscodePolicy::default(),
+            "/in.mkv",
+            DRY_RUN_OUTPUT_SENTINEL,
+        );
+        classify(p, &decision)
+    }
+
+    /// Conforms on every axis, so the planner returns `AlreadyOptimal`.
     fn optimal() -> SurveyOutcome {
-        SurveyOutcome::AlreadyOptimal
+        let p = probe_of(
+            vec![vid("h264", 1920, 1080, Some(5_000_000))],
+            vec![aud(1, "eac3", 6)],
+        );
+        let o = classify_probe(&p);
+        assert_eq!(o, SurveyOutcome::AlreadyOptimal, "fixture must be optimal");
+        o
     }
+
+    /// 20 Mbps against a 12 Mbps ceiling (x1.25 tolerance). The reason list is
+    /// DERIVED by `classify`, never stated here.
     fn transcode() -> SurveyOutcome {
-        SurveyOutcome::WouldTranscode {
-            predicted_deletion_refusals: Vec::new(),
-            reasons: vec!["BitrateAboveCeiling".into()],
-        }
+        let p = probe_of(
+            vec![vid("h264", 1920, 1080, Some(20_000_000))],
+            vec![aud(1, "eac3", 6)],
+        );
+        let o = classify_probe(&p);
+        assert!(
+            matches!(o, SurveyOutcome::WouldTranscode { .. }),
+            "fixture must transcode, got {o:?}"
+        );
+        o
     }
+
+    /// Audio-only: the planner cannot judge it, and `classify` renders the
+    /// `Undecidable` into the reported string.
     fn undecidable() -> SurveyOutcome {
-        SurveyOutcome::CannotDecide {
-            why: "NoDuration".into(),
-        }
+        let p = probe_of(Vec::new(), vec![aud(1, "eac3", 6)]);
+        let o = classify_probe(&p);
+        assert!(
+            matches!(o, SurveyOutcome::CannotDecide { .. }),
+            "fixture must be undecidable, got {o:?}"
+        );
+        o
     }
+
+    /// The one outcome `classify` genuinely does NOT produce: `survey_files`
+    /// records it from the probe's `Err` arm. Hand-built on purpose.
     fn probe_failed() -> SurveyOutcome {
         SurveyOutcome::ProbeFailed {
             error: "ffprobe: not found".into(),
@@ -415,9 +508,66 @@ mod tests {
     fn a_transcode_outcome_carries_its_reasons() {
         // "would transcode: 1400" without reasons is not actionable — the operator cannot tell
         // an over-tight bitrate ceiling from a genuine backlog of bad files.
+        //
+        // The reasons asserted here are the ones `classify` DERIVED from the
+        // planner's decision for a 20 Mbps file, not a list this test wrote.
+        // Emptying `reasons` inside `classify` now fails this test.
         let s = summary_of(&[transcode()]);
         match &s.files[0].outcome {
-            SurveyOutcome::WouldTranscode { reasons, .. } => assert!(!reasons.is_empty()),
+            SurveyOutcome::WouldTranscode { reasons, .. } => {
+                assert!(!reasons.is_empty(), "the derived reason list must survive");
+                assert!(
+                    reasons.iter().any(|r| r.contains("VideoBitrateAboveCeiling")),
+                    "the reason must name the policy dimension that was actually \
+                     breached, in the form `classify` produces: {reasons:?}"
+                );
+            }
+            other => panic!("expected WouldTranscode, got {other:?}"),
+        }
+    }
+
+    /// The OTHER field `classify` derives, and the more expensive one to get
+    /// wrong: `predicted_deletion_refusals` is what tells an operator that a
+    /// full re-encode will finish and then KEEP the original, doubling disk
+    /// for that title instead of reclaiming any.
+    ///
+    /// This asserts only that the refusal is derived and reaches the survey —
+    /// the gate's own rules live in `foundry::directplay` and are tested
+    /// there. Nothing here restates them.
+    #[test]
+    fn a_predicted_deletion_refusal_is_derived_from_the_source_not_assumed_empty() {
+        // A PQ/10-bit source that the bitrate ceiling forces into a re-encode:
+        // the plan re-encodes video, so the deletion gate will refuse.
+        let mut v = vid("hevc", 1920, 1080, Some(30_000_000));
+        v.pix_fmt = Some("yuv420p10le".to_string());
+        v.color_transfer = Some("smpte2084".to_string());
+        let p = probe_of(vec![v], vec![aud(1, "eac3", 6)]);
+
+        match classify_probe(&p) {
+            SurveyOutcome::WouldTranscode {
+                predicted_deletion_refusals,
+                ..
+            } => assert!(
+                !predicted_deletion_refusals.is_empty(),
+                "a re-encode of an HDR source must be predicted as un-deletable"
+            ),
+            other => panic!("expected WouldTranscode, got {other:?}"),
+        }
+
+        // ...and the same file WITHOUT the HDR tagging predicts no refusal, so
+        // the assertion above is about the source, not about every transcode.
+        let sdr = probe_of(
+            vec![vid("h264", 1920, 1080, Some(30_000_000))],
+            vec![aud(1, "eac3", 6)],
+        );
+        match classify_probe(&sdr) {
+            SurveyOutcome::WouldTranscode {
+                predicted_deletion_refusals,
+                ..
+            } => assert!(
+                predicted_deletion_refusals.is_empty(),
+                "an SDR re-encode has nothing to refuse over: {predicted_deletion_refusals:?}"
+            ),
             other => panic!("expected WouldTranscode, got {other:?}"),
         }
     }

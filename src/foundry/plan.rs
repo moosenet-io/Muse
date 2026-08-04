@@ -755,6 +755,7 @@ mod tests {
             chapter_count: 0,
             title: None,
             other_stream_count: 0,
+            notes: Vec::new(),
         }
     }
 
@@ -778,6 +779,7 @@ mod tests {
             channels: Some(channels),
             language: Some("eng".to_string()),
             bitrate_bps: Some(640_000),
+            ..Default::default()
         }
     }
 
@@ -1017,6 +1019,7 @@ mod tests {
             channels: Some(2),
             language: None,
             bitrate_bps: None,
+            ..Default::default()
         });
         assert_eq!(
             decide(&p),

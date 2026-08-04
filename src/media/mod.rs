@@ -43,6 +43,7 @@
 //! through its own roots.
 
 pub mod capability;
+pub mod derive;
 pub mod paths;
 pub mod probe;
 

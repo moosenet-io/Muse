@@ -196,6 +196,31 @@ pub struct MediaProbe {
     /// Streams of a type Foundry does not model at all. Honest about the file
     /// containing more than we described.
     pub other_stream_count: usize,
+    /// What THIS PARSER did to the document that the parsed values alone do
+    /// not show (S130-A MPRB-03).
+    ///
+    /// Deliberately narrow, and the narrowness is the point. A note records a
+    /// fact about the *reading* — a tag we cut at [`MAX_TAG_LEN`], a frame-rate
+    /// field that was present but unusable, colour tags that contradict each
+    /// other — so that a consumer can tell "ffprobe did not say" from "ffprobe
+    /// said something we could not use". Those two render identically as
+    /// `None`, and the module's governing rule is that ignorance must never be
+    /// indistinguishable from absence.
+    ///
+    /// It is **not** an error channel and **never** changes a verdict: every
+    /// field it describes is already populated (or already `None`) before the
+    /// note is written, and nothing in the crate branches on the contents of
+    /// this vector.
+    ///
+    /// It is also **not** where derivation honesty lives. "This bit depth was
+    /// inferred from `pix_fmt` rather than observed" is carried in the RETURN
+    /// TYPE of [`crate::media::derive::bit_depth`] instead — a caller can
+    /// ignore a note, and cannot ignore an enum it has to match on. See that
+    /// module for why the spec's note-based design was not followed.
+    ///
+    /// Bounded at [`MAX_NOTES`]; an over-cap parse says so in its last entry
+    /// rather than dropping the excess silently.
+    pub notes: Vec<String>,
 }
 
 /// A Matroska attachment (typically a subtitle font).
@@ -299,9 +324,57 @@ pub struct VideoStream {
     /// of the feature. Filtering it out here — once, in the parser — is the
     /// only place it can be got right for every consumer.
     pub attached_pic: bool,
+    /// ffprobe's `level`, the codec level as an integer — 150 is HEVC 5.0,
+    /// 41 is H.264 4.1 (S130-A MPRB-03).
+    ///
+    /// Carried raw, in ffprobe's own encoding, and **not** rescaled: H.264
+    /// renders level 4.1 as `41` while HEVC renders 5.0 as `150` (the general
+    /// level times 30). Normalizing the two into one "level" number would
+    /// require knowing the codec at the point of parse and would produce a
+    /// value that means different things for different codecs — a device
+    /// profile matches level against a codec, so the codec-relative number is
+    /// the one it needs.
+    ///
+    /// `None` when ffprobe reported no level, or reported `-99`, which is what
+    /// it writes for a stream whose level it could not determine — a negative
+    /// value is folded to `None` by [`as_u32`] rather than becoming a level
+    /// nothing can satisfy.
+    pub level: Option<u32>,
+    /// ffprobe's `bits_per_raw_sample`, **as observed** (S130-A MPRB-03).
+    ///
+    /// The OBSERVED depth only. It is frequently absent, and it is deliberately
+    /// not back-filled from `pix_fmt` here: that inference already has a home
+    /// in [`crate::foundry::hdr::pixel_bit_depth`], and
+    /// [`crate::media::derive::bit_depth`] is where the two are combined with
+    /// the answer's provenance attached. A `None` here means "ffprobe did not
+    /// state it", never "this stream has no depth".
+    pub bits_per_raw_sample: Option<u8>,
+    /// `r_frame_rate` as frames per second — ffprobe's *base* frame rate, the
+    /// lowest rate every frame timestamp is an integer multiple of.
+    ///
+    /// Parsed from the `"24000/1001"` rational by [`as_ratio`], so a `"0/0"`
+    /// (which ffprobe emits for a stream with no meaningful rate) is `None`
+    /// rather than a division by zero. When the field was PRESENT but
+    /// unusable, [`MediaProbe::notes`] says so — otherwise this `None` would be
+    /// indistinguishable from ffprobe not having reported a rate at all.
+    pub frame_rate_fps: Option<f64>,
+    /// `avg_frame_rate` as frames per second — duration divided by frame count.
+    ///
+    /// Kept SEPARATE from [`Self::frame_rate_fps`] rather than collapsed into
+    /// one "frame rate", because the two disagreeing is itself the fact: a
+    /// telecined or variable-frame-rate file has `r_frame_rate` far above its
+    /// average, and a device profile that matches the base rate against a
+    /// 30fps ceiling would refuse a file that plays at 23.976.
+    pub avg_frame_rate_fps: Option<f64>,
+    /// `color_range`, lowercased — `"tv"` (limited, 16-235) or `"pc"` (full,
+    /// 0-255).
+    ///
+    /// Carried because getting it wrong is visible: a full-range file played
+    /// as limited crushes blacks and clips whites. Not interpreted here.
+    pub color_range: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioStream {
     pub index: u32,
     pub codec: String,
@@ -310,15 +383,47 @@ pub struct AudioStream {
     /// muxer wrote no tag, which is common and is not an error.
     pub language: Option<String>,
     pub bitrate_bps: Option<u64>,
+    /// ffprobe's `profile`, lowercased — `"dts-hd ma"`, `"lc"`, `"ma"`
+    /// (S130-A MPRB-03).
+    ///
+    /// This is the field that separates DTS from DTS-HD MA and AAC-LC from
+    /// AAC-HE, which `codec_name` does not: ffprobe reports both DTS variants
+    /// as `dts`. A client profile that accepts DTS but not DTS-HD needs this.
+    pub profile: Option<String>,
+    /// `sample_rate` in Hz. 48000 for almost everything; 44100 for CD-sourced
+    /// audio; 96000 for some lossless tracks a client may not accept.
+    pub sample_rate_hz: Option<u32>,
+    /// `channel_layout` verbatim (trimmed, lowercased) — `"5.1(side)"`,
+    /// `"7.1"`, or ffprobe's literal `"unknown"`.
+    ///
+    /// **`"unknown"` is kept, not folded to `None`.** This is the one place
+    /// [`normalize_descriptor`]'s rule is deliberately not applied: for a
+    /// layout, "the muxer declared the channel positions unknown" is a
+    /// different and more actionable fact than "no layout field was present",
+    /// and a downmix decision made on the first is not the same as one made on
+    /// the second. [`Self::channels`] stays typed either way, so nothing
+    /// depends on parsing this string.
+    pub channel_layout: Option<String>,
+    /// `disposition.default` — the track a player picks with no user choice.
+    pub default: bool,
+    /// `disposition.forced` — a track a player must show regardless of the
+    /// user's subtitle preference (foreign-dialogue dubs).
+    pub forced: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SubtitleStream {
     pub index: u32,
     pub codec: String,
     pub language: Option<String>,
     pub forced: bool,
     pub default: bool,
+    /// `disposition.hearing_impaired` — an SDH track (S130-A MPRB-03).
+    ///
+    /// Carried because it changes which track is the right DEFAULT, not
+    /// whether one exists: auto-selecting an SDH track for a viewer who did
+    /// not ask for one puts `[door creaks]` on screen for the whole film.
+    pub hearing_impaired: bool,
 }
 
 /// **The** set of subtitle codec names Muse treats as BITMAP (image) rather
@@ -1314,6 +1419,28 @@ struct RawStream {
     disposition: Option<RawDisposition>,
     #[serde(default)]
     tags: Option<RawTags>,
+
+    // --- S130-A MPRB-03 ---------------------------------------------------
+    // Already present in the JSON `build_ffprobe_args` asks for today; the argv
+    // is UNCHANGED by this item. These are fields the struct simply did not
+    // extract. Every one is the permissive `Option<serde_json::Value>` /
+    // `Option<String>` shape the doc comment on `RawProbe` explains, for the
+    // same reason: ffprobe renders `level` as a number and `sample_rate` as a
+    // string, in the same document.
+    #[serde(default)]
+    level: Option<serde_json::Value>,
+    #[serde(default)]
+    bits_per_raw_sample: Option<serde_json::Value>,
+    #[serde(default)]
+    r_frame_rate: Option<serde_json::Value>,
+    #[serde(default)]
+    avg_frame_rate: Option<serde_json::Value>,
+    #[serde(default)]
+    color_range: Option<String>,
+    #[serde(default)]
+    sample_rate: Option<serde_json::Value>,
+    #[serde(default)]
+    channel_layout: Option<String>,
 }
 
 /// One `side_data_list` entry.
@@ -1348,6 +1475,10 @@ struct RawDisposition {
     forced: Option<i64>,
     #[serde(default)]
     attached_pic: Option<i64>,
+    /// S130-A MPRB-03. ffprobe spells it with the underscore; there is no
+    /// second spelling to alias.
+    #[serde(default)]
+    hearing_impaired: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1407,6 +1538,221 @@ fn as_u32(v: &Option<serde_json::Value>) -> Option<u32> {
     as_u64(v).and_then(|n| u32::try_from(n).ok())
 }
 
+fn as_u8(v: &Option<serde_json::Value>) -> Option<u8> {
+    as_u64(v).and_then(|n| u8::try_from(n).ok())
+}
+
+/// Read one of ffprobe's rational fields — `"24000/1001"`, `"25/1"`, `"0/0"` —
+/// as a `f64` (S130-A MPRB-03).
+///
+/// **A zero denominator is `None`, and that is the whole reason this function
+/// exists rather than a `split('/')` at the call site.** `"0/0"` is what
+/// ffprobe writes for a stream with no meaningful rate — an attachment, a
+/// still, a damaged track — and it is not rare. `0/0` in f64 is `NaN`, which
+/// does not panic but is worse: it compares FALSE against everything, so a
+/// `fps > 30` ceiling silently passes and a `fps < 30` floor silently fails,
+/// on the same file, with no error anywhere. A zero numerator over a nonzero
+/// denominator is a genuine "zero frames per second" and is likewise `None`,
+/// because a rate of zero is not a rate.
+///
+/// Follows the [`as_u64`]/[`as_f64`] convention exactly: unparseable, negative
+/// or non-finite is `None`, never `0`. A bare number (some ffprobe builds emit
+/// `sample_aspect_ratio`-style fields unrationalized) is accepted too, so the
+/// function is about the VALUE's meaning rather than about its rendering.
+pub fn as_ratio(v: &Option<serde_json::Value>) -> Option<f64> {
+    let s = match v.as_ref()? {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => return finite_positive(n.as_f64()?),
+        _ => return None,
+    };
+    let Some((num, den)) = s.split_once('/') else {
+        // Not a rational at all — try it as a plain decimal rather than
+        // discarding a usable value.
+        return finite_positive(num_from(&s)?);
+    };
+    let num = num_from(num)?;
+    let den = num_from(den)?;
+    if den == 0.0 {
+        return None;
+    }
+    finite_positive(num / den)
+}
+
+fn num_from(s: &str) -> Option<f64> {
+    s.trim().parse::<f64>().ok().filter(|f| f.is_finite())
+}
+
+/// A rate is a fact only when it is finite and strictly positive.
+fn finite_positive(f: f64) -> Option<f64> {
+    (f.is_finite() && f > 0.0).then_some(f)
+}
+
+/// Most streams one document may describe before it is refused
+/// (S130-A MPRB-03).
+///
+/// **512.** The three pieces of evidence, because a bound with no evidence is
+/// a magic number:
+///
+/// 1. **Measured, in this library.** The largest stream count the operator's
+///    survey found on one file is **42 subtitle streams** — recorded twice,
+///    independently, in [`crate::foundry::validate::SubtitleBand::Extreme`]
+///    and in [`crate::subtitles::discover::embedded_from_probe`]. Add a video
+///    stream, a handful of audio tracks and the attached-font set an ASS-styled
+///    release carries, and the worst REAL shape in this 16,221-file library is
+///    comfortably under 200 streams.
+/// 2. **Measured, independently.** The largest ffprobe document in this
+///    library is ~71 KB (see [`MAX_CAPTURED_BYTES`]). A `-show_streams` stream
+///    object runs a few hundred bytes to ~1.5 KB with side data, which puts
+///    that document at tens-to-low-hundreds of streams — the same ceiling
+///    arrived at from a different measurement.
+/// 3. **Corroboration, NOT verified on this host.** libavformat carries its own
+///    `max_streams` option, documented as defaulting to 1000, above which
+///    ffmpeg itself refuses a file. That would make a >1000-stream document one
+///    ffprobe would never have produced for us in the first place. ffmpeg is
+///    installed on neither the dev box nor <host>, so this is read from
+///    documentation rather than checked, and it is corroboration only — points
+///    1 and 2 carry the bound on their own.
+///
+/// So 512 is ~2.5x above the worst real shape and below the point where the
+/// producing tool would itself have given up. The cost of it being too low is
+/// a real file refused, which is why the margin is that wide; the cost of no
+/// bound at all is a hostile or corrupt document turning one file into
+/// unbounded allocation across a 16,221-item sweep.
+///
+/// Counted over the RAW stream list, before cover art and unindexed streams are
+/// filtered out, because the bound is on how much document we agree to read —
+/// filtering happens after we have already paid for it.
+///
+/// Reported as [`ProbeError::MalformedOutput`], not as a truncation: a probe of
+/// only the first 512 streams is a partial view of the file, and a partial view
+/// is exactly what this module refuses to hand back.
+pub const MAX_STREAMS: usize = 512;
+
+/// Longest tag or descriptor string carried out of a document
+/// (S130-A MPRB-03).
+///
+/// **1024 bytes.** The strings this bounds are a language code, a container or
+/// stream title, an attachment's font filename, and ffprobe's colour/profile
+/// descriptors. The real ceiling among those is the FILENAME: every filesystem
+/// this library is served from caps a single name at 255 bytes (`NAME_MAX`), and
+/// titles in this library are derived from filenames, so 1024 is four times the
+/// largest value that can legitimately occur. No real tag is cut by this.
+///
+/// It is also chosen to agree with the bound above it rather than to be able to
+/// defeat it: 512 streams x a handful of bounded strings each stays in the low
+/// megabytes, comfortably inside the 8 MiB capture cap, so no combination of
+/// the two limits can be walked past.
+///
+/// Truncation is **recorded in [`MediaProbe::notes`]**, never silent. A cut
+/// string that says nothing about having been cut is the exact fault this
+/// module has already been bitten by once, in the output drain: a truncation
+/// that presents as intact data gets read as data.
+///
+/// Cut on a `char` boundary, so a multi-byte name is shortened rather than
+/// producing invalid UTF-8.
+pub const MAX_TAG_LEN: usize = 1024;
+
+/// Most entries [`MediaProbe::notes`] will hold.
+///
+/// **32.** Notes are per-document observations, and a healthy file produces
+/// none; the cap exists so a pathological document (512 streams each with a
+/// cut tag) cannot turn an advisory list into unbounded growth. When it binds,
+/// the last entry SAYS how many were dropped rather than the list ending
+/// without explanation.
+pub const MAX_NOTES: usize = 32;
+
+/// Bounded, order-preserving collector for [`MediaProbe::notes`].
+///
+/// The suppression counter is the point: a list that silently stops growing is
+/// a list that lies about how much it saw.
+#[derive(Debug, Default)]
+struct Notes {
+    entries: Vec<String>,
+    suppressed: usize,
+}
+
+impl Notes {
+    fn push(&mut self, note: String) {
+        if self.entries.len() < MAX_NOTES {
+            self.entries.push(note);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+
+    /// Finish, never exceeding [`MAX_NOTES`] entries.
+    ///
+    /// When anything was suppressed the LAST slot is spent on saying so, and
+    /// the entry it displaces is counted as suppressed too — so the number in
+    /// the message is the true number of notes not shown, not one less.
+    fn into_vec(mut self) -> Vec<String> {
+        if self.suppressed > 0 {
+            self.suppressed += 1;
+            let n = self.suppressed;
+            let last = self.entries.len() - 1;
+            self.entries[last] =
+                format!("… and {n} further parse notes, suppressed at the {MAX_NOTES}-note cap");
+        }
+        self.entries
+    }
+}
+
+/// Trim a tag/descriptor to [`MAX_TAG_LEN`], recording the cut.
+///
+/// Takes the field's name so the note names WHICH string was cut — "a tag was
+/// truncated" is not actionable, "the title tag was truncated" is.
+fn bounded(s: String, what: &str, notes: &mut Notes) -> String {
+    if s.len() <= MAX_TAG_LEN {
+        return s;
+    }
+    let original = s.len();
+    // `floor_char_boundary` is unstable, so walk back to a boundary by hand.
+    let mut end = MAX_TAG_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    notes.push(format!(
+        "{what} was {original} bytes and was truncated to {MAX_TAG_LEN} \
+         (MAX_TAG_LEN); the value below is a PREFIX, not the whole tag"
+    ));
+    s[..end].to_string()
+}
+
+/// [`normalize_descriptor`], then [`bounded`].
+fn bounded_descriptor(
+    v: &Option<String>,
+    what: &str,
+    notes: &mut Notes,
+) -> Option<String> {
+    normalize_descriptor(v).map(|s| bounded(s, what, notes))
+}
+
+/// Read a rational field, and record the case where it was PRESENT but
+/// unusable.
+///
+/// Without the note, ffprobe's `"0/0"` and ffprobe saying nothing at all both
+/// arrive as `None`, and a consumer cannot tell "this file has no frame rate"
+/// from "we did not look". Same rule the module already applies to a probe
+/// failure that cannot state its cause.
+fn rate_field(
+    v: &Option<serde_json::Value>,
+    what: &str,
+    index: u32,
+    notes: &mut Notes,
+) -> Option<f64> {
+    let parsed = as_ratio(v);
+    if parsed.is_none() {
+        if let Some(raw) = v.as_ref() {
+            notes.push(format!(
+                "stream {index}: {what} was reported as `{}`, which is not a usable rate — \
+                 read as unknown, not as zero",
+                truncate_for_log(&raw.to_string())
+            ));
+        }
+    }
+    parsed
+}
+
 /// Read an ffprobe boolean-ish flag: `1`/`0`, or the strings `"1"`/`"0"`.
 ///
 /// `None` when the flag was absent or unreadable, and every caller must treat
@@ -1450,6 +1796,20 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
         return Err(ProbeError::NoStreams);
     }
 
+    // S130-A MPRB-03. Refused, not truncated — see `MAX_STREAMS` for the
+    // evidence behind the number and for why a partial read is worse than an
+    // error here.
+    if raw.streams.len() > MAX_STREAMS {
+        return Err(ProbeError::MalformedOutput {
+            message: format!(
+                "ffprobe described {} streams, above the {MAX_STREAMS}-stream cap \
+                 (MAX_STREAMS) — refusing to describe this file from a partial read of it",
+                raw.streams.len()
+            ),
+        });
+    }
+
+    let mut notes = Notes::default();
     let format = raw.format;
     let container = format
         .as_ref()
@@ -1476,14 +1836,19 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
             unindexed_stream_count += 1;
             continue;
         };
-        let codec = s.codec_name.clone().unwrap_or_default();
+        let codec = bounded(
+            s.codec_name.clone().unwrap_or_default(),
+            &format!("stream {index}'s codec name"),
+            &mut notes,
+        );
         let disposition = s.disposition.as_ref();
         let language = s
             .tags
             .as_ref()
             .and_then(|t| t.language.clone().or_else(|| t.language_upper.clone()))
             .map(|l| l.trim().to_ascii_lowercase())
-            .filter(|l| !l.is_empty() && l != "und");
+            .filter(|l| !l.is_empty() && l != "und")
+            .map(|l| bounded(l, &format!("stream {index}'s language tag"), &mut notes));
 
         match s.codec_type.as_deref() {
             Some("video") => {
@@ -1497,26 +1862,91 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
                     other_stream_count += 1;
                     continue;
                 }
+                let color_transfer = bounded_descriptor(
+                    &s.color_transfer,
+                    &format!("stream {index}'s color_transfer"),
+                    &mut notes,
+                );
+                let color_primaries = bounded_descriptor(
+                    &s.color_primaries,
+                    &format!("stream {index}'s color_primaries"),
+                    &mut notes,
+                );
+                // A DESCRIPTION of the document's own inconsistency, not a
+                // judgement about it. Wide-gamut primaries with an SDR transfer
+                // is the shape of a remux whose colour tags were rewritten by
+                // something that only understood one of the two fields. Both
+                // lists are read from `foundry::hdr` — this deliberately does
+                // NOT restate them, and it deliberately does not decide
+                // anything: `classify_hdr` remains the single authority on what
+                // the dynamic range is, and it is unaffected by this note.
+                if let (Some(p), Some(t)) = (color_primaries.as_deref(), color_transfer.as_deref())
+                {
+                    if crate::foundry::hdr::WIDE_GAMUT_PRIMARIES.contains(&p)
+                        && crate::foundry::hdr::SDR_TRANSFERS.contains(&t)
+                    {
+                        notes.push(format!(
+                            "stream {index}: wide-gamut primaries `{p}` are declared alongside \
+                             the SDR transfer `{t}` — the two tags disagree, and this note \
+                             changes no verdict"
+                        ));
+                    }
+                }
                 video.push(VideoStream {
                     index,
                     codec,
                     width: as_u32(&s.width),
                     height: as_u32(&s.height),
                     bitrate_bps: as_u64(&s.bit_rate),
-                    pix_fmt: normalize_descriptor(&s.pix_fmt),
-                    profile: normalize_descriptor(&match &s.profile {
-                        // ffprobe renders `profile` as a string for most
-                        // codecs but as a bare integer for a few (and for
-                        // unrecognized ones). Both are read; neither is
-                        // allowed to fail the whole document.
-                        Some(serde_json::Value::String(p)) => Some(p.clone()),
-                        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-                        _ => None,
-                    }),
-                    codec_tag: normalize_descriptor(&s.codec_tag_string),
-                    color_transfer: normalize_descriptor(&s.color_transfer),
-                    color_primaries: normalize_descriptor(&s.color_primaries),
-                    color_space: normalize_descriptor(&s.color_space),
+                    pix_fmt: bounded_descriptor(
+                        &s.pix_fmt,
+                        &format!("stream {index}'s pix_fmt"),
+                        &mut notes,
+                    ),
+                    profile: bounded_descriptor(
+                        &match &s.profile {
+                            // ffprobe renders `profile` as a string for most
+                            // codecs but as a bare integer for a few (and for
+                            // unrecognized ones). Both are read; neither is
+                            // allowed to fail the whole document.
+                            Some(serde_json::Value::String(p)) => Some(p.clone()),
+                            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                            _ => None,
+                        },
+                        &format!("stream {index}'s video profile"),
+                        &mut notes,
+                    ),
+                    codec_tag: bounded_descriptor(
+                        &s.codec_tag_string,
+                        &format!("stream {index}'s codec tag"),
+                        &mut notes,
+                    ),
+                    color_transfer,
+                    color_primaries,
+                    color_space: bounded_descriptor(
+                        &s.color_space,
+                        &format!("stream {index}'s color_space"),
+                        &mut notes,
+                    ),
+                    level: as_u32(&s.level),
+                    bits_per_raw_sample: as_u8(&s.bits_per_raw_sample),
+                    frame_rate_fps: rate_field(
+                        &s.r_frame_rate,
+                        "r_frame_rate",
+                        index,
+                        &mut notes,
+                    ),
+                    avg_frame_rate_fps: rate_field(
+                        &s.avg_frame_rate,
+                        "avg_frame_rate",
+                        index,
+                        &mut notes,
+                    ),
+                    color_range: bounded_descriptor(
+                        &s.color_range,
+                        &format!("stream {index}'s color_range"),
+                        &mut notes,
+                    ),
                     side_data: s
                         .side_data_list
                         .iter()
@@ -1540,6 +1970,27 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
                 channels: as_u32(&s.channels),
                 language,
                 bitrate_bps: as_u64(&s.bit_rate),
+                profile: bounded_descriptor(
+                    &match &s.profile {
+                        Some(serde_json::Value::String(p)) => Some(p.clone()),
+                        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                        _ => None,
+                    },
+                    &format!("stream {index}'s audio profile"),
+                    &mut notes,
+                ),
+                sample_rate_hz: as_u32(&s.sample_rate),
+                // NOT `normalize_descriptor`: see the field's doc comment for
+                // why ffprobe's literal `"unknown"` is kept here and folded to
+                // `None` everywhere else.
+                channel_layout: s
+                    .channel_layout
+                    .as_ref()
+                    .map(|l| l.trim().to_ascii_lowercase())
+                    .filter(|l| !l.is_empty())
+                    .map(|l| bounded(l, &format!("stream {index}'s channel layout"), &mut notes)),
+                default: disposition.and_then(|d| d.default).unwrap_or(0) != 0,
+                forced: disposition.and_then(|d| d.forced).unwrap_or(0) != 0,
             }),
             Some("subtitle") => subtitles.push(SubtitleStream {
                 index,
@@ -1547,6 +1998,7 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
                 language,
                 forced: disposition.and_then(|d| d.forced).unwrap_or(0) != 0,
                 default: disposition.and_then(|d| d.default).unwrap_or(0) != 0,
+                hearing_impaired: disposition.and_then(|d| d.hearing_impaired).unwrap_or(0) != 0,
             }),
             Some("attachment") => attachments.push(AttachmentStream {
                 index,
@@ -1556,7 +2008,10 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
                     .as_ref()
                     .and_then(|t| t.filename.clone())
                     .map(|n| n.trim().to_string())
-                    .filter(|n| !n.is_empty()),
+                    .filter(|n| !n.is_empty())
+                    .map(|n| {
+                        bounded(n, &format!("stream {index}'s attachment filename"), &mut notes)
+                    }),
             }),
             Some("data") => data_stream_count += 1,
             _ => other_stream_count += 1,
@@ -1568,7 +2023,10 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
         .and_then(|f| f.tags.as_ref())
         .and_then(|t| t.title.clone().or_else(|| t.title_upper.clone()))
         .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty());
+        .filter(|t| !t.is_empty())
+        .map(|t| bounded(t, "the container title tag", &mut notes));
+
+    let container = bounded(container, "the container format name", &mut notes);
 
     Ok(MediaProbe {
         container,
@@ -1584,6 +2042,7 @@ pub fn parse_probe_json(stdout: &str) -> Result<MediaProbe, ProbeError> {
         chapter_count: raw.chapters.len(),
         title,
         other_stream_count,
+        notes: notes.into_vec(),
     })
 }
 
@@ -2942,4 +3401,366 @@ mod tests {
         assert!(out.status.success(), "the child must exit normally: {:?}", out.status);
         assert!(String::from_utf8_lossy(&out.stdout).contains("output truncated"));
     }
+
+    // --- S130-A MPRB-03 -----------------------------------------------------
+    //
+    // What this item did NOT do, stated here because it is the load-bearing
+    // decision: it added **no** HDR/Dolby-Vision classifier and **no** subtitle
+    // codec list. `foundry::hdr` is the sole authority on the first (and is
+    // what `foundry::directplay::may_delete_original` consumes to refuse
+    // deleting a DV master), and `subtitles::discover::is_image_codec` on the
+    // second. `media::derive` composes them; it restates neither. See that
+    // module's header for the full table.
+
+    /// A document carrying every field MPRB-03 added, in the renderings
+    /// ffprobe actually mixes within one document: `level` as a bare number,
+    /// `sample_rate` as a string, the rates as rationals.
+    const FULL_FIELDS: &str = r#"{
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "hevc",
+                "codec_type": "video",
+                "profile": "Main 10",
+                "width": 3840, "height": 2160,
+                "pix_fmt": "yuv420p10le",
+                "level": 153,
+                "bits_per_raw_sample": "10",
+                "r_frame_rate": "24000/1001",
+                "avg_frame_rate": "24000/1001",
+                "color_range": "tv",
+                "color_transfer": "smpte2084",
+                "color_primaries": "bt2020",
+                "disposition": { "default": 1, "attached_pic": 0 }
+            },
+            {
+                "index": 1,
+                "codec_name": "dts",
+                "codec_type": "audio",
+                "profile": "DTS-HD MA",
+                "channels": 8,
+                "sample_rate": "48000",
+                "channel_layout": "7.1",
+                "disposition": { "default": 1, "forced": 0 },
+                "tags": { "language": "eng" }
+            },
+            {
+                "index": 2,
+                "codec_name": "hdmv_pgs_subtitle",
+                "codec_type": "subtitle",
+                "disposition": { "default": 0, "forced": 0, "hearing_impaired": 1 },
+                "tags": { "language": "eng" }
+            }
+        ],
+        "format": { "format_name": "matroska,webm", "duration": "7200.0" }
+    }"#;
+
+    #[test]
+    fn mprb03_the_new_video_fields_parse_from_the_document_we_already_fetch() {
+        let p = parse_probe_json(FULL_FIELDS).expect("must parse");
+        let v = p.primary_video().expect("a video stream");
+
+        assert_eq!(v.level, Some(153), "HEVC level 5.1, in ffprobe's own units");
+        assert_eq!(
+            v.bits_per_raw_sample,
+            Some(10),
+            "the OBSERVED depth, string-rendered in this document"
+        );
+        // 24000/1001, not 24. A rate rounded to 24 would fail a `<= 24` device
+        // ceiling by 0.0 and pass a `>= 24` one — the reason the ratio is kept
+        // as a ratio.
+        let fps = v.frame_rate_fps.expect("r_frame_rate parses");
+        assert!((fps - 23.976_023).abs() < 1e-5, "got {fps}");
+        assert!((v.avg_frame_rate_fps.unwrap() - 23.976_023).abs() < 1e-5);
+        assert_eq!(v.color_range.as_deref(), Some("tv"));
+
+        // And the argv is untouched: every field above came out of the JSON
+        // ffprobe already returned. This item costs no extra I/O against a
+        // 16,221-file library, and this assertion is what stops that claim
+        // from quietly becoming false.
+        assert_eq!(
+            build_ffprobe_args("/x"),
+            vec![
+                "-v", "error", "-print_format", "json", "-show_format",
+                "-show_streams", "-show_chapters", "--", "/x",
+            ]
+        );
+    }
+
+    #[test]
+    fn mprb03_the_new_audio_and_subtitle_fields_parse() {
+        let p = parse_probe_json(FULL_FIELDS).expect("must parse");
+
+        let a = &p.audio[0];
+        // `codec_name` is plain `dts` for both DTS and DTS-HD MA; the profile
+        // is the only thing that separates them, which is why it is carried.
+        assert_eq!(a.codec, "dts");
+        assert_eq!(a.profile.as_deref(), Some("dts-hd ma"));
+        assert_eq!(a.sample_rate_hz, Some(48_000));
+        assert_eq!(a.channel_layout.as_deref(), Some("7.1"));
+        assert!(a.default, "disposition.default must reach AudioStream");
+        assert!(!a.forced);
+
+        let s = &p.subtitles[0];
+        assert!(
+            s.hearing_impaired,
+            "an SDH track must be distinguishable, or it gets auto-selected"
+        );
+        assert!(!s.default);
+    }
+
+    #[test]
+    fn mprb03_a_real_captured_document_carries_the_new_fields_too() {
+        // The synthetic fixture above proves the parser reads a shape we
+        // invented. This one proves it reads the shape ffprobe on the
+        // DEPLOYMENT HOST actually emitted — `level` and `color_range` were
+        // sitting unread in this captured document the whole time.
+        let p = parse_probe_json(LIVE_DOLBY_VISION_STREAM).expect("live capture must parse");
+        let v = p.primary_video().expect("a video stream");
+        assert_eq!(v.level, Some(150), "HEVC 5.0 as this real file reports it");
+        assert_eq!(v.color_range.as_deref(), Some("tv"));
+        // This capture carries no rate fields at all, and an absent field is
+        // silent — no note, because there is nothing we failed to read.
+        assert_eq!(v.frame_rate_fps, None);
+        assert!(p.notes.is_empty(), "notes: {:?}", p.notes);
+    }
+
+    #[test]
+    fn mprb03_as_ratio_never_divides_by_zero_and_never_returns_a_zero_rate() {
+        let s = |t: &str| Some(serde_json::Value::String(t.to_string()));
+
+        // The case this function exists for. `0/0` is what ffprobe writes for
+        // a stream with no meaningful rate; as an f64 it is NaN, which
+        // compares false against every ceiling AND every floor.
+        assert_eq!(as_ratio(&s("0/0")), None);
+        assert_eq!(as_ratio(&s("24/0")), None);
+        // A real rate is not rounded.
+        let ntsc = as_ratio(&s("24000/1001")).unwrap();
+        assert!((ntsc - 23.976_023).abs() < 1e-5, "got {ntsc}");
+        assert_eq!(as_ratio(&s("25/1")), Some(25.0));
+        // Zero frames per second is not a rate.
+        assert_eq!(as_ratio(&s("0/1")), None);
+        // Unparseable, empty, absent, negative, wrong type.
+        assert_eq!(as_ratio(&s("")), None);
+        assert_eq!(as_ratio(&s("garbage")), None);
+        assert_eq!(as_ratio(&s("N/A")), None);
+        assert_eq!(as_ratio(&s("-24/1")), None);
+        assert_eq!(as_ratio(&None), None);
+        assert_eq!(as_ratio(&Some(serde_json::Value::Bool(true))), None);
+        // A bare number is a value too — the function is about meaning, not
+        // rendering.
+        assert_eq!(as_ratio(&Some(serde_json::json!(29.97))), Some(29.97));
+        assert_eq!(as_ratio(&Some(serde_json::json!(0))), None);
+    }
+
+    #[test]
+    fn mprb03_an_unusable_rate_is_noted_so_it_is_not_read_as_never_looked_at() {
+        let json = r#"{
+            "streams": [{
+                "index": 0, "codec_name": "h264", "codec_type": "video",
+                "width": 1920, "height": 1080,
+                "r_frame_rate": "0/0"
+            }],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        assert_eq!(p.primary_video().unwrap().frame_rate_fps, None);
+        assert!(
+            p.notes.iter().any(|n| n.contains("r_frame_rate") && n.contains("0/0")),
+            "a field that was present but unusable must say so, or it is \
+             indistinguishable from a field nobody read: {:?}",
+            p.notes
+        );
+        // And it changed nothing else.
+        assert_eq!(p.primary_video().unwrap().width, Some(1920));
+    }
+
+    #[test]
+    fn mprb03_channel_layout_keeps_ffprobes_literal_unknown() {
+        // Deliberately the one place `normalize_descriptor`'s "unknown => None"
+        // rule is NOT applied: "the muxer declared the positions unknown" and
+        // "no layout field at all" are different facts, and a downmix decision
+        // reads them differently.
+        let json = r#"{
+            "streams": [
+                { "index": 0, "codec_name": "flac", "codec_type": "audio",
+                  "channels": 6, "channel_layout": "unknown" },
+                { "index": 1, "codec_name": "aac", "codec_type": "audio",
+                  "channels": 2 }
+            ],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        assert_eq!(p.audio[0].channel_layout.as_deref(), Some("unknown"));
+        assert_eq!(p.audio[1].channel_layout, None);
+        // The typed count is unaffected either way, so nothing depends on
+        // parsing that string.
+        assert_eq!(p.audio[0].channels, Some(6));
+    }
+
+    #[test]
+    fn mprb03_contradictory_colour_tags_are_noted_and_change_no_verdict() {
+        let json = r#"{
+            "streams": [{
+                "index": 0, "codec_name": "hevc", "codec_type": "video",
+                "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le",
+                "color_primaries": "bt2020", "color_transfer": "bt709"
+            }],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+        let p = parse_probe_json(json).unwrap();
+        let v = p.primary_video().unwrap();
+        assert!(
+            p.notes.iter().any(|n| n.contains("bt2020") && n.contains("bt709")),
+            "notes: {:?}",
+            p.notes
+        );
+        // Both tags survive verbatim — the note describes the document, it does
+        // not repair it.
+        assert_eq!(v.color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(v.color_transfer.as_deref(), Some("bt709"));
+        // And the ONE authority on dynamic range is untouched by the note: a
+        // recognised SDR transfer is still SDR. If this ever disagrees with
+        // `foundry::hdr`, a second classifier has appeared.
+        assert_eq!(crate::foundry::hdr::classify_hdr(v), crate::foundry::hdr::HdrVerdict::Sdr);
+    }
+
+    fn document_with_streams(n: usize) -> String {
+        let streams: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"index":{i},"codec_name":"subrip","codec_type":"subtitle"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"streams":[{}],"format":{{"format_name":"matroska,webm"}}}}"#,
+            streams.join(",")
+        )
+    }
+
+    #[test]
+    fn mprb03_a_document_above_the_stream_cap_is_refused_not_truncated() {
+        let over = parse_probe_json(&document_with_streams(MAX_STREAMS + 1));
+        match over {
+            Err(ProbeError::MalformedOutput { message }) => {
+                assert!(
+                    message.contains(&(MAX_STREAMS + 1).to_string())
+                        && message.contains(&MAX_STREAMS.to_string()),
+                    "the message must name both the count seen and the cap: {message}"
+                );
+            }
+            other => panic!("expected MalformedOutput, got {other:?}"),
+        }
+
+        // Exactly at the cap is a real file, not an attack, and must parse.
+        let at = parse_probe_json(&document_with_streams(MAX_STREAMS))
+            .expect("a document AT the cap must still parse");
+        assert_eq!(at.subtitles.len(), MAX_STREAMS);
+
+        // And the measured worst case in this library — 42 subtitle streams on
+        // one file — is nowhere near it. This is the assertion that would fail
+        // if someone tightened the bound to a number a real file exceeds.
+        assert!(
+            MAX_STREAMS > 42 * 4,
+            "the cap must stay well clear of the largest shape this library holds"
+        );
+    }
+
+    #[test]
+    fn mprb03_an_over_long_tag_is_cut_and_says_that_it_was_cut() {
+        let long = "A".repeat(MAX_TAG_LEN * 2);
+        let json = format!(
+            r#"{{"streams":[{{"index":0,"codec_name":"h264","codec_type":"video",
+                 "width":1920,"height":1080}}],
+                "format":{{"format_name":"matroska,webm","tags":{{"title":"{long}"}}}}}}"#
+        );
+        let p = parse_probe_json(&json).unwrap();
+        let title = p.title.expect("the title survives, truncated");
+        assert_eq!(title.len(), MAX_TAG_LEN);
+        assert!(
+            p.notes.iter().any(|n| n.contains("title") && n.contains("truncated")),
+            "a silent truncation is data that lies about being whole: {:?}",
+            p.notes
+        );
+    }
+
+    #[test]
+    fn mprb03_truncation_cuts_on_a_char_boundary_not_mid_codepoint() {
+        // A real library holds non-ASCII titles. Slicing a `String` at an
+        // arbitrary byte index PANICS, which in a 16,221-file sweep is one
+        // file taking down the worker.
+        // A **3-byte** codepoint, chosen deliberately. This test was first
+        // written with `é` (2 bytes), and mutation testing proved it BLIND:
+        // `MAX_TAG_LEN` is 1024, which is even, so a run of 2-byte characters
+        // puts a char boundary exactly at the cut index and the boundary walk
+        // never has to do anything. Deleting the walk entirely left the test
+        // green. 1024 % 3 == 1, so with a 3-byte character the cut index lands
+        // one byte INSIDE a codepoint and an unguarded `s[..MAX_TAG_LEN]`
+        // panics — which is the fault this test exists to catch.
+        //
+        // The two-byte case is kept as well, since it is the common one in a
+        // Latin-script library; it just cannot carry the test on its own.
+        for ch in ['\u{2603}', 'é'] {
+            let long: String = std::iter::repeat(ch).take(MAX_TAG_LEN).collect();
+            assert!(long.len() > MAX_TAG_LEN, "the fixture must exceed the cap");
+            let json = format!(
+                r#"{{"streams":[{{"index":0,"codec_name":"h264","codec_type":"video",
+                     "width":1920,"height":1080}}],
+                    "format":{{"format_name":"matroska,webm","tags":{{"title":"{long}"}}}}}}"#
+            );
+            let p = parse_probe_json(&json).expect("must not panic");
+            let title = p.title.unwrap();
+            assert!(title.len() <= MAX_TAG_LEN, "{ch:?}: {}", title.len());
+            assert!(title.chars().all(|c| c == ch), "{ch:?}: mangled codepoint");
+            // And the cut really did have to move: a whole number of 3-byte
+            // characters cannot end on 1024, so the length must be short of
+            // the cap rather than exactly on it.
+            if ch == '\u{2603}' {
+                assert_eq!(
+                    title.len(),
+                    MAX_TAG_LEN - 1,
+                    "the cut must walk back to the nearest char boundary"
+                );
+            }
+            assert!(!p.notes.is_empty());
+        }
+    }
+
+    #[test]
+    fn mprb03_the_note_list_is_bounded_and_says_how_many_it_dropped() {
+        // 40 streams that each produce exactly one note, against a 32 cap.
+        let streams: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    r#"{{"index":{i},"codec_name":"h264","codec_type":"video",
+                       "width":1920,"height":1080,"r_frame_rate":"0/0"}}"#
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"streams":[{}],"format":{{"format_name":"matroska,webm"}}}}"#,
+            streams.join(",")
+        );
+        let p = parse_probe_json(&json).unwrap();
+
+        assert_eq!(p.notes.len(), MAX_NOTES, "the cap must actually bind");
+        let last = p.notes.last().unwrap();
+        assert!(
+            last.contains("9 further"),
+            "31 notes shown out of 40 means 9 not shown, and the list must say \
+             so rather than just stopping: {last}"
+        );
+        // The earlier notes are the real ones, not all marker.
+        assert!(p.notes[0].contains("r_frame_rate"));
+    }
+
+    #[test]
+    fn mprb03_a_healthy_document_produces_no_notes_at_all() {
+        // The negative that makes every assertion above mean something: notes
+        // are an exception channel, not decoration on every parse.
+        assert!(h264_mkv().notes.is_empty());
+        assert!(parse_probe_json(FULL_FIELDS).unwrap().notes.is_empty());
+    }
+
 }

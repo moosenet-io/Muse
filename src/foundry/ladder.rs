@@ -857,6 +857,7 @@ mod tests {
             channels: Some(channels),
             language: Some("eng".into()),
             bitrate_bps: Some(640_000),
+            ..Default::default()
         }
     }
 
@@ -875,6 +876,7 @@ mod tests {
             chapter_count: 0,
             title: None,
             other_stream_count: 0,
+            notes: Vec::new(),
         }
     }
 
@@ -1704,6 +1706,7 @@ mod tests {
                 language: Some("eng".into()),
                 forced: false,
                 default: true,
+                ..Default::default()
             }];
 
             for name in [RenditionName::Mobile, RenditionName::Web] {
@@ -1738,6 +1741,7 @@ mod tests {
             language: Some("eng".into()),
             forced: false,
             default: true,
+            ..Default::default()
         }];
 
         let RenditionOutcome::Encode { args, .. } = rung(&p, RenditionName::Web, &ctx_available())

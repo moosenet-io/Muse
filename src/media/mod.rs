@@ -52,10 +52,15 @@
 //! through its own roots.
 
 pub mod capability;
+/// MPRB-09: the distributional census and the direct-play candidate share —
+/// the number that sizes spec E.
+pub mod coverage;
 pub mod derive;
 /// MPRB-05: the stored, versioned form of a probe — see the `MediaProbe` vs
 /// `MediaInfoDoc` decision recorded above.
 pub mod doc;
+/// MPRB-09: the two read-only HTTP doors onto [`coverage`].
+pub mod http;
 pub mod paths;
 pub mod probe;
 

@@ -172,6 +172,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/friends/opt-out",
             post(crate::discord::friend_opt_out_handler),
         )
+        // MPRB-09: `GET /probe/coverage` — the distributional census and the
+        // direct-play candidate share, as JSON. Aggregate counts only (no
+        // title, path or library name), read-only, and bearer-gated like every
+        // other library-shaped surface.
+        .route("/probe/coverage", get(crate::media::http::coverage_json))
         // MUSEX-17/18: graph-visualization + Constellation GUI
         // control/settings surface — see `crate::web::protected_routes`.
         .merge(crate::web::protected_routes())
@@ -242,6 +247,13 @@ fn ops_routes() -> Router<Arc<AppState>> {
         // before re-reading `/api/library*`. See
         // `crate::web::dashboard::trigger_library_scan`.
         .route("/library/scan", post(crate::web::dashboard::trigger_library_scan))
+        // MPRB-09: render the probe coverage report as Markdown, for the
+        // operator to commit as `docs/reports/probe-coverage.md`. Read-only —
+        // one paged `SELECT` over `media_files` and a pure renderer.
+        .route(
+            "/probe/coverage-report",
+            post(crate::media::http::coverage_markdown),
+        )
         // FOUNDRY-02: report what transcoding WOULD do. Encodes nothing, writes nothing.
         .route("/foundry/survey", post(crate::web::dashboard::foundry_survey))
         // FOUNDRY-04: really encode a diverse sample TO SCRATCH and verify it.

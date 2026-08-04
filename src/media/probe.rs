@@ -1727,13 +1727,23 @@ fn finite_positive(f: f64) -> Option<f64> {
 /// **512.** The three pieces of evidence, because a bound with no evidence is
 /// a magic number:
 ///
-/// 1. **Measured, in this library.** The largest stream count the operator's
-///    survey found on one file is **42 subtitle streams** — recorded twice,
-///    independently, in [`crate::foundry::validate::SubtitleBand::Extreme`]
-///    and in [`crate::subtitles::discover::embedded_from_probe`]. Add a video
-///    stream, a handful of audio tracks and the attached-font set an ASS-styled
-///    release carries, and the worst REAL shape in this 16,221-file library is
-///    comfortably under 200 streams.
+/// 1. **Measured, in this library.** The largest subtitle-stream count on one
+///    file is **61** (S130-A MPRB-04: every file with 12 or more streams — 1,346
+///    of them — probed, because the probe index truncates its per-file codec
+///    list at 12 without saying so). The figure is not restated here: it is
+///    read from the committed `ffprobe` document by
+///    `crate::media::probe_golden::measured_max_subtitle_streams`, and that is
+///    what the test below checks this cap against. Add a video stream, a
+///    handful of audio tracks and the attached-font set an ASS-styled release
+///    carries — the largest whole-file stream count found is 66 — and the worst
+///    REAL shape in this 16,221-file library is comfortably under 200 streams.
+///
+///    Superseded, and recorded because the drift is the lesson: this evidence
+///    used to read **42**, "recorded twice, independently" in
+///    [`crate::foundry::validate::SubtitleBand::Extreme`] and in
+///    [`crate::subtitles::discover::embedded_from_probe`]. Two independent
+///    recordings of one measurement is not corroboration; it is two things to
+///    forget to update, and both were stale together.
 /// 2. **Measured, independently.** The largest ffprobe document in this
 ///    library is ~71 KB (see [`MAX_CAPTURED_BYTES`]). A `-show_streams` stream
 ///    object runs a few hundred bytes to ~1.5 KB with side data, which puts
@@ -3897,12 +3907,21 @@ mod tests {
             .expect("a document AT the cap must still parse");
         assert_eq!(at.subtitles.len(), MAX_STREAMS);
 
-        // And the measured worst case in this library — 42 subtitle streams on
-        // one file — is nowhere near it. This is the assertion that would fail
-        // if someone tightened the bound to a number a real file exceeds.
+        // And the measured worst case in this library is nowhere near it. This
+        // is the assertion that would fail if someone tightened the bound to a
+        // number a real file exceeds — so the worst case is READ from the
+        // golden corpus rather than written out here, which is exactly how the
+        // previous figure (42) went stale without this test noticing.
+        let measured = crate::media::probe_golden::measured_max_subtitle_streams();
         assert!(
-            MAX_STREAMS > 42 * 4,
-            "the cap must stay well clear of the largest shape this library holds"
+            measured > 0,
+            "precondition: the corpus must actually carry a subtitle-heavy file, \
+             or the bound below is checked against nothing"
+        );
+        assert!(
+            MAX_STREAMS > measured * 4,
+            "the cap ({MAX_STREAMS}) must stay well clear of the largest shape this \
+             library holds ({measured} subtitle streams)"
         );
     }
 

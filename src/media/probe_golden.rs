@@ -41,7 +41,7 @@
 //! | `multi_audio_eac3` | 11 audio streams, 24 subtitles, per-track dispositions |
 //! | `anime_attachments_fonts` | 11 font attachments plus an ASS subtitle track |
 //! | `extreme_40_attachments` | the library's attachment maximum |
-//! | `extreme_61_subtitles` | the library's subtitle maximum — **61**, not the 42 recorded in `foundry::validate` |
+//! | `extreme_61_subtitles` | the library's subtitle maximum — **61**, and the one home of that figure |
 //! | `extreme_66_streams_2video` | the library's stream-count maximum, and 2 video streams |
 //! | `frame_rate_base_differs_from_average` | the only real file found where `r_frame_rate` != `avg_frame_rate` |
 //! | `fail_ebml_*` (7) | every `probe_failed` file the full-library survey found |
@@ -303,6 +303,32 @@ fn read(path: &Path) -> String {
 fn probe_of(name: &str) -> MediaProbe {
     parse_probe_json(&read(&ok_path(name)))
         .unwrap_or_else(|e| panic!("fixture {name} must parse, got {e}"))
+}
+
+/// The largest subtitle-stream count on any single file in this library —
+/// **read from the committed `ffprobe` documents, never typed in.**
+///
+/// This is the ONE home of that figure. Every bound and every comment sized
+/// against it resolves through this function or through the fixture it reads,
+/// so re-measuring the library means minting a fixture, not editing a number in
+/// five comments. The predecessor of this arrangement is why it exists: the
+/// figure was written out by hand in `foundry::validate` (three times), in
+/// `media::probe`'s `MAX_STREAMS` evidence, and in `subtitles::discover`, and
+/// every one of those copies was stale together.
+///
+/// Scope, stated honestly: this is the maximum over the **corpus**, and the
+/// corpus is a deliberate collection of worst real cases rather than the
+/// library. It equals the library maximum because
+/// `extreme_61_subtitles` was captured for exactly that reason —
+/// `the_hand_written_facts_about_extreme_61_subtitles` is what pins that
+/// correspondence, and it fails if a bigger fixture is minted without the
+/// bounds being re-checked.
+pub(crate) fn measured_max_subtitle_streams() -> usize {
+    OK_FIXTURES
+        .iter()
+        .map(|name| probe_of(name).subtitles.len())
+        .max()
+        .expect("the golden corpus is never empty")
 }
 
 /// Run a committed failure fixture through the production interpretation step
@@ -694,19 +720,31 @@ mod tests {
 
     /// The library's subtitle maximum — **61**, measured.
     ///
-    /// `foundry::validate` records 42 as the worst case in three places. That
-    /// number is stale: a scan of every file in this library with 12 or more
-    /// streams (1,346 of them) found 61 subtitles on this one. It matters
-    /// because every subtitle stream is stream-copied and verified
+    /// How it was measured, so a future reader can tell whether it is still
+    /// current: every file in the 16,221-title library with 12 or more streams
+    /// was probed — 1,346 of them — and this one carried the most subtitles.
+    /// The `>= 12` cut is not a sample: the probe index that would otherwise
+    /// have answered the question **truncates its per-file codec list at 12
+    /// entries and says nothing about having done so**, so 1,346 files sat
+    /// pinned at exactly 12 and a file with 61 subtitles was indistinguishable
+    /// from one with 12. Anything read off that index at face value undercounts.
+    /// (S130-A MPRB-04; it supersedes the 42 `foundry::validate` used to record.)
+    ///
+    /// It matters because every subtitle stream is stream-copied and verified
     /// positionally, so this is the shape most likely to expose a mapping bug,
-    /// and a bound sized for 42 is a bound sized for the wrong library.
+    /// and a bound sized for the wrong worst case is sized for the wrong library.
     #[test]
     fn the_hand_written_facts_about_extreme_61_subtitles() {
         let p = probe_of("extreme_61_subtitles");
         assert_eq!(p.subtitles.len(), 61);
-        assert!(
-            p.subtitles.len() > 42,
-            "the measured worst case exceeds the 42 recorded in foundry::validate"
+        // This fixture must BE the corpus maximum, because
+        // `measured_max_subtitle_streams` is what every bound is checked
+        // against. Minting a bigger fixture fails here, which is the prompt to
+        // re-check those bounds rather than let them drift silently.
+        assert_eq!(
+            p.subtitles.len(),
+            measured_max_subtitle_streams(),
+            "extreme_61_subtitles is the corpus subtitle maximum"
         );
         // Indices are absolute and the argv maps by absolute index, so they
         // must be distinct and must not have been renumbered by the parser.
@@ -717,6 +755,35 @@ mod tests {
         assert_eq!(idx.len(), n, "subtitle indices must be distinct");
         assert_eq!(p.unindexed_stream_count, 0);
         assert!(p.subtitles.iter().filter(|s| s.default).count() <= 1);
+    }
+
+    /// `subtitle_band`'s `Extreme` band is written for the library's worst real
+    /// subtitle count, so it is checked against the MEASURED figure rather than
+    /// against a number restated in its doc comment.
+    ///
+    /// This is the assertion that would have caught the stale 42: the band's
+    /// doc named a worst case that no longer matched the library, and nothing
+    /// mechanical connected the two. Now something does.
+    ///
+    /// (`MAX_STREAMS` is the other bound sized against this figure, and it is
+    /// checked in `probe::tests::mprb03_a_document_above_the_stream_cap_is_refused_not_truncated`
+    /// where the constant lives — deliberately not also here.)
+    #[test]
+    fn the_extreme_subtitle_band_still_covers_the_measured_worst_case() {
+        let measured = measured_max_subtitle_streams();
+        // Precondition, not the assertion: a corpus maximum of 0 would make
+        // `Extreme` unreachable and the check below would fail for a reason
+        // that has nothing to do with the band. Pin what the input IS.
+        assert_eq!(
+            measured,
+            probe_of("extreme_61_subtitles").subtitles.len(),
+            "precondition: the corpus maximum is the extreme_61_subtitles fixture"
+        );
+        assert_eq!(
+            crate::foundry::validate::subtitle_band(measured),
+            crate::foundry::validate::SubtitleBand::Extreme,
+            "the library's worst real subtitle count must land in the band written for it"
+        );
     }
 
     /// The library's stream-count maximum, and a file with two real video

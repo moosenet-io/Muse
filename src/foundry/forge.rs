@@ -1194,6 +1194,49 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 /// actually matters — *does this inode have another name?* — and answers it
 /// from the inode itself, so it holds whatever the original's path is doing.
 /// Fail closed: if the link count cannot be read, the backup stays.
+/// Give `dest` the same owner, group and mode as `src`, best-effort.
+///
+/// Warns rather than failing: see the call site for why a metadata mismatch
+/// must not discard a verified encode.
+fn copy_ownership_and_mode(src: &Path, dest: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(md) = std::fs::metadata(src) else {
+        tracing::warn!(
+            src = %src.display(),
+            "foundry: could not read the original's ownership — the replacement keeps \
+             the process's own, which may leave it unmanageable by the media stack"
+        );
+        return;
+    };
+
+    if let Err(e) = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(md.mode())) {
+        tracing::warn!(error = %e, dest = %dest.display(), mode = md.mode(),
+            "foundry: could not set the replacement's mode to match the original");
+    }
+
+    // `chown` needs libc; std has no safe wrapper. A failure here is common and
+    // benign on a root_squash export, so it warns rather than escalating.
+    let c_dest = match std::ffi::CString::new(dest.as_os_str().as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // SAFETY: `c_dest` is a valid NUL-terminated C string that outlives the
+    // call, and chown takes uid/gid by value. No memory is shared or retained.
+    let rc = unsafe { libc::chown(c_dest.as_ptr(), md.uid(), md.gid()) };
+    if rc != 0 {
+        tracing::warn!(
+            dest = %dest.display(),
+            uid = md.uid(),
+            gid = md.gid(),
+            error = %std::io::Error::last_os_error(),
+            "foundry: could not set the replacement's owner to match the original — the \
+             media stack may be unable to manage this file"
+        );
+    }
+}
+
 fn rollback_superseded(superseded: &Path) {
     use std::os::unix::fs::MetadataExt;
     match std::fs::symlink_metadata(superseded) {
@@ -1731,6 +1774,26 @@ fn run_encode_and_swap(
             return Err(e);
         }
     };
+
+    // **Inherit the original's ownership and mode.**
+    //
+    // `fs::copy` copies the SOURCE's permission bits but the new file is owned
+    // by whoever the process runs as. Muse runs as root; this library is
+    // uniformly `nobody:nogroup 0666` on an NFS export. So every rewritten file
+    // came out `root:root 0644` — still world-readable, so playback worked and
+    // nothing looked wrong — while Sonarr, Radarr and every other non-root
+    // manager silently lost the ability to rename, move or delete it. At 463
+    // titles that is 463 files the *arr stack can no longer manage, discovered
+    // long after the fact.
+    //
+    // Found by independently verifying the first ten rewrites rather than by
+    // any failure: nothing errored, and the run reported complete success.
+    //
+    // Fail-SOFT. The bytes are correct and verified; refusing the swap over a
+    // metadata mismatch would discard good work and leave the library
+    // un-optimized. A loud warning is the right weight — the file is usable
+    // either way, and an operator can fix ownership in bulk.
+    copy_ownership_and_mode(original_p, inflight.as_path());
 
     // Flush the copy to disk before verifying it. `fs::copy` leaves the bytes
     // in the page cache; verifying a file that exists only in cache and then
@@ -3434,6 +3497,67 @@ mod tests {
     /// leaving ~20 GB that had to be removed manually; at 16,000 items that
     /// fills the scratch filesystem and then presents as unrelated encode
     /// failures.
+    /// **The replacement must inherit the original's mode.**
+    ///
+    /// `fs::copy` gives the new file the process's ownership. Muse runs as
+    /// root; this library is uniformly `nobody:nogroup 0666`. Every rewritten
+    /// file came out `root:root 0644` — world-readable, so playback worked and
+    /// nothing looked broken — while every non-root media manager silently lost
+    /// the ability to rename, move or delete it.
+    ///
+    /// Ownership itself cannot be asserted here (changing uid needs privileges
+    /// a test does not have and should not want), so this pins the half that
+    /// is testable: the mode is carried across.
+    #[test]
+    fn a_replacement_inherits_the_originals_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-forge-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let original = dir.join("Movie.avi");
+        let replacement = dir.join("Movie.mkv");
+        std::fs::write(&original, b"original").expect("write");
+        std::fs::write(&replacement, b"replacement").expect("write");
+
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o666))
+            .expect("set original mode");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o644))
+            .expect("set replacement mode");
+
+        copy_ownership_and_mode(&original, &replacement);
+
+        let got = std::fs::metadata(&replacement).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            got, 0o666,
+            "the replacement must carry the original's mode, or the media stack \
+             loses write access to every file Foundry touches"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable original must not panic or corrupt the replacement — it
+    /// warns and leaves the file alone.
+    #[test]
+    fn an_unreadable_original_leaves_the_replacement_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muse-forge-mode-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let replacement = dir.join("Movie.mkv");
+        std::fs::write(&replacement, b"replacement").expect("write");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o644))
+            .expect("mode");
+
+        copy_ownership_and_mode(&dir.join("does-not-exist.avi"), &replacement);
+
+        assert!(replacement.is_file());
+        let got = std::fs::metadata(&replacement).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, 0o644, "unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **The one total-loss path in the module.**
     ///
     /// In the different-container shape the rollback runs precisely when

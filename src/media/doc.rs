@@ -440,6 +440,7 @@ mod tests {
                 channels: Some(6),
                 language: Some("eng".to_string()),
                 bitrate_bps: Some(640_000),
+                ..Default::default()
             }],
             subtitles: vec![],
             attachments: vec![],
@@ -448,6 +449,7 @@ mod tests {
             chapter_count: 12,
             title: Some("A Film".to_string()),
             other_stream_count: 0,
+            notes: Vec::new(),
         }
     }
 

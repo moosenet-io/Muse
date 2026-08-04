@@ -474,6 +474,7 @@ mod tests {
                 chapter_count: 0,
                 title: None,
                 other_stream_count: 0,
+                notes: Vec::new(),
             }
         }
 

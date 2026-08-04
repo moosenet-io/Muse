@@ -23,7 +23,9 @@
 //! h264/aac mkv, and validating twelve h264/aac files proves almost nothing:
 //! that path is a stream copy. The value is entirely in the awkward tail the
 //! operator measured — `msmpeg4v2` at 294x240, `mpeg4` + ac3, h264 1918x802
-//! with **42 subtitle streams**, h264 1280x688 with **dts + ac3**. So the
+//! carrying **dozens of subtitle streams** (the measured maximum is recorded
+//! once, at [`SubtitleBand::Extreme`], and is *not* this file), h264 1280x688
+//! with **dts + ac3**. So the
 //! sample is chosen by *coverage of distinct shapes*
 //! ([`select_diverse_sample`]), not by position in a directory walk.
 //!
@@ -251,9 +253,36 @@ pub enum SubtitleBand {
     Few,
     /// 5-20.
     Many,
-    /// >20. The operator measured a file with **42** subtitle streams; every
-    /// one of them is stream-copied and every one is verified positionally, so
-    /// this is the shape most likely to expose a mapping bug.
+    /// >20. Every subtitle stream is stream-copied and every one is verified
+    /// positionally, so this is the shape most likely to expose a mapping bug.
+    ///
+    /// # The measured worst case: **61** subtitle streams on one file
+    ///
+    /// **How it was measured**, so a future reader can judge whether it is
+    /// still current rather than trusting a bare number: S130-A MPRB-04 probed
+    /// every file in the 16,221-title library with 12 or more streams — 1,346
+    /// files — and took the largest subtitle count found. It was not a sample.
+    ///
+    /// **Why the `>= 12` cut, and the trap it exists to route around:** the
+    /// probe index that would otherwise have answered the question truncates
+    /// its per-file codec list at **12 entries and does not say that it has**.
+    /// So 1,346 files sat pinned at exactly 12, a 61-subtitle file was
+    /// indistinguishable from a 12-subtitle one, and anything read off that
+    /// index at face value undercounts. This band previously recorded **42**,
+    /// which is below the true figure; the index's silent cap is the obvious
+    /// way a low number could have been arrived at, though no provenance for
+    /// the 42 itself survives, so that is where the reconstruction stops.
+    ///
+    /// **Where the figure lives.** Not here — this paragraph is prose, and
+    /// prose drifts. It is asserted against the real committed `ffprobe`
+    /// document by `media::probe_golden`'s `extreme_61_subtitles` fixture, and
+    /// `the_extreme_subtitle_band_still_covers_the_measured_worst_case` checks
+    /// [`subtitle_band`] against that measurement rather than against this
+    /// comment. Re-measuring the library means minting a fixture; it does not
+    /// mean editing a number in five places, which is how the 42 survived.
+    ///
+    /// The band's own threshold (`>20`) is unchanged and needs no change: 61
+    /// classifies `Extreme` exactly as 42 did.
     Extreme,
 }
 
@@ -353,7 +382,7 @@ pub fn diversity_key(probe: &MediaProbe) -> DiversityKey {
 ///
 /// Used only to ORDER the shapes when the sample limit is smaller than the
 /// number of distinct shapes available — so a limit of 12 spends its budget on
-/// `msmpeg4v2` at 294x240 and the 42-subtitle file, not on twelve flavours of
+/// `msmpeg4v2` at 294x240 and the [`SubtitleBand::Extreme`] file, not on twelve flavours of
 /// h264/aac.
 pub fn awkwardness(key: &DiversityKey, policy: &TranscodePolicy) -> u32 {
     let mut score = 0;

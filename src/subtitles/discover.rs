@@ -68,9 +68,13 @@ pub fn is_image_codec(codec: &str) -> bool {
 /// Enumerate the embedded subtitle tracks in an already-taken probe.
 /// **Pure** — the ffprobe call itself lives in [`crate::media::probe`].
 ///
-/// One sampled library file carries 42 subtitle streams, so this is not a
-/// theoretical list; it is routinely the largest of the three tiers, and it is
-/// the tier that is already in sync by construction.
+/// Real files in this library carry dozens of subtitle streams — the measured
+/// worst case is recorded once, at
+/// [`crate::foundry::validate::SubtitleBand::Extreme`], and deliberately not
+/// restated here; this module used to carry its own copy of that figure and it
+/// went stale along with every other copy. So this is not a theoretical list;
+/// it is routinely the largest of the three tiers, and it is the tier that is
+/// already in sync by construction.
 pub fn embedded_from_probe(probe: &MediaProbe) -> Vec<AvailableSubtitle> {
     probe.subtitles.iter().map(available_from_stream).collect()
 }
@@ -416,7 +420,10 @@ mod tests {
 
     #[test]
     fn a_file_with_many_subtitle_streams_yields_all_of_them() {
-        // One sampled library file has 42. None may be dropped.
+        // 42 here is "many", not a claim about the library — the library's
+        // measured maximum has one home (foundry::validate::SubtitleBand::Extreme,
+        // asserted in media::probe_golden). What is under test is that NONE are
+        // dropped, whatever the count.
         let streams: Vec<SubtitleStream> = (0..42).map(|i| stream(i, "subrip", Some("eng"))).collect();
         let available = embedded_from_probe(&probe_with(streams));
         assert_eq!(available.len(), 42);

@@ -2333,3 +2333,314 @@ mod auth {
         );
     }
 }
+
+// =====================================================================
+// HTTPLIVE-01 (Plane MUSE #157): live request/response coverage for the
+// `/ops/probe/:id/why` route, and a single behavioural tripwire for the
+// axum-version-vs-route-syntax pin.
+//
+// ## What this module is NOT
+// It is not "the first live HTTP test in Muse". That premise, as filed,
+// is FALSE against this tree and was checked before any code was written:
+// this very file (MUSET-01) has driven the real `axum::Router` through
+// `tower::ServiceExt::oneshot` since Phase 0, `tower` has been a
+// dev-dependency with the `util` feature since then (`Cargo.toml`
+// `[dev-dependencies]`), and the `auth` module above ALREADY observes a
+// live `401`-without-token and a live fail-closed `503`-when-unconfigured
+// on `/ops/ingest/arr` and friends. Restating that coverage under a new
+// name would be exactly the "a claim must not outrun its mechanism"
+// failure this epic is about, pointed the other way.
+//
+// ## What was actually missing, and is added here
+// 1. `/ops/probe/:id/why` — MPRB-08's route — had NO router-level
+//    coverage at all. Every assertion about it (that it is registered,
+//    that it is bearer-gated, that `:id` captures) was made by reading
+//    source text. Its four live behaviours are observed below.
+// 2. A **behavioural** version tripwire. The stated risk is an axum 0.8
+//    bump silently breaking every `:id` route. The existing guards catch
+//    that only where somebody remembered to write a pin assertion, and
+//    they catch it by reading `Cargo.toml`'s text — which would still
+//    read "0.7" if a `cargo update` moved the resolved crate. The single
+//    assertion here instead ROUTES a request through a two-line router
+//    built from the axum actually linked into this binary, so it fails on
+//    the version bump regardless of what any file says.
+//
+// ## What is NOT covered here, and why (disclosed, not skipped quietly)
+// "Row not found => 404" is NOT observed live. It cannot be, on this
+// route or any other in the crate: every `MuseError::NotFound` in Muse is
+// produced by a `repo::*` `fetch_optional(...).ok_or_else(...)`, i.e.
+// AFTER a real query. There is no handler that 404s before touching the
+// pool. The three existing "unknown id must 404" assertions (in
+// `db_gated`, on `/query/similar`, `/api/channels/:id/lineup`,
+// `/proactive/:id/ack`) therefore SKIP on this fleet — there is no
+// `MUSE_TEST_DATABASE_URL` (#130) — and this module deliberately does NOT
+// add a fourth skipping test to make the count look better. What IS
+// pinned below is the *other* 404: the one that means "this path did not
+// route", which is what gives `route_matches_and_reaches_the_handler`'s
+// `assert_ne!(404)` its discriminating power.
+mod http_live {
+    use super::*;
+    use std::time::Duration;
+
+    use super::auth::{with_token_config, TEST_API_TOKEN};
+
+    /// The route under test, with a concrete id substituted.
+    const PROBE_WHY_PATH: &str = "/ops/probe/7/why";
+
+    /// Any single `oneshot` in this module is bounded, so a regression that
+    /// makes a handler block reports as a FAILURE rather than wedging the
+    /// suite (ANTI-HANG). 10s is ~5x the slowest path here (the bounded
+    /// pool below gives up after 2s) and is not a timing assertion — it is
+    /// only a liveness backstop.
+    const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+
+    async fn send_bounded(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+        tokio::time::timeout(RESPONSE_DEADLINE, send(app, req))
+            .await
+            .expect("the router must produce a response well inside the deadline")
+    }
+
+    /// `lazy_test_pool` (used by the rest of this file) never dials at all,
+    /// because every test above it short-circuits before a query. The
+    /// `route_matches_and_reaches_the_handler` test below is the one case
+    /// that deliberately DOES let a query happen — reaching the pool is the
+    /// proof the handler ran — so it needs a pool that fails FAST instead of
+    /// sitting on sqlx's 30s default `acquire_timeout`.
+    ///
+    /// Port 1 on loopback is closed, so `connect` returns `ECONNREFUSED`
+    /// immediately; the 2s `acquire_timeout` is the backstop for any
+    /// environment where it does not. Nothing outside this process is
+    /// contacted (loopback only), and no environment variable is read — this
+    /// module's behaviour does not depend on `TMPDIR`, on a filesystem, or on
+    /// any ambient config.
+    fn unreachable_fast_fail_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy("postgres://user:pass@127.0.0.1:1/muse_test_unreachable")
+            .expect("connect_lazy should never fail synchronously")
+    }
+
+    fn app_fast_fail_db(config: Config) -> axum::Router {
+        router(no_upstream_state_with_config(
+            unreachable_fast_fail_pool(),
+            config,
+        ))
+    }
+
+    // -----------------------------------------------------------------
+    // 1. A valid path MATCHES and reaches the handler.
+    //
+    // Two independent observations, because they fail for different
+    // reasons and one of them costs no I/O:
+    //
+    //  (a) `:id` is a CAPTURE, not a literal. A non-numeric id routes to
+    //      the handler's `Path<i64>` extractor and is rejected `400`
+    //      BEFORE the handler body runs, so no pool is touched. Under the
+    //      `{id}` mutation the segment is a literal, `/ops/probe/abc/why`
+    //      matches nothing, and the status is `404` — a clean kill with
+    //      zero network.
+    //
+    //      Note on which guard rejects: the `400` here comes from axum's
+    //      `PathRejection` (`Path<i64>` cannot parse `"abc"`), which is
+    //      the extractor bound to THIS route — reaching it at all is the
+    //      thing being asserted. The request carries a valid bearer token
+    //      precisely so that the auth layer is not the guard doing the
+    //      rejecting; if it were, the status would be `401`/`503`, both of
+    //      which are distinct from `400` and would fail this test.
+    //
+    //  (b) the handler body actually RUNS. Observed by letting a
+    //      well-formed id through to `repo::media_file::get`, whose query
+    //      against the unroutable pool surfaces as `MuseError::Database`
+    //      => `500`. A `500` here is not a defect being tolerated: it is
+    //      the only status that proves execution got past routing,
+    //      extraction and auth into the handler. `404`/`501` (not routed)
+    //      and `401`/`503` (stopped at auth) are all asserted against
+    //      explicitly.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn probe_why_id_segment_is_a_capture_not_a_literal() {
+        let (status, _) = send_bounded(
+            app_no_db_with_config(with_token_config()),
+            with_bearer(get("/ops/probe/abc/why"), TEST_API_TOKEN),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`/ops/probe/:id/why` must MATCH a non-numeric id and reject it at the \
+             `Path<i64>` extractor (400). A 404 here means the `:id` segment is being \
+             treated as a literal — the axum-0.8 `{{id}}` failure mode this route's own \
+             doc comment warns about."
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_why_route_matches_and_reaches_the_handler() {
+        let (status, _) = send_bounded(
+            app_fast_fail_db(with_token_config()),
+            with_bearer(get(PROBE_WHY_PATH), TEST_API_TOKEN),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{PROBE_WHY_PATH} did not route — the route form no longer matches"
+        );
+        assert_ne!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "{PROBE_WHY_PATH} fell through to a nest fallback instead of its handler"
+        );
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a valid token must not be rejected"
+        );
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the handler ran and its first statement (`repo::media_file::get`) hit the \
+             unroutable pool — that DB error IS the proof of execution"
+        );
+    }
+
+    /// The discriminator the two assertions above lean on: on this router a
+    /// `404` genuinely means "nothing matched", and it is produced even for
+    /// a path sitting under the bearer-gated `/ops` nest with no credential
+    /// at all — `route_layer` applies to MATCHED routes only. Without this,
+    /// `assert_ne!(status, NOT_FOUND)` would be asserting against a status
+    /// nothing was known to produce.
+    #[tokio::test]
+    async fn an_unmatched_path_under_the_protected_nest_is_404_not_401_or_500() {
+        let (status, _) = send_bounded(
+            app_no_db_with_config(with_token_config()),
+            get("/ops/probe/7/why/definitely-not-a-route"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------
+    // 2. No bearer token => 401, before the handler.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn probe_why_without_token_is_401_and_never_reaches_the_handler() {
+        // Deliberately run against the fast-fail pool: if the auth layer
+        // were removed, this request would reach `repo::media_file::get`
+        // and surface `500`, not `401`. The status is therefore a direct
+        // readout of whether the middleware ran, not an inference.
+        let (status, body) = send_bounded(
+            app_fast_fail_db(with_token_config()),
+            get(PROBE_WHY_PATH),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated caller must not learn library structure or file paths"
+        );
+        // A 401 must carry no payload: proof this is a pre-handler
+        // rejection, not a handler that ran and happened to answer 401.
+        assert!(body.get("relative_path").is_none());
+        assert!(body.get("explanation").is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_why_with_wrong_token_is_401() {
+        let (status, _) = send_bounded(
+            app_fast_fail_db(with_token_config()),
+            with_bearer(get(PROBE_WHY_PATH), "not-the-configured-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------
+    // 3. `MUSE_API_TOKEN` unset => the protected surface fails CLOSED.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn probe_why_fails_closed_503_when_token_unconfigured() {
+        // `Config::default()` is the unconfigured state (`api_token: None`,
+        // `auth_disabled: false`) — set on the struct, not via an env var,
+        // so this test cannot be perturbed by the ambient environment or by
+        // another test running in parallel.
+        let (status, body) = send_bounded(
+            app_fast_fail_db(Config::default()),
+            with_bearer(get(PROBE_WHY_PATH), TEST_API_TOKEN),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "with no token configured the route must fail CLOSED, never open"
+        );
+        // Must be the AUTH layer's 503, not a coincidental handler 503 —
+        // and emphatically not a 200 with a payload.
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("auth not configured"),
+            "expected the auth layer's own 503: {body:?}"
+        );
+        assert!(body.get("relative_path").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // 4. THE version tripwire — one assertion, one place.
+    //
+    // Behavioural, not textual. It builds a router from the axum crate
+    // actually linked into this binary and routes real requests through
+    // it, so it fails the moment the compiled axum's path-parameter
+    // grammar stops agreeing with the `:id` form every route in
+    // `crate::http` uses. Reading `Cargo.toml` would not: the manifest
+    // would still say `0.7` after a resolver change, and a text guard
+    // proves what the source says, not what the router does.
+    //
+    // On an axum 0.8 bump this fails one of two ways — `:id` stops
+    // capturing, or `Router::route(":id")` panics at registration. Both
+    // are a failing test, which is the point.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn colon_form_is_the_correct_path_param_syntax_for_the_linked_axum() {
+        use axum::routing::get as axum_get;
+
+        async fn echo(axum::extract::Path(id): axum::extract::Path<String>) -> String {
+            id
+        }
+
+        let app: axum::Router = axum::Router::new()
+            .route("/colon/:id", axum_get(echo))
+            .route("/brace/{id}", axum_get(echo));
+
+        // `:id` CAPTURES.
+        let (status, body) = send_bounded(app.clone(), get("/colon/captured-value")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the linked axum no longer treats `:id` as a path parameter — every `:id` \
+             route in `crate::http` is broken. See `muse_axum_brace_route_bug`."
+        );
+        assert_eq!(body, Value::String("captured-value".to_string()));
+
+        // `{id}` is a LITERAL under this axum, i.e. it does NOT capture.
+        // If this flips, axum has moved to the 0.8 grammar and the whole
+        // crate's route strings must be migrated together.
+        //
+        // (Asserted only in the negative — that it does not CAPTURE. The
+        // positive half, "it matches its own literal text", is not asserted
+        // because `{` and `}` are not legal in a request URI, so there is no
+        // way to send that request without hand-rolling an invalid one.)
+        let (status, _) = send_bounded(app, get("/brace/some-value")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the linked axum now treats `{{id}}` as a capture (0.8 grammar); the crate's \
+             `:id` routes must be migrated in the same change"
+        );
+    }
+}

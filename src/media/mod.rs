@@ -51,6 +51,9 @@
 //! The two guards share no configuration and no state; each path resolves
 //! through its own roots.
 
+/// MPRB-07: the resumable, rate-limited probe backfill worker — the thing that
+/// drains MPRB-05's queue for the 16,221 files that predate the probe path.
+pub mod backfill;
 pub mod capability;
 /// MPRB-09: the distributional census and the direct-play candidate share —
 /// the number that sizes spec E.
@@ -63,6 +66,9 @@ pub mod doc;
 pub mod http;
 pub mod paths;
 pub mod probe;
+/// MPRB-06's persistence edge, moved here by MPRB-07 when the backfill worker
+/// became its second consumer. One definition, two callers.
+pub(crate) mod sink;
 /// The `ffprobe` fixture scrubber (S130-A MPRB-04). Test-only: it exists to
 /// mint and to guard `tests/golden/probe/`, and adding a second binary target
 /// for it was declined — see the module docs.

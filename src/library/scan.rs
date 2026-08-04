@@ -62,9 +62,11 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::error::MuseResult;
-use crate::media::derive::suspicion;
 use crate::media::doc::StoredMediaInfo;
-use crate::media::probe::{MediaProbe, ProbeError};
+// MPRB-07 moved these four out of this module and into `crate::media::sink`
+// unchanged, when the backfill worker became the second consumer of the same
+// persistence edge. See that module for why there is one definition, not two.
+use crate::media::sink::{probe_write, DbProbeSink, ProbeSink, ProbeWrite};
 use crate::media::MediaCore;
 use crate::metadata::resolve::{self, NamedProvider, ResolveIds};
 use crate::models::library::Library;
@@ -730,88 +732,6 @@ impl ProbeDecision {
             Self::NoCapability => "no_ffprobe_on_this_host",
             Self::UpToDate => "unchanged_and_already_probed",
             Self::DeferredToBackfill => "unchanged_left_to_the_backfill",
-        }
-    }
-}
-
-/// What a finished probe should have written to the row.
-///
-/// A borrowed view, not a copy: it exists so the decision of *which* MPRB-05
-/// writer to call, and *what* to label the result, can be made and tested
-/// without a database connection.
-#[derive(Debug)]
-enum ProbeWrite<'a> {
-    /// It parsed. `suspicion` is [`crate::media::derive::suspicion`]'s verdict —
-    /// `None` for a file with nothing wrong with it. A suspicious result is
-    /// still stored, and stored labelled; MPRB-05's `set_probe_result` owns that
-    /// rule and this type only carries the description to it.
-    Document {
-        probe: &'a MediaProbe,
-        suspicion: Option<&'static str>,
-    },
-    /// It did not. The `ProbeError` is passed through **verbatim**;
-    /// classification happens in `StoredProbeState::from_error` →
-    /// `ProbeError::state` (MPRB-02), and nowhere else. This module contains no
-    /// `match` over `ProbeError` — deliberately, because a second one would be
-    /// free to drift from the first the moment a variant is added.
-    Failure { error: &'a ProbeError },
-}
-
-/// Decide what to write, from what the probe returned.
-fn probe_write(result: &Result<MediaProbe, ProbeError>) -> ProbeWrite<'_> {
-    match result {
-        Ok(probe) => ProbeWrite::Document {
-            probe,
-            // Called, not restated. `suspicion` is MPRB-03's rule and there is
-            // exactly one of it.
-            suspicion: suspicion(probe).map(|s| s.as_str()),
-        },
-        Err(error) => ProbeWrite::Failure { error },
-    }
-}
-
-/// The database edge of the probe step — **the only part of it that needs a
-/// pool**, and deliberately the only part that is not exercised without one.
-///
-/// Its whole body is a two-arm dispatch onto MPRB-05's writers. Everything that
-/// decides anything — whether to probe, what the probe said, how a failure is
-/// classified, what gets counted — sits above this trait and runs for real in
-/// the tests below against a recording fake. Without this split the entire item
-/// would be verifiable only where `MUSE_TEST_DATABASE_URL` is set, which is not
-/// where it is built (MUSE #130).
-///
-/// `Send + Sync` is required at the use site rather than left to inference: the
-/// scan runs inside an axum handler, and a `&dyn Trait` held across an `await`
-/// is what silently makes that handler's future non-`Send`.
-#[async_trait]
-trait ProbeSink {
-    async fn record(
-        &self,
-        media_file_id: i64,
-        relative_path: &str,
-        write: &ProbeWrite<'_>,
-    ) -> MuseResult<()>;
-}
-
-/// The production sink: MPRB-05's two writers, and nothing else.
-struct DbProbeSink<'a>(&'a PgPool);
-
-#[async_trait]
-impl ProbeSink for DbProbeSink<'_> {
-    async fn record(
-        &self,
-        media_file_id: i64,
-        relative_path: &str,
-        write: &ProbeWrite<'_>,
-    ) -> MuseResult<()> {
-        match write {
-            ProbeWrite::Document { probe, suspicion } => {
-                repo::media_file::set_probe_result(self.0, media_file_id, relative_path, probe, *suspicion)
-                    .await
-            }
-            ProbeWrite::Failure { error } => {
-                repo::media_file::set_probe_error(self.0, media_file_id, error).await
-            }
         }
     }
 }
@@ -2132,6 +2052,7 @@ mod tests {
 
     mod probe_step {
         use super::*;
+        use crate::media::probe::{MediaProbe, ProbeError};
         use crate::media::derive::Suspicion;
         use crate::media::doc::{MediaInfoDoc, StoredProbeState};
         use crate::media::probe::{parse_probe_json, ProbeState};

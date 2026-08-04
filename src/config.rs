@@ -363,6 +363,35 @@ pub struct Config {
     /// `media::capability` for the bounds.
     pub capability_timeout_secs: Option<u64>,
 
+    // --- S130-A MPRB-07: the probe backfill worker ---
+    /// Probes per minute the backfill worker is allowed to issue
+    /// (`MUSE_PROBE_BACKFILL_RATE_PER_MIN`). `None` keeps
+    /// `media::backfill::DEFAULT_RATE_PER_MIN` (30).
+    ///
+    /// The knob exists because the sweep's cost is now MEASURED and the spec's
+    /// figure is not: ~0.17s per probe, ~46 minutes for the whole 16,221-file
+    /// library. 30/min is deliberate conservatism against a shared NFS mount and
+    /// a live serving path, not a bound anyone derived — so an operator draining
+    /// an idle library must be able to raise it, and an operator with a busy
+    /// mount must be able to lower it. Clamped; see `media::backfill`.
+    pub probe_backfill_rate_per_min: Option<u32>,
+    /// How many rows one keyset page of the backfill queue fetches
+    /// (`MUSE_PROBE_BACKFILL_BATCH`). `None` keeps
+    /// `media::backfill::DEFAULT_BATCH_SIZE`.
+    pub probe_backfill_batch: Option<i64>,
+    /// Failed attempts after which a file leaves the backfill queue for good
+    /// (`MUSE_PROBE_BACKFILL_MAX_ATTEMPTS`). `None` keeps
+    /// `media::backfill::DEFAULT_MAX_ATTEMPTS`.
+    ///
+    /// The SAME value is passed to `repo::media_file::list_needing_probe` and to
+    /// `repo::media_file::probe_progress`, because a progress report computed
+    /// against a different bound describes a queue that is not the one running.
+    pub probe_backfill_max_attempts: Option<i32>,
+    /// Ceiling on how many files ONE backfill run probes, `0` for "the whole
+    /// queue" (`MUSE_PROBE_BACKFILL_MAX_FILES`). `None` keeps
+    /// `media::backfill::DEFAULT_MAX_FILES_PER_RUN`.
+    pub probe_backfill_max_files: Option<u64>,
+
     // --- SUBS-01: the subtitle system ---
     /// Wyzie subtitle-provider API key (`WYZIE_KEY`).
     ///
@@ -792,6 +821,19 @@ impl Config {
             // being read as zero, which would report every tool as timed out.
             capability_timeout_secs: env_opt("MUSE_CAPABILITY_TIMEOUT_SECS")
                 .and_then(|v| v.trim().parse().ok()),
+            // MPRB-07. Same door, same blank-is-unset parse. An unparseable
+            // value falls back to the compiled default rather than to zero:
+            // zero probes per minute is a worker that never runs, and zero
+            // attempts is a queue that is permanently empty — both would look
+            // like "the backfill is done" while nothing had happened.
+            probe_backfill_rate_per_min: env_opt("MUSE_PROBE_BACKFILL_RATE_PER_MIN")
+                .and_then(|v| v.trim().parse().ok()),
+            probe_backfill_batch: env_opt("MUSE_PROBE_BACKFILL_BATCH")
+                .and_then(|v| v.trim().parse().ok()),
+            probe_backfill_max_attempts: env_opt("MUSE_PROBE_BACKFILL_MAX_ATTEMPTS")
+                .and_then(|v| v.trim().parse().ok()),
+            probe_backfill_max_files: env_opt("MUSE_PROBE_BACKFILL_MAX_FILES")
+                .and_then(|v| v.trim().parse().ok()),
             // SUBS-01. Read exactly like every other optional credential:
             // from the environment at runtime, never a literal.
             wyzie_key: env_opt("WYZIE_KEY").map(QbitPassword::from),
@@ -1005,6 +1047,15 @@ impl Default for Config {
             // Likewise: unset means the compiled version-probe deadline, never
             // an unbounded one. `media::capability` resolves it.
             capability_timeout_secs: None,
+
+            // MPRB-07: unset means the compiled defaults (30/min, 200-row
+            // pages, 3 attempts, whole-queue runs), never "unlimited" and never
+            // zero. `media::backfill::BackfillConfig::resolve` is what turns
+            // these into the values the loop actually paces itself with.
+            probe_backfill_rate_per_min: None,
+            probe_backfill_batch: None,
+            probe_backfill_max_attempts: None,
+            probe_backfill_max_files: None,
 
             // SUBS-01 defaults are the SAFE values: no provider credential
             // (so the provider tier is inert) and no store directory (so

@@ -1,0 +1,22 @@
+container: matroska,webm
+duration_secs: Some(7436.930000)
+format_bitrate_bps: Some(25979106)
+size_bytes: Some(24150599646)
+title: None
+chapter_count: 11
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 2
+subtitle_count: 5
+attachment_count: 0
+video index=0 codec=hevc size=Some(3832)xSome(2068) bitrate=None pix_fmt=Some("yuv420p10le") profile=Some("main 10") tag=Some("[0][0][0][0]") level=Some(150) bits_per_raw_sample=None r_fps=Some(23.976024) avg_fps=Some(23.976024) range=Some("tv") transfer=Some("smpte2084") primaries=Some("bt2020") space=Some("bt2020nc") attached_pic=false
+  side_data kind="DOVI configuration record" dv_profile=Some(8) dv_bl_compat=Some(1) rpu=Some(true) bl=Some(true) el=Some(false)
+audio index=1 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("jpn") bitrate=Some(768000) profile=None default=true forced=false
+audio index=2 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("eng") bitrate=Some(768000) profile=None default=false forced=false
+subtitle index=3 codec=subrip lang=Some("eng") default=false forced=true hearing_impaired=false bitmap=false
+subtitle index=4 codec=subrip lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=5 codec=subrip lang=Some("eng") default=false forced=false hearing_impaired=true bitmap=false
+subtitle index=6 codec=subrip lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=7 codec=subrip lang=Some("fre") default=false forced=false hearing_impaired=false bitmap=false

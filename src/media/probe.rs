@@ -7,13 +7,24 @@
 //! consumes it through the permanent re-export shim in [`crate::foundry`].
 //!
 //! ## The split, and why it is not cosmetic
-//! `ffprobe` **is not installed on <host>**, the host Muse runs on (verified
-//! 2026-07-31), and it is not installed on the dev box either. If parsing lived
-//! inside the invocation, none of it could be tested anywhere in this fleet's
-//! current shape — the parser would ship unexercised, on the one code path that
-//! decides whether a file gets re-encoded. So [`parse_probe_json`] is a pure
-//! `&str -> Result` function tested against captured `ffprobe` output, and
-//! [`run_ffprobe`] is the thin, untestable-here layer that produces that `&str`.
+//! `ffprobe` is **not installed on the dev box**, which is where this suite is
+//! written and where its test gate runs. If parsing lived inside the
+//! invocation, none of it could be tested there — the parser would ship
+//! unexercised, on the one code path that decides whether a file gets
+//! re-encoded. So [`parse_probe_json`] is a pure `&str -> Result` function
+//! tested against captured `ffprobe` output, and [`run_ffprobe`] is the thin,
+//! untestable-here layer that produces that `&str`.
+//!
+//! **CORRECTION (S130-A `MPRB-04`, 2026-08-04).** An earlier version of this
+//! paragraph also said ffprobe is not installed on <host>. **That was wrong.**
+//! `ffprobe 5.1.9-0+deb12u1` is installed on <host> — the deployment host, which
+//! mounts the library — and running it there is how the golden corpus in
+//! [`crate::media::probe_golden`] was captured. The architectural argument
+//! above is unchanged and the split stays: the host that RUNS Muse and the host
+//! that TESTS it are different machines, and only the second one's capabilities
+//! decide what a test can do. But the factual claim was stale, it was repeated
+//! in five places in this file, and it was used to justify leaving several
+//! things unverified that could have been verified all along.
 //!
 //! ## What this module refuses to do
 //! It never returns a *partial* or *empty* [`MediaProbe`] to paper over a
@@ -87,10 +98,13 @@ use crate::media::paths::ResolvedPath;
 /// `if (opt[1] == '-' && opt[2] == '\0') { handleoptions = 0; continue; }` —
 /// present in the `n5.1` tag, which is the ffprobe build on the deployment host
 /// (`5.1.9-0+deb12u1`), and still present on master. This mattered enough to
-/// check: ffprobe is installed on neither the dev box nor <host>, so no test in
-/// this suite can catch a terminator ffprobe would have rejected, and an
-/// unsupported `--` would have failed EVERY probe in production while the
-/// suite stayed green.
+/// check: ffprobe is not installed on the dev box, so no test in this suite can
+/// catch a terminator ffprobe would have rejected, and an unsupported `--`
+/// would have failed EVERY probe in production while the suite stayed green.
+/// (It IS installed on <host> — see the module docs' correction — and every
+/// capture in the golden corpus was taken with this exact argv, `--` included,
+/// and succeeded. That is live evidence the terminator is accepted, though it
+/// is evidence from a capture run rather than from a test.)
 pub fn build_ffprobe_args(file_path: &str) -> Vec<String> {
     vec![
         "-v".to_string(),
@@ -501,12 +515,17 @@ pub struct SubtitleStream {
 /// `-c:s` argument or a third-party tool rather than from `ffprobe`.
 ///
 /// # What this claim rests on
-/// **Source reading, not execution.** `ffprobe` is installed on neither the dev
-/// box nor <host>, so no descriptor name here was confirmed against a live
-/// probe. Every row above was verified by reading FFmpeg `master`
-/// (`libavcodec/codec_desc.c`, `libavcodec/{pgssub,dvdsub,dvbsub}dec.c`,
-/// `fftools/ffprobe.c`). If ffprobe ever becomes available, re-confirm rather
-/// than inheriting this note.
+/// **Source reading, plus one row now confirmed live.** Every row above was
+/// verified by reading FFmpeg `master` (`libavcodec/codec_desc.c`,
+/// `libavcodec/{pgssub,dvdsub,dvbsub}dec.c`, `fftools/ffprobe.c`).
+///
+/// S130-A `MPRB-04` then confirmed `dvd_subtitle` against a live
+/// `ffprobe 5.1.9` on <host> — the `dvd_vob_data_stream` fixture in
+/// [`crate::media::probe_golden`] is a real DVD rip whose subtitle streams come
+/// back with exactly that `codec_name`. The other six rows remain source-read
+/// only: this library contains no `dvb_subtitle` or `xsub` file to probe, and
+/// the three alias rows are names ffprobe cannot emit at all. Stated
+/// row-by-row rather than upgrading the whole table on one confirmation.
 pub const BITMAP_SUBTITLE_CODECS: &[&str] = &[
     // canonical ffprobe `codec_name` values
     "hdmv_pgs_subtitle",
@@ -806,14 +825,42 @@ pub fn run_ffprobe_with_limits(
         });
     }
 
-    if !captured.status.success() {
+    interpret_probe_output(
+        captured.status.success(),
+        captured.status.code(),
+        &captured.stdout,
+        &captured.stderr,
+    )
+}
+
+/// Turn a finished `ffprobe` run into a [`MediaProbe`] or a [`ProbeError`].
+///
+/// Extracted by S130-A `MPRB-04` and called by **both** entry points, because
+/// until then this rule was written out twice — once in
+/// [`run_ffprobe_with_limits`] and once in [`run_ffprobe_async`] — and a
+/// restatement is a thing that can drift. It is also the only part of the
+/// invocation layer that can be exercised without a process, which is what lets
+/// the golden corpus in [`crate::media::probe_golden`] test the REAL failure
+/// path against the 7 files the full-library survey could not read, rather than
+/// against a rule the test wrote for itself.
+///
+/// `success` and `code` are both taken because they are not interchangeable:
+/// a child killed by a signal has `success() == false` and `code() == None`,
+/// and deriving one from the other would render that case as a clean exit.
+pub fn interpret_probe_output(
+    success: bool,
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<MediaProbe, ProbeError> {
+    if !success {
         return Err(ProbeError::ExitFailure {
-            code: captured.status.code(),
-            stderr: String::from_utf8_lossy(&captured.stderr).into_owned(),
+            code,
+            stderr: String::from_utf8_lossy(stderr).into_owned(),
         });
     }
 
-    parse_probe_json(&String::from_utf8_lossy(&captured.stdout))
+    parse_probe_json(&String::from_utf8_lossy(stdout))
 }
 
 // --- The async entry point (S130-A MPRB-02) --------------------------------
@@ -852,14 +899,12 @@ pub async fn run_ffprobe_async(
     // `run_ffprobe_with_limits` checks and this does not.
     let captured = spawn_with_timeout_async(ffprobe_bin, &args, timeout, max_output_bytes).await?;
 
-    if !captured.status.success() {
-        return Err(ProbeError::ExitFailure {
-            code: captured.status.code(),
-            stderr: String::from_utf8_lossy(&captured.stderr).into_owned(),
-        });
-    }
-
-    parse_probe_json(&String::from_utf8_lossy(&captured.stdout))
+    interpret_probe_output(
+        captured.status.success(),
+        captured.status.code(),
+        &captured.stdout,
+        &captured.stderr,
+    )
 }
 
 /// How long the timeout path waits for a killed child to be reaped.
@@ -1641,7 +1686,7 @@ fn finite_positive(f: f64) -> Option<f64> {
 ///    `max_streams` option, documented as defaulting to 1000, above which
 ///    ffmpeg itself refuses a file. That would make a >1000-stream document one
 ///    ffprobe would never have produced for us in the first place. ffmpeg is
-///    installed on neither the dev box nor <host>, so this is read from
+///    not installed on the dev box, so this is read from
 ///    documentation rather than checked, and it is corroboration only — points
 ///    1 and 2 carry the bound on their own.
 ///
@@ -3202,7 +3247,7 @@ mod tests {
     // --- The async entry point ---------------------------------------------
     //
     // These use STUB `ffprobe` scripts written to a temp dir. ffprobe is
-    // installed on neither the dev box nor <host>, so a test that needed the
+    // not installed on the dev box, so a test that needed the
     // real binary would not run anywhere in this fleet — the same reason the
     // parser is a pure function. A stub cannot tell us how ffprobe behaves; it
     // tells us how OUR process handling behaves, which is what MPRB-02 changed.

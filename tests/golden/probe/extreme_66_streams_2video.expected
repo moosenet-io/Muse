@@ -1,0 +1,79 @@
+container: matroska,webm
+duration_secs: Some(11687.980000)
+format_bitrate_bps: Some(30689747)
+size_bytes: Some(44837644688)
+title: Some("Fixture Title")
+chapter_count: 64
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 1
+video_count: 1
+audio_count: 5
+subtitle_count: 59
+attachment_count: 0
+video index=0 codec=hevc size=Some(3840)xSome(1634) bitrate=None pix_fmt=Some("yuv420p10le") profile=Some("main 10") tag=Some("[0][0][0][0]") level=Some(150) bits_per_raw_sample=None r_fps=Some(23.976024) avg_fps=Some(23.976024) range=Some("tv") transfer=Some("smpte2084") primaries=Some("bt2020") space=Some("bt2020nc") attached_pic=false
+  side_data kind="DOVI configuration record" dv_profile=Some(8) dv_bl_compat=Some(1) rpu=Some(true) bl=Some(true) el=Some(false)
+audio index=1 codec=truehd channels=Some(8) layout=Some("7.1") sample_rate=Some(48000) lang=Some("eng") bitrate=None profile=None default=true forced=false
+audio index=2 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("eng") bitrate=Some(768000) profile=None default=false forced=false
+audio index=3 codec=ac3 channels=Some(2) layout=Some("stereo") sample_rate=Some(48000) lang=Some("eng") bitrate=Some(224000) profile=None default=false forced=false
+audio index=4 codec=ac3 channels=Some(2) layout=Some("stereo") sample_rate=Some(48000) lang=Some("eng") bitrate=Some(224000) profile=None default=false forced=false
+audio index=5 codec=ac3 channels=Some(2) layout=Some("stereo") sample_rate=Some(48000) lang=Some("eng") bitrate=Some(224000) profile=None default=false forced=false
+subtitle index=6 codec=hdmv_pgs_subtitle lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=7 codec=hdmv_pgs_subtitle lang=Some("ara") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=8 codec=hdmv_pgs_subtitle lang=Some("bul") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=9 codec=hdmv_pgs_subtitle lang=Some("chi") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=10 codec=hdmv_pgs_subtitle lang=Some("chi") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=11 codec=hdmv_pgs_subtitle lang=Some("hrv") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=12 codec=hdmv_pgs_subtitle lang=Some("cze") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=13 codec=hdmv_pgs_subtitle lang=Some("dan") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=14 codec=hdmv_pgs_subtitle lang=Some("dut") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=15 codec=hdmv_pgs_subtitle lang=Some("est") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=16 codec=hdmv_pgs_subtitle lang=Some("fin") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=17 codec=hdmv_pgs_subtitle lang=Some("fre") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=18 codec=hdmv_pgs_subtitle lang=Some("ger") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=19 codec=hdmv_pgs_subtitle lang=Some("gre") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=20 codec=hdmv_pgs_subtitle lang=Some("heb") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=21 codec=hdmv_pgs_subtitle lang=Some("hun") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=22 codec=hdmv_pgs_subtitle lang=Some("ice") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=23 codec=hdmv_pgs_subtitle lang=Some("ind") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=24 codec=hdmv_pgs_subtitle lang=Some("ita") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=25 codec=hdmv_pgs_subtitle lang=Some("jpn") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=26 codec=hdmv_pgs_subtitle lang=Some("kor") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=27 codec=hdmv_pgs_subtitle lang=Some("lav") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=28 codec=hdmv_pgs_subtitle lang=Some("lit") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=29 codec=hdmv_pgs_subtitle lang=Some("may") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=30 codec=hdmv_pgs_subtitle lang=Some("nor") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=31 codec=hdmv_pgs_subtitle lang=Some("per") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=32 codec=hdmv_pgs_subtitle lang=Some("pol") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=33 codec=hdmv_pgs_subtitle lang=Some("por") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=34 codec=hdmv_pgs_subtitle lang=Some("por") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=35 codec=hdmv_pgs_subtitle lang=Some("rum") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=36 codec=hdmv_pgs_subtitle lang=Some("rus") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=37 codec=hdmv_pgs_subtitle lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=38 codec=hdmv_pgs_subtitle lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=39 codec=hdmv_pgs_subtitle lang=Some("swe") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=40 codec=hdmv_pgs_subtitle lang=Some("tha") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=41 codec=hdmv_pgs_subtitle lang=Some("tur") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=42 codec=hdmv_pgs_subtitle lang=Some("ukr") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=43 codec=hdmv_pgs_subtitle lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=44 codec=hdmv_pgs_subtitle lang=Some("dan") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=45 codec=hdmv_pgs_subtitle lang=Some("dut") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=46 codec=hdmv_pgs_subtitle lang=Some("fre") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=47 codec=hdmv_pgs_subtitle lang=Some("ger") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=48 codec=hdmv_pgs_subtitle lang=Some("jpn") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=49 codec=hdmv_pgs_subtitle lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=50 codec=hdmv_pgs_subtitle lang=Some("swe") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=51 codec=hdmv_pgs_subtitle lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=52 codec=hdmv_pgs_subtitle lang=Some("dan") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=53 codec=hdmv_pgs_subtitle lang=Some("dut") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=54 codec=hdmv_pgs_subtitle lang=Some("fre") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=55 codec=hdmv_pgs_subtitle lang=Some("ger") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=56 codec=hdmv_pgs_subtitle lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=57 codec=hdmv_pgs_subtitle lang=Some("swe") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=58 codec=hdmv_pgs_subtitle lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=59 codec=hdmv_pgs_subtitle lang=Some("dan") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=60 codec=hdmv_pgs_subtitle lang=Some("dut") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=61 codec=hdmv_pgs_subtitle lang=Some("fre") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=62 codec=hdmv_pgs_subtitle lang=Some("ger") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=63 codec=hdmv_pgs_subtitle lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=true
+subtitle index=64 codec=hdmv_pgs_subtitle lang=Some("swe") default=false forced=false hearing_impaired=false bitmap=true

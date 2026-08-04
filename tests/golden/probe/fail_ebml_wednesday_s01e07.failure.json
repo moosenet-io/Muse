@@ -1,0 +1,6 @@
+{
+  "exit_code": 1,
+  "success": false,
+  "stderr": "[matroska,webm @ 0xADDR] 0x00 at pos 0 (0x0) invalid as first byte of an EBML number\n[matroska,webm @ 0xADDR] EBML header parsing failed\nfixture-fail_ebml_wednesday_s01e07.bin: Invalid data found when processing input\n",
+  "stdout": "{\n\n}\n"
+}

@@ -1,0 +1,5 @@
+error_variant: ExitFailure
+is_retryable: false
+state: probe_failed
+message: ffprobe exited with 1 — the file is unreadable or is not media: [matroska,webm @ 0xADDR] EBML header parsing failed
+fixture-fail_ebml_blade_47_ronin.bin: Invalid data found when processing input

@@ -1,0 +1,50 @@
+container: matroska,webm
+duration_secs: Some(3861.600000)
+format_bitrate_bps: Some(7572845)
+size_bytes: Some(3655412720)
+title: Some("Fixture Title")
+chapter_count: 4
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 11
+subtitle_count: 24
+attachment_count: 0
+video index=0 codec=hevc size=Some(1920)xSome(1080) bitrate=None pix_fmt=Some("yuv420p10le") profile=Some("main 10") tag=Some("[0][0][0][0]") level=Some(120) bits_per_raw_sample=None r_fps=Some(24.000000) avg_fps=Some(24.000000) range=Some("tv") transfer=Some("smpte2084") primaries=Some("bt2020") space=Some("bt2020nc") attached_pic=false
+  side_data kind="DOVI configuration record" dv_profile=Some(8) dv_bl_compat=Some(1) rpu=Some(true) bl=Some(true) el=Some(false)
+audio index=1 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("ger") bitrate=Some(256000) profile=None default=false forced=false
+audio index=2 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("cze") bitrate=Some(256000) profile=None default=false forced=false
+audio index=3 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("ita") bitrate=Some(256000) profile=None default=false forced=false
+audio index=4 codec=aac channels=Some(2) layout=Some("stereo") sample_rate=Some(48000) lang=Some("spa") bitrate=None profile=Some("lc") default=false forced=false
+audio index=5 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("fre") bitrate=Some(256000) profile=None default=false forced=false
+audio index=6 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("tur") bitrate=Some(256000) profile=None default=false forced=false
+audio index=7 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("eng") bitrate=Some(256000) profile=None default=true forced=false
+audio index=8 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("hun") bitrate=Some(256000) profile=None default=false forced=false
+audio index=9 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("spa") bitrate=Some(256000) profile=None default=false forced=false
+audio index=10 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("pol") bitrate=Some(256000) profile=None default=false forced=false
+audio index=11 codec=eac3 channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("por") bitrate=Some(256000) profile=None default=false forced=false
+subtitle index=12 codec=subrip lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=13 codec=subrip lang=Some("eng") default=false forced=false hearing_impaired=true bitmap=false
+subtitle index=14 codec=subrip lang=Some("cze") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=15 codec=subrip lang=Some("dan") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=16 codec=subrip lang=Some("ger") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=17 codec=subrip lang=Some("gre") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=18 codec=subrip lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=19 codec=subrip lang=Some("spa") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=20 codec=subrip lang=Some("fin") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=21 codec=subrip lang=Some("fre") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=22 codec=subrip lang=Some("hun") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=23 codec=subrip lang=Some("ita") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=24 codec=subrip lang=Some("jpn") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=25 codec=subrip lang=Some("kor") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=26 codec=subrip lang=Some("dut") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=27 codec=subrip lang=Some("nor") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=28 codec=subrip lang=Some("pol") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=29 codec=subrip lang=Some("por") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=30 codec=subrip lang=Some("por") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=31 codec=subrip lang=Some("rum") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=32 codec=subrip lang=Some("slo") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=33 codec=subrip lang=Some("swe") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=34 codec=subrip lang=Some("tur") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=35 codec=subrip lang=Some("chi") default=false forced=false hearing_impaired=false bitmap=false

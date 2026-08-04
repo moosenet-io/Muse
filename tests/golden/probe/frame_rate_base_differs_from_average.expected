@@ -1,0 +1,15 @@
+container: avi
+duration_secs: Some(2553.386720)
+format_bitrate_bps: Some(565518)
+size_bytes: Some(180498432)
+title: None
+chapter_count: 0
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 1
+subtitle_count: 0
+attachment_count: 0
+video index=0 codec=mpeg4 size=Some(448)xSome(352) bitrate=Some(473405) pix_fmt=Some("yuv420p") profile=None tag=Some("dx50") level=None bits_per_raw_sample=None r_fps=Some(23.976024) avg_fps=Some(23.976000) range=None transfer=None primaries=None space=None attached_pic=false
+audio index=1 codec=mp3 channels=Some(2) layout=Some("stereo") sample_rate=Some(44100) lang=None bitrate=Some(79552) profile=None default=false forced=false

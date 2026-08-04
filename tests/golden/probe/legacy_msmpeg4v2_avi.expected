@@ -1,0 +1,15 @@
+container: avi
+duration_secs: Some(30.066939)
+format_bitrate_bps: Some(957540)
+size_bytes: Some(3598788)
+title: Some("Fixture Title")
+chapter_count: 0
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 1
+subtitle_count: 0
+attachment_count: 0
+video index=0 codec=msmpeg4v2 size=Some(320)xSome(240) bitrate=Some(913742) pix_fmt=Some("yuv420p") profile=None tag=Some("mp42") level=None bits_per_raw_sample=None r_fps=Some(25.000000) avg_fps=Some(25.000000) range=None transfer=None primaries=None space=None attached_pic=false
+audio index=1 codec=mp3 channels=Some(1) layout=Some("mono") sample_rate=Some(22050) lang=None bitrate=Some(128) profile=None default=false forced=false

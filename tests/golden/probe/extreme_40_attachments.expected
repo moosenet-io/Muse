@@ -1,0 +1,60 @@
+container: matroska,webm
+duration_secs: Some(1480.315000)
+format_bitrate_bps: Some(7886823)
+size_bytes: Some(1459372823)
+title: Some("Fixture Title")
+chapter_count: 5
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 2
+subtitle_count: 4
+attachment_count: 40
+video index=0 codec=h264 size=Some(1920)xSome(1080) bitrate=None pix_fmt=Some("yuv420p10le") profile=Some("high 10") tag=Some("[0][0][0][0]") level=Some(50) bits_per_raw_sample=Some(10) r_fps=Some(23.976024) avg_fps=Some(23.976024) range=Some("tv") transfer=Some("bt709") primaries=Some("bt709") space=Some("bt709") attached_pic=false
+audio index=1 codec=flac channels=Some(6) layout=Some("5.1(side)") sample_rate=Some(48000) lang=Some("eng") bitrate=None profile=None default=true forced=false
+audio index=2 codec=flac channels=Some(2) layout=Some("stereo") sample_rate=Some(48000) lang=Some("jpn") bitrate=None profile=None default=false forced=false
+subtitle index=3 codec=ass lang=Some("eng") default=true forced=false hearing_impaired=false bitmap=false
+subtitle index=4 codec=ass lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=5 codec=ass lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=false
+subtitle index=6 codec=hdmv_pgs_subtitle lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=true
+attachment index=7 codec=ttf filename=Some("attachment.ttf")
+attachment index=8 codec=ttf filename=Some("attachment.ttf")
+attachment index=9 codec=ttf filename=Some("attachment.ttf")
+attachment index=10 codec=ttf filename=Some("attachment.ttf")
+attachment index=11 codec=ttf filename=Some("attachment.ttf")
+attachment index=12 codec=ttf filename=Some("attachment.ttf")
+attachment index=13 codec=ttf filename=Some("attachment.ttf")
+attachment index=14 codec=otf filename=Some("attachment.otf")
+attachment index=15 codec=otf filename=Some("attachment.otf")
+attachment index=16 codec=ttf filename=Some("attachment.ttf")
+attachment index=17 codec=ttf filename=Some("attachment.ttf")
+attachment index=18 codec=ttf filename=Some("attachment.ttf")
+attachment index=19 codec=ttf filename=Some("attachment.ttf")
+attachment index=20 codec=ttf filename=Some("attachment.ttf")
+attachment index=21 codec=ttf filename=Some("attachment.ttf")
+attachment index=22 codec=ttf filename=Some("attachment.ttf")
+attachment index=23 codec=ttf filename=Some("attachment.ttf")
+attachment index=24 codec=ttf filename=Some("attachment.ttf")
+attachment index=25 codec=otf filename=Some("attachment.otf")
+attachment index=26 codec=otf filename=Some("attachment.otf")
+attachment index=27 codec=otf filename=Some("attachment.otf")
+attachment index=28 codec=ttf filename=Some("attachment.ttf")
+attachment index=29 codec=ttf filename=Some("attachment.ttf")
+attachment index=30 codec=ttf filename=Some("attachment.ttf")
+attachment index=31 codec=ttf filename=Some("attachment.ttf")
+attachment index=32 codec=ttf filename=Some("attachment.ttf")
+attachment index=33 codec=otf filename=Some("attachment.otf")
+attachment index=34 codec=otf filename=Some("attachment.otf")
+attachment index=35 codec=ttf filename=Some("attachment.otf")
+attachment index=36 codec=ttf filename=Some("attachment.otf")
+attachment index=37 codec=ttf filename=Some("attachment.ttf")
+attachment index=38 codec=ttf filename=Some("attachment.otf")
+attachment index=39 codec=ttf filename=Some("attachment.ttf")
+attachment index=40 codec=ttf filename=Some("attachment.ttf")
+attachment index=41 codec=ttf filename=Some("attachment.otf")
+attachment index=42 codec=ttf filename=Some("attachment.otf")
+attachment index=43 codec=ttf filename=Some("attachment.ttf")
+attachment index=44 codec=ttf filename=Some("attachment.ttf")
+attachment index=45 codec=ttf filename=Some("attachment.otf")
+attachment index=46 codec=ttf filename=Some("attachment.otf")

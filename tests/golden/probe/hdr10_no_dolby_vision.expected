@@ -1,0 +1,16 @@
+container: matroska,webm
+duration_secs: Some(8502.486000)
+format_bitrate_bps: Some(26156957)
+size_bytes: Some(27799895388)
+title: Some("Fixture Title")
+chapter_count: 35
+data_stream_count: 0
+unindexed_stream_count: 0
+other_stream_count: 0
+video_count: 1
+audio_count: 1
+subtitle_count: 1
+attachment_count: 0
+video index=0 codec=hevc size=Some(3840)xSome(1600) bitrate=None pix_fmt=Some("yuv420p10le") profile=Some("main 10") tag=Some("[0][0][0][0]") level=Some(153) bits_per_raw_sample=None r_fps=Some(23.976024) avg_fps=Some(23.976024) range=Some("tv") transfer=Some("smpte2084") primaries=Some("bt2020") space=Some("bt2020nc") attached_pic=false
+audio index=1 codec=dts channels=Some(8) layout=Some("7.1") sample_rate=Some(48000) lang=Some("eng") bitrate=None profile=Some("dts-hd ma") default=true forced=false
+subtitle index=2 codec=dvd_subtitle lang=Some("eng") default=false forced=false hearing_impaired=false bitmap=true
